@@ -1,0 +1,53 @@
+[server]
+# Bind address and port (env: SCTL_LISTEN)
+listen = "0.0.0.0:1337"
+
+# Maximum concurrent HTTP connections (not currently enforced)
+max_connections = 10
+
+# Maximum concurrent WebSocket shell sessions
+max_sessions = 20
+
+# Maximum output entries kept per session buffer (ring buffer, default 1000)
+session_buffer_size = 1000
+
+# Default timeout for POST /api/exec commands (milliseconds, 30 s)
+exec_timeout_ms = 30000
+
+# Maximum commands per POST /api/exec/batch request
+max_batch_size = 20
+
+# Maximum file size for GET/PUT /api/files (bytes, 2 MB)
+max_file_size = 2097152
+
+# Directory for persistent data (journals, etc). Default /var/lib/sctl
+# data_dir = "/var/lib/sctl"
+
+# Enable output journaling to disk (default true)
+# journal_enabled = true
+
+# Default terminal dimensions for PTY sessions
+# default_terminal_rows = 24
+# default_terminal_cols = 80
+
+[auth]
+# Pre-shared API key for all authenticated endpoints.
+# STRONGLY recommended: set via SCTL_API_KEY env var instead of
+# storing in config file.
+api_key = "change-me"
+
+[shell]
+# Shell binary used for exec and sessions
+default_shell = "/bin/sh"
+
+# Default working directory for exec and sessions
+default_working_dir = "/"
+
+[device]
+# Device serial number reported in GET /api/info (env: SCTL_DEVICE_SERIAL)
+serial = "SCTL-0000-DEV-001"
+
+[logging]
+# Log level filter (env: RUST_LOG)
+# Examples: "info", "debug", "sctl=debug,tower_http=info"
+level = "info"

@@ -1,0 +1,35 @@
+[package]
+name = "sctl"
+version = "0.3.0"
+edition = "2021"
+description = "Remote device control server for AI agents — HTTP + WebSocket API with PTY support"
+license = "GPL-3.0-only"
+authors = ["Alexandre Grenier"]
+repository = "https://github.com/gawd-ai/sctl"
+homepage = "https://github.com/gawd-ai/sctl"
+readme = "README.md"
+keywords = ["remote-shell", "ai-agent", "pty", "embedded", "iot"]
+categories = ["command-line-utilities", "network-programming"]
+rust-version = "1.75"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "signal", "sync", "time", "macros", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+uuid = { version = "1", features = ["v4"] }
+futures = "0.3"
+base64 = "0.22"
+libc = "0.2"
+nix = { version = "0.29", features = ["term", "signal", "process"] }
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"

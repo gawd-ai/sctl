@@ -1,0 +1,14 @@
+{
+  "devices": {
+    "router-1": {
+      "url": "http://192.168.1.1:1337",
+      "api_key": "your-api-key-for-router-1",
+      "playbooks_dir": "/etc/sctl/playbooks"
+    },
+    "router-2": {
+      "url": "http://192.168.1.2:1337",
+      "api_key": "your-api-key-for-router-2"
+    }
+  },
+  "default_device": "router-1"
+}

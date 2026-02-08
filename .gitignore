@@ -1,0 +1,30 @@
+# Build artifacts
+**/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+
+# Dev environment
+/tmp/sctl-dev/
+
+# Node / Web UI
+web/node_modules/
+web/.svelte-kit/
+web/dist/
+web/build/
+node_modules/
+
+# Environment files
+.env
+.env.*

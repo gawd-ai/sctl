@@ -1,0 +1,27 @@
+[package]
+name = "mcp-sctl"
+version = "0.1.0"
+edition = "2021"
+description = "MCP proxy for AI agents to control remote Linux devices via sctl"
+license = "GPL-3.0-only"
+authors = ["Alexandre Grenier"]
+repository = "https://github.com/gawd-ai/sctl"
+homepage = "https://github.com/gawd-ai/sctl"
+readme = "README.md"
+keywords = ["mcp", "sctl", "remote-shell", "ai-agent", "iot"]
+categories = ["command-line-utilities", "network-programming"]
+rust-version = "1.75"
+
+[[bin]]
+name = "mcp-sctl"
+path = "src/main.rs"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "io-util", "io-std", "sync", "time"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+clap = { version = "4", features = ["derive"] }
+serde_yaml = "0.9"
