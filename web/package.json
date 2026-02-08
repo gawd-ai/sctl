@@ -47,7 +47,7 @@
     "@xterm/xterm": "^5.5.0",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/addon-web-links": "^0.11.0",
-    "gawdux": "file:../../gawdux",
+    "gawdux": "github:gawd-ai/gawdux",
     "flowbite-svelte": "^0.47.0",
     "flowbite-svelte-icons": "^2.0.0"
   },
