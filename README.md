@@ -61,6 +61,7 @@ The fastest path from zero to AI-controlled devices:
 git clone https://github.com/gawd-ai/sctl.git && cd sctl
 
 # Build everything and start the dev stack
+chmod +x rundev.sh
 ./rundev.sh
 ```
 
@@ -237,7 +238,7 @@ See the [security review](server/docs/REVIEW.md) for a detailed analysis.
 
 ## Requirements
 
-- **Rust 1.75+** ([rustup.rs](https://rustup.rs/))
+- **Rust 1.82+** ([rustup.rs](https://rustup.rs/))
 - **Docker** (for ARM cross-compilation via [cross](https://github.com/cross-rs/cross), optional)
 - **Target device**: any Linux system with `/bin/sh` (tested on OpenWrt ARM and x86_64)
 

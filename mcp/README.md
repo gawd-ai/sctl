@@ -402,7 +402,7 @@ make doc
 
 ### Prerequisites
 
-- Rust 1.75+
+- Rust 1.82+
 - A running sctl instance to connect to
 
 ### Dependencies

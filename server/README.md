@@ -16,17 +16,17 @@ Works on any Linux system -- from x86_64 servers to ARM embedded devices (OpenWr
 ┌──────────────┐         HTTPS / WSS          ┌──────────────────────┐
 │              │ ◄──────────────────────────► │  sctl                │
 │  AI Agent /  │   Bearer token auth          │  ┌────────────────┐  │
-│  Dashboard   │                              │  │ HTTP routes     │  │
-│              │   POST /api/exec             │  │  exec, files,   │  │
-│              │   GET  /api/info             │  │  info, health   │  │
+│  Dashboard   │                              │  │ HTTP routes    │  │
+│              │   POST /api/exec             │  │  exec, files,  │  │
+│              │   GET  /api/info             │  │  info, health  │  │
 │              │   GET  /api/ws               │  ├────────────────┤  │
-│              │                              │  │ WebSocket       │  │
-│              │ ◄─ session.stdout ────────── │  │  sessions mgr   │  │
-│              │ ── session.exec ───────────► │  │  stdin/out/err  │  │
+│              │                              │  │ WebSocket      │  │
+│              │ ◄─ session.stdout ────────── │  │  sessions mgr  │  │
+│              │ ── session.exec ───────────► │  │  stdin/out/err │  │
 └──────────────┘                              │  └────────────────┘  │
                                               │       ▼              │
                                               │  ┌────────────────┐  │
-                                              │  │ /bin/sh -c ...  │  │
+                                              │  │ /bin/sh -c ... │  │
                                               │  └────────────────┘  │
                                               └──────────────────────┘
                                                    Linux device
@@ -490,7 +490,7 @@ File writes use a temp-file-then-rename pattern, so readers never see partial co
 
 ### Prerequisites
 
-- Rust 1.75+
+- Rust 1.82+
 - Docker (for `cross` ARM builds)
 
 ### Makefile targets
