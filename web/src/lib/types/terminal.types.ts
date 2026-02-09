@@ -60,6 +60,8 @@ export interface SessionInfo {
 	attached: boolean;
 	serverId?: string;
 	serverName?: string;
+	/** Session no longer exists on the server (e.g. device rebooted). */
+	dead?: boolean;
 }
 
 // ── Reconnect ───────────────────────────────────────────────────────

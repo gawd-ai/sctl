@@ -79,7 +79,7 @@ fn builtin_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "device_exec",
-            "description": "Execute a shell command on a sctl device and return stdout, stderr, and exit code.",
+            "description": "Execute a shell command on a sctl device and return stdout, stderr, and exit code.\n\nIMPORTANT: If you have already attached to or been given a session in this conversation, prefer using session_exec or session_exec_wait in that session instead. Sessions are visible to the user in the terminal UI (sctlin), so working in a session lets the user watch your progress in real time. Only use device_exec when no session has been established in the conversation or when you explicitly need an independent execution context.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -111,7 +111,7 @@ fn builtin_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "device_exec_batch",
-            "description": "Execute multiple shell commands sequentially on a sctl device. Returns results for each command.",
+            "description": "Execute multiple shell commands sequentially on a sctl device. Returns results for each command.\n\nIMPORTANT: If you have already attached to or been given a session in this conversation, prefer using session_exec in that session instead. Sessions are visible to the user in the terminal UI (sctlin), so working in a session lets the user watch your progress in real time. Only use device_exec_batch when no session has been established in the conversation or when you explicitly need independent execution.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -835,10 +835,22 @@ async fn get_ws_connection(
     args: &Value,
     registry: &DeviceRegistry,
 ) -> Result<std::sync::Arc<crate::websocket::DeviceWsConnection>, ToolResult> {
-    let (name, client) = match registry.resolve_with_name(get_device_param(args)) {
-        Ok(v) => v,
-        Err(e) => return Err(ToolResult::error(e)),
+    // If no explicit device, try to auto-route by session_id
+    let device = match get_device_param(args) {
+        Some(d) => Some(d.to_string()),
+        None => {
+            if let Some(sid) = args.get("session_id").and_then(Value::as_str) {
+                registry.resolve_session_device(sid).await
+            } else {
+                None
+            }
+        }
     };
+    let (name, client) =
+        match registry.resolve_with_name(device.as_deref()) {
+            Ok(v) => v,
+            Err(e) => return Err(ToolResult::error(e)),
+        };
     registry
         .ws_pool
         .get_or_connect(name, client)
@@ -892,6 +904,12 @@ async fn handle_session_start(args: &Value, registry: &DeviceRegistry) -> ToolRe
                         .to_string(),
                 )
             } else {
+                // Register session→device mapping for auto-routing
+                if let Some(sid) = v["session_id"].as_str() {
+                    let device_name =
+                        get_device_param(args).unwrap_or(registry.default_device());
+                    registry.register_session(sid, device_name).await;
+                }
                 let mut result = json!({
                     "session_id": v["session_id"],
                     "pid": v["pid"],
@@ -923,6 +941,9 @@ async fn handle_session_exec(args: &Value, registry: &DeviceRegistry) -> ToolRes
         Some(c) => c,
         None => return ToolResult::error("Missing required parameter: command".into()),
     };
+
+    // Auto-set AI working status
+    ws.auto_set_ai_working(session_id, "write").await;
 
     match ws
         .send(json!({
@@ -1028,6 +1049,9 @@ async fn handle_session_send(args: &Value, registry: &DeviceRegistry) -> ToolRes
         None => return ToolResult::error("Missing required parameter: data".into()),
     };
 
+    // Auto-set AI working status
+    ws.auto_set_ai_working(session_id, "write").await;
+
     // First: interpret literal escape sequences (e.g. `\u0003` → Ctrl-C).
     // MCP clients often send these as literal text rather than decoded bytes.
     let unescaped = unescape_control_chars(raw_data);
@@ -1067,6 +1091,9 @@ async fn handle_session_read(args: &Value, registry: &DeviceRegistry) -> ToolRes
         .get("timeout_ms")
         .and_then(Value::as_u64)
         .unwrap_or(5000);
+
+    // Auto-set AI working status (read activity)
+    ws.auto_set_ai_working(session_id, "read").await;
 
     match ws.read_output(session_id, since, timeout_ms).await {
         Ok(result) => {
@@ -1231,6 +1258,13 @@ async fn handle_session_list(args: &Value, registry: &DeviceRegistry) -> ToolRes
         }
     }
 
+    // Register session→device mappings for auto-routing
+    for (device, s) in &all_sessions {
+        if let Some(sid) = s["session_id"].as_str() {
+            registry.register_session(sid, device).await;
+        }
+    }
+
     let sessions: Vec<Value> = all_sessions
         .into_iter()
         .map(|(device, mut s)| {
@@ -1264,6 +1298,9 @@ async fn handle_session_exec_wait(args: &Value, registry: &DeviceRegistry) -> To
         .get("timeout_ms")
         .and_then(Value::as_u64)
         .unwrap_or(30000);
+
+    // Auto-set AI working status
+    ws.auto_set_ai_working(session_id, "write").await;
 
     match ws.exec_wait(session_id, command, timeout_ms).await {
         Ok(result) => ToolResult::success(json!({
@@ -1407,6 +1444,12 @@ async fn handle_session_ai_status(args: &Value, registry: &DeviceRegistry) -> To
         .await
     {
         Ok(v) => {
+            // Sync local AI working tracking
+            if working {
+                ws.mark_ai_working(session_id).await;
+            } else {
+                ws.clear_ai_working(session_id).await;
+            }
             let mut result = json!({
                 "ok": true,
                 "session_id": v["session_id"].as_str().unwrap_or(session_id),

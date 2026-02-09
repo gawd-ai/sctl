@@ -10,6 +10,7 @@
 #   ./rundev.sh stop     # stop all services and deregister MCP
 #   ./rundev.sh status   # show what's running
 #   ./rundev.sh claude   # only register MCP in Claude Code (no build/start)
+#   ./rundev.sh relay    # build + start with tunnel relay (relay + client + MCP via relay)
 #
 set -euo pipefail
 
@@ -29,6 +30,12 @@ WEB_PID_FILE="$DATA_DIR/web.pid"
 CONFIG_FILE="$DATA_DIR/devices.json"
 MCP_NAME="sctl"
 WEB_PORT=5173
+
+# Relay mode config
+RELAY_LISTEN="127.0.0.1:8443"
+RELAY_PID_FILE="$DATA_DIR/relay.pid"
+TUNNEL_KEY="dev-tunnel-key"
+DEVICE_SERIAL="DEV-LOCAL-001"
 
 # Binaries (release for speed, debug takes too long on PTY-heavy sessions)
 SCTL_BIN="$SCTL_DIR/target/release/sctl"
@@ -98,6 +105,15 @@ do_kill() {
         rm -f "$WEB_PID_FILE"
     fi
 
+    # Kill relay
+    if [[ -f "$RELAY_PID_FILE" ]]; then
+        pid=$(cat "$RELAY_PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            graceful_stop "$pid" "relay"
+        fi
+        rm -f "$RELAY_PID_FILE"
+    fi
+
     # Kill any lingering mcp-sctl processes
     pkill -INT -f "mcp-sctl" 2>/dev/null && ok "Stopped mcp-sctl" || true
 }
@@ -142,6 +158,25 @@ do_status() {
     fi
 
     echo ""
+    echo "--- tunnel relay ---"
+    if [[ -f "$RELAY_PID_FILE" ]] && kill -0 "$(cat "$RELAY_PID_FILE")" 2>/dev/null; then
+        echo "  Running (PID $(cat "$RELAY_PID_FILE")), listening on $RELAY_LISTEN"
+        if curl -sf "http://${RELAY_LISTEN}/api/health" >/dev/null 2>&1; then
+            echo "  Health: OK"
+            # Show connected devices
+            local devices
+            devices=$(curl -sf -H "Authorization: Bearer $TUNNEL_KEY" "http://${RELAY_LISTEN}/api/tunnel/devices" 2>/dev/null) || true
+            if [[ -n "$devices" ]]; then
+                echo "  Devices: $devices"
+            fi
+        else
+            echo "  Health: not responding"
+        fi
+    else
+        echo "  Not running"
+    fi
+
+    echo ""
     echo "--- mcp-sctl ---"
     if claude mcp get "$MCP_NAME" 2>/dev/null; then
         echo "  Registered in Claude Code"
@@ -156,7 +191,13 @@ do_launch() {
     mkdir -p "$DATA_DIR"
     mkdir -p "$PLAYBOOKS_DIR"
 
-    cat > "$CONFIG_FILE" <<EOF
+    # Merge local device into existing config (preserve other devices)
+    if [[ -f "$CONFIG_FILE" ]] && command -v jq &>/dev/null; then
+        jq --arg url "$DEVICE_URL" --arg key "$API_KEY" --arg pb "$PLAYBOOKS_DIR" \
+            '.devices.local = {url: $url, api_key: $key, playbooks_dir: $pb} | .default_device = "local"' \
+            "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    else
+        cat > "$CONFIG_FILE" <<EOF
 {
   "devices": {
     "local": {
@@ -168,6 +209,7 @@ do_launch() {
   "default_device": "local"
 }
 EOF
+    fi
     ok "Config written: $CONFIG_FILE"
 
     # Stop any running instances (clean slate)
@@ -304,9 +346,14 @@ do_claude() {
         exit 1
     fi
 
-    # Create config if missing
+    # Create or merge config (preserve other devices)
     mkdir -p "$DATA_DIR" "$PLAYBOOKS_DIR"
-    cat > "$CONFIG_FILE" <<EOF
+    if [[ -f "$CONFIG_FILE" ]] && command -v jq &>/dev/null; then
+        jq --arg url "$DEVICE_URL" --arg key "$API_KEY" --arg pb "$PLAYBOOKS_DIR" \
+            '.devices.local = {url: $url, api_key: $key, playbooks_dir: $pb} | .default_device = "local"' \
+            "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    else
+        cat > "$CONFIG_FILE" <<EOF
 {
   "devices": {
     "local": {
@@ -318,6 +365,7 @@ do_claude() {
   "default_device": "local"
 }
 EOF
+    fi
 
     log "Registering mcp-sctl with Claude Code..."
     claude mcp remove "$MCP_NAME" 2>/dev/null || true
@@ -327,6 +375,206 @@ EOF
     echo ""
     echo "  Restart Claude Code or start a new conversation"
     echo "  to pick up the MCP server. Run /mcp to verify."
+}
+
+# --- relay (build + start with tunnel relay in front) ---
+do_relay() {
+    do_build
+
+    mkdir -p "$DATA_DIR" "$PLAYBOOKS_DIR"
+
+    # Generate relay TOML config
+    cat > "$DATA_DIR/relay.toml" <<EOF
+[server]
+listen = "$RELAY_LISTEN"
+journal_enabled = false
+
+[auth]
+api_key = "unused"
+
+[device]
+serial = "RELAY"
+
+[tunnel]
+relay = true
+tunnel_key = "$TUNNEL_KEY"
+EOF
+
+    # Generate tunnel client TOML config
+    cat > "$DATA_DIR/client.toml" <<EOF
+[server]
+listen = "$LISTEN"
+data_dir = "$DATA_DIR"
+
+[auth]
+api_key = "$API_KEY"
+
+[device]
+serial = "$DEVICE_SERIAL"
+
+[tunnel]
+tunnel_key = "$TUNNEL_KEY"
+url = "ws://$RELAY_LISTEN/api/tunnel/register"
+EOF
+
+    # Merge relay device into MCP config (via relay URL, not direct)
+    local relay_device_url="http://$RELAY_LISTEN/d/$DEVICE_SERIAL"
+    if [[ -f "$CONFIG_FILE" ]] && command -v jq &>/dev/null; then
+        jq --arg url "$relay_device_url" --arg key "$API_KEY" --arg pb "$PLAYBOOKS_DIR" \
+            '.devices.local = {url: $url, api_key: $key, playbooks_dir: $pb} | .default_device = "local"' \
+            "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    else
+        cat > "$CONFIG_FILE" <<EOF
+{
+  "devices": {
+    "local": {
+      "url": "$relay_device_url",
+      "api_key": "$API_KEY",
+      "playbooks_dir": "$PLAYBOOKS_DIR"
+    }
+  },
+  "default_device": "local"
+}
+EOF
+    fi
+    ok "Config written: $CONFIG_FILE (MCP via relay)"
+
+    # Stop any running instances
+    do_kill
+
+    # Start relay first
+    log "Starting relay on $RELAY_LISTEN..."
+    "$SCTL_BIN" serve --config "$DATA_DIR/relay.toml" &>"$DATA_DIR/relay.log" &
+    relay_pid=$!
+    echo "$relay_pid" > "$RELAY_PID_FILE"
+
+    for _ in $(seq 1 30); do
+        if curl -sf "http://${RELAY_LISTEN}/api/health" >/dev/null 2>&1; then
+            ok "Relay running (PID $relay_pid) on $RELAY_LISTEN"
+            break
+        fi
+        if ! kill -0 "$relay_pid" 2>/dev/null; then
+            err "Relay exited unexpectedly. Log:"
+            tail -20 "$DATA_DIR/relay.log"
+            exit 1
+        fi
+        sleep 0.2
+    done
+
+    if ! curl -sf "http://${RELAY_LISTEN}/api/health" >/dev/null 2>&1; then
+        err "Relay failed to start within 6s. Log:"
+        tail -20 "$DATA_DIR/relay.log"
+        exit 1
+    fi
+
+    # Start sctl as tunnel client
+    log "Starting sctl (tunnel client) on $LISTEN..."
+    RUST_LOG=info \
+        "$SCTL_BIN" serve --config "$DATA_DIR/client.toml" &>"$DATA_DIR/sctl.log" &
+    sctl_pid=$!
+    echo "$sctl_pid" > "$PID_FILE"
+
+    for _ in $(seq 1 30); do
+        if curl -sf "http://${LISTEN}/api/health" >/dev/null 2>&1; then
+            ok "sctl running (PID $sctl_pid) on $LISTEN"
+            break
+        fi
+        if ! kill -0 "$sctl_pid" 2>/dev/null; then
+            err "sctl exited unexpectedly. Log:"
+            tail -20 "$DATA_DIR/sctl.log"
+            exit 1
+        fi
+        sleep 0.2
+    done
+
+    if ! curl -sf "http://${LISTEN}/api/health" >/dev/null 2>&1; then
+        err "sctl failed to start within 6s. Log:"
+        tail -20 "$DATA_DIR/sctl.log"
+        exit 1
+    fi
+
+    # Wait for device to register with relay
+    log "Waiting for tunnel registration..."
+    local registered=false
+    for _ in $(seq 1 30); do
+        local devices
+        devices=$(curl -sf -H "Authorization: Bearer $TUNNEL_KEY" "http://${RELAY_LISTEN}/api/tunnel/devices" 2>/dev/null) || true
+        if echo "$devices" | grep -q "$DEVICE_SERIAL" 2>/dev/null; then
+            ok "Device $DEVICE_SERIAL registered with relay"
+            registered=true
+            break
+        fi
+        sleep 0.2
+    done
+
+    if [[ "$registered" != "true" ]]; then
+        err "Device failed to register with relay within 6s"
+        echo "  Relay log:"
+        tail -10 "$DATA_DIR/relay.log"
+        echo "  Client log:"
+        tail -10 "$DATA_DIR/sctl.log"
+        exit 1
+    fi
+
+    # Start web dev server
+    log "Starting web dev server on port $WEB_PORT..."
+    local node_bin
+    node_bin=$(command -v node 2>/dev/null || command -v node.exe 2>/dev/null) || { err "node not found in PATH"; exit 1; }
+    (cd "$WEB_DIR" && exec "$node_bin" node_modules/vite/bin/vite.js dev --port "$WEB_PORT" --strictPort) &>"$DATA_DIR/web.log" &
+    web_pid=$!
+    echo "$web_pid" > "$WEB_PID_FILE"
+
+    for _ in $(seq 1 75); do
+        if curl -sf "http://localhost:${WEB_PORT}" >/dev/null 2>&1; then
+            ok "Web dev server running (PID $web_pid) on http://localhost:$WEB_PORT"
+            break
+        fi
+        if ! kill -0 "$web_pid" 2>/dev/null; then
+            err "Web dev server exited unexpectedly. Log:"
+            tail -20 "$DATA_DIR/web.log"
+            exit 1
+        fi
+        sleep 0.2
+    done
+
+    if ! curl -sf "http://localhost:${WEB_PORT}" >/dev/null 2>&1; then
+        err "Web dev server failed to start within 15s. Log:"
+        tail -20 "$DATA_DIR/web.log"
+        exit 1
+    fi
+
+    # Register MCP server with Claude Code (via relay)
+    log "Registering mcp-sctl with Claude Code (via relay)..."
+    claude mcp remove "$MCP_NAME" 2>/dev/null || true
+    claude mcp add --transport stdio \
+        "$MCP_NAME" -- "$MCP_BIN" --config "$CONFIG_FILE"
+    ok "MCP server '$MCP_NAME' registered"
+
+    echo ""
+    echo "============================================"
+    ok "Tunnel dev environment ready!"
+    echo ""
+    echo "  Relay:        http://$RELAY_LISTEN (PID $relay_pid)"
+    echo "  sctl:         http://$LISTEN (PID $sctl_pid, tunnel client)"
+    echo "  Device URL:   http://$RELAY_LISTEN/d/$DEVICE_SERIAL"
+    echo "  Web UI:       http://localhost:$WEB_PORT (PID $web_pid)"
+    echo "  MCP server:   $MCP_NAME (stdio, routed through relay)"
+    echo "  Tunnel key:   $TUNNEL_KEY"
+    echo ""
+    echo "  All MCP/sctlin traffic goes: client -> relay -> tunnel -> sctl"
+    echo ""
+    echo "  Restart Claude Code or start a new conversation"
+    echo "  to pick up the MCP server. Run /mcp to verify."
+    echo ""
+    echo "  Press Ctrl+C to stop all services."
+    echo "============================================"
+    echo ""
+
+    # Stay alive: tail logs and wait for Ctrl+C
+    trap 'echo ""; log "Shutting down..."; kill $TAIL_PID 2>/dev/null; do_stop; exit 0' INT TERM
+    tail -f "$DATA_DIR/relay.log" "$DATA_DIR/sctl.log" "$DATA_DIR/web.log" &
+    TAIL_PID=$!
+    wait $TAIL_PID
 }
 
 # --- setup (default: build + start) ---
@@ -343,14 +591,16 @@ case "${1:-setup}" in
     stop)   do_stop ;;
     status) do_status ;;
     claude) do_claude ;;
+    relay)  do_relay ;;
     *)
-        echo "Usage: $0 [setup|build|start|stop|status|claude]"
+        echo "Usage: $0 [setup|build|start|stop|status|claude|relay]"
         echo "  (default)  build everything + start all services + register MCP"
         echo "  build      build only (server, mcp, web) — no start/stop"
         echo "  start      restart all services without rebuilding"
         echo "  stop       stop all services + deregister MCP"
         echo "  status     show what's running"
         echo "  claude     only register MCP in Claude Code (no build/start)"
+        echo "  relay      build + start with tunnel relay (tests full tunnel path)"
         exit 1
         ;;
 esac

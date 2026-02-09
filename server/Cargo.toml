@@ -27,6 +27,8 @@ base64 = "0.22"
 libc = "0.2"
 nix = { version = "0.29", features = ["term", "signal", "process"] }
 clap = { version = "4", features = ["derive"] }
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+futures-util = "0.3"
 
 [profile.release]
 opt-level = "s"

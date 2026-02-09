@@ -7,7 +7,7 @@
 		theme?: TerminalTheme;
 		readonly?: boolean;
 		overlayLabel?: string;
-		overlayColor?: 'blue' | 'green';
+		overlayColor?: 'blue' | 'green' | 'gray';
 		rows?: number;
 		cols?: number;
 		ondata?: (data: string) => void;
@@ -181,11 +181,11 @@
 		{#if overlayLabel && instance}
 			<div
 				class="sctlin-readonly-overlay"
-				style:border-color={overlayColor === 'blue' ? '#3b82f6' : '#22c55e'}
+				style:border-color={overlayColor === 'gray' ? '#525252' : overlayColor === 'blue' ? '#3b82f6' : '#22c55e'}
 			>
 				<span
 					class="sctlin-readonly-badge"
-					style:background={overlayColor === 'blue' ? '#3b82f6' : '#22c55e'}
+					style:background={overlayColor === 'gray' ? '#525252' : overlayColor === 'blue' ? '#3b82f6' : '#22c55e'}
 				>{overlayLabel}</span>
 			</div>
 		{/if}

@@ -9,7 +9,7 @@
 //! and re-attaches to all active sessions using `session.attach` with the last
 //! known sequence number, so no output is lost.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -97,6 +97,8 @@ pub struct DeviceWsConnection {
     sessions: Arc<Mutex<HashMap<String, SessionBuffer>>>,
     connected: Arc<AtomicBool>,
     notifiers: Arc<WsNotifiers>,
+    /// Tracks which sessions the AI is currently marked as working in.
+    ai_working_sessions: Arc<Mutex<HashSet<String>>>,
 }
 
 impl DeviceWsConnection {
@@ -118,6 +120,9 @@ impl DeviceWsConnection {
             ai_status_result: Arc::new(Mutex::new(None)),
         });
 
+        let ai_working_sessions: Arc<Mutex<HashSet<String>>> =
+            Arc::new(Mutex::new(HashSet::new()));
+
         let (out_tx, out_rx) = mpsc::channel::<Value>(256);
 
         // Initial connect
@@ -134,6 +139,7 @@ impl DeviceWsConnection {
             Arc::clone(&sessions),
             Arc::clone(&connected),
             Arc::clone(&notifiers),
+            Arc::clone(&ai_working_sessions),
             ws_url.clone(),
         ));
 
@@ -142,6 +148,7 @@ impl DeviceWsConnection {
             sessions,
             connected,
             notifiers,
+            ai_working_sessions,
         })
     }
 
@@ -367,6 +374,44 @@ impl DeviceWsConnection {
     pub async fn is_pty_session(&self, session_id: &str) -> bool {
         let sessions = self.sessions.lock().await;
         sessions.get(session_id).is_some_and(|buf| buf.is_pty)
+    }
+
+    /// Check whether AI is currently marked as working in a session.
+    pub async fn is_ai_working(&self, session_id: &str) -> bool {
+        self.ai_working_sessions.lock().await.contains(session_id)
+    }
+
+    /// Mark AI as working in a session (local tracking only, no WS message).
+    pub async fn mark_ai_working(&self, session_id: &str) {
+        self.ai_working_sessions
+            .lock()
+            .await
+            .insert(session_id.to_string());
+    }
+
+    /// Clear AI working state for a session (local tracking only).
+    pub async fn clear_ai_working(&self, session_id: &str) {
+        self.ai_working_sessions.lock().await.remove(session_id);
+    }
+
+    /// Auto-set AI working status if not already working.
+    /// Sends `session.ai_status` with `working=true` to the server.
+    /// On failure (e.g. AI_NOT_ALLOWED), logs but does not propagate the error.
+    pub async fn auto_set_ai_working(&self, session_id: &str, activity: &str) {
+        if self.is_ai_working(session_id).await {
+            return;
+        }
+        match self
+            .set_ai_status(session_id, true, Some(activity), None)
+            .await
+        {
+            Ok(_) => {
+                self.mark_ai_working(session_id).await;
+            }
+            Err(e) => {
+                eprintln!("mcp-sctl: auto-set AI status failed for {session_id}: {e}");
+            }
+        }
     }
 
     /// List all sessions on the remote device by sending `session.list`.
@@ -623,6 +668,7 @@ async fn ws_io_loop(
     sessions: Arc<Mutex<HashMap<String, SessionBuffer>>>,
     connected: Arc<AtomicBool>,
     notifiers: Arc<WsNotifiers>,
+    ai_working_sessions: Arc<Mutex<HashSet<String>>>,
     ws_url: String,
 ) {
     let (mut ws_sink, mut ws_reader) = ws_stream.split();
@@ -638,6 +684,7 @@ async fn ws_io_loop(
                                 &parsed,
                                 &sessions,
                                 &notifiers,
+                                &ai_working_sessions,
                             ).await;
                         }
                     }
@@ -702,6 +749,7 @@ async fn dispatch_message(
     msg: &Value,
     sessions: &Arc<Mutex<HashMap<String, SessionBuffer>>>,
     n: &WsNotifiers,
+    ai_working_sessions: &Arc<Mutex<HashSet<String>>>,
 ) {
     let msg_type = msg["type"].as_str().unwrap_or("");
 
@@ -799,14 +847,36 @@ async fn dispatch_message(
             // Acknowledged — no action needed, the tool already returned ok
         }
         "session.ai_status.ack" => {
+            // Sync local tracking from the ack
+            let session_id = msg["session_id"].as_str().unwrap_or("");
+            let working = msg["working"].as_bool().unwrap_or(false);
+            if !session_id.is_empty() {
+                let mut ai_set = ai_working_sessions.lock().await;
+                if working {
+                    ai_set.insert(session_id.to_string());
+                } else {
+                    ai_set.remove(session_id);
+                }
+            }
             *n.ai_status_result.lock().await = Some(msg.clone());
             n.ai_status_notify.notify_waiters();
+        }
+        "session.ai_status_changed" => {
+            // Sync local AI working tracking from broadcast
+            let session_id = msg["session_id"].as_str().unwrap_or("unknown");
+            let working = msg["working"].as_bool().unwrap_or(false);
+            let mut ai_set = ai_working_sessions.lock().await;
+            if working {
+                ai_set.insert(session_id.to_string());
+            } else {
+                ai_set.remove(session_id);
+            }
+            eprintln!("mcp-sctl: broadcast {msg_type} for session {session_id}");
         }
         "session.created"
         | "session.destroyed"
         | "session.renamed"
-        | "session.ai_permission_changed"
-        | "session.ai_status_changed" => {
+        | "session.ai_permission_changed" => {
             // Broadcast events from other clients — log for observability
             let session_id = msg["session_id"].as_str().unwrap_or("unknown");
             eprintln!("mcp-sctl: broadcast {msg_type} for session {session_id}");

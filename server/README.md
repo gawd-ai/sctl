@@ -10,7 +10,7 @@ Remote device control server for AI agents.
 
 sctl exposes HTTP and WebSocket APIs that let an AI agent (or any authenticated client) execute commands, manage interactive shell sessions with full PTY support, read/write files, and query device status on Linux devices -- all protected by a pre-shared API key.
 
-Works on any Linux system -- from x86_64 servers to ARM embedded devices (OpenWrt, Raspberry Pi, etc.).
+Works on any Linux system -- x86_64 servers, ARM single-board computers, RISC-V routers, and more.
 
 ```
 ┌──────────────┐         HTTPS / WSS          ┌──────────────────────┐
@@ -98,6 +98,15 @@ level = "info"                      # Log filter (env: RUST_LOG)
 [supervisor]
 max_backoff = 60                    # Max seconds between restart attempts
 stable_threshold = 60               # Seconds of uptime before resetting backoff
+
+# Optional -- omit [tunnel] entirely to disable
+[tunnel]
+relay = false                       # true = relay mode, false = client mode
+tunnel_key = "shared-secret"        # Device<->relay auth
+url = "wss://relay.example.com/api/tunnel/register"  # Client mode only
+reconnect_delay_secs = 5            # Client mode initial backoff
+reconnect_max_delay_secs = 60       # Client mode max backoff
+heartbeat_interval_secs = 30        # Client mode ping interval
 ```
 
 ## API Reference
@@ -115,6 +124,22 @@ All endpoints except `/api/health` require `Authorization: Bearer <key>`.
 | GET    | `/api/ws`         | Yes* | WebSocket interactive sessions       |
 
 *WebSocket auth uses `?token=<key>` query parameter.
+
+#### Tunnel endpoints (when `tunnel.relay = true`)
+
+| Method | Path                          | Auth         | Description                 |
+|--------|-------------------------------|--------------|-----------------------------|
+| GET    | `/api/tunnel/register`        | `tunnel_key` | Device WS registration      |
+| GET    | `/api/tunnel/devices`         | `tunnel_key` | List connected devices      |
+| GET    | `/d/{serial}/api/health`      | No           | Proxied device health       |
+| GET    | `/d/{serial}/api/info`        | `api_key`    | Proxied device info         |
+| POST   | `/d/{serial}/api/exec`        | `api_key`    | Proxied command execution   |
+| POST   | `/d/{serial}/api/exec/batch`  | `api_key`    | Proxied batch execution     |
+| GET    | `/d/{serial}/api/files`       | `api_key`    | Proxied file read/list      |
+| PUT    | `/d/{serial}/api/files`       | `api_key`    | Proxied file write          |
+| GET    | `/d/{serial}/api/ws`          | `api_key`    | Proxied WS sessions         |
+
+Clients connect to the relay using the same API -- just a different base URL (`https://relay.example.com/d/DEVICE-SERIAL` instead of `http://device:1337`).
 
 ### Error codes
 
@@ -392,6 +417,41 @@ Sessions support AI/human collaboration via permission and status tracking:
 - **`session.ai_status`** -- AI reports its working state (`working`, `activity`, `message`)
 - Changes are broadcast to all connected clients for real-time UI updates
 
+## Reverse Tunnel
+
+sctl includes a built-in reverse tunnel for devices behind CGNAT (LTE/5G connections) that can't accept inbound connections. Any sctl instance can act as a **relay** -- devices connect outbound and clients reach them through it.
+
+```
+Device (behind CGNAT)                 Relay (VPS)                      Clients
+ +--------+                           +-------------+                  +---------+
+ | sctl   |--- outbound WS ---------> | sctl        | <--- HTTP/WS -- | mcp-sctl|
+ | server |   (registers serial)      | (relay mode)|   (same API)    | sctlin  |
+ +--------+                           +-------------+                  +---------+
+```
+
+**Relay mode** -- run on a VPS or any publicly reachable host:
+
+```toml
+[tunnel]
+relay = true
+tunnel_key = "shared-secret"
+```
+
+**Client mode** -- run on a CGNAT device:
+
+```toml
+[tunnel]
+tunnel_key = "shared-secret"
+url = "wss://relay.example.com/api/tunnel/register"
+```
+
+Clients just use a different base URL. No changes to mcp-sctl or sctlin:
+
+- Direct: `http://10.42.0.192:1337`
+- Via relay: `https://relay.example.com/d/BPI-RV2-V11-001`
+
+Devices register dynamically with their serial and API key. The relay learns devices on connect and routes client requests through the tunnel. Sessions, exec, files, and info all work transparently.
+
 ### Example session
 
 ```
@@ -421,42 +481,38 @@ The `since` field is the last `seq` the client received. The server replays all 
 
 ### Cross-compilation
 
-sctl targets `armv7-unknown-linux-musleabihf` for static linking on OpenWrt:
+sctl uses [`cross`](https://github.com/cross-rs/cross) for static musl builds targeting embedded devices:
 
 ```bash
 # Install cross (Docker-based cross-compiler)
 cargo install cross --git https://github.com/cross-rs/cross
 
-# Build
+# ARM (e.g. Raspberry Pi, OpenWrt ARM routers)
 cross build --release --target armv7-unknown-linux-musleabihf
+
+# RISC-V (e.g. BPI-RV2, OpenWrt RISC-V routers)
+cross build --release --target riscv64gc-unknown-linux-musl
 ```
 
 Or use the Makefile:
 
 ```bash
-make build-arm
+make build-arm     # ARM build
+make build-riscv   # RISC-V build
 ```
 
-### OpenWrt init.d
+### Deploy to device
 
-A procd init script is included at `files/sctl.init`.
-
-Deploy to a device:
+Deploy to a device over SSH:
 
 ```bash
-make deploy HOST=192.168.1.1
+make deploy HOST=192.168.1.1         # ARM
+make deploy-riscv HOST=192.168.1.1   # RISC-V
 ```
 
-This copies the binary, config, and init script, then enables the service. Manual setup:
+This copies the binary, config, and init script, then enables the service.
 
-```bash
-scp target/armv7-unknown-linux-musleabihf/release/sctl root@device:/usr/bin/
-scp sctl.toml.example root@device:/etc/sctl/sctl.toml
-scp files/sctl.init root@device:/etc/init.d/sctl
-
-ssh root@device "chmod +x /etc/init.d/sctl && /etc/init.d/sctl enable"
-ssh root@device "/etc/init.d/sctl start"
-```
+For OpenWrt devices, a procd init script is included at `files/sctl.init`.
 
 ## Security
 
@@ -491,7 +547,7 @@ File writes use a temp-file-then-rename pattern, so readers never see partial co
 ### Prerequisites
 
 - Rust 1.82+
-- Docker (for `cross` ARM builds)
+- Docker (for `cross` ARM/RISC-V builds)
 
 ### Makefile targets
 
@@ -499,7 +555,9 @@ File writes use a temp-file-then-rename pattern, so readers never see partial co
 make dev          # Run locally with debug logging
 make build        # Build release binary
 make build-arm    # Cross-compile for ARM
-make deploy HOST= # Deploy to device
+make build-riscv  # Cross-compile for RISC-V
+make deploy HOST= # Deploy to device (ARM)
+make deploy-riscv HOST= # Deploy to device (RISC-V)
 make fmt          # Check formatting
 make lint         # Run clippy lints
 make test         # Run tests

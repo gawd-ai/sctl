@@ -75,12 +75,13 @@
 		>
 			<!-- Connection dot button -->
 			<button
-				class="w-5 h-5 flex items-center justify-center rounded transition-colors hover:bg-neutral-600/50"
-				title={session.attached ? 'Detach session' : 'Attach session'}
-				onclick={(e: MouseEvent) => { e.stopPropagation(); ondotclick?.(session.key); }}
+				class="w-5 h-5 flex items-center justify-center rounded transition-colors {session.dead ? 'cursor-default' : 'hover:bg-neutral-600/50'}"
+				title={session.dead ? 'Session lost' : session.attached ? 'Detach session' : 'Attach session'}
+				onclick={(e: MouseEvent) => { e.stopPropagation(); if (!session.dead) ondotclick?.(session.key); }}
+				disabled={session.dead}
 			>
 				<span class="w-1.5 h-1.5 rounded-full shrink-0
-					{session.attached ? 'bg-green-500' : 'bg-yellow-500'}"></span>
+					{session.dead ? 'bg-neutral-500' : session.attached ? 'bg-green-500' : 'bg-yellow-500'}"></span>
 			</button>
 			{#if editingKey === session.key}
 				<!-- svelte-ignore a11y_autofocus -->
@@ -95,8 +96,8 @@
 			{:else}
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
 				<span
-					class="font-mono"
-					ondblclick={(e) => { e.stopPropagation(); startEditing(session); }}
+					class="font-mono {session.dead ? 'line-through text-neutral-600' : ''}"
+					ondblclick={(e) => { e.stopPropagation(); if (!session.dead) startEditing(session); }}
 				>{#if session.serverName}<span class="text-neutral-600">{session.serverName} · </span>{/if}{session.label || shortId(session.sessionId)}</span>
 			{/if}
 			<!-- Close tab button -->

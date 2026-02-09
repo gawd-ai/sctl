@@ -76,6 +76,14 @@ pub struct SessionListItem {
     pub ai_status_message: Option<String>,
 }
 
+/// Events produced by [`SessionManager::sweep`] for callers to broadcast.
+pub enum SweepEvent {
+    /// Session was destroyed (removed from pool). Contains `(session_id, reason)`.
+    Destroyed(String, String),
+    /// AI working status was auto-cleared due to inactivity. Contains `session_id`.
+    AiAutoCleared(String),
+}
+
 /// Internal bookkeeping for a session.
 #[allow(clippy::struct_excessive_bools)]
 pub struct SessionEntry {
@@ -99,6 +107,8 @@ pub struct SessionEntry {
     pub ai_activity: Option<String>,
     /// Short status message from the AI (e.g. "Running tests").
     pub ai_status_message: Option<String>,
+    /// Last time the AI sent a command or status update. Used for idle auto-clear.
+    pub ai_last_activity: Option<Instant>,
 }
 
 impl SessionManager {
@@ -248,6 +258,7 @@ impl SessionManager {
                 ai_is_working: false,
                 ai_activity: None,
                 ai_status_message: None,
+                ai_last_activity: None,
             },
         );
 
@@ -286,6 +297,17 @@ impl SessionManager {
                     .await
             }
             None => Err(format!("Session {session_id} not found")),
+        }
+    }
+
+    /// Touch AI last activity timestamp for a session (called on exec/stdin
+    /// when AI is working, to prevent idle auto-clear).
+    pub async fn touch_ai_activity(&self, session_id: &str) {
+        let mut sessions = self.sessions.write().await;
+        if let Some(entry) = sessions.get_mut(session_id) {
+            if entry.ai_is_working {
+                entry.ai_last_activity = Some(Instant::now());
+            }
         }
     }
 
@@ -487,9 +509,11 @@ impl SessionManager {
                 if working {
                     entry.ai_activity = activity.map(ToString::to_string);
                     entry.ai_status_message = message.map(ToString::to_string);
+                    entry.ai_last_activity = Some(Instant::now());
                 } else {
                     entry.ai_activity = None;
                     entry.ai_status_message = None;
+                    entry.ai_last_activity = None;
                 }
                 Ok(())
             }
@@ -571,6 +595,7 @@ impl SessionManager {
                     ai_is_working: false,
                     ai_activity: None,
                     ai_status_message: None,
+                    ai_last_activity: None,
                 },
             );
 
@@ -586,17 +611,18 @@ impl SessionManager {
         );
     }
 
-    /// Periodic sweep that handles two cases:
+    /// Periodic sweep that handles three cases:
     ///
     /// 1. **Exited sessions** — process already dead. Cleaned up immediately.
     /// 2. **Idle-timeout sessions** — running sessions whose client requested a
     ///    non-zero `idle_timeout`. If the session is detached and has been idle
     ///    longer than the timeout, it is gracefully killed (SIGTERM → wait →
     ///    SIGKILL). Sessions with `idle_timeout == 0` are **never** auto-killed.
+    /// 3. **AI idle timeout** — if AI is marked as working but no activity has
+    ///    arrived within 60s, auto-clear the AI status.
     ///
-    /// Returns a list of `(session_id, reason)` for each destroyed session,
-    /// so callers can broadcast lifecycle events.
-    pub async fn sweep(&self) -> Vec<(String, String)> {
+    /// Returns a list of sweep events for callers to broadcast.
+    pub async fn sweep(&self) -> Vec<SweepEvent> {
         // Quick check with read lock
         {
             let sessions = self.sessions.read().await;
@@ -605,8 +631,25 @@ impl SessionManager {
             }
         }
 
-        let mut destroyed: Vec<(String, String)> = Vec::new();
+        let ai_idle_timeout = std::time::Duration::from_secs(60);
+        let mut events: Vec<SweepEvent> = Vec::new();
         let mut sessions = self.sessions.write().await;
+
+        // --- AI idle auto-clear (must happen before removing dead sessions) ---
+        for (id, entry) in sessions.iter_mut() {
+            if entry.ai_is_working {
+                if let Some(last) = entry.ai_last_activity {
+                    if last.elapsed() > ai_idle_timeout {
+                        info!("Session {id}: AI idle timeout (>60s), auto-clearing");
+                        entry.ai_is_working = false;
+                        entry.ai_activity = None;
+                        entry.ai_status_message = None;
+                        entry.ai_last_activity = None;
+                        events.push(SweepEvent::AiAutoCleared(id.clone()));
+                    }
+                }
+            }
+        }
 
         // --- Collect exited sessions (process dead) — remove immediately ---
         let mut dead: Vec<String> = Vec::new();
@@ -623,7 +666,7 @@ impl SessionManager {
                     "Cleaned up exited session {id}, remaining: {}",
                     sessions.len()
                 );
-                destroyed.push((id.clone(), "exited".to_string()));
+                events.push(SweepEvent::Destroyed(id.clone(), "exited".to_string()));
             }
         }
 
@@ -655,9 +698,9 @@ impl SessionManager {
         // Graceful kill outside the lock
         for (id, entry) in to_kill {
             entry.session.graceful_kill().await;
-            destroyed.push((id, "idle_timeout".to_string()));
+            events.push(SweepEvent::Destroyed(id, "idle_timeout".to_string()));
         }
 
-        destroyed
+        events
     }
 }

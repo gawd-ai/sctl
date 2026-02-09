@@ -151,6 +151,7 @@
 	export async function attachSession(sessionId: string): Promise<void> {
 		try {
 			const existing = sessions.find((s) => s.sessionId === sessionId);
+			if (existing?.dead) return; // Dead sessions cannot be re-attached
 			const since = seqMap.get(sessionId) ?? 0;
 
 			const result = await client.attachSession(sessionId, since);
@@ -219,6 +220,15 @@
 			}
 		} catch (err) {
 			console.error('Failed to attach session:', err);
+			// If attach fails, the session is likely gone — mark dead
+			if (existing) {
+				unsubscribeSession(sessionId);
+				sessions = sessions.map((s) =>
+					s.sessionId === sessionId
+						? { ...s, dead: true, attached: false, aiIsWorking: false, aiActivity: undefined, aiStatusMessage: undefined }
+						: s
+				);
+			}
 		}
 	}
 
@@ -414,6 +424,29 @@
 		seqMap.set(sessionId, Math.max(prev, seq));
 	}
 
+	/** Reconcile local sessions with remote server state after reconnect.
+	 *  Sessions not on the server are marked dead; sessions on the server
+	 *  have their AI state synced. */
+	function reconcileWithRemote(remote: RemoteSessionInfo[]): void {
+		const remoteIds = new Set(remote.map((r) => r.session_id));
+		sessions = sessions.map((s) => {
+			if (!remoteIds.has(s.sessionId)) {
+				// Session no longer exists on server — mark dead
+				unsubscribeSession(s.sessionId);
+				return { ...s, dead: true, attached: false, aiIsWorking: false, aiActivity: undefined, aiStatusMessage: undefined };
+			}
+			// Session exists — sync AI state from server
+			const r = remote.find((x) => x.session_id === s.sessionId)!;
+			return {
+				...s,
+				userAllowsAi: r.user_allows_ai ?? s.userAllowsAi,
+				aiIsWorking: r.ai_is_working ?? false,
+				aiActivity: r.ai_activity,
+				aiStatusMessage: r.ai_status_message,
+			};
+		});
+	}
+
 	// ── AI permission ────────────────────────────────────────────────
 
 	async function toggleUserAllowsAi(): Promise<void> {
@@ -439,7 +472,7 @@
 	function handleTerminalData(sessionId: string, data: string): void {
 		const session = sessions.find((s) => s.sessionId === sessionId);
 		if (suppressedInput.has(sessionId)) return;
-		if (!session?.attached || session.aiIsWorking) return;
+		if (!session?.attached || session.aiIsWorking || session.dead) return;
 		if (DA_RESPONSE_RE.test(data)) return;
 		client.sendStdin(sessionId, data);
 	}
@@ -516,14 +549,18 @@
 			config.callbacks?.onConnectionChange?.(status);
 
 			if (status === 'connected') {
-				// Re-attach local sessions on reconnect
-				if (sessions.length > 0) {
-					for (const session of sessions) {
-						attachSession(session.sessionId);
+				// Fetch remote sessions first, then reconcile before re-attaching
+				fetchRemoteSessions().then((remote) => {
+					if (sessions.length > 0) {
+						reconcileWithRemote(remote);
+						// Only re-attach non-dead sessions
+						for (const session of sessions) {
+							if (!session.dead) {
+								attachSession(session.sessionId);
+							}
+						}
 					}
-				}
-				// Always fetch remote session list so the UI can show them
-				fetchRemoteSessions();
+				});
 			}
 		});
 
@@ -630,6 +667,7 @@
 					onrename={(key, label) => renameSession(key, label)}
 					ondotclick={(key) => {
 						const s = sessions.find((x) => x.key === key);
+						if (s?.dead) return;
 						if (s?.attached) detachSession(key);
 						else if (s) attachSession(s.sessionId);
 					}}
@@ -653,9 +691,9 @@
 				<!-- svelte-ignore binding_property_non_reactive -->
 				<Terminal
 					theme={config.theme}
-					readonly={session.aiIsWorking || !session.attached}
-					overlayLabel={session.aiIsWorking ? (session.aiActivity === 'read' ? 'AI Reading' : 'AI Executing') : undefined}
-					overlayColor={session.aiActivity === 'read' ? 'blue' : 'green'}
+					readonly={session.dead || session.aiIsWorking || !session.attached}
+					overlayLabel={session.dead ? 'Session Lost' : session.aiIsWorking ? (session.aiActivity === 'read' ? 'AI Reading' : 'AI Executing') : undefined}
+					overlayColor={session.dead ? 'gray' : session.aiActivity === 'read' ? 'blue' : 'green'}
 					rows={config.defaultRows}
 					cols={config.defaultCols}
 					ondata={(data) => handleTerminalData(session.sessionId, data)}
@@ -677,7 +715,7 @@
 			aiIsWorking={activeSession()?.aiIsWorking ?? false}
 			aiActivity={activeSession()?.aiActivity}
 			aiStatusMessage={activeSession()?.aiStatusMessage}
-			disabled={!activeSession()?.attached}
+			disabled={!activeSession()?.attached || activeSession()?.dead === true}
 			{terminalRows}
 			{terminalCols}
 			ontoggleai={toggleUserAllowsAi}

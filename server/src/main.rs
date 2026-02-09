@@ -4,7 +4,7 @@
 
 //! # sctl
 //!
-//! Remote shell control service for BPI-R2 (`OpenWrt` ARM) network devices.
+//! Remote shell control service for Linux devices.
 //!
 //! sctl exposes HTTP and WebSocket APIs on port 1337 that allow an AI agent
 //! (or any authenticated client) to execute commands, manage interactive shell
@@ -31,6 +31,20 @@
 //! *WebSocket auth is via `?token=<key>` query param (no `Authorization` header
 //! available during the upgrade handshake).
 //!
+//! ### Tunnel endpoints (when `tunnel.relay = true`)
+//!
+//! | Method | Path                          | Auth       | Description                 |
+//! |--------|-------------------------------|------------|-----------------------------|
+//! | GET    | `/api/tunnel/register`        | `tunnel_key` | Device WS registration      |
+//! | GET    | `/api/tunnel/devices`         | `tunnel_key` | List connected devices      |
+//! | GET    | `/d/{serial}/api/health`      | No           | Proxied device health       |
+//! | GET    | `/d/{serial}/api/info`        | `api_key`    | Proxied device info         |
+//! | POST   | `/d/{serial}/api/exec`        | `api_key`    | Proxied command execution   |
+//! | POST   | `/d/{serial}/api/exec/batch`  | `api_key`    | Proxied batch execution     |
+//! | GET    | `/d/{serial}/api/files`       | `api_key`    | Proxied file read/list      |
+//! | PUT    | `/d/{serial}/api/files`       | `api_key`    | Proxied file write          |
+//! | GET    | `/d/{serial}/api/ws`          | `api_key`    | Proxied WS sessions         |
+//!
 //! ## Architecture
 //!
 //! ```text
@@ -53,6 +67,10 @@
 //!   mod.rs         — SessionManager (lifecycle, attach/detach, sweep, recovery)
 //! ws/
 //!   mod.rs         — WebSocket upgrade, message dispatch, subscriber pattern
+//! tunnel/
+//!   mod.rs         — Reverse tunnel module root
+//!   client.rs      — Outbound WS to relay, reconnect, handles proxied requests
+//!   relay.rs       — Device registration, client routing, REST/WS proxy
 //! ```
 
 mod auth;
@@ -61,6 +79,7 @@ mod routes;
 mod sessions;
 mod shell;
 mod supervisor;
+mod tunnel;
 mod util;
 mod ws;
 
@@ -84,7 +103,7 @@ use auth::ApiKey;
 use config::Config;
 use sessions::SessionManager;
 
-/// Remote shell control service for `OpenWrt` network devices.
+/// Remote shell control service for Linux devices.
 #[derive(Parser)]
 #[command(name = "sctl", version)]
 struct Cli {
@@ -226,7 +245,7 @@ async fn run_server(config_path: Option<&str>) {
 
     let ws_route = Router::new().route("/api/ws", get(ws::ws_upgrade));
 
-    let app = Router::new()
+    let mut app = Router::new()
         .merge(public_routes)
         .merge(authed_routes)
         .merge(ws_route)
@@ -234,11 +253,34 @@ async fn run_server(config_path: Option<&str>) {
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
+    // Tunnel: add relay routes if configured
+    let tunnel_config = state.config.tunnel.clone();
+    if let Some(ref tc) = tunnel_config {
+        if tc.relay {
+            info!("Tunnel relay mode enabled");
+            let relay_state = tunnel::relay::RelayState::new(tc.tunnel_key.clone());
+            let relay_routes = tunnel::relay::relay_router(relay_state);
+            app = app.merge(relay_routes);
+        }
+    }
+
     let listener = TcpListener::bind(&state.config.server.listen)
         .await
         .expect("Failed to bind");
 
     info!("Server ready");
+
+    // Tunnel: spawn client if configured
+    let _tunnel_client_task = if let Some(ref tc) = tunnel_config {
+        if tc.url.is_some() && !tc.relay {
+            info!("Tunnel client mode enabled, will connect to {}", tc.url.as_deref().unwrap());
+            Some(tunnel::client::spawn(state.clone(), tc.clone()))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Periodic sweep: clean up sessions whose process has exited
     let mgr = state.session_manager.clone();
@@ -247,13 +289,24 @@ async fn run_server(config_path: Option<&str>) {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
-            let destroyed = mgr.sweep().await;
-            for (session_id, reason) in destroyed {
-                let _ = sweep_tx.send(serde_json::json!({
-                    "type": "session.destroyed",
-                    "session_id": session_id,
-                    "reason": reason,
-                }));
+            let events = mgr.sweep().await;
+            for event in events {
+                match event {
+                    sessions::SweepEvent::Destroyed(session_id, reason) => {
+                        let _ = sweep_tx.send(serde_json::json!({
+                            "type": "session.destroyed",
+                            "session_id": session_id,
+                            "reason": reason,
+                        }));
+                    }
+                    sessions::SweepEvent::AiAutoCleared(session_id) => {
+                        let _ = sweep_tx.send(serde_json::json!({
+                            "type": "session.ai_status_changed",
+                            "session_id": session_id,
+                            "working": false,
+                        }));
+                    }
+                }
             }
         }
     });

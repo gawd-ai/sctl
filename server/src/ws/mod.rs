@@ -272,6 +272,7 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                                     let _ = tx.send(resp).await;
                                     continue;
                                 }
+                                state.session_manager.touch_ai_activity(session_id).await;
                                 handle_session_exec(
                                     &state,
                                     &tx,
@@ -285,6 +286,7 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                                 let session_id = parsed["session_id"].as_str().unwrap_or("");
                                 let data = parsed["data"].as_str().unwrap_or("");
                                 if !session_id.is_empty() {
+                                    state.session_manager.touch_ai_activity(session_id).await;
                                     handle_session_stdin(&state, &tx, session_id, data).await;
                                 }
                             }

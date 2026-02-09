@@ -68,6 +68,10 @@ pub struct DeviceRegistry {
     default_device: String,
     /// Lazy WebSocket connection pool for session tools.
     pub ws_pool: WsPool,
+    /// Maps session IDs to their owning device name.
+    /// Populated by `session_list` and `session_start` so that subsequent
+    /// session tools can auto-route without an explicit `device` parameter.
+    session_device_map: Mutex<HashMap<String, String>>,
 }
 
 impl DeviceRegistry {
@@ -86,6 +90,7 @@ impl DeviceRegistry {
             clients,
             default_device: config.default_device,
             ws_pool: WsPool::new(),
+            session_device_map: Mutex::new(HashMap::new()),
         }
     }
 
@@ -128,5 +133,18 @@ impl DeviceRegistry {
     /// Access all HTTP clients (keyed by device name).
     pub fn clients(&self) -> &HashMap<String, SctlClient> {
         &self.clients
+    }
+
+    /// Record which device owns a session.
+    pub async fn register_session(&self, session_id: &str, device: &str) {
+        self.session_device_map
+            .lock()
+            .await
+            .insert(session_id.to_string(), device.to_string());
+    }
+
+    /// Look up which device owns a session.
+    pub async fn resolve_session_device(&self, session_id: &str) -> Option<String> {
+        self.session_device_map.lock().await.get(session_id).cloned()
     }
 }

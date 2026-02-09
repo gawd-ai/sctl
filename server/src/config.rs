@@ -29,6 +29,15 @@
 //!
 //! [logging]
 //! level = "info"
+//!
+//! # Optional — omit entirely to disable tunnel
+//! [tunnel]
+//! relay = false                            # true = relay mode, false = client mode
+//! tunnel_key = "shared-secret"             # device<->relay auth
+//! url = "wss://relay.example.com/api/tunnel/register"  # client mode only
+//! reconnect_delay_secs = 5                 # client mode, initial backoff
+//! reconnect_max_delay_secs = 60            # client mode, max backoff
+//! heartbeat_interval_secs = 30             # client mode, ping interval
 //! ```
 
 use serde::Deserialize;
@@ -49,6 +58,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub supervisor: SupervisorConfig,
+    /// Optional tunnel configuration for relay or client mode.
+    pub tunnel: Option<TunnelConfig>,
 }
 
 /// HTTP server and resource-limit settings.
@@ -142,6 +153,32 @@ pub struct LoggingConfig {
     pub level: String,
 }
 
+/// Tunnel configuration — enables relay mode or client (outbound) mode.
+///
+/// - **Relay mode** (`relay = true`): this instance acts as a relay server.
+///   Devices connect inbound, clients connect to `/d/{serial}/api/*`.
+/// - **Client mode** (`url` is set): this instance connects outbound to a relay.
+/// - If neither is set, tunnel is disabled (default behavior).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TunnelConfig {
+    /// Run as a tunnel relay (default false).
+    #[serde(default)]
+    pub relay: bool,
+    /// Shared secret for device<->relay authentication.
+    pub tunnel_key: String,
+    /// Relay URL for client mode (e.g. `wss://relay.example.com/api/tunnel/register`).
+    pub url: Option<String>,
+    /// Seconds between reconnect attempts (client mode, default 5).
+    #[serde(default = "default_reconnect_delay")]
+    pub reconnect_delay_secs: u64,
+    /// Max seconds between reconnect attempts (client mode, default 60).
+    #[serde(default = "default_reconnect_max_delay")]
+    pub reconnect_max_delay_secs: u64,
+    /// Seconds between heartbeat pings (client mode, default 30).
+    #[serde(default = "default_heartbeat_interval")]
+    pub heartbeat_interval_secs: u64,
+}
+
 fn default_listen() -> String {
     "0.0.0.0:1337".to_string()
 }
@@ -201,6 +238,15 @@ fn default_supervisor_max_backoff() -> u64 {
 }
 fn default_supervisor_stable_threshold() -> u64 {
     60
+}
+fn default_reconnect_delay() -> u64 {
+    5
+}
+fn default_reconnect_max_delay() -> u64 {
+    60
+}
+fn default_heartbeat_interval() -> u64 {
+    30
 }
 
 impl Default for ServerConfig {
@@ -287,6 +333,7 @@ impl Config {
                 device: DeviceConfig::default(),
                 logging: LoggingConfig::default(),
                 supervisor: SupervisorConfig::default(),
+                tunnel: None,
             }
         };
 
