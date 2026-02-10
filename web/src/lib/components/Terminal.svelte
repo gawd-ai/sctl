@@ -2,17 +2,20 @@
 	import { onMount } from 'svelte';
 	import type { TerminalTheme } from '../types/terminal.types';
 	import type { XtermInstance } from '../utils/xterm';
+	import SearchBar from './SearchBar.svelte';
 
 	interface Props {
 		theme?: TerminalTheme;
 		readonly?: boolean;
 		overlayLabel?: string;
 		overlayColor?: 'blue' | 'green' | 'gray';
+		showSearch?: boolean;
 		rows?: number;
 		cols?: number;
 		ondata?: (data: string) => void;
 		onresize?: (rows: number, cols: number) => void;
 		onready?: () => void;
+		onsearchclose?: () => void;
 	}
 
 	let {
@@ -20,12 +23,19 @@
 		readonly = false,
 		overlayLabel = undefined,
 		overlayColor = 'green',
+		showSearch = false,
 		rows = undefined,
 		cols = undefined,
 		ondata = undefined,
 		onresize = undefined,
-		onready = undefined
+		onready = undefined,
+		onsearchclose = undefined
 	}: Props = $props();
+
+	let searchMatchCount: number | undefined = $state(undefined);
+	let searchCurrentMatch: number | undefined = $state(undefined);
+	let lastSearchTerm = '';
+	let lastSearchOpts = { caseSensitive: false, regex: false };
 
 	let container: HTMLDivElement | undefined = $state();
 	let instance: XtermInstance | null = $state(null);
@@ -168,6 +178,67 @@
 	export function focus(): void {
 		instance?.terminal.focus();
 	}
+
+	/** Search terminal content. */
+	export function searchNext(term: string, opts?: { caseSensitive?: boolean; regex?: boolean }): void {
+		if (!instance) return;
+		try {
+			instance.searchAddon.findNext(term, {
+				caseSensitive: opts?.caseSensitive,
+				regex: opts?.regex
+			});
+		} catch {
+			// Invalid regex
+		}
+	}
+
+	export function searchPrev(term: string, opts?: { caseSensitive?: boolean; regex?: boolean }): void {
+		if (!instance) return;
+		try {
+			instance.searchAddon.findPrevious(term, {
+				caseSensitive: opts?.caseSensitive,
+				regex: opts?.regex
+			});
+		} catch {
+			// Invalid regex
+		}
+	}
+
+	export function clearSearch(): void {
+		instance?.searchAddon.clearDecorations();
+		searchMatchCount = undefined;
+		searchCurrentMatch = undefined;
+	}
+
+	function handleSearch(term: string, opts: { caseSensitive: boolean; regex: boolean }) {
+		lastSearchTerm = term;
+		lastSearchOpts = opts;
+		if (!instance || !term) {
+			clearSearch();
+			return;
+		}
+		try {
+			instance.searchAddon.findNext(term, {
+				caseSensitive: opts.caseSensitive,
+				regex: opts.regex
+			});
+		} catch {
+			// Invalid regex — silently ignore until user fixes the pattern
+		}
+	}
+
+	function handleSearchNext() {
+		if (lastSearchTerm) searchNext(lastSearchTerm, lastSearchOpts);
+	}
+
+	function handleSearchPrev() {
+		if (lastSearchTerm) searchPrev(lastSearchTerm, lastSearchOpts);
+	}
+
+	function handleSearchClose() {
+		clearSearch();
+		onsearchclose?.();
+	}
 </script>
 
 {#if error}
@@ -177,6 +248,16 @@
 	</div>
 {:else}
 	<div class="sctlin-terminal-wrapper" class:sctlin-readonly={overlayLabel && instance}>
+		{#if showSearch && instance}
+			<SearchBar
+				matchCount={searchMatchCount}
+				currentMatch={searchCurrentMatch}
+				onsearch={handleSearch}
+				onnext={handleSearchNext}
+				onprev={handleSearchPrev}
+				onclose={handleSearchClose}
+			/>
+		{/if}
 		<div class="sctlin-terminal" bind:this={container}></div>
 		{#if overlayLabel && instance}
 			<div

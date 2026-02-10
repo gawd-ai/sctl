@@ -6,9 +6,10 @@ Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before contributing.
 
 ## Prerequisites
 
-- Rust 1.75+ ([rustup](https://rustup.rs/))
-- Docker (for ARM cross-compilation only)
+- Rust 1.82+ ([rustup](https://rustup.rs/))
+- Docker (for ARM/RISC-V cross-compilation via [cross](https://github.com/cross-rs/cross), optional)
 - Node.js 20+ (for the web UI, optional)
+- jq (for `rundev.sh device` commands, optional)
 
 ## Project Structure
 
@@ -31,6 +32,27 @@ The fastest way to get a full working dev environment:
 ```
 
 This builds the server, MCP proxy, and web UI, starts all services locally, and registers the MCP server with Claude Code.
+
+### Other `rundev.sh` commands
+
+```bash
+./rundev.sh build    # Build only (no start/stop)
+./rundev.sh start    # Restart services without rebuilding
+./rundev.sh stop     # Stop all services + deregister MCP
+./rundev.sh status   # Show what's running
+./rundev.sh claude   # Only register MCP in Claude Code
+./rundev.sh tunnel   # Start tunnel dev env (relay + physical devices)
+```
+
+### Device management
+
+```bash
+./rundev.sh device add <name> <host>   # Discover + register via SSH
+./rundev.sh device ls                  # List devices with health status
+./rundev.sh device deploy <name>       # Cross-compile + full deploy
+./rundev.sh device upgrade <name>      # Binary-only upgrade
+./rundev.sh device rm <name>           # Remove a device
+```
 
 Or run components individually:
 

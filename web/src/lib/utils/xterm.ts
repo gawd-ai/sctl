@@ -37,6 +37,7 @@ function toXtermTheme(theme: TerminalTheme): Record<string, string | undefined> 
 export interface XtermInstance {
 	terminal: import('@xterm/xterm').Terminal;
 	fitAddon: import('@xterm/addon-fit').FitAddon;
+	searchAddon: import('@xterm/addon-search').SearchAddon;
 	dispose: () => void;
 }
 
@@ -52,10 +53,11 @@ export async function createTerminal(
 	theme?: TerminalTheme,
 	options?: { rows?: number; cols?: number }
 ): Promise<XtermInstance> {
-	const [{ Terminal }, { FitAddon }, { WebLinksAddon }] = await Promise.all([
+	const [{ Terminal }, { FitAddon }, { WebLinksAddon }, { SearchAddon }] = await Promise.all([
 		import('@xterm/xterm'),
 		import('@xterm/addon-fit'),
-		import('@xterm/addon-web-links')
+		import('@xterm/addon-web-links'),
+		import('@xterm/addon-search')
 	]);
 
 	// Dynamic CSS import — xterm needs its stylesheet
@@ -72,8 +74,10 @@ export async function createTerminal(
 
 	const fitAddon = new FitAddon();
 	const webLinksAddon = new WebLinksAddon();
+	const searchAddon = new SearchAddon();
 	terminal.loadAddon(fitAddon);
 	terminal.loadAddon(webLinksAddon);
+	terminal.loadAddon(searchAddon);
 
 	terminal.open(container);
 
@@ -85,7 +89,9 @@ export async function createTerminal(
 	return {
 		terminal,
 		fitAddon,
+		searchAddon,
 		dispose: () => {
+			searchAddon.dispose();
 			webLinksAddon.dispose();
 			fitAddon.dispose();
 			terminal.dispose();

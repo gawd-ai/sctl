@@ -1,13 +1,22 @@
 {
+  "config_version": 2,
   "devices": {
     "router-1": {
       "url": "http://192.168.1.1:1337",
       "api_key": "your-api-key-for-router-1",
-      "playbooks_dir": "/etc/sctl/playbooks"
+      "playbooks_dir": "/etc/sctl/playbooks",
+      "host": "192.168.1.1",
+      "serial": "SCTL-0001",
+      "arch": "armv7l",
+      "sctl_version": "0.3.0",
+      "added_at": "2026-01-01T00:00:00Z"
     },
     "router-2": {
       "url": "http://192.168.1.2:1337",
-      "api_key": "your-api-key-for-router-2"
+      "api_key": "your-api-key-for-router-2",
+      "host": "192.168.1.2",
+      "serial": "SCTL-0002",
+      "arch": "riscv64"
     }
   },
   "default_device": "router-1"

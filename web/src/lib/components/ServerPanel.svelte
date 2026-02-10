@@ -5,8 +5,12 @@
 		ServerConfig,
 		SessionInfo,
 		RemoteSessionInfo,
-		ConnectionStatus
+		ConnectionStatus,
+		DeviceInfo,
+		ActivityEntry
 	} from '../types/terminal.types';
+	import DeviceInfoPanel from './DeviceInfoPanel.svelte';
+	import ActivityFeed from './ActivityFeed.svelte';
 
 	interface Props {
 		servers: ServerConfig[];
@@ -29,6 +33,9 @@
 		onaddserver?: (config: Omit<ServerConfig, 'id'>) => void;
 		onremoveserver?: (serverId: string) => void;
 		oneditserver?: (serverId: string, updates: Partial<ServerConfig>) => void;
+		serverDeviceInfo?: Record<string, DeviceInfo | null>;
+		onrefreshinfo?: (serverId: string) => void;
+		serverActivity?: Record<string, ActivityEntry[]>;
 	}
 
 	let {
@@ -51,7 +58,10 @@
 		onopensession,
 		onaddserver,
 		onremoveserver,
-		oneditserver
+		oneditserver,
+		serverDeviceInfo = {},
+		onrefreshinfo,
+		serverActivity = {}
 	}: Props = $props();
 
 	// ── Internal types ──────────────────────────────────────────────
@@ -72,11 +82,17 @@
 		pid?: number;
 		status: 'attached' | 'open' | 'detached';
 		isActive: boolean;
+		sessionStatus?: 'running' | 'exited';
+		idle?: boolean;
+		exitCode?: number;
+		idleTimeout?: number;
 	}
 
 	// ── State ────────────────────────────────────────────────────────
 
 	let expandedServers: Record<string, boolean> = $state({});
+	let infoExpanded: Record<string, boolean> = $state({});
+	let activityExpanded: Record<string, boolean> = $state({});
 	let flyoutServerId: string | null = $state(null);
 	let flyoutTop = $state(0);
 	let hoverTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -190,7 +206,11 @@
 				label: rs.name || shortId(rs.session_id),
 				pid: rs.pid,
 				status: 'detached' as const,
-				isActive: false
+				isActive: false,
+				sessionStatus: rs.status,
+				idle: rs.idle,
+				exitCode: rs.exit_code,
+				idleTimeout: rs.idle_timeout
 			}));
 
 		return [...localDisplay, ...unattached];
@@ -638,6 +658,22 @@
 			{/if}
 		</div>
 		{#if !inFlyout}
+			<!-- Device info toggle -->
+			{#if server.status === 'connected' && serverDeviceInfo?.[server.id]}
+				<button
+					class="w-5 h-5 flex items-center justify-center rounded transition-colors
+						{infoExpanded[server.id]
+							? 'text-neutral-200 bg-neutral-800'
+							: 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}"
+					title="Device info"
+					onclick={(e) => { e.stopPropagation(); infoExpanded = { ...infoExpanded, [server.id]: !infoExpanded[server.id] }; }}
+				>
+					<svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+						<rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+						<path d="M8 21h8M12 17v4" />
+					</svg>
+				</button>
+			{/if}
 			<!-- Settings — aligned with kill buttons -->
 			<button
 				class="mr-1.5 w-5 h-5 flex items-center justify-center rounded transition-colors
@@ -711,6 +747,45 @@
 		</div>
 	{/if}
 
+	<!-- Device info panel -->
+	{#if !inFlyout && infoExpanded[server.id] && serverDeviceInfo?.[server.id]}
+		{@const devInfo = serverDeviceInfo[server.id]}
+		{#if devInfo}
+			<div class="border-b border-neutral-800/30">
+				<DeviceInfoPanel info={devInfo} onrefresh={() => onrefreshinfo?.(server.id)} />
+			</div>
+		{/if}
+	{/if}
+
+	<!-- Activity feed -->
+	{#if !inFlyout && server.status === 'connected' && (serverActivity?.[server.id]?.length ?? 0) > 0}
+		{@const actEntries = serverActivity[server.id] ?? []}
+		<div
+			class="flex items-center h-5 cursor-pointer hover:bg-neutral-800/40 transition-colors"
+			style="padding-left: {dotW}px"
+			onclick={() => { activityExpanded = { ...activityExpanded, [server.id]: !activityExpanded[server.id] }; }}
+		>
+			<span class="text-neutral-500 mr-1">
+				{#if activityExpanded[server.id]}
+					<svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+						<path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" />
+					</svg>
+				{:else}
+					<svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+						<path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
+					</svg>
+				{/if}
+			</span>
+			<span class="text-[10px] text-neutral-500 font-mono">activity</span>
+			<span class="ml-1 text-[9px] text-neutral-600 tabular-nums">{actEntries.length}</span>
+		</div>
+		{#if activityExpanded[server.id]}
+			<div class="max-h-48 overflow-y-auto border-b border-neutral-800/30">
+				<ActivityFeed entries={actEntries} />
+			</div>
+		{/if}
+	{/if}
+
 	<!-- Sessions -->
 	{#each sessions as session (session.id)}
 		<div
@@ -721,16 +796,20 @@
 			<div class="shrink-0 flex items-center justify-center" style="width: {dotW}px">
 				<button
 					class="w-5 h-5 flex items-center justify-center rounded transition-colors hover:bg-neutral-600/50"
-					title={session.status === 'attached' ? 'Detach session' : 'Attach session'}
+					title={session.sessionStatus === 'exited'
+						? `Exited (code ${session.exitCode ?? '?'})`
+						: session.idleTimeout
+							? `Auto-kill in ${session.idleTimeout}s`
+							: session.status === 'attached' ? 'Detach session' : 'Attach session'}
 					onclick={(e: MouseEvent) => { e.stopPropagation(); const serverId = session.serverId; const sessionId = session.id; if (inFlyout) flyoutServerId = null; if (session.status === 'attached') ondetachsession?.(serverId, sessionId); else onattachsession?.(serverId, sessionId); }}
 				>
 					<span class="w-1.5 h-1.5 rounded-full shrink-0
-						{session.status === 'attached' ? 'bg-green-500' : 'bg-yellow-500'}
+						{session.sessionStatus === 'exited' ? 'bg-neutral-500' : session.idle ? 'bg-neutral-600' : session.status === 'attached' ? 'bg-green-500' : 'bg-yellow-500'}
 						{session.isActive ? 'ring-2 ring-green-400/40 ring-offset-1 ring-offset-neutral-950' : ''}"></span>
 				</button>
 			</div>
 			<span class="font-mono text-[10px] truncate flex-1
-				{session.isActive ? 'text-neutral-200' : 'text-neutral-500'}"
+				{session.sessionStatus === 'exited' ? 'text-neutral-600' : session.isActive ? 'text-neutral-200' : 'text-neutral-500'}"
 			>{session.label}</span>
 			{#if session.status !== 'attached'}
 				<button

@@ -503,14 +503,27 @@ make build-riscv   # RISC-V build
 
 ### Deploy to device
 
-Deploy to a device over SSH:
+The easiest way to deploy is with `rundev.sh`, which auto-detects architecture and handles cross-compilation:
+
+```bash
+# One-time: discover device (probes arch, serial, api_key via SSH)
+./rundev.sh device add mydevice 192.168.1.1
+
+# Full deploy: cross-compile + binary + config + init script
+./rundev.sh device deploy mydevice
+
+# Later upgrades: binary-only (stop → upload → start)
+./rundev.sh device upgrade mydevice
+```
+
+Alternatively, use the Makefile directly:
 
 ```bash
 make deploy HOST=192.168.1.1         # ARM
 make deploy-riscv HOST=192.168.1.1   # RISC-V
 ```
 
-This copies the binary, config, and init script, then enables the service.
+Both approaches copy the binary, config, and init script, then enable the service.
 
 For OpenWrt devices, a procd init script is included at `files/sctl.init`.
 

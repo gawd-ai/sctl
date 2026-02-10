@@ -2,6 +2,34 @@
 
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
 
+// ── Activity feed ───────────────────────────────────────────────────
+
+export type ActivityType =
+	| 'exec'
+	| 'file_read'
+	| 'file_write'
+	| 'file_list'
+	| 'session_start'
+	| 'session_exec'
+	| 'session_kill'
+	| 'session_signal';
+
+export type ActivitySource = 'mcp' | 'ws' | 'rest' | 'unknown';
+
+export interface ActivityEntry {
+	id: number;
+	timestamp: number;
+	activity_type: ActivityType;
+	source: ActivitySource;
+	summary: string;
+	detail?: Record<string, unknown>;
+}
+
+export interface WsActivityNewMsg {
+	type: 'activity.new';
+	entry: ActivityEntry;
+}
+
 // ── Theme ───────────────────────────────────────────────────────────
 
 export interface TerminalTheme {
@@ -86,6 +114,7 @@ export interface SctlinCallbacks {
 	onRemoteSessions?: (sessions: RemoteSessionInfo[]) => void;
 	onSessionsChange?: (sessions: SessionInfo[]) => void;
 	onActiveSessionChange?: (sessionId: string | null) => void;
+	onActivity?: (entry: ActivityEntry) => void;
 }
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -283,6 +312,54 @@ export interface RemoteSessionInfo {
 	ai_is_working?: boolean;
 	ai_activity?: string;
 	ai_status_message?: string;
+	status?: 'running' | 'exited';
+	idle?: boolean;
+	idle_timeout?: number;
+	exit_code?: number;
+}
+
+// ── REST API types ─────────────────────────────────────────────────
+
+export interface DeviceInfo {
+	serial: string;
+	hostname: string;
+	kernel: string;
+	system_uptime_secs: number;
+	cpu_model: string;
+	load_average: [number, number, number];
+	memory: { total_bytes: number; used_bytes: number; available_bytes: number };
+	disk: { total_bytes: number; used_bytes: number; available_bytes: number; mount_point: string };
+	interfaces: NetworkInterface[];
+	tunnel?: { url: string; connected: boolean };
+}
+
+export interface NetworkInterface {
+	name: string;
+	state: string;
+	mac: string;
+	addresses: string[];
+}
+
+export interface DirEntry {
+	name: string;
+	type: 'file' | 'directory' | 'symlink' | 'other';
+	size: number;
+	modified?: string;
+	symlink_target?: string;
+}
+
+export interface FileContent {
+	content: string;
+	encoding: string;
+	size: number;
+	path: string;
+}
+
+export interface ExecResult {
+	exit_code: number;
+	stdout: string;
+	stderr: string;
+	duration_ms: number;
 }
 
 export interface ServerConfig {
@@ -382,4 +459,5 @@ export type WsServerMsg =
 	| WsSessionAllowAiAckMsg
 	| WsSessionAiPermissionChangedBroadcast
 	| WsSessionAiStatusChangedBroadcast
+	| WsActivityNewMsg
 	| WsErrorMsg;

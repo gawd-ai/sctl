@@ -26,7 +26,7 @@ sctl is a two-component system that lets AI agents (Claude, GPT, local models) o
 
 | Component | What it does |
 |-----------|-------------|
-| **[sctl](server/)** | Lightweight server that runs on the target device (ARM or x86) |
+| **[sctl](server/)** | Lightweight server that runs on the target device (ARM, RISC-V, or x86) |
 | **[mcp-sctl](mcp/)** | MCP proxy that translates AI tool calls into sctl API requests |
 | **[sctlin](web/)** | Svelte 5 terminal UI component library with xterm.js |
 
@@ -159,19 +159,22 @@ Manage a fleet of devices from a single MCP server:
 
 ```json
 {
+  "config_version": 2,
   "devices": {
     "router-1": {
       "url": "http://192.168.1.1:1337",
       "api_key": "key-for-router-1",
-      "playbooks_dir": "/etc/sctl/playbooks"
+      "playbooks_dir": "/etc/sctl/playbooks",
+      "host": "192.168.1.1",
+      "serial": "SCTL-0001",
+      "arch": "armv7l"
     },
     "router-2": {
       "url": "http://192.168.1.2:1337",
-      "api_key": "key-for-router-2"
-    },
-    "prod-server": {
-      "url": "http://10.0.0.5:1337",
-      "api_key": "key-for-prod"
+      "api_key": "key-for-router-2",
+      "host": "192.168.1.2",
+      "serial": "SCTL-0002",
+      "arch": "riscv64"
     }
   },
   "default_device": "router-1"
@@ -182,6 +185,31 @@ Manage a fleet of devices from a single MCP server:
 mcp-sctl --config devices.json
 ```
 
+The metadata fields (`host`, `serial`, `arch`, `sctl_version`, `added_at`) are used by `rundev.sh device` commands for deployment and status. mcp-sctl ignores unknown fields, so they're safe to include.
+
+## Device Management
+
+`rundev.sh` includes device management commands that handle discovery, cross-compilation, deployment, and upgrades:
+
+```bash
+# Discover and register a device (probes via SSH for arch, serial, api_key)
+./rundev.sh device add bpi 10.42.0.192
+
+# List all devices with live health checks
+./rundev.sh device ls
+
+# Full deploy: cross-compile + upload binary + config + init script
+./rundev.sh device deploy bpi
+
+# Binary-only upgrade: cross-compile + stop + upload + start
+./rundev.sh device upgrade bpi
+
+# Remove a device
+./rundev.sh device rm bpi
+```
+
+Supported architectures: `riscv64`, `armv7l`, `aarch64`, `x86_64`. Cross-compilation uses [cross](https://github.com/cross-rs/cross) with static musl builds.
+
 ## Deployment
 
 ### Any Linux
@@ -190,16 +218,32 @@ mcp-sctl --config devices.json
 SCTL_API_KEY=change-me ./sctl serve --config sctl.toml
 ```
 
-### OpenWrt / Embedded ARM
+### OpenWrt / Embedded (via rundev.sh)
+
+The easiest way to deploy to a device:
+
+```bash
+# One-time: discover the device
+./rundev.sh device add mydevice 192.168.1.1
+
+# Deploy (cross-compiles, uploads binary + config + init script)
+./rundev.sh device deploy mydevice
+```
+
+### OpenWrt / Embedded (via Makefile)
+
+Alternatively, use the server Makefile directly:
 
 ```bash
 cd server
 
-# Cross-compile for ARMv7
+# Cross-compile for ARMv7 or RISC-V
 make build-arm
+make build-riscv
 
 # Deploy to device (copies binary, config, init script)
-make deploy HOST=192.168.1.1
+make deploy HOST=192.168.1.1         # ARM
+make deploy-riscv HOST=192.168.1.1   # RISC-V
 ```
 
 A [procd init script](server/files/sctl.init) is included for OpenWrt service management with auto-restart.
@@ -211,6 +255,29 @@ sctl includes a built-in supervisor with exponential backoff restart:
 ```bash
 ./sctl supervise --config sctl.toml
 ```
+
+## Reverse Tunnel
+
+sctl includes a built-in reverse tunnel for devices behind CGNAT (LTE/5G) that can't accept inbound connections. Any sctl instance can act as a relay -- devices connect outbound and clients reach them through it.
+
+```
+Device (behind CGNAT)                 Relay (public VPS)               Clients
+ +--------+                           +-------------+                  +---------+
+ | sctl   |--- outbound WS ---------> | sctl        | <--- HTTP/WS -- | mcp-sctl|
+ | server |   (registers serial)      | (relay mode)|   (same API)    | sctlin  |
+ +--------+                           +-------------+                  +---------+
+```
+
+Clients use the same API -- just a different base URL (`https://relay.example.com/d/DEVICE-SERIAL` instead of `http://device:1337`). See the [server README](server/README.md#reverse-tunnel) for full configuration details.
+
+### Dev testing with tunnel
+
+```bash
+# Starts tunnel relay + local client + connects all configured physical devices
+./rundev.sh tunnel
+```
+
+This builds everything, starts a local tunnel relay, connects your registered devices via SSH, and rewrites the MCP config so all traffic flows through the relay. Ctrl+C restores all devices to normal operation.
 
 ## Security
 
@@ -239,8 +306,9 @@ See the [security review](server/docs/REVIEW.md) for a detailed analysis.
 ## Requirements
 
 - **Rust 1.82+** ([rustup.rs](https://rustup.rs/))
-- **Docker** (for ARM cross-compilation via [cross](https://github.com/cross-rs/cross), optional)
-- **Target device**: any Linux system with `/bin/sh` (tested on OpenWrt ARM and x86_64)
+- **Docker** (for ARM/RISC-V cross-compilation via [cross](https://github.com/cross-rs/cross), optional)
+- **jq** (for `rundev.sh device` commands, optional)
+- **Target device**: any Linux system with `/bin/sh` (tested on OpenWrt ARM, RISC-V, and x86_64)
 
 ## Contributing
 

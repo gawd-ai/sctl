@@ -28,5 +28,14 @@ export type {
 	WsErrorMsg,
 	WsServerMsg,
 	RemoteSessionInfo,
-	ServerConfig
+	ServerConfig,
+	DeviceInfo,
+	NetworkInterface,
+	DirEntry,
+	FileContent,
+	ExecResult,
+	ActivityType,
+	ActivitySource,
+	ActivityEntry,
+	WsActivityNewMsg
 } from './terminal.types';

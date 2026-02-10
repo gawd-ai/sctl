@@ -43,6 +43,7 @@ See [devices.example.json](devices.example.json) for the config format:
 
 ```json
 {
+  "config_version": 2,
   "devices": {
     "router-1": {
       "url": "http://192.168.1.1:1337",
@@ -57,6 +58,8 @@ See [devices.example.json](devices.example.json) for the config format:
   "default_device": "router-1"
 }
 ```
+
+The config file may also contain metadata fields (`host`, `serial`, `arch`, `sctl_version`, `added_at`) used by `rundev.sh device` commands. mcp-sctl ignores these unknown fields.
 
 ### Claude Code integration
 
@@ -91,6 +94,7 @@ Configuration is resolved from three sources (tried in order):
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
+| `config_version` | number | no | Config format version (current: 2). Warns on older versions. |
 | `devices` | object | yes | Map of device name to `{url, api_key, playbooks_dir?}` |
 | `default_device` | string | no | Default device name. Required if multiple devices. Auto-detected if only one device. |
 

@@ -1,7 +1,9 @@
 <script lang="ts">
 	import '../app.css';
 	import { onMount } from 'svelte';
-	import { TerminalContainer, TerminalTabs, ServerPanel } from '$lib';
+	import { TerminalContainer, TerminalTabs, ServerPanel, ToastContainer, QuickExecBar, FileBrowser, CommandPalette } from '$lib';
+	import { SctlRestClient } from '$lib/utils/rest-client';
+	import { KeyboardManager } from '$lib/utils/keyboard';
 	import { AppSidebar } from 'gawdux';
 	import type { SidebarConfig } from 'gawdux';
 	import type {
@@ -9,7 +11,9 @@
 		SessionInfo,
 		ConnectionStatus,
 		RemoteSessionInfo,
-		ServerConfig
+		ServerConfig,
+		DeviceInfo,
+		ActivityEntry
 	} from '$lib';
 
 	// ── Persistence ──────────────────────────────────────────────────
@@ -90,6 +94,28 @@
 	let activeServerId: string | null = $state(null);
 	let activeKeys: Record<string, string | null> = $state({});
 
+	// REST clients + device info
+	let serverRestClients: Record<string, SctlRestClient> = {};
+	let serverDeviceInfo: Record<string, DeviceInfo | null> = $state({});
+
+	// Activity feed
+	let serverActivity: Record<string, ActivityEntry[]> = $state({});
+
+	// Toast
+	let toastRef: ToastContainer | undefined = $state();
+
+	// Keyboard
+	const keyboard = new KeyboardManager();
+
+	// Quick exec
+	let quickExecVisible = $state(false);
+
+	// File browser
+	let fileBrowserVisible = $state(false);
+
+	// Command palette
+	let commandPaletteVisible = $state(false);
+
 	const sidebarConfig: SidebarConfig = {
 		storageKey: 'sctlin-sidebar',
 		defaultCollapsed: true,
@@ -155,7 +181,20 @@
 			},
 			callbacks: {
 				onConnectionChange: (status) => {
+					const prevStatus = connectionStatuses[server.id];
 					connectionStatuses = { ...connectionStatuses, [server.id]: status };
+
+					// Toast on connection status transitions
+					if (status === 'connected' && prevStatus !== 'connected') {
+						toastRef?.push(`Connected to ${server.name}`, 'success');
+						// Fetch device info + activity
+						fetchDeviceInfo(server.id);
+						fetchActivity(server.id);
+					} else if (status === 'reconnecting' && prevStatus === 'connected') {
+						toastRef?.push(`Reconnecting to ${server.name}...`, 'warning');
+					} else if (status === 'disconnected' && prevStatus === 'connected') {
+						toastRef?.push(`Disconnected from ${server.name}`, 'info');
+					}
 				},
 				onRemoteSessions: (sessions) => {
 					serverRemoteSessions = { ...serverRemoteSessions, [server.id]: sessions };
@@ -166,9 +205,50 @@
 				onActiveSessionChange: (key) => {
 					activeKeys = { ...activeKeys, [server.id]: key };
 				},
-				onError: (err) => console.error(`[sctlin:${server.name}]`, err.message)
+				onActivity: (entry) => {
+					const current = serverActivity[server.id] ?? [];
+					// Deduplicate: REST fetch on connect may overlap with WS broadcast
+					if (current.some((e) => e.id === entry.id)) return;
+					const updated = [...current, entry];
+					// Cap at 200 entries
+					serverActivity = {
+						...serverActivity,
+						[server.id]: updated.length > 200 ? updated.slice(-200) : updated
+					};
+				},
+				onError: (err) => {
+					console.error(`[sctlin:${server.name}]`, err.message);
+					toastRef?.push(err.message, 'error');
+				}
 			}
 		};
+	}
+
+	// ── Device info ─────────────────────────────────────────────────
+
+	async function fetchDeviceInfo(serverId: string): Promise<void> {
+		const client = serverRestClients[serverId];
+		if (!client) return;
+		try {
+			const info = await client.getInfo();
+			serverDeviceInfo = { ...serverDeviceInfo, [serverId]: info };
+		} catch (err) {
+			console.error(`Failed to fetch device info for ${serverId}:`, err);
+			serverDeviceInfo = { ...serverDeviceInfo, [serverId]: null };
+		}
+	}
+
+	// ── Activity feed ───────────────────────────────────────────────
+
+	async function fetchActivity(serverId: string): Promise<void> {
+		const client = serverRestClients[serverId];
+		if (!client) return;
+		try {
+			const entries = await client.getActivity(0, 100);
+			serverActivity = { ...serverActivity, [serverId]: entries };
+		} catch (err) {
+			console.error(`Failed to fetch activity for ${serverId}:`, err);
+		}
 	}
 
 	// ── Server management ────────────────────────────────────────────
@@ -178,6 +258,8 @@
 		if (!server || serverConfigs[id]) return;
 		serverConfigs = { ...serverConfigs, [id]: buildConfig(server) };
 		connectionStatuses = { ...connectionStatuses, [id]: 'connecting' };
+		// Create REST client
+		serverRestClients[id] = new SctlRestClient(server.wsUrl, server.apiKey);
 		if (!activeServerId) activeServerId = id;
 		saveServers();
 	}
@@ -189,6 +271,11 @@
 		serverSessions = { ...serverSessions, [id]: [] };
 		serverRemoteSessions = { ...serverRemoteSessions, [id]: [] };
 		delete containerRefs[id];
+		delete serverRestClients[id];
+		const { [id]: _di, ...restDi } = serverDeviceInfo;
+		serverDeviceInfo = restDi;
+		const { [id]: _act, ...restAct } = serverActivity;
+		serverActivity = restAct;
 		if (activeServerId === id) {
 			const connected = Object.keys(rest);
 			activeServerId = connected.length > 0 ? connected[0] : null;
@@ -295,6 +382,8 @@
 					}
 				});
 			});
+			// Safety timeout: clean up if connection never succeeds
+			setTimeout(() => { try { unsub(); } catch {} }, 15000);
 		}
 	}
 
@@ -314,7 +403,118 @@
 				connectServer(entry.id);
 			}
 		}
+
+		// Register keyboard shortcuts
+		const cleanups: (() => void)[] = [];
+
+		cleanups.push(keyboard.register({
+			key: 't', alt: true,
+			description: 'New session on active server',
+			action: () => { if (activeServerId) newSession(activeServerId); }
+		}));
+
+		cleanups.push(keyboard.register({
+			key: 'w', alt: true,
+			description: 'Close active tab',
+			action: () => {
+				if (!activeServerId) return;
+				const key = activeKeys[activeServerId];
+				if (key) containerRefs[activeServerId]?.closeTab(key);
+			}
+		}));
+
+		cleanups.push(keyboard.register({
+			key: 'ArrowLeft', alt: true,
+			description: 'Previous tab',
+			action: () => switchTab(-1)
+		}));
+
+		cleanups.push(keyboard.register({
+			key: 'ArrowRight', alt: true,
+			description: 'Next tab',
+			action: () => switchTab(1)
+		}));
+
+		// Alt+1-9 for tab switching
+		for (let i = 1; i <= 9; i++) {
+			cleanups.push(keyboard.register({
+				key: String(i), alt: true,
+				description: `Switch to tab ${i}`,
+				action: () => switchToTabN(i - 1)
+			}));
+		}
+
+		cleanups.push(keyboard.register({
+			key: 'f', alt: true,
+			description: 'Toggle terminal search',
+			action: () => {
+				if (activeServerId) containerRefs[activeServerId]?.toggleSearch();
+			}
+		}));
+
+		cleanups.push(keyboard.register({
+			key: 'k', alt: true,
+			description: 'Toggle quick exec bar',
+			action: () => { quickExecVisible = !quickExecVisible; }
+		}));
+
+		cleanups.push(keyboard.register({
+			key: 'p', alt: true,
+			description: 'Toggle command palette',
+			action: () => { commandPaletteVisible = !commandPaletteVisible; }
+		}));
+
+		cleanups.push(keyboard.register({
+			key: '\\', alt: true,
+			description: 'Split terminal vertically',
+			action: () => {
+				if (activeServerId) containerRefs[activeServerId]?.splitVertical();
+			}
+		}));
+
+		cleanups.push(keyboard.register({
+			key: '-', alt: true,
+			description: 'Split terminal horizontally',
+			action: () => {
+				if (activeServerId) containerRefs[activeServerId]?.splitHorizontal();
+			}
+		}));
+
+		cleanups.push(keyboard.register({
+			key: 'q', alt: true,
+			description: 'Close split pane',
+			action: () => {
+				if (activeServerId) containerRefs[activeServerId]?.unsplit();
+			}
+		}));
+
+		return () => {
+			for (const fn of cleanups) fn();
+		};
 	});
+
+	// ── Tab navigation helpers ──────────────────────────────────────
+
+	function switchTab(direction: number): void {
+		if (unifiedSessions.length === 0) return;
+		const currentKey = unifiedActiveKey;
+		const currentIdx = unifiedSessions.findIndex((s) => s.key === currentKey);
+		const newIdx = (currentIdx + direction + unifiedSessions.length) % unifiedSessions.length;
+		const target = unifiedSessions[newIdx];
+		if (target?.serverId) {
+			activeServerId = target.serverId;
+			containerRefs[target.serverId]?.selectSession(target.key);
+		}
+	}
+
+	function switchToTabN(index: number): void {
+		if (index >= unifiedSessions.length) return;
+		const target = unifiedSessions[index];
+		if (target?.serverId) {
+			activeServerId = target.serverId;
+			containerRefs[target.serverId]?.selectSession(target.key);
+		}
+	}
 
 	function resetState(): void {
 		try { localStorage.removeItem(STORAGE_KEY); } catch {}
@@ -334,11 +534,22 @@
 				return 'bg-neutral-600';
 		}
 	}
+
+	// ── Quick exec handler ──────────────────────────────────────────
+
+	async function handleQuickExec(command: string) {
+		if (!activeServerId) throw new Error('No server connected');
+		const client = serverRestClients[activeServerId];
+		if (!client) throw new Error('No REST client available');
+		return client.exec(command);
+	}
 </script>
 
 <svelte:head>
 	<title>sctlin</title>
 </svelte:head>
+
+<svelte:window onkeydown={(e) => keyboard.handleKeydown(e)} />
 
 <div class="h-screen bg-neutral-950 flex flex-col">
 	<!-- Main area -->
@@ -355,6 +566,8 @@
 					activeSessionId={getActiveSessionId()}
 					collapsed={ctx.collapsed}
 					collapsedWidth={ctx.collapsedWidth}
+					{serverDeviceInfo}
+					{serverActivity}
 					onconnect={connectServer}
 					ondisconnect={disconnectServer}
 					onselectsession={selectSession}
@@ -367,6 +580,7 @@
 					onaddserver={addServer}
 					onremoveserver={removeServer}
 					oneditserver={editServer}
+					onrefreshinfo={fetchDeviceInfo}
 				/>
 			{/snippet}
 			{#snippet toggleBar({ collapsed, toggle })}
@@ -435,28 +649,58 @@
 				</div>
 			{/if}
 
-			<!-- Container stack -->
-			<div class="flex-1 relative min-h-0">
-				<!-- Logo in background -->
-				<div class="absolute inset-0 flex items-center justify-center bg-neutral-950 pointer-events-none">
-					<img src="/sctl-logo.png" alt="sctl" class="max-w-full max-h-full w-auto h-auto opacity-90" style="object-fit: contain;" />
+			<!-- Container stack + file browser -->
+			<div class="flex-1 flex min-h-0">
+				<!-- Terminal containers -->
+				<div class="flex-1 relative min-h-0 min-w-0">
+					<!-- Logo in background -->
+					<div class="absolute inset-0 flex items-center justify-center bg-neutral-950 pointer-events-none">
+						<img src="/sctl-logo.png" alt="sctl" class="max-w-full max-h-full w-auto h-auto opacity-90" style="object-fit: contain;" />
+					</div>
+
+					{#each servers as server (server.id)}
+						{#if serverConfigs[server.id]}
+							<div
+								class="absolute inset-0"
+								style:visibility={server.id === activeServerId ? 'visible' : 'hidden'}
+							>
+								<TerminalContainer
+									config={serverConfigs[server.id]}
+									showTabs={false}
+									onToggleFileBrowser={() => { fileBrowserVisible = !fileBrowserVisible; }}
+									fileBrowserOpen={fileBrowserVisible}
+									bind:this={containerRefs[server.id]}
+								/>
+							</div>
+						{/if}
+					{/each}
 				</div>
 
-				{#each servers as server (server.id)}
-					{#if serverConfigs[server.id]}
-						<div
-							class="absolute inset-0"
-							style:visibility={server.id === activeServerId ? 'visible' : 'hidden'}
-						>
-							<TerminalContainer
-								config={serverConfigs[server.id]}
-								showTabs={false}
-								bind:this={containerRefs[server.id]}
-							/>
-						</div>
-					{/if}
-				{/each}
+				<!-- File browser (right side panel) -->
+				<FileBrowser
+					visible={fileBrowserVisible}
+					restClient={activeServerId ? serverRestClients[activeServerId] ?? null : null}
+					onclose={() => { fileBrowserVisible = false; }}
+				/>
 			</div>
 		</div>
 	</div>
 </div>
+
+<!-- Toast notifications -->
+<ToastContainer bind:this={toastRef} />
+
+<!-- Quick exec overlay -->
+<QuickExecBar
+	visible={quickExecVisible}
+	serverName={activeServer?.name}
+	onexec={handleQuickExec}
+	onclose={() => { quickExecVisible = false; }}
+/>
+
+<!-- Command palette overlay -->
+<CommandPalette
+	visible={commandPaletteVisible}
+	shortcuts={keyboard.getAll()}
+	onclose={() => { commandPaletteVisible = false; }}
+/>

@@ -26,6 +26,7 @@
 //! | POST   | `/api/exec/batch` | Yes  | Batch command execution              |
 //! | GET    | `/api/files`      | Yes  | Read file or list directory          |
 //! | PUT    | `/api/files`      | Yes  | Write file (atomic)                  |
+//! | GET    | `/api/activity`   | Yes  | Activity journal (operation log)     |
 //! | GET    | `/api/ws`         | Yes* | WebSocket for interactive sessions   |
 //!
 //! *WebSocket auth is via `?token=<key>` query param (no `Authorization` header
@@ -43,6 +44,7 @@
 //! | POST   | `/d/{serial}/api/exec/batch`  | `api_key`    | Proxied batch execution     |
 //! | GET    | `/d/{serial}/api/files`       | `api_key`    | Proxied file read/list      |
 //! | PUT    | `/d/{serial}/api/files`       | `api_key`    | Proxied file write          |
+//! | GET    | `/d/{serial}/api/activity`    | `api_key`    | Proxied activity journal    |
 //! | GET    | `/d/{serial}/api/ws`          | `api_key`    | Proxied WS sessions         |
 //!
 //! ## Architecture
@@ -50,6 +52,7 @@
 //! ```text
 //! main.rs          — entry point, clap subcommands, router setup, graceful shutdown
 //! supervisor.rs    — built-in supervisor (fork/restart loop)
+//! activity.rs      — in-memory activity journal (ring buffer + broadcast)
 //! auth.rs          — Bearer token middleware, constant-time comparison
 //! config.rs        — TOML + env-var configuration
 //! routes/
@@ -57,6 +60,7 @@
 //!   info.rs        — GET /api/info (system introspection)
 //!   exec.rs        — POST /api/exec, POST /api/exec/batch
 //!   files.rs       — GET/PUT /api/files (read, write, list)
+//!   activity.rs    — GET /api/activity (operation log)
 //! shell/
 //!   process.rs     — spawn_shell(), spawn_shell_pgroup(), exec_command()
 //!   pty.rs         — PTY allocation, spawn, resize
@@ -73,6 +77,7 @@
 //!   relay.rs       — Device registration, client routing, REST/WS proxy
 //! ```
 
+mod activity;
 mod auth;
 mod config;
 mod routes;
@@ -100,6 +105,7 @@ use tokio::sync::broadcast;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
+use activity::ActivityLog;
 use auth::ApiKey;
 use config::Config;
 use sessions::SessionManager;
@@ -140,6 +146,8 @@ pub struct AppState {
     /// Broadcast channel for session lifecycle events (created/destroyed/renamed).
     /// All connected WebSocket clients subscribe to receive real-time updates.
     pub session_events: broadcast::Sender<Value>,
+    /// In-memory activity journal for REST/WS operation tracking.
+    pub activity_log: Arc<ActivityLog>,
     /// Whether the tunnel client is currently connected to the relay.
     pub tunnel_connected: Arc<AtomicBool>,
     /// Number of tunnel reconnects since startup.
@@ -227,12 +235,14 @@ async fn run_server(config_path: Option<&str>) {
     }
 
     let (session_events, _) = broadcast::channel(256);
+    let activity_log = Arc::new(ActivityLog::new(200, session_events.clone()));
 
     let state = AppState {
         session_manager,
         config: Arc::new(config),
         start_time: Instant::now(),
         session_events,
+        activity_log,
         tunnel_connected: Arc::new(AtomicBool::new(false)),
         tunnel_reconnects: Arc::new(AtomicU64::new(0)),
     };
@@ -248,6 +258,7 @@ async fn run_server(config_path: Option<&str>) {
             "/api/files",
             get(routes::files::get_file).put(routes::files::put_file),
         )
+        .route("/api/activity", get(routes::activity::get_activity))
         .layer(middleware::from_fn(auth::require_api_key));
 
     let ws_route = Router::new().route("/api/ws", get(ws::ws_upgrade));

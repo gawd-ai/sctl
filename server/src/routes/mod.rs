@@ -4,6 +4,7 @@
 //! [`health`] require authentication via the [`crate::auth::require_api_key`]
 //! middleware.
 
+pub mod activity;
 pub mod exec;
 pub mod files;
 pub mod health;

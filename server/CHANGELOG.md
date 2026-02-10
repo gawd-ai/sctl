@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Reverse tunnel** — built-in relay for CGNAT devices (LTE/5G). Any sctl instance can act as a relay (`tunnel.relay = true`); devices connect outbound via WebSocket and clients access them through `/d/{serial}/api/*` proxy endpoints.
+- **AI collaboration** — `session.allow_ai` (toggle AI input permission), `session.ai_status` (report working state), and broadcast events (`session.ai_permission_changed`, `session.ai_status_changed`) for real-time UI feedback.
+- **Session rename** — `session.rename` message with `session.renamed` broadcast to all connected clients.
+- **Shell discovery** — `shell.list` message to enumerate available shells on the device.
+- **TLS via rustls** — switched from native-tls to rustls for outbound TLS connections.
+- **Tunnel reliability** — drain pending requests on device disconnect, heartbeat sweep for stale connections, backpressure handling, structured logging for tunnel operations.
+
 ## [0.3.0] - 2026-02-06
 
 ### Added

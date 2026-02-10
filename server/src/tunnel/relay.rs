@@ -175,6 +175,7 @@ pub fn relay_router(relay_state: RelayState) -> Router {
             "/d/{serial}/api/files",
             get(proxy_file_read).put(proxy_file_write),
         )
+        .route("/d/{serial}/api/activity", get(proxy_activity))
         .route("/d/{serial}/api/ws", get(proxy_ws));
 
     tunnel_admin.merge(device_proxy).with_state(relay_state)
@@ -825,6 +826,49 @@ fn proxy_response_to_http(response: &Value) -> Result<Json<Value>, (StatusCode, 
             Json(body),
         ))
     }
+}
+
+/// `GET /d/{serial}/api/activity` — proxied activity journal.
+async fn proxy_activity(
+    State(state): State<RelayState>,
+    AxumPath(serial): AxumPath<String>,
+    Query(query): Query<ActivityProxyQuery>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "tunnel.activity",
+        "request_id": request_id,
+        "since_id": query.since_id,
+        "limit": query.limit,
+    });
+
+    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
+}
+
+/// Query parameters for the activity proxy endpoint.
+#[derive(Deserialize)]
+struct ActivityProxyQuery {
+    #[serde(default)]
+    since_id: u64,
+    #[serde(default = "default_activity_limit")]
+    limit: usize,
+}
+
+fn default_activity_limit() -> usize {
+    50
 }
 
 // ─── WS Proxy ────────────────────────────────────────────────────────────────

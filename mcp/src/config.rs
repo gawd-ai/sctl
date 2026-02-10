@@ -15,6 +15,10 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Bump this when the config format changes (new required fields, renamed keys, etc.).
+/// mcp-sctl will warn if the on-disk version is older, so users know to update.
+pub const CONFIG_VERSION: u32 = 2;
+
 /// CLI arguments parsed by `clap`.
 #[derive(Parser)]
 #[command(name = "mcp-sctl", about = "MCP server for sctl devices")]
@@ -27,6 +31,8 @@ pub struct Cli {
 /// Raw JSON config file structure.
 #[derive(Deserialize)]
 pub struct DevicesConfig {
+    /// Config format version — checked against `CONFIG_VERSION` to detect stale files.
+    pub config_version: Option<u32>,
     pub devices: HashMap<String, DeviceEntry>,
     pub default_device: Option<String>,
 }
@@ -50,12 +56,23 @@ pub struct ResolvedConfig {
 /// Load and validate configuration from CLI args, env vars, or config file.
 pub fn load_config(cli: &Cli) -> Result<ResolvedConfig, String> {
     if let Some(path) = &cli.config {
-        load_from_file(path)
+        load_from_file(&expand_tilde(path))
     } else if let Ok(path) = std::env::var("SCTL_CONFIG") {
-        load_from_file(&PathBuf::from(path))
+        load_from_file(&expand_tilde(&PathBuf::from(path)))
     } else {
         load_from_env()
     }
+}
+
+/// Expand a leading `~` to `$HOME`.
+fn expand_tilde(path: &PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    path.clone()
 }
 
 fn load_from_file(path: &PathBuf) -> Result<ResolvedConfig, String> {
@@ -64,6 +81,24 @@ fn load_from_file(path: &PathBuf) -> Result<ResolvedConfig, String> {
 
     let config: DevicesConfig = serde_json::from_str(&contents)
         .map_err(|e| format!("Failed to parse config file {}: {}", path.display(), e))?;
+
+    // Warn about missing or outdated config version
+    match config.config_version {
+        None => eprintln!(
+            "Warning: {} has no config_version field (expected {}). \
+             Config may be outdated — check devices.example.json for the current format.",
+            path.display(),
+            CONFIG_VERSION
+        ),
+        Some(v) if v < CONFIG_VERSION => eprintln!(
+            "Warning: {} has config_version {} but mcp-sctl expects {}. \
+             Config may be outdated — check devices.example.json for the current format.",
+            path.display(),
+            v,
+            CONFIG_VERSION
+        ),
+        _ => {}
+    }
 
     if config.devices.is_empty() {
         return Err("Config file contains no devices".into());

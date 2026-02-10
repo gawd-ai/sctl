@@ -25,7 +25,15 @@ pub struct SctlClient {
 impl SctlClient {
     /// Create a new client for a sctl device at the given URL.
     pub fn new(base_url: String, api_key: String) -> Self {
-        let http = reqwest::Client::new();
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        default_headers.insert(
+            reqwest::header::HeaderName::from_static("x-sctl-client"),
+            reqwest::header::HeaderValue::from_static("mcp"),
+        );
+        let http = reqwest::Client::builder()
+            .default_headers(default_headers)
+            .build()
+            .expect("Failed to build HTTP client");
         // Strip trailing slash for consistent URL construction
         let base_url = base_url.trim_end_matches('/').to_string();
         Self {

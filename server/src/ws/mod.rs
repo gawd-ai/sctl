@@ -60,6 +60,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 use tracing::info;
 
+use crate::activity::{ActivitySource, ActivityType};
 use crate::sessions::buffer::{OutputBuffer, OutputEntry, OutputStream};
 use crate::AppState;
 
@@ -730,6 +731,20 @@ async fn handle_session_start(
             }
             let _ = state.session_events.send(broadcast);
 
+            state
+                .activity_log
+                .log(
+                    ActivityType::SessionStart,
+                    ActivitySource::Ws,
+                    format!("session {}", &session_id[..8.min(session_id.len())]),
+                    Some(json!({
+                        "session_id": session_id,
+                        "pty": use_pty,
+                        "persistent": persistent,
+                    })),
+                )
+                .await;
+
             Some(session_id)
         }
         Err(e) => {
@@ -779,6 +794,16 @@ async fn handle_session_exec(
             resp["request_id"] = json!(rid);
         }
         let _ = tx.send(resp).await;
+
+        state
+            .activity_log
+            .log(
+                ActivityType::SessionExec,
+                ActivitySource::Ws,
+                crate::activity::truncate_str(command, 80),
+                Some(json!({ "session_id": session_id })),
+            )
+            .await;
     }
 }
 
@@ -822,6 +847,16 @@ async fn handle_session_kill(
             resp["request_id"] = json!(rid);
         }
         let _ = tx.send(resp).await;
+
+        state
+            .activity_log
+            .log(
+                ActivityType::SessionKill,
+                ActivitySource::Ws,
+                format!("session {}", &session_id[..8.min(session_id.len())]),
+                Some(json!({ "session_id": session_id })),
+            )
+            .await;
     } else {
         let mut resp = json!({
             "type": "error",
@@ -859,6 +894,20 @@ async fn handle_session_signal(
                 resp["request_id"] = json!(rid);
             }
             let _ = tx.send(resp).await;
+
+            state
+                .activity_log
+                .log(
+                    ActivityType::SessionSignal,
+                    ActivitySource::Ws,
+                    format!(
+                        "signal {} → {}",
+                        signal,
+                        &session_id[..8.min(session_id.len())]
+                    ),
+                    Some(json!({ "session_id": session_id, "signal": signal })),
+                )
+                .await;
         }
         Err(e) => {
             let mut resp = json!({

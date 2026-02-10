@@ -30,12 +30,13 @@ static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::activity::{self, ActivityType};
 use crate::AppState;
 
 /// Query parameters for `GET /api/files`.
@@ -157,15 +158,37 @@ fn format_system_time(time: SystemTime) -> Option<String> {
 /// | 500  | `IO_ERROR`         | Other I/O failure                |
 pub async fn get_file(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<FilesQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let source = activity::source_from_headers(&headers);
     let path = validate_path(&query.path)?;
 
     if query.list || query.path.ends_with('/') {
-        return list_directory(&path).await;
+        let result = list_directory(&path).await?;
+        state
+            .activity_log
+            .log(
+                ActivityType::FileList,
+                source,
+                activity::truncate_str(&query.path, 80),
+                None,
+            )
+            .await;
+        return Ok(result);
     }
 
-    read_file(&path, state.config.server.max_file_size).await
+    let result = read_file(&path, state.config.server.max_file_size).await?;
+    state
+        .activity_log
+        .log(
+            ActivityType::FileRead,
+            source,
+            activity::truncate_str(&query.path, 80),
+            None,
+        )
+        .await;
+    Ok(result)
 }
 
 /// Read a single file, returning UTF-8 text or base64 for binary.
@@ -351,8 +374,10 @@ async fn list_directory(path: &Path) -> Result<Json<Value>, (StatusCode, Json<Va
 /// | 500  | `IO_ERROR`         | Write, chmod, or rename failure    |
 pub async fn put_file(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<FileWriteRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let source = activity::source_from_headers(&headers);
     let path = validate_path(&payload.path)?;
 
     let bytes = if payload.encoding.as_deref() == Some("base64") {
@@ -448,6 +473,19 @@ pub async fn put_file(
             Json(json!({"error": format!("Failed to rename: {e}"), "code": "IO_ERROR"})),
         ));
     }
+
+    state
+        .activity_log
+        .log(
+            ActivityType::FileWrite,
+            source,
+            activity::truncate_str(&payload.path, 80),
+            Some(json!({
+                "size": bytes.len(),
+                "mode": payload.mode,
+            })),
+        )
+        .await;
 
     Ok(Json(json!({
         "path": path.to_string_lossy(),

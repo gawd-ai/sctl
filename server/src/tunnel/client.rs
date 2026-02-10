@@ -251,6 +251,9 @@ async fn handle_relay_message(
         "tunnel.file.write" => {
             handle_tunnel_file_write(state, ws_sink, &msg, request_id.as_deref()).await;
         }
+        "tunnel.activity" => {
+            handle_tunnel_activity(state, ws_sink, &msg, request_id.as_deref()).await;
+        }
         // Forwarded session.* messages from clients via relay
         t if t.starts_with("session.") => {
             handle_forwarded_session_message(state, ws_sink, subscriber_tasks, &msg).await;
@@ -508,6 +511,7 @@ async fn handle_tunnel_file_read(
 
     match crate::routes::files::get_file(
         axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
         axum::extract::Query(query),
     )
     .await
@@ -560,8 +564,12 @@ async fn handle_tunnel_file_write(
         encoding,
     };
 
-    match crate::routes::files::put_file(axum::extract::State(state.clone()), axum::Json(payload))
-        .await
+    match crate::routes::files::put_file(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(payload),
+    )
+    .await
     {
         Ok(axum::Json(body)) => {
             send_response(
@@ -588,6 +596,32 @@ async fn handle_tunnel_file_write(
             .await;
         }
     }
+}
+
+/// Handle tunnel.activity — activity journal read
+async fn handle_tunnel_activity(
+    state: &AppState,
+    ws_sink: &WsSink,
+    msg: &Value,
+    request_id: Option<&str>,
+) {
+    let since_id = msg["since_id"].as_u64().unwrap_or(0);
+    let limit = msg["limit"].as_u64().unwrap_or(50) as usize;
+    let entries = state
+        .activity_log
+        .read_since(since_id, limit.min(200))
+        .await;
+
+    send_response(
+        ws_sink,
+        json!({
+            "type": "tunnel.activity.result",
+            "request_id": request_id,
+            "status": 200,
+            "body": { "entries": entries },
+        }),
+    )
+    .await;
 }
 
 /// Handle forwarded `session.*` messages from clients through the relay.

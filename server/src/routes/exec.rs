@@ -8,10 +8,15 @@
 
 use std::collections::HashMap;
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::activity::{self, ActivityType};
 use crate::shell::process;
 use crate::AppState;
 
@@ -59,8 +64,10 @@ pub struct ExecResponse {
 /// - `500 Internal Server Error` with `{"code":"EXEC_FAILED"}` — spawn or wait failure
 pub async fn exec(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<ExecRequest>,
 ) -> Result<Json<ExecResponse>, (StatusCode, Json<Value>)> {
+    let source = activity::source_from_headers(&headers);
     let timeout = payload
         .timeout_ms
         .unwrap_or(state.config.server.exec_timeout_ms);
@@ -84,13 +91,29 @@ pub async fn exec(
     ))
     .await
     {
-        Ok(result) => Ok(Json(ExecResponse {
-            exit_code: result.exit_code,
-            stdout: result.stdout,
-            stderr: result.stderr,
-            duration_ms: result.duration_ms,
-            request_id: payload.request_id,
-        })),
+        Ok(result) => {
+            state
+                .activity_log
+                .log(
+                    ActivityType::Exec,
+                    source,
+                    activity::truncate_str(&payload.command, 80),
+                    Some(json!({
+                        "exit_code": result.exit_code,
+                        "duration_ms": result.duration_ms,
+                        "stdout_preview": activity::truncate_str(&result.stdout, 200),
+                        "stderr_preview": activity::truncate_str(&result.stderr, 200),
+                    })),
+                )
+                .await;
+            Ok(Json(ExecResponse {
+                exit_code: result.exit_code,
+                stdout: result.stdout,
+                stderr: result.stderr,
+                duration_ms: result.duration_ms,
+                request_id: payload.request_id,
+            }))
+        }
         Err(process::ExecError::Timeout) => {
             let mut err = json!({"error": "Command timed out", "code": "TIMEOUT"});
             if let Some(ref rid) = payload.request_id {
@@ -169,8 +192,10 @@ pub struct BatchExecResponse {
 /// - `400 Bad Request` with `{"code":"BATCH_TOO_LARGE"}` — exceeds `max_batch_size`
 pub async fn batch_exec(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<BatchExecRequest>,
 ) -> Result<Json<BatchExecResponse>, (StatusCode, Json<Value>)> {
+    let source = activity::source_from_headers(&headers);
     if payload.commands.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -229,27 +254,46 @@ pub async fn batch_exec(
         ))
         .await
         {
-            Ok(result) => results.push(ExecResponse {
-                exit_code: result.exit_code,
-                stdout: result.stdout,
-                stderr: result.stderr,
-                duration_ms: result.duration_ms,
-                request_id: None,
-            }),
-            Err(process::ExecError::Timeout) => results.push(ExecResponse {
-                exit_code: -1,
-                stdout: String::new(),
-                stderr: "Command timed out".to_string(),
-                duration_ms: timeout,
-                request_id: None,
-            }),
-            Err(e) => results.push(ExecResponse {
-                exit_code: -1,
-                stdout: String::new(),
-                stderr: e.to_string(),
-                duration_ms: 0,
-                request_id: None,
-            }),
+            Ok(result) => {
+                state
+                    .activity_log
+                    .log(
+                        ActivityType::Exec,
+                        source,
+                        activity::truncate_str(&cmd.command, 80),
+                        Some(json!({
+                            "exit_code": result.exit_code,
+                            "duration_ms": result.duration_ms,
+                            "batch": true,
+                        })),
+                    )
+                    .await;
+                results.push(ExecResponse {
+                    exit_code: result.exit_code,
+                    stdout: result.stdout,
+                    stderr: result.stderr,
+                    duration_ms: result.duration_ms,
+                    request_id: None,
+                });
+            }
+            Err(process::ExecError::Timeout) => {
+                results.push(ExecResponse {
+                    exit_code: -1,
+                    stdout: String::new(),
+                    stderr: "Command timed out".to_string(),
+                    duration_ms: timeout,
+                    request_id: None,
+                });
+            }
+            Err(e) => {
+                results.push(ExecResponse {
+                    exit_code: -1,
+                    stdout: String::new(),
+                    stderr: e.to_string(),
+                    duration_ms: 0,
+                    request_id: None,
+                });
+            }
         }
     }
 

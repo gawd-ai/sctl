@@ -6,6 +6,14 @@ export { default as Terminal } from './components/Terminal.svelte';
 export { default as TerminalTabs } from './components/TerminalTabs.svelte';
 export { default as ControlBar } from './components/ControlBar.svelte';
 export { default as ServerPanel } from './components/ServerPanel.svelte';
+export { default as ToastContainer } from './components/ToastContainer.svelte';
+export { default as SearchBar } from './components/SearchBar.svelte';
+export { default as DeviceInfoPanel } from './components/DeviceInfoPanel.svelte';
+export { default as QuickExecBar } from './components/QuickExecBar.svelte';
+export { default as SplitPane } from './components/SplitPane.svelte';
+export { default as FileBrowser } from './components/FileBrowser.svelte';
+export { default as CommandPalette } from './components/CommandPalette.svelte';
+export { default as ActivityFeed } from './components/ActivityFeed.svelte';
 
 // Types
 export type {
@@ -32,9 +40,20 @@ export type {
 	WsShellListMsg,
 	WsShellListedMsg,
 	RemoteSessionInfo,
-	ServerConfig
+	ServerConfig,
+	DeviceInfo,
+	NetworkInterface,
+	DirEntry,
+	FileContent,
+	ExecResult,
+	ActivityType,
+	ActivitySource,
+	ActivityEntry,
+	WsActivityNewMsg
 } from './types/terminal.types';
 
 // Utilities
 export { SctlWsClient } from './utils/ws-client';
 export { createTerminal, applyTheme, DEFAULT_THEME, type XtermInstance } from './utils/xterm';
+export { SctlRestClient } from './utils/rest-client';
+export { KeyboardManager, type Shortcut } from './utils/keyboard';

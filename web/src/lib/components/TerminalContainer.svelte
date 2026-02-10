@@ -10,19 +10,23 @@
 		WsSessionDestroyedBroadcast,
 		WsSessionRenamedBroadcast,
 		WsSessionAiPermissionChangedBroadcast,
-		WsSessionAiStatusChangedBroadcast
+		WsSessionAiStatusChangedBroadcast,
+		WsActivityNewMsg
 	} from '../types/terminal.types';
 	import { SctlWsClient } from '../utils/ws-client';
 	import Terminal from './Terminal.svelte';
 	import TerminalTabs from './TerminalTabs.svelte';
 	import ControlBar from './ControlBar.svelte';
+	import SplitPane from './SplitPane.svelte';
 
 	interface Props {
 		config: SctlinConfig;
 		showTabs?: boolean;
+		onToggleFileBrowser?: () => void;
+		fileBrowserOpen?: boolean;
 	}
 
-	let { config, showTabs = true }: Props = $props();
+	let { config, showTabs = true, onToggleFileBrowser = undefined, fileBrowserOpen = false }: Props = $props();
 
 	let sessions: SessionInfo[] = $state([]);
 	let activeKey: string | null = $state(null);
@@ -54,6 +58,13 @@
 
 	let sessionCounter = 0;
 	let client: SctlWsClient;
+	let searchVisible = $state(false);
+
+	// Split pane state
+	let splitDirection: 'horizontal' | 'vertical' | null = $state(null);
+	let splitSecondKey: string | null = $state(null);
+	let splitRatio = $state(0.5);
+	let focusedPane: 'primary' | 'secondary' = $state('primary');
 
 	const SESSION_START_TIMEOUT_MS = 15_000;
 
@@ -110,8 +121,8 @@
 
 			const result = await Promise.race([startPromise, timeoutPromise]);
 
-			const serverAllowsAi = (result as Record<string, unknown>).user_allows_ai as boolean | undefined;
-			const serverName = (result as Record<string, unknown>).name as string | undefined;
+			const serverAllowsAi = (result as unknown as Record<string, unknown>).user_allows_ai as boolean | undefined;
+			const serverName = (result as unknown as Record<string, unknown>).name as string | undefined;
 			const key = crypto.randomUUID();
 			const session: SessionInfo = {
 				key,
@@ -149,8 +160,8 @@
 	/** Attach to a server session by its server-assigned sessionId.
 	 *  Accepts sessionId because the session may not be local yet. */
 	export async function attachSession(sessionId: string): Promise<void> {
+		const existing = sessions.find((s) => s.sessionId === sessionId);
 		try {
-			const existing = sessions.find((s) => s.sessionId === sessionId);
 			if (existing?.dead) return; // Dead sessions cannot be re-attached
 			const since = seqMap.get(sessionId) ?? 0;
 
@@ -496,6 +507,81 @@
 		}
 	}
 
+	// ── Search ──────────────────────────────────────────────────────
+
+	export function toggleSearch(): void {
+		searchVisible = !searchVisible;
+	}
+
+	// ── Split panes ────────────────────────────────────────────────
+
+	export function splitHorizontal(): void {
+		doSplit('horizontal');
+	}
+
+	export function splitVertical(): void {
+		doSplit('vertical');
+	}
+
+	export function unsplit(): void {
+		if (!splitDirection) return;
+		// Keep the focused pane's session
+		if (focusedPane === 'secondary' && splitSecondKey) {
+			setActiveKey(splitSecondKey);
+		}
+		splitDirection = null;
+		splitSecondKey = null;
+		focusedPane = 'primary';
+		// Re-fit the remaining terminal
+		tick().then(() => {
+			if (activeKey) terminalRefs[activeKey]?.fit();
+		});
+	}
+
+	function doSplit(dir: 'horizontal' | 'vertical'): void {
+		if (!activeKey || sessions.length < 1) return;
+		if (splitDirection) {
+			// Already split — just change direction
+			splitDirection = dir;
+			tick().then(fitAllPanes);
+			return;
+		}
+		// Find a second session (next in list, or start a new one)
+		const currentIdx = sessions.findIndex((s) => s.key === activeKey);
+		const otherSession = sessions.find((s, i) => i !== currentIdx && !s.dead);
+		if (otherSession) {
+			splitSecondKey = otherSession.key;
+		} else {
+			// Start a new session for the second pane
+			startSession().then(() => {
+				splitSecondKey = sessions[sessions.length - 1]?.key ?? null;
+				// Re-set activeKey to the original (startSession changes it)
+				if (activeKey !== sessions[currentIdx]?.key) {
+					activeKey = sessions[currentIdx]?.key ?? activeKey;
+				}
+				tick().then(fitAllPanes);
+			});
+			splitDirection = dir;
+			return;
+		}
+		splitDirection = dir;
+		tick().then(fitAllPanes);
+	}
+
+	function fitAllPanes(): void {
+		if (activeKey) terminalRefs[activeKey]?.fit();
+		if (splitSecondKey) terminalRefs[splitSecondKey]?.fit();
+	}
+
+	function handleSplitRatioChange(newRatio: number): void {
+		splitRatio = newRatio;
+		tick().then(fitAllPanes);
+	}
+
+	function handlePaneFocus(pane: 'primary' | 'secondary'): void {
+		focusedPane = pane;
+	}
+
 	// ── Public accessors ────────────────────────────────────────────
 
 	export function getSessionList(): SessionInfo[] {
@@ -618,6 +704,10 @@
 			}
 		});
 
+		client.on('activity.new', (msg: WsActivityNewMsg) => {
+			config.callbacks?.onActivity?.(msg.entry);
+		});
+
 		if (config.autoConnect !== false) {
 			client.connect();
 		}
@@ -682,30 +772,120 @@
 			<div class="absolute inset-0 pointer-events-none" style="background: rgba(12, 12, 12, 0.85); z-index: 0;"></div>
 		{/if}
 
-		{#each sessions as session (session.key)}
-			<div
-				class="absolute inset-0"
-				style:visibility={session.key !== activeKey ? 'hidden' : null}
-				style:z-index="1"
-			>
-				<!-- svelte-ignore binding_property_non_reactive -->
-				<Terminal
-					theme={config.theme}
-					readonly={session.dead || session.aiIsWorking || !session.attached}
-					overlayLabel={session.dead ? 'Session Lost' : session.aiIsWorking ? (session.aiActivity === 'read' ? 'AI Reading' : 'AI Executing') : undefined}
-					overlayColor={session.dead ? 'gray' : session.aiActivity === 'read' ? 'blue' : 'green'}
-					rows={config.defaultRows}
-					cols={config.defaultCols}
-					ondata={(data) => handleTerminalData(session.sessionId, data)}
-					onresize={(r, c) => handleTerminalResize(session.sessionId, r, c)}
-					onready={() => {
-						flushBuffer(session.sessionId);
-						syncTerminalSize(session.sessionId, session.attached);
-					}}
-					bind:this={terminalRefs[session.key]}
-				/>
-			</div>
-		{/each}
+		{#if splitDirection && splitSecondKey}
+			{@const primarySession = sessions.find((s) => s.key === activeKey)}
+			{@const secondarySession = sessions.find((s) => s.key === splitSecondKey)}
+			{#if primarySession && secondarySession}
+				<div class="absolute inset-0" style:z-index="1">
+					<SplitPane
+						direction={splitDirection}
+						ratio={splitRatio}
+						onratiochange={handleSplitRatioChange}
+					>
+						{#snippet first()}
+							<!-- svelte-ignore a11y_no_static_element_interactions -->
+							<!-- svelte-ignore a11y_click_events_have_key_events -->
+							<div
+								class="w-full h-full {focusedPane === 'primary' ? 'ring-1 ring-neutral-600 ring-inset' : ''}"
+								onclick={() => handlePaneFocus('primary')}
+							>
+								<!-- svelte-ignore binding_property_non_reactive -->
+								<Terminal
+									theme={config.theme}
+									readonly={primarySession.dead || primarySession.aiIsWorking || !primarySession.attached}
+									overlayLabel={primarySession.dead ? 'Session Lost' : primarySession.aiIsWorking ? (primarySession.aiActivity === 'read' ? 'AI Reading' : 'AI Executing') : undefined}
+									overlayColor={primarySession.dead ? 'gray' : primarySession.aiActivity === 'read' ? 'blue' : 'green'}
+									showSearch={searchVisible && focusedPane === 'primary'}
+									rows={config.defaultRows}
+									cols={config.defaultCols}
+									ondata={(data) => handleTerminalData(primarySession.sessionId, data)}
+									onresize={(r, c) => handleTerminalResize(primarySession.sessionId, r, c)}
+									onready={() => {
+										flushBuffer(primarySession.sessionId);
+										syncTerminalSize(primarySession.sessionId, primarySession.attached);
+									}}
+									onsearchclose={() => { searchVisible = false; }}
+									bind:this={terminalRefs[primarySession.key]}
+								/>
+							</div>
+						{/snippet}
+						{#snippet second()}
+							<!-- svelte-ignore a11y_no_static_element_interactions -->
+							<!-- svelte-ignore a11y_click_events_have_key_events -->
+							<div
+								class="w-full h-full {focusedPane === 'secondary' ? 'ring-1 ring-neutral-600 ring-inset' : ''}"
+								onclick={() => handlePaneFocus('secondary')}
+							>
+								<!-- svelte-ignore binding_property_non_reactive -->
+								<Terminal
+									theme={config.theme}
+									readonly={secondarySession.dead || secondarySession.aiIsWorking || !secondarySession.attached}
+									overlayLabel={secondarySession.dead ? 'Session Lost' : secondarySession.aiIsWorking ? (secondarySession.aiActivity === 'read' ? 'AI Reading' : 'AI Executing') : undefined}
+									overlayColor={secondarySession.dead ? 'gray' : secondarySession.aiActivity === 'read' ? 'blue' : 'green'}
+									showSearch={searchVisible && focusedPane === 'secondary'}
+									rows={config.defaultRows}
+									cols={config.defaultCols}
+									ondata={(data) => handleTerminalData(secondarySession.sessionId, data)}
+									onresize={(r, c) => handleTerminalResize(secondarySession.sessionId, r, c)}
+									onready={() => {
+										flushBuffer(secondarySession.sessionId);
+										syncTerminalSize(secondarySession.sessionId, secondarySession.attached);
+									}}
+									onsearchclose={() => { searchVisible = false; }}
+									bind:this={terminalRefs[secondarySession.key]}
+								/>
+							</div>
+						{/snippet}
+					</SplitPane>
+				</div>
+			{/if}
+			<!-- Hidden: other sessions still mounted to keep their xterm state -->
+			{#each sessions.filter((s) => s.key !== activeKey && s.key !== splitSecondKey) as session (session.key)}
+				<div class="absolute inset-0" style:visibility="hidden" style:z-index="0">
+					<!-- svelte-ignore binding_property_non_reactive -->
+					<Terminal
+						theme={config.theme}
+						readonly={true}
+						rows={config.defaultRows}
+						cols={config.defaultCols}
+						ondata={(data) => handleTerminalData(session.sessionId, data)}
+						onresize={(r, c) => handleTerminalResize(session.sessionId, r, c)}
+						onready={() => {
+							flushBuffer(session.sessionId);
+							syncTerminalSize(session.sessionId, session.attached);
+						}}
+						bind:this={terminalRefs[session.key]}
+					/>
+				</div>
+			{/each}
+		{:else}
+			{#each sessions as session (session.key)}
+				<div
+					class="absolute inset-0"
+					style:visibility={session.key !== activeKey ? 'hidden' : null}
+					style:z-index="1"
+				>
+					<!-- svelte-ignore binding_property_non_reactive -->
+					<Terminal
+						theme={config.theme}
+						readonly={session.dead || session.aiIsWorking || !session.attached}
+						overlayLabel={session.dead ? 'Session Lost' : session.aiIsWorking ? (session.aiActivity === 'read' ? 'AI Reading' : 'AI Executing') : undefined}
+						overlayColor={session.dead ? 'gray' : session.aiActivity === 'read' ? 'blue' : 'green'}
+						showSearch={searchVisible && session.key === activeKey}
+						rows={config.defaultRows}
+						cols={config.defaultCols}
+						ondata={(data) => handleTerminalData(session.sessionId, data)}
+						onresize={(r, c) => handleTerminalResize(session.sessionId, r, c)}
+						onready={() => {
+							flushBuffer(session.sessionId);
+							syncTerminalSize(session.sessionId, session.attached);
+						}}
+						onsearchclose={() => { searchVisible = false; }}
+						bind:this={terminalRefs[session.key]}
+					/>
+				</div>
+			{/each}
+		{/if}
 	</div>
 
 	<!-- Control bar — shown whenever a session tab is open -->
@@ -720,6 +900,8 @@
 			{terminalCols}
 			ontoggleai={toggleUserAllowsAi}
 			onsignal={handleSignal}
+			{onToggleFileBrowser}
+			{fileBrowserOpen}
 		/>
 	{/if}
 </div>

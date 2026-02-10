@@ -9,6 +9,8 @@
 		terminalCols?: number;
 		ontoggleai?: () => void;
 		onsignal?: (signal: number) => void;
+		onToggleFileBrowser?: () => void;
+		fileBrowserOpen?: boolean;
 	}
 
 	let {
@@ -20,7 +22,9 @@
 		terminalRows = 0,
 		terminalCols = 0,
 		ontoggleai = undefined,
-		onsignal = undefined
+		onsignal = undefined,
+		onToggleFileBrowser = undefined,
+		fileBrowserOpen = false
 	}: Props = $props();
 
 	// Four visual states:
@@ -93,6 +97,20 @@
 		<span class="text-[9px] text-neutral-400 truncate max-w-48 mr-2" title={aiStatusMessage}>
 			{aiStatusMessage}
 		</span>
+	{/if}
+
+	<!-- File browser toggle -->
+	{#if onToggleFileBrowser}
+		<button
+			class="flex items-center gap-1 px-1.5 py-0.5 rounded transition-colors
+				{fileBrowserOpen ? 'bg-neutral-700 text-neutral-200' : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800'}"
+			onclick={onToggleFileBrowser}
+			title="Toggle file browser"
+		>
+			<svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+				<path stroke-linecap="round" stroke-linejoin="round" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+			</svg>
+		</button>
 	{/if}
 
 	<!-- AI control button (right) -->
