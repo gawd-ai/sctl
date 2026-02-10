@@ -1,0 +1,17 @@
+#!/bin/sh
+# Pre-commit hook: ensure cargo fmt is satisfied
+
+failed=0
+
+for crate in server mcp; do
+    if ! cargo fmt --check --manifest-path "$crate/Cargo.toml" >/dev/null 2>&1; then
+        echo "error: $crate/ has formatting issues. Run: (cd $crate && cargo fmt)"
+        failed=1
+    fi
+done
+
+if [ "$failed" -eq 1 ]; then
+    echo ""
+    echo "Commit blocked - fix formatting first."
+    exit 1
+fi
