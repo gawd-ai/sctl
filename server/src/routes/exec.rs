@@ -245,7 +245,7 @@ pub async fn batch_exec(
             }
         };
 
-        match Box::pin(process::exec_command(
+        let resp = match Box::pin(process::exec_command(
             shell,
             working_dir,
             &cmd.command,
@@ -255,50 +255,56 @@ pub async fn batch_exec(
         .await
         {
             Ok(result) => {
-                state
-                    .activity_log
-                    .log(
-                        ActivityType::Exec,
-                        source,
-                        activity::truncate_str(&cmd.command, 80),
-                        Some(json!({
-                            "exit_code": result.exit_code,
-                            "duration_ms": result.duration_ms,
-                            "batch": true,
-                        })),
-                    )
-                    .await;
-                results.push(ExecResponse {
+                log_batch_exec(&state, source, &cmd.command, &result).await;
+                ExecResponse {
                     exit_code: result.exit_code,
                     stdout: result.stdout,
                     stderr: result.stderr,
                     duration_ms: result.duration_ms,
                     request_id: None,
-                });
+                }
             }
-            Err(process::ExecError::Timeout) => {
-                results.push(ExecResponse {
-                    exit_code: -1,
-                    stdout: String::new(),
-                    stderr: "Command timed out".to_string(),
-                    duration_ms: timeout,
-                    request_id: None,
-                });
-            }
-            Err(e) => {
-                results.push(ExecResponse {
-                    exit_code: -1,
-                    stdout: String::new(),
-                    stderr: e.to_string(),
-                    duration_ms: 0,
-                    request_id: None,
-                });
-            }
-        }
+            Err(process::ExecError::Timeout) => ExecResponse {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: "Command timed out".to_string(),
+                duration_ms: timeout,
+                request_id: None,
+            },
+            Err(e) => ExecResponse {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: e.to_string(),
+                duration_ms: 0,
+                request_id: None,
+            },
+        };
+        results.push(resp);
     }
 
     Ok(Json(BatchExecResponse {
         results,
         request_id: payload.request_id,
     }))
+}
+
+async fn log_batch_exec(
+    state: &AppState,
+    source: activity::ActivitySource,
+    command: &str,
+    result: &process::ExecResult,
+) {
+    state
+        .activity_log
+        .log(
+            ActivityType::Exec,
+            source,
+            activity::truncate_str(command, 80),
+            Some(json!({
+                "exit_code": result.exit_code,
+                "duration_ms": result.duration_ms,
+                "batch": true,
+            })),
+        )
+        .await;
 }

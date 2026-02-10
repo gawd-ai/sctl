@@ -606,7 +606,7 @@ async fn handle_tunnel_activity(
     request_id: Option<&str>,
 ) {
     let since_id = msg["since_id"].as_u64().unwrap_or(0);
-    let limit = msg["limit"].as_u64().unwrap_or(50) as usize;
+    let limit = usize::try_from(msg["limit"].as_u64().unwrap_or(50)).unwrap_or(50);
     let entries = state
         .activity_log
         .read_since(since_id, limit.min(200))

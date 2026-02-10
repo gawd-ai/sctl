@@ -466,30 +466,53 @@ pub async fn put_file(
         }
     }
 
-    if let Err(e) = tokio::fs::rename(&temp_path, &path).await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Failed to rename: {e}"), "code": "IO_ERROR"})),
-        ));
-    }
-
-    state
-        .activity_log
-        .log(
-            ActivityType::FileWrite,
-            source,
-            activity::truncate_str(&payload.path, 80),
-            Some(json!({
-                "size": bytes.len(),
-                "mode": payload.mode,
-            })),
-        )
-        .await;
+    rename_temp_to_final(&temp_path, &path).await?;
+    log_file_write(
+        &state,
+        source,
+        &payload.path,
+        bytes.len(),
+        payload.mode.as_ref(),
+    )
+    .await;
 
     Ok(Json(json!({
         "path": path.to_string_lossy(),
         "size": bytes.len(),
         "ok": true
     })))
+}
+
+async fn rename_temp_to_final(
+    temp_path: &Path,
+    final_path: &Path,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    tokio::fs::rename(temp_path, final_path).await.map_err(|e| {
+        let tp = temp_path.to_path_buf();
+        tokio::spawn(async move {
+            let _ = tokio::fs::remove_file(&tp).await;
+        });
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to rename: {e}"), "code": "IO_ERROR"})),
+        )
+    })
+}
+
+async fn log_file_write(
+    state: &AppState,
+    source: activity::ActivitySource,
+    path: &str,
+    size: usize,
+    mode: Option<&String>,
+) {
+    state
+        .activity_log
+        .log(
+            ActivityType::FileWrite,
+            source,
+            activity::truncate_str(path, 80),
+            Some(json!({ "size": size, "mode": mode })),
+        )
+        .await;
 }

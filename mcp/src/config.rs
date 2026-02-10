@@ -13,7 +13,7 @@
 use clap::Parser;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Bump this when the config format changes (new required fields, renamed keys, etc.).
 /// mcp-sctl will warn if the on-disk version is older, so users know to update.
@@ -65,17 +65,17 @@ pub fn load_config(cli: &Cli) -> Result<ResolvedConfig, String> {
 }
 
 /// Expand a leading `~` to `$HOME`.
-fn expand_tilde(path: &PathBuf) -> PathBuf {
+fn expand_tilde(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     if let Some(rest) = s.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
             return PathBuf::from(home).join(rest);
         }
     }
-    path.clone()
+    path.to_path_buf()
 }
 
-fn load_from_file(path: &PathBuf) -> Result<ResolvedConfig, String> {
+fn load_from_file(path: &Path) -> Result<ResolvedConfig, String> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read config file {}: {}", path.display(), e))?;
 
