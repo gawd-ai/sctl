@@ -76,9 +76,7 @@ pub fn relay_router(relay_state: RelayState) -> Router {
         )
         .route("/d/{serial}/api/ws", get(proxy_ws));
 
-    tunnel_admin
-        .merge(device_proxy)
-        .with_state(relay_state)
+    tunnel_admin.merge(device_proxy).with_state(relay_state)
 }
 
 // ─── Device Registration ─────────────────────────────────────────────────────
@@ -108,11 +106,7 @@ async fn device_register_ws(
 
 /// Handle a registered device's WebSocket connection.
 #[allow(clippy::too_many_lines)]
-async fn handle_device_ws(
-    socket: axum::extract::ws::WebSocket,
-    state: RelayState,
-    serial: String,
-) {
+async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayState, serial: String) {
     let (mut ws_sink, mut ws_stream) = socket.split();
     let (device_tx, mut device_rx) = mpsc::channel::<Value>(256);
 
@@ -123,10 +117,7 @@ async fn handle_device_ws(
     };
     let api_key = match serde_json::from_str::<Value>(&text) {
         Ok(msg) if msg["type"].as_str() == Some("tunnel.register") => {
-            msg["api_key"]
-                .as_str()
-                .unwrap_or("")
-                .to_string()
+            msg["api_key"].as_str().unwrap_or("").to_string()
         }
         _ => {
             warn!("Tunnel relay: device '{serial}' sent invalid registration");
@@ -193,9 +184,7 @@ async fn handle_device_ws(
                     "tunnel.ping" => {
                         // Device heartbeat — respond and update timestamp
                         *heartbeat.lock().await = Instant::now();
-                        let _ = device_tx
-                            .send(json!({"type": "tunnel.pong"}))
-                            .await;
+                        let _ = device_tx.send(json!({"type": "tunnel.pong"})).await;
                     }
                     t if t.ends_with(".result") => {
                         // Response to a REST-over-WS request
@@ -233,8 +222,7 @@ async fn handle_device_ws(
                                         let mut msg = parsed.clone();
                                         if let Some(rid) = msg["request_id"].as_str() {
                                             if let Some(colon_pos) = rid.find(':') {
-                                                msg["request_id"] =
-                                                    json!(&rid[colon_pos + 1..]);
+                                                msg["request_id"] = json!(&rid[colon_pos + 1..]);
                                             }
                                         }
                                         let _ = client_tx.send(msg).await;
@@ -244,19 +232,29 @@ async fn handle_device_ws(
                         }
                     }
                     // Session lifecycle broadcasts — forward to ALL clients of this device
-                    "session.started" | "session.created" | "session.destroyed"
-                    | "session.closed" | "session.exited" | "session.renamed"
-                    | "session.ai_status_changed" | "session.ai_permission_changed"
-                    | "session.exec.ack" | "session.signal.ack" | "session.resize.ack"
-                    | "session.attached" | "session.listed" | "session.allow_ai.ack"
-                    | "session.ai_status.ack" | "session.rename.ack" | "shell.listed"
+                    "session.started"
+                    | "session.created"
+                    | "session.destroyed"
+                    | "session.closed"
+                    | "session.exited"
+                    | "session.renamed"
+                    | "session.ai_status_changed"
+                    | "session.ai_permission_changed"
+                    | "session.exec.ack"
+                    | "session.signal.ack"
+                    | "session.resize.ack"
+                    | "session.attached"
+                    | "session.listed"
+                    | "session.allow_ai.ack"
+                    | "session.ai_status.ack"
+                    | "session.rename.ack"
+                    | "shell.listed"
                     | "error" => {
                         // Auto-subscribe client to session output on session.started
                         if msg_type == "session.started" {
-                            if let (Some(rid), Some(sid)) = (
-                                parsed["request_id"].as_str(),
-                                parsed["session_id"].as_str(),
-                            ) {
+                            if let (Some(rid), Some(sid)) =
+                                (parsed["request_id"].as_str(), parsed["session_id"].as_str())
+                            {
                                 if let Some(colon_pos) = rid.find(':') {
                                     let client_id = &rid[..colon_pos];
                                     session_subs
@@ -350,10 +348,7 @@ async fn tunnel_request(
         )
     })?;
 
-    let request_id = msg["request_id"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
+    let request_id = msg["request_id"].as_str().unwrap_or("").to_string();
 
     let (tx, rx) = oneshot::channel();
     device
@@ -708,10 +703,7 @@ async fn handle_client_ws(
     let (client_tx, mut client_rx) = mpsc::channel::<Value>(256);
 
     // Register this client
-    clients
-        .write()
-        .await
-        .insert(client_id.clone(), client_tx);
+    clients.write().await.insert(client_id.clone(), client_tx);
 
     info!("Tunnel relay: client '{client_id}' connected to device '{serial}'");
 
@@ -738,10 +730,7 @@ async fn handle_client_ws(
                 };
 
                 let msg_type = parsed["type"].as_str().unwrap_or("").to_string();
-                let original_rid = parsed["request_id"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
+                let original_rid = parsed["request_id"].as_str().unwrap_or("").to_string();
 
                 // Tag request_id with client_id for routing responses back
                 let tagged_rid = format!("{client_id}:{original_rid}");

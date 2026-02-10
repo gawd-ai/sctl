@@ -273,7 +273,10 @@ async fn run_server(config_path: Option<&str>) {
     // Tunnel: spawn client if configured
     let _tunnel_client_task = if let Some(ref tc) = tunnel_config {
         if tc.url.is_some() && !tc.relay {
-            info!("Tunnel client mode enabled, will connect to {}", tc.url.as_deref().unwrap());
+            info!(
+                "Tunnel client mode enabled, will connect to {}",
+                tc.url.as_deref().unwrap()
+            );
             Some(tunnel::client::spawn(state.clone(), tc.clone()))
         } else {
             None

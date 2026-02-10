@@ -846,11 +846,10 @@ async fn get_ws_connection(
             }
         }
     };
-    let (name, client) =
-        match registry.resolve_with_name(device.as_deref()) {
-            Ok(v) => v,
-            Err(e) => return Err(ToolResult::error(e)),
-        };
+    let (name, client) = match registry.resolve_with_name(device.as_deref()) {
+        Ok(v) => v,
+        Err(e) => return Err(ToolResult::error(e)),
+    };
     registry
         .ws_pool
         .get_or_connect(name, client)
@@ -906,8 +905,7 @@ async fn handle_session_start(args: &Value, registry: &DeviceRegistry) -> ToolRe
             } else {
                 // Register session→device mapping for auto-routing
                 if let Some(sid) = v["session_id"].as_str() {
-                    let device_name =
-                        get_device_param(args).unwrap_or(registry.default_device());
+                    let device_name = get_device_param(args).unwrap_or(registry.default_device());
                     registry.register_session(sid, device_name).await;
                 }
                 let mut result = json!({

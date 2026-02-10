@@ -18,10 +18,16 @@ use crate::sessions::buffer::{OutputBuffer, OutputEntry};
 use crate::AppState;
 
 /// Type alias for the WS sink to reduce verbosity.
-type WsSink = Arc<Mutex<futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    tokio_tungstenite::tungstenite::Message,
->>>;
+type WsSink = Arc<
+    Mutex<
+        futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tokio_tungstenite::tungstenite::Message,
+        >,
+    >,
+>;
 
 /// Spawn the tunnel client task. Returns a `JoinHandle` that runs until cancelled.
 pub fn spawn(state: AppState, tunnel_config: TunnelConfig) -> tokio::task::JoinHandle<()> {
@@ -30,7 +36,10 @@ pub fn spawn(state: AppState, tunnel_config: TunnelConfig) -> tokio::task::JoinH
 
 /// Main loop: connect, handle messages, reconnect on failure.
 async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
-    let relay_url = config.url.as_deref().expect("tunnel.url must be set for client mode");
+    let relay_url = config
+        .url
+        .as_deref()
+        .expect("tunnel.url must be set for client mode");
     let mut delay = Duration::from_secs(config.reconnect_delay_secs);
     let max_delay = Duration::from_secs(config.reconnect_max_delay_secs);
 
@@ -42,7 +51,10 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
                 delay = Duration::from_secs(config.reconnect_delay_secs);
             }
             Err(e) => {
-                warn!("Tunnel: connection error: {e}, reconnecting in {}s", delay.as_secs());
+                warn!(
+                    "Tunnel: connection error: {e}, reconnecting in {}s",
+                    delay.as_secs()
+                );
             }
         }
         tokio::time::sleep(delay).await;
@@ -208,7 +220,9 @@ async fn handle_tunnel_exec(
     request_id: Option<&str>,
 ) {
     let command = msg["command"].as_str().unwrap_or("");
-    let timeout_ms = msg["timeout_ms"].as_u64().unwrap_or(state.config.server.exec_timeout_ms);
+    let timeout_ms = msg["timeout_ms"]
+        .as_u64()
+        .unwrap_or(state.config.server.exec_timeout_ms);
     let shell = msg["shell"]
         .as_str()
         .unwrap_or(&state.config.shell.default_shell);
@@ -266,12 +280,15 @@ async fn handle_tunnel_exec_batch(
     request_id: Option<&str>,
 ) {
     let Some(commands) = msg["commands"].as_array() else {
-        send_response(ws_sink, json!({
-            "type": "tunnel.exec_batch.result",
-            "request_id": request_id,
-            "status": 400,
-            "body": {"error": "commands array is required", "code": "INVALID_REQUEST"}
-        }))
+        send_response(
+            ws_sink,
+            json!({
+                "type": "tunnel.exec_batch.result",
+                "request_id": request_id,
+                "status": 400,
+                "body": {"error": "commands array is required", "code": "INVALID_REQUEST"}
+            }),
+        )
         .await;
         return;
     };
@@ -357,57 +374,61 @@ async fn handle_tunnel_exec_batch(
         }
     }
 
-    send_response(ws_sink, json!({
-        "type": "tunnel.exec_batch.result",
-        "request_id": request_id,
-        "status": 200,
-        "body": {"results": results}
-    }))
+    send_response(
+        ws_sink,
+        json!({
+            "type": "tunnel.exec_batch.result",
+            "request_id": request_id,
+            "status": 200,
+            "body": {"results": results}
+        }),
+    )
     .await;
 }
 
 /// Handle tunnel.info — system information
-async fn handle_tunnel_info(
-    state: &AppState,
-    ws_sink: &WsSink,
-    request_id: Option<&str>,
-) {
+async fn handle_tunnel_info(state: &AppState, ws_sink: &WsSink, request_id: Option<&str>) {
     // Call the info handler directly — it returns JSON
     match crate::routes::info::info(axum::extract::State(state.clone())).await {
         Ok(axum::Json(body)) => {
-            send_response(ws_sink, json!({
-                "type": "tunnel.info.result",
-                "request_id": request_id,
-                "status": 200,
-                "body": body,
-            }))
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "tunnel.info.result",
+                    "request_id": request_id,
+                    "status": 200,
+                    "body": body,
+                }),
+            )
             .await;
         }
         Err(status) => {
-            send_response(ws_sink, json!({
-                "type": "tunnel.info.result",
-                "request_id": request_id,
-                "status": status.as_u16(),
-                "body": {"error": "Failed to get info"},
-            }))
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "tunnel.info.result",
+                    "request_id": request_id,
+                    "status": status.as_u16(),
+                    "body": {"error": "Failed to get info"},
+                }),
+            )
             .await;
         }
     }
 }
 
 /// Handle tunnel.health — health check
-async fn handle_tunnel_health(
-    state: &AppState,
-    ws_sink: &WsSink,
-    request_id: Option<&str>,
-) {
+async fn handle_tunnel_health(state: &AppState, ws_sink: &WsSink, request_id: Option<&str>) {
     let axum::Json(body) = crate::routes::health::health(axum::extract::State(state.clone())).await;
-    send_response(ws_sink, json!({
-        "type": "tunnel.health.result",
-        "request_id": request_id,
-        "status": 200,
-        "body": body,
-    }))
+    send_response(
+        ws_sink,
+        json!({
+            "type": "tunnel.health.result",
+            "request_id": request_id,
+            "status": 200,
+            "body": body,
+        }),
+    )
     .await;
 }
 
@@ -433,21 +454,27 @@ async fn handle_tunnel_file_read(
     .await
     {
         Ok(axum::Json(body)) => {
-            send_response(ws_sink, json!({
-                "type": "tunnel.file.read.result",
-                "request_id": request_id,
-                "status": 200,
-                "body": body,
-            }))
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "tunnel.file.read.result",
+                    "request_id": request_id,
+                    "status": 200,
+                    "body": body,
+                }),
+            )
             .await;
         }
         Err((status, axum::Json(body))) => {
-            send_response(ws_sink, json!({
-                "type": "tunnel.file.read.result",
-                "request_id": request_id,
-                "status": status.as_u16(),
-                "body": body,
-            }))
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "tunnel.file.read.result",
+                    "request_id": request_id,
+                    "status": status.as_u16(),
+                    "body": body,
+                }),
+            )
             .await;
         }
     }
@@ -474,28 +501,31 @@ async fn handle_tunnel_file_write(
         encoding,
     };
 
-    match crate::routes::files::put_file(
-        axum::extract::State(state.clone()),
-        axum::Json(payload),
-    )
-    .await
+    match crate::routes::files::put_file(axum::extract::State(state.clone()), axum::Json(payload))
+        .await
     {
         Ok(axum::Json(body)) => {
-            send_response(ws_sink, json!({
-                "type": "tunnel.file.write.result",
-                "request_id": request_id,
-                "status": 200,
-                "body": body,
-            }))
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "tunnel.file.write.result",
+                    "request_id": request_id,
+                    "status": 200,
+                    "body": body,
+                }),
+            )
             .await;
         }
         Err((status, axum::Json(body))) => {
-            send_response(ws_sink, json!({
-                "type": "tunnel.file.write.result",
-                "request_id": request_id,
-                "status": status.as_u16(),
-                "body": body,
-            }))
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "tunnel.file.write.result",
+                    "request_id": request_id,
+                    "status": status.as_u16(),
+                    "body": body,
+                }),
+            )
             .await;
         }
     }
@@ -631,7 +661,11 @@ async fn handle_forwarded_session_message(
             let session_id = msg["session_id"].as_str().unwrap_or("");
             let command = msg["command"].as_str().unwrap_or("");
             state.session_manager.touch_ai_activity(session_id).await;
-            if let Err(e) = state.session_manager.exec_command(session_id, command).await {
+            if let Err(e) = state
+                .session_manager
+                .exec_command(session_id, command)
+                .await
+            {
                 let mut resp = json!({
                     "type": "error",
                     "code": "SESSION_ERROR",
@@ -658,13 +692,20 @@ async fn handle_forwarded_session_message(
             let data = msg["data"].as_str().unwrap_or("");
             if !session_id.is_empty() {
                 state.session_manager.touch_ai_activity(session_id).await;
-                if let Err(e) = state.session_manager.send_to_session(session_id, data).await {
-                    send_response(ws_sink, json!({
-                        "type": "error",
-                        "code": "SESSION_ERROR",
-                        "session_id": session_id,
-                        "message": e,
-                    }))
+                if let Err(e) = state
+                    .session_manager
+                    .send_to_session(session_id, data)
+                    .await
+                {
+                    send_response(
+                        ws_sink,
+                        json!({
+                            "type": "error",
+                            "code": "SESSION_ERROR",
+                            "session_id": session_id,
+                            "message": e,
+                        }),
+                    )
                     .await;
                 }
             }
@@ -712,7 +753,11 @@ async fn handle_forwarded_session_message(
             if !session_id.is_empty() && signal != 0 {
                 #[allow(clippy::cast_possible_truncation)]
                 let signal_i32 = signal as i32;
-                match state.session_manager.signal_session(session_id, signal_i32).await {
+                match state
+                    .session_manager
+                    .signal_session(session_id, signal_i32)
+                    .await
+                {
                     Ok(()) => {
                         let mut resp = json!({
                             "type": "session.signal.ack",
@@ -839,7 +884,11 @@ async fn handle_forwarded_session_message(
             #[allow(clippy::cast_possible_truncation)]
             let cols = msg["cols"].as_u64().unwrap_or(0) as u16;
             if !session_id.is_empty() && rows > 0 && cols > 0 {
-                match state.session_manager.resize_session(session_id, rows, cols).await {
+                match state
+                    .session_manager
+                    .resize_session(session_id, rows, cols)
+                    .await
+                {
                     Ok(()) => {
                         let mut resp = json!({
                             "type": "session.resize.ack",
@@ -872,7 +921,11 @@ async fn handle_forwarded_session_message(
             let allowed = msg["allowed"].as_bool();
             if !session_id.is_empty() {
                 if let Some(allowed) = allowed {
-                    match state.session_manager.set_user_allows_ai(session_id, allowed).await {
+                    match state
+                        .session_manager
+                        .set_user_allows_ai(session_id, allowed)
+                        .await
+                    {
                         Ok(ai_cleared) => {
                             let mut resp = json!({
                                 "type": "session.allow_ai.ack",
@@ -919,7 +972,11 @@ async fn handle_forwarded_session_message(
                 if let Some(working) = working {
                     let activity = msg["activity"].as_str();
                     let message = msg["message"].as_str();
-                    match state.session_manager.set_ai_status(session_id, working, activity, message).await {
+                    match state
+                        .session_manager
+                        .set_ai_status(session_id, working, activity, message)
+                        .await
+                    {
                         Ok(()) => {
                             let mut resp = json!({
                                 "type": "session.ai_status.ack",

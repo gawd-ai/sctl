@@ -145,6 +145,10 @@ impl DeviceRegistry {
 
     /// Look up which device owns a session.
     pub async fn resolve_session_device(&self, session_id: &str) -> Option<String> {
-        self.session_device_map.lock().await.get(session_id).cloned()
+        self.session_device_map
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
     }
 }

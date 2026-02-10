@@ -120,8 +120,7 @@ impl DeviceWsConnection {
             ai_status_result: Arc::new(Mutex::new(None)),
         });
 
-        let ai_working_sessions: Arc<Mutex<HashSet<String>>> =
-            Arc::new(Mutex::new(HashSet::new()));
+        let ai_working_sessions: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
         let (out_tx, out_rx) = mpsc::channel::<Value>(256);
 
