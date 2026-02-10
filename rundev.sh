@@ -10,7 +10,8 @@
 #   ./rundev.sh stop     # stop all services and deregister MCP
 #   ./rundev.sh status   # show what's running
 #   ./rundev.sh claude   # only register MCP in Claude Code (no build/start)
-#   ./rundev.sh tunnel   # build + start tunnel dev env (relay + clients + MCP via relay)
+#   ./rundev.sh tunnel [--cloudflared | --relay-url <url>]
+#                        # build + start tunnel dev env (relay + clients + MCP via relay)
 #
 # Device management:
 #   ./rundev.sh device add <name> <host>   # discover + register a device
@@ -47,6 +48,7 @@ RELAY_LISTEN="0.0.0.0:8443"
 RELAY_PID_FILE="$DATA_DIR/relay.pid"
 TUNNEL_KEY="dev-tunnel-key"
 DEVICE_SERIAL="DEV-LOCAL-001"
+CLOUDFLARED_PID_FILE="$DATA_DIR/cloudflared.pid"
 
 # Binaries (release for speed, debug takes too long on PTY-heavy sessions)
 SCTL_BIN="$SCTL_DIR/target/release/sctl"
@@ -233,6 +235,15 @@ do_kill() {
             graceful_stop "$pid" "relay"
         fi
         rm -f "$RELAY_PID_FILE"
+    fi
+
+    # Kill cloudflared
+    if [[ -f "$CLOUDFLARED_PID_FILE" ]]; then
+        pid=$(cat "$CLOUDFLARED_PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            graceful_stop "$pid" "cloudflared"
+        fi
+        rm -f "$CLOUDFLARED_PID_FILE"
     fi
 
     # Kill any lingering mcp-sctl processes
@@ -868,6 +879,47 @@ do_device_upgrade() {
 # ─── tunnel (build + start tunnel dev env with relay) ─────────────────
 
 do_tunnel() {
+    local use_cloudflared=false
+    local remote_relay_url=""
+
+    # Parse flags
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --cloudflared)
+                use_cloudflared=true
+                shift
+                ;;
+            --relay-url)
+                if [[ -z "${2:-}" ]]; then
+                    err "Missing URL for --relay-url"
+                    exit 1
+                fi
+                remote_relay_url="$2"
+                shift 2
+                ;;
+            *)
+                err "Unknown flag: $1"
+                err "Usage: $0 tunnel [--cloudflared | --relay-url <url>]"
+                exit 1
+                ;;
+        esac
+    done
+
+    # Validate mutual exclusivity
+    if [[ "$use_cloudflared" == "true" && -n "$remote_relay_url" ]]; then
+        err "--cloudflared and --relay-url are mutually exclusive"
+        exit 1
+    fi
+
+    # Check cloudflared binary exists
+    if [[ "$use_cloudflared" == "true" ]]; then
+        if ! command -v cloudflared &>/dev/null; then
+            err "cloudflared not found in PATH"
+            err "Install: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
+            exit 1
+        fi
+    fi
+
     do_build
 
     mkdir -p "$DATA_DIR" "$PLAYBOOKS_DIR"
@@ -941,6 +993,43 @@ EOF
 
     wait_for_health "http://127.0.0.1:8443/api/health" "$relay_pid" "Relay on $RELAY_LISTEN" "$DATA_DIR/relay.log"
 
+    # Start cloudflared quick tunnel if requested
+    if [[ "$use_cloudflared" == "true" ]]; then
+        log "Starting cloudflared quick tunnel..."
+        cloudflared tunnel --url http://localhost:8443 --no-autoupdate \
+            &>"$DATA_DIR/cloudflared.log" &
+        local cf_pid=$!
+        echo "$cf_pid" > "$CLOUDFLARED_PID_FILE"
+
+        # Poll log for the trycloudflare.com URL (up to 30s)
+        local cf_url=""
+        for _ in $(seq 1 60); do
+            if ! kill -0 "$cf_pid" 2>/dev/null; then
+                err "cloudflared exited unexpectedly. Log:"
+                tail -20 "$DATA_DIR/cloudflared.log"
+                mv "$CONFIG_FILE.pre-tunnel" "$CONFIG_FILE"
+                exit 1
+            fi
+            cf_url=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' "$DATA_DIR/cloudflared.log" 2>/dev/null | head -1) || true
+            if [[ -n "$cf_url" ]]; then
+                break
+            fi
+            sleep 0.5
+        done
+
+        if [[ -z "$cf_url" ]]; then
+            err "cloudflared failed to produce a URL within 30s. Log:"
+            tail -20 "$DATA_DIR/cloudflared.log"
+            mv "$CONFIG_FILE.pre-tunnel" "$CONFIG_FILE"
+            exit 1
+        fi
+
+        # Convert https:// → wss:// and append tunnel register path
+        remote_relay_url="${cf_url/https:\/\//wss://}/api/tunnel/register"
+        ok "cloudflared tunnel: $cf_url (PID $cf_pid)"
+        ok "Remote relay URL: $remote_relay_url"
+    fi
+
     # Start local sctl as tunnel client
     log "Starting sctl (tunnel client) on $LISTEN..."
     RUST_LOG=info \
@@ -985,15 +1074,22 @@ EOF
             local rname="${remote_names[$i]}"
             local rhost="${remote_hosts[$i]}"
 
-            # Detect our LAN IP toward this device
-            local our_ip
-            our_ip=$(ip route get "$rhost" 2>/dev/null | grep -oP 'src \K\S+' || true)
-            if [[ -z "$our_ip" ]]; then
-                warn "Cannot determine route to $rhost — skipping $rname"
-                continue
+            # Determine the tunnel URL for this remote device
+            local device_tunnel_url
+            if [[ -n "$remote_relay_url" ]]; then
+                device_tunnel_url="$remote_relay_url"
+                log "  $rname ($rhost) — relay via cloudflared/external"
+            else
+                # Detect our LAN IP toward this device
+                local our_ip
+                our_ip=$(ip route get "$rhost" 2>/dev/null | grep -oP 'src \K\S+' || true)
+                if [[ -z "$our_ip" ]]; then
+                    warn "Cannot determine route to $rhost — skipping $rname"
+                    continue
+                fi
+                device_tunnel_url="ws://$our_ip:8443/api/tunnel/register"
+                log "  $rname ($rhost) — relay via $our_ip:8443"
             fi
-
-            log "  $rname ($rhost) — relay via $our_ip:8443"
 
             # SSH in: stop init.d, create temp config, start sctl with tunnel
             local remote_script
@@ -1015,7 +1111,7 @@ cat >> /tmp/sctl-relay.toml <<TEOF
 
 [tunnel]
 tunnel_key = "$TUNNEL_KEY"
-url = "ws://$our_ip:8443/api/tunnel/register"
+url = "$device_tunnel_url"
 TEOF
 
 # Start sctl with tunnel config
@@ -1106,6 +1202,12 @@ REOF
     ok "Tunnel dev environment ready!"
     echo ""
     echo "  Relay:        http://127.0.0.1:8443 (PID $relay_pid)"
+    if [[ "$use_cloudflared" == "true" ]]; then
+        echo "  Cloudflared:  ${remote_relay_url/wss:\/\//https://}"
+    fi
+    if [[ -n "$remote_relay_url" ]]; then
+        echo "  Remote URL:   $remote_relay_url"
+    fi
     echo "  Local sctl:   http://$LISTEN (PID $sctl_pid, tunnel client)"
     echo "  Device URL:   http://127.0.0.1:8443/d/$DEVICE_SERIAL"
     if [[ ${#remote_names[@]} -gt 0 ]]; then
@@ -1158,6 +1260,16 @@ REOF
             wait
         fi
 
+        # Kill cloudflared
+        if [[ -f "$CLOUDFLARED_PID_FILE" ]]; then
+            local cf_pid
+            cf_pid=$(cat "$CLOUDFLARED_PID_FILE")
+            if kill -0 "$cf_pid" 2>/dev/null; then
+                graceful_stop "$cf_pid" "cloudflared"
+            fi
+            rm -f "$CLOUDFLARED_PID_FILE"
+        fi
+
         # Restore config from backup
         if [[ -f "$CONFIG_FILE.pre-tunnel" ]]; then
             mv "$CONFIG_FILE.pre-tunnel" "$CONFIG_FILE"
@@ -1172,7 +1284,11 @@ REOF
     trap tunnel_cleanup INT TERM
 
     # Tail logs and wait
-    tail -f "$DATA_DIR/relay.log" "$DATA_DIR/sctl.log" "$DATA_DIR/web.log" &
+    local tail_files=("$DATA_DIR/relay.log" "$DATA_DIR/sctl.log" "$DATA_DIR/web.log")
+    if [[ -f "$DATA_DIR/cloudflared.log" ]]; then
+        tail_files+=("$DATA_DIR/cloudflared.log")
+    fi
+    tail -f "${tail_files[@]}" &
     TAIL_PID=$!
     wait $TAIL_PID
 }
@@ -1193,7 +1309,7 @@ case "${1:-setup}" in
     stop)   do_stop ;;
     status) do_status ;;
     claude) do_claude ;;
-    tunnel) do_tunnel ;;
+    tunnel) shift; do_tunnel "$@" ;;
     device)
         case "${2:-ls}" in
             add)     do_device_add "$3" "${4:-}" ;;
@@ -1225,6 +1341,8 @@ case "${1:-setup}" in
         echo "  status   show what's running"
         echo "  claude   only register MCP in Claude Code (no build/start)"
         echo "  tunnel   build + start tunnel dev env (relay + clients via tunnel)"
+        echo "             --cloudflared        use Cloudflare Quick Tunnel (double CGNAT)"
+        echo "             --relay-url <url>    use an external relay URL"
         echo ""
         echo "Device management:"
         echo "  device ls                  list devices with health status"
