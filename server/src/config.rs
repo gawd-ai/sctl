@@ -177,6 +177,12 @@ pub struct TunnelConfig {
     /// Seconds between heartbeat pings (client mode, default 30).
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval_secs: u64,
+    /// Seconds before a device is considered dead if no heartbeat (relay mode, default 90).
+    #[serde(default = "default_heartbeat_timeout")]
+    pub heartbeat_timeout_secs: u64,
+    /// Default proxy request timeout in seconds (relay mode, default 60).
+    #[serde(default = "default_tunnel_proxy_timeout")]
+    pub tunnel_proxy_timeout_secs: u64,
 }
 
 fn default_listen() -> String {
@@ -247,6 +253,12 @@ fn default_reconnect_max_delay() -> u64 {
 }
 fn default_heartbeat_interval() -> u64 {
     30
+}
+fn default_heartbeat_timeout() -> u64 {
+    90
+}
+fn default_tunnel_proxy_timeout() -> u64 {
+    60
 }
 
 impl Default for ServerConfig {

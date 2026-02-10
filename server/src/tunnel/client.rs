@@ -42,11 +42,17 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
         .expect("tunnel.url must be set for client mode");
     let mut delay = Duration::from_secs(config.reconnect_delay_secs);
     let max_delay = Duration::from_secs(config.reconnect_max_delay_secs);
+    let mut reconnects: u64 = 0;
 
     loop {
         info!("Tunnel: connecting to relay at {relay_url}");
         match connect_and_run(&state, &config, relay_url).await {
-            Ok(()) => {
+            Ok(DisconnectReason::RelayShutdown) => {
+                // Relay sent intentional shutdown — skip backoff
+                info!("Tunnel: relay shutting down, reconnecting immediately...");
+                delay = Duration::from_secs(config.reconnect_delay_secs);
+            }
+            Ok(DisconnectReason::Clean) => {
                 info!("Tunnel: connection closed cleanly, reconnecting...");
                 delay = Duration::from_secs(config.reconnect_delay_secs);
             }
@@ -57,17 +63,33 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
                 );
             }
         }
+        reconnects += 1;
+        state
+            .tunnel_reconnects
+            .store(reconnects, std::sync::atomic::Ordering::Relaxed);
+        state
+            .tunnel_connected
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(max_delay);
     }
 }
 
+/// Reason the tunnel connection ended.
+enum DisconnectReason {
+    /// Relay sent `tunnel.relay_shutdown` — intentional, skip backoff.
+    RelayShutdown,
+    /// Normal close frame or EOF.
+    Clean,
+}
+
 /// A single connection attempt: connect, register, handle messages until disconnect.
+#[allow(clippy::too_many_lines)]
 async fn connect_and_run(
     state: &AppState,
     config: &TunnelConfig,
     relay_url: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<DisconnectReason, Box<dyn std::error::Error + Send + Sync>> {
     // Build the URL with auth query params
     let url = format!(
         "{}?token={}&serial={}",
@@ -79,6 +101,9 @@ async fn connect_and_run(
     let ws_sink = Arc::new(Mutex::new(ws_sink));
 
     info!("Tunnel: connected to relay, registering...");
+    state
+        .tunnel_connected
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 
     // Send registration message with our api_key
     {
@@ -123,6 +148,35 @@ async fn connect_and_run(
     });
 
     let mut ws_stream = ws_stream;
+    let mut disconnect_reason = DisconnectReason::Clean;
+
+    // Re-subscribe to all running sessions after reconnect
+    {
+        let sessions = state.session_manager.list_sessions().await;
+        for s in &sessions {
+            if s.status == "running" {
+                if let Some(buffer) = state.session_manager.get_buffer(&s.session_id).await {
+                    let last_seq = {
+                        let buf = buffer.lock().await;
+                        buf.next_seq().saturating_sub(1)
+                    };
+                    let sink_clone = ws_sink.clone();
+                    let sid = s.session_id.clone();
+                    let task = tokio::spawn(tunnel_subscriber_task(
+                        sid.clone(),
+                        buffer,
+                        sink_clone,
+                        last_seq,
+                    ));
+                    subscriber_tasks.lock().await.insert(sid, task);
+                }
+            }
+        }
+        let count = subscriber_tasks.lock().await.len();
+        if count > 0 {
+            info!("Tunnel: re-subscribed to {count} running sessions");
+        }
+    }
 
     loop {
         tokio::select! {
@@ -132,6 +186,11 @@ async fn connect_and_run(
                 match msg {
                     tokio_tungstenite::tungstenite::Message::Text(text) => {
                         let parsed: Value = serde_json::from_str(&text)?;
+                        if parsed["type"].as_str() == Some("tunnel.relay_shutdown") {
+                            info!("Tunnel: relay sent shutdown notification");
+                            disconnect_reason = DisconnectReason::RelayShutdown;
+                            break;
+                        }
                         handle_relay_message(state, &ws_sink, &subscriber_tasks, parsed).await;
                     }
                     tokio_tungstenite::tungstenite::Message::Close(_) => break,
@@ -157,7 +216,7 @@ async fn connect_and_run(
         task.abort();
     }
 
-    Ok(())
+    Ok(disconnect_reason)
 }
 
 /// Handle a message from the relay (proxied client request or control message).
@@ -197,7 +256,7 @@ async fn handle_relay_message(
             handle_forwarded_session_message(state, ws_sink, subscriber_tasks, &msg).await;
         }
         _ => {
-            warn!("Tunnel client: unknown message type: {msg_type}");
+            warn!(msg_type, "Unknown tunnel message type");
         }
     }
 }
@@ -1071,7 +1130,7 @@ async fn handle_forwarded_session_message(
             send_response(ws_sink, resp).await;
         }
         _ => {
-            warn!("Tunnel client: unknown forwarded session message type: {msg_type}");
+            warn!(msg_type, "Unknown forwarded session message type");
         }
     }
 }

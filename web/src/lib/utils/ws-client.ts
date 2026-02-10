@@ -25,7 +25,7 @@ const DEFAULT_RECONNECT: ReconnectConfig = {
 	enabled: true,
 	initialDelay: 500,
 	maxDelay: 10_000,
-	maxAttempts: 3
+	maxAttempts: Infinity
 };
 
 const ACK_TIMEOUT_MS = 10_000;
@@ -47,6 +47,7 @@ export class SctlWsClient {
 	private requestCounter = 0;
 	private intentionalClose = false;
 	private pingInterval: ReturnType<typeof setInterval> | null = null;
+	private _reconnectCount = 0;
 
 	readonly wsUrl: string;
 	readonly apiKey: string;
@@ -64,6 +65,11 @@ export class SctlWsClient {
 		return this._status;
 	}
 
+	/** Number of reconnect cycles since the last successful connect. */
+	get reconnectCount(): number {
+		return this._reconnectCount;
+	}
+
 	connect(): void {
 		if (this.ws && (this.ws.readyState === WebSocket.CONNECTING || this.ws.readyState === WebSocket.OPEN)) {
 			return;
@@ -76,6 +82,9 @@ export class SctlWsClient {
 		const ws = new WebSocket(url);
 
 		ws.onopen = () => {
+			if (this.reconnectAttempt > 0) {
+				this._reconnectCount++;
+			}
 			this.reconnectAttempt = 0;
 			this.setStatus('connected');
 			this.startPing();

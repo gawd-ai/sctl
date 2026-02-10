@@ -539,6 +539,8 @@ impl DeviceWsConnection {
         let mut accumulated = String::new();
         let mut last_read_seq = start_seq;
         let marker_suffix = format!("{}__", marker); // e.g. __SCTL_<nonce>_DONE_0__
+        let mut disconnected_since: Option<tokio::time::Instant> = None;
+        const DISCONNECT_GRACE_SECS: u64 = 10;
 
         loop {
             let remaining = deadline.duration_since(tokio::time::Instant::now());
@@ -548,6 +550,19 @@ impl DeviceWsConnection {
                     exit_code: None,
                     timed_out: true,
                 });
+            }
+
+            // Fast-fail if disconnected for too long
+            if self.is_connected() {
+                disconnected_since = None;
+            } else {
+                let since = disconnected_since.get_or_insert_with(tokio::time::Instant::now);
+                if since.elapsed().as_secs() >= DISCONNECT_GRACE_SECS {
+                    return Err(format!(
+                        "WebSocket disconnected for {}s during exec_wait",
+                        DISCONNECT_GRACE_SECS
+                    ));
+                }
             }
 
             let poll_timeout = remaining.as_millis().min(1000) as u64;

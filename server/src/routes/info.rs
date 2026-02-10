@@ -51,7 +51,7 @@ pub async fn info(State(state): State<AppState>) -> Result<Json<Value>, StatusCo
     // Disk usage for root filesystem
     let disk = get_disk_usage("/");
 
-    Ok(Json(json!({
+    let mut response = json!({
         "serial": state.config.device.serial,
         "hostname": hostname.trim(),
         "kernel": kernel.split(' ').take(3).collect::<Vec<_>>().join(" "),
@@ -64,7 +64,20 @@ pub async fn info(State(state): State<AppState>) -> Result<Json<Value>, StatusCo
         },
         "disk": disk,
         "interfaces": interfaces,
-    })))
+    });
+
+    // Include tunnel status if tunnel client mode is configured
+    if let Some(ref tc) = state.config.tunnel {
+        if tc.url.is_some() && !tc.relay {
+            response["tunnel"] = json!({
+                "connected": state.tunnel_connected.load(std::sync::atomic::Ordering::Relaxed),
+                "relay_url": tc.url,
+                "reconnects": state.tunnel_reconnects.load(std::sync::atomic::Ordering::Relaxed),
+            });
+        }
+    }
+
+    Ok(Json(response))
 }
 
 fn read_proc_file(path: &str) -> String {

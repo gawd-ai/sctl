@@ -6,6 +6,7 @@
 //! 3. Translates client requests to tunnel messages over the device WS
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,7 +22,7 @@ use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
-use tracing::{info, warn};
+use tracing::{info, info_span, warn, Instrument};
 
 /// State shared across all relay handlers.
 #[derive(Clone)]
@@ -30,6 +31,10 @@ pub struct RelayState {
     pub devices: Arc<RwLock<HashMap<String, ConnectedDevice>>>,
     /// The shared tunnel key for device registration auth.
     pub tunnel_key: String,
+    /// Seconds before a device is evicted for missed heartbeat (default 90).
+    pub heartbeat_timeout_secs: u64,
+    /// Default proxy request timeout in seconds (default 60).
+    pub tunnel_proxy_timeout_secs: u64,
 }
 
 /// A device connected to the relay via its outbound WS tunnel.
@@ -46,14 +51,110 @@ pub struct ConnectedDevice {
     pub session_subscriptions: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     /// Last heartbeat from device.
     pub last_heartbeat: Arc<Mutex<Instant>>,
+    /// When this device connected.
+    pub connected_since: Instant,
+    /// Count of messages dropped due to client backpressure.
+    pub dropped_messages: Arc<AtomicU64>,
+}
+
+/// Drain all pending requests for a device, sending error responses on each oneshot.
+/// Also notifies all connected WS clients that the device disconnected.
+async fn drain_device(device: &ConnectedDevice, reason: &str) {
+    // Drain pending REST-over-WS requests
+    let mut pending = device.pending_requests.lock().await;
+    let count = pending.len();
+    for (_, sender) in pending.drain() {
+        let _ = sender.send(json!({
+            "type": "error",
+            "status": 502,
+            "body": {"error": reason, "code": "DEVICE_DISCONNECTED"},
+        }));
+    }
+    if count > 0 {
+        info!(
+            serial = %device.serial,
+            count,
+            "Drained {count} pending requests: {reason}"
+        );
+    }
+
+    // Notify all connected WS clients
+    let clients = device.clients.read().await;
+    if !clients.is_empty() {
+        let disconnect_msg = json!({
+            "type": "tunnel.device_disconnected",
+            "serial": device.serial,
+            "reason": reason,
+        });
+        for (_, client_tx) in clients.iter() {
+            let _ = client_tx.try_send(disconnect_msg.clone());
+        }
+    }
 }
 
 impl RelayState {
-    pub fn new(tunnel_key: String) -> Self {
+    pub fn new(
+        tunnel_key: String,
+        heartbeat_timeout_secs: u64,
+        tunnel_proxy_timeout_secs: u64,
+    ) -> Self {
         Self {
             devices: Arc::new(RwLock::new(HashMap::new())),
             tunnel_key,
+            heartbeat_timeout_secs,
+            tunnel_proxy_timeout_secs,
         }
+    }
+
+    /// Evict devices whose heartbeat is older than `heartbeat_timeout_secs`.
+    /// Returns the serials of evicted devices.
+    pub async fn sweep_dead_devices(&self) -> Vec<String> {
+        let timeout = Duration::from_secs(self.heartbeat_timeout_secs);
+        let now = Instant::now();
+
+        // First pass: identify dead devices and drain them (read lock)
+        let mut dead_serials = Vec::new();
+        {
+            let devices = self.devices.read().await;
+            for (serial, device) in devices.iter() {
+                let last_hb = *device.last_heartbeat.lock().await;
+                if now.duration_since(last_hb) > timeout {
+                    drain_device(device, "heartbeat timeout").await;
+                    dead_serials.push(serial.clone());
+                }
+            }
+        }
+
+        // Second pass: remove dead devices (write lock)
+        if !dead_serials.is_empty() {
+            let mut devices = self.devices.write().await;
+            for serial in &dead_serials {
+                devices.remove(serial);
+                warn!(serial = %serial, "Evicted device (heartbeat timeout)");
+            }
+        }
+
+        dead_serials
+    }
+
+    /// Send a message to all connected devices (e.g., for relay shutdown).
+    pub async fn broadcast_to_devices(&self, msg: Value) {
+        let devices = self.devices.read().await;
+        for (serial, device) in devices.iter() {
+            if device.device_tx.send(msg.clone()).await.is_err() {
+                warn!(serial = %serial, "Failed to send broadcast to device");
+            }
+        }
+    }
+
+    /// Drain all devices and clear state (used during relay shutdown).
+    pub async fn drain_all(&self) {
+        let mut devices = self.devices.write().await;
+        for (serial, device) in devices.iter() {
+            drain_device(device, "relay shutting down").await;
+            info!(serial = %serial, "Drained device for relay shutdown");
+        }
+        devices.clear();
     }
 }
 
@@ -99,9 +200,12 @@ async fn device_register_ws(
     }
 
     let serial = query.serial.clone();
-    info!("Tunnel relay: device '{serial}' connecting...");
+    info!(serial = %serial, "Device connecting...");
 
-    ws.on_upgrade(move |socket| handle_device_ws(socket, state, serial))
+    ws.on_upgrade(move |socket| {
+        handle_device_ws(socket, state, serial.clone())
+            .instrument(info_span!("tunnel_device", serial = %serial))
+    })
 }
 
 /// Handle a registered device's WebSocket connection.
@@ -112,7 +216,7 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
 
     // Wait for the registration message which contains the api_key
     let Some(Ok(axum::extract::ws::Message::Text(text))) = ws_stream.next().await else {
-        warn!("Tunnel relay: device '{serial}' disconnected before registration");
+        warn!(serial = %serial, "Device disconnected before registration");
         return;
     };
     let api_key = match serde_json::from_str::<Value>(&text) {
@@ -120,13 +224,13 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
             msg["api_key"].as_str().unwrap_or("").to_string()
         }
         _ => {
-            warn!("Tunnel relay: device '{serial}' sent invalid registration");
+            warn!(serial = %serial, "Device sent invalid registration");
             return;
         }
     };
 
     if api_key.is_empty() {
-        warn!("Tunnel relay: device '{serial}' registered with empty api_key");
+        warn!(serial = %serial, "Device registered with empty api_key");
         return;
     }
 
@@ -138,16 +242,29 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
         clients: Arc::new(RwLock::new(HashMap::new())),
         session_subscriptions: Arc::new(RwLock::new(HashMap::new())),
         last_heartbeat: Arc::new(Mutex::new(Instant::now())),
+        connected_since: Instant::now(),
+        dropped_messages: Arc::new(AtomicU64::new(0)),
     };
 
     let pending_requests = device.pending_requests.clone();
     let clients = device.clients.clone();
     let session_subs = device.session_subscriptions.clone();
     let heartbeat = device.last_heartbeat.clone();
+    let dropped_messages = device.dropped_messages.clone();
 
-    // Store the device
-    state.devices.write().await.insert(serial.clone(), device);
-    info!("Tunnel relay: device '{serial}' registered");
+    // Handle duplicate serial: drain stale connection before replacing
+    {
+        let mut devices = state.devices.write().await;
+        if let Some(old_device) = devices.get(&serial) {
+            warn!(
+                serial = %serial,
+                "Device re-registering while stale connection exists, evicting old"
+            );
+            drain_device(old_device, "replaced by new connection").await;
+        }
+        devices.insert(serial.clone(), device);
+    }
+    info!(serial = %serial, "Device registered");
 
     // Send ack
     let ack = json!({"type": "tunnel.register.ack", "serial": &serial});
@@ -210,7 +327,7 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                             }
                         }
                     }
-                    // Session output messages — route to subscribed clients
+                    // Session output messages — route to subscribed clients (backpressure-aware)
                     "session.stdout" | "session.stderr" | "session.system" => {
                         if let Some(session_id) = parsed["session_id"].as_str() {
                             let subs = session_subs.read().await;
@@ -225,7 +342,14 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                                                 msg["request_id"] = json!(&rid[colon_pos + 1..]);
                                             }
                                         }
-                                        let _ = client_tx.send(msg).await;
+                                        if client_tx.try_send(msg).is_err() {
+                                            dropped_messages.fetch_add(1, Ordering::Relaxed);
+                                            warn!(
+                                                serial = %serial,
+                                                client_id = %cid,
+                                                "Dropped session output message (client backpressure)"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -282,14 +406,21 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                             }
                         }
 
-                        // No client tag — broadcast to all clients
+                        // No client tag — broadcast to all clients (backpressure-aware)
                         let clients_read = clients.read().await;
-                        for (_, client_tx) in clients_read.iter() {
-                            let _ = client_tx.send(parsed.clone()).await;
+                        for (cid, client_tx) in clients_read.iter() {
+                            if client_tx.try_send(parsed.clone()).is_err() {
+                                dropped_messages.fetch_add(1, Ordering::Relaxed);
+                                warn!(
+                                    serial = %serial,
+                                    client_id = %cid,
+                                    "Dropped broadcast message (client backpressure)"
+                                );
+                            }
                         }
                     }
                     _ => {
-                        warn!("Tunnel relay: unknown message from device '{serial}': {msg_type}");
+                        warn!(serial = %serial, msg_type, "Unknown message from device");
                     }
                 }
             }
@@ -298,8 +429,14 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
         }
     }
 
-    // Device disconnected — cleanup
-    info!("Tunnel relay: device '{serial}' disconnected");
+    // Device disconnected — drain pending requests and notify clients before removing
+    {
+        let devices = state.devices.read().await;
+        if let Some(device) = devices.get(&serial) {
+            drain_device(device, "device disconnected").await;
+        }
+    }
+    info!(serial = %serial, "Device disconnected");
     state.devices.write().await.remove(&serial);
     send_task.abort();
 }
@@ -318,16 +455,36 @@ async fn list_devices(
         return (StatusCode::FORBIDDEN, "Invalid tunnel key").into_response();
     }
 
+    let now = Instant::now();
     let devices = state.devices.read().await;
-    let list: Vec<Value> = devices
-        .values()
-        .map(|d| {
-            json!({
-                "serial": d.serial,
-                "clients": d.clients.try_read().map(|c| c.len()).unwrap_or(0),
-            })
-        })
-        .collect();
+    let mut list: Vec<Value> = Vec::with_capacity(devices.len());
+
+    for d in devices.values() {
+        let last_hb = *d.last_heartbeat.lock().await;
+        #[allow(clippy::cast_possible_truncation)]
+        let hb_ago_ms = now.duration_since(last_hb).as_millis() as u64;
+        let pending_count = d.pending_requests.lock().await.len();
+        let clients_read = d.clients.read().await;
+        let client_ids: Vec<&String> = clients_read.keys().collect();
+        let subs = d.session_subscriptions.read().await;
+        let subs_map: HashMap<&String, Vec<&String>> = subs
+            .iter()
+            .map(|(sid, cids)| (sid, cids.iter().collect()))
+            .collect();
+        #[allow(clippy::cast_possible_truncation)]
+        let connected_ms = now.duration_since(d.connected_since).as_millis() as u64;
+
+        list.push(json!({
+            "serial": d.serial,
+            "clients": client_ids,
+            "client_count": client_ids.len(),
+            "last_heartbeat_ago_ms": hb_ago_ms,
+            "pending_requests_count": pending_count,
+            "session_subscriptions": subs_map,
+            "connected_since_ms": connected_ms,
+            "dropped_messages": d.dropped_messages.load(Ordering::Relaxed),
+        }));
+    }
 
     Json(json!({"devices": list})).into_response()
 }
@@ -339,6 +496,7 @@ async fn tunnel_request(
     state: &RelayState,
     serial: &str,
     msg: Value,
+    timeout_secs: u64,
 ) -> Result<Value, (StatusCode, Json<Value>)> {
     let devices = state.devices.read().await;
     let device = devices.get(serial).ok_or_else(|| {
@@ -368,7 +526,7 @@ async fn tunnel_request(
     drop(devices); // Release read lock while waiting
 
     // Wait for response with timeout
-    match tokio::time::timeout(Duration::from_secs(60), rx).await {
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
         Ok(Ok(response)) => Ok(response),
         Ok(Err(_)) => Err((
             StatusCode::BAD_GATEWAY,
@@ -433,7 +591,7 @@ async fn proxy_health(
         "request_id": request_id,
     });
 
-    let response = tunnel_request(&state, &serial, msg).await?;
+    let response = tunnel_request(&state, &serial, msg, 10).await?;
     let status = response["status"].as_u64().unwrap_or(200);
     let body = response["body"].clone();
 
@@ -471,7 +629,7 @@ async fn proxy_info(
         "request_id": request_id,
     });
 
-    let response = tunnel_request(&state, &serial, msg).await?;
+    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -509,11 +667,15 @@ async fn proxy_exec(
     }
 
     let request_id = uuid::Uuid::new_v4().to_string();
+    // Derive timeout: command timeout_ms + 5s margin, or config default
+    let timeout_secs = payload["timeout_ms"]
+        .as_u64()
+        .map_or(state.tunnel_proxy_timeout_secs, |ms| ms / 1000 + 5);
     let mut msg = payload;
     msg["type"] = json!("tunnel.exec");
     msg["request_id"] = json!(request_id);
 
-    let response = tunnel_request(&state, &serial, msg).await?;
+    let response = tunnel_request(&state, &serial, msg, timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -551,11 +713,22 @@ async fn proxy_exec_batch(
     }
 
     let request_id = uuid::Uuid::new_v4().to_string();
+    // Sum command timeouts + 5s margin per command, or config default
+    let timeout_secs =
+        payload["commands"]
+            .as_array()
+            .map_or(state.tunnel_proxy_timeout_secs, |cmds| {
+                let total_ms: u64 = cmds
+                    .iter()
+                    .map(|c| c["timeout_ms"].as_u64().unwrap_or(30_000))
+                    .sum();
+                total_ms / 1000 + 5 * cmds.len() as u64
+            });
     let mut msg = payload;
     msg["type"] = json!("tunnel.exec_batch");
     msg["request_id"] = json!(request_id);
 
-    let response = tunnel_request(&state, &serial, msg).await?;
+    let response = tunnel_request(&state, &serial, msg, timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -592,7 +765,7 @@ async fn proxy_file_read(
         "list": query.list,
     });
 
-    let response = tunnel_request(&state, &serial, msg).await?;
+    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -634,7 +807,7 @@ async fn proxy_file_write(
     msg["type"] = json!("tunnel.file.write");
     msg["request_id"] = json!(request_id);
 
-    let response = tunnel_request(&state, &serial, msg).await?;
+    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -685,7 +858,8 @@ async fn proxy_ws(
     drop(devices);
 
     ws.on_upgrade(move |socket| {
-        handle_client_ws(socket, state, serial, device_tx, clients, session_subs)
+        let span = info_span!("tunnel_client", serial = %serial);
+        handle_client_ws(socket, state, serial, device_tx, clients, session_subs).instrument(span)
     })
 }
 
@@ -705,7 +879,7 @@ async fn handle_client_ws(
     // Register this client
     clients.write().await.insert(client_id.clone(), client_tx);
 
-    info!("Tunnel relay: client '{client_id}' connected to device '{serial}'");
+    info!(client_id = %client_id, serial = %serial, "Client connected to device");
 
     // Forward client_rx messages to WS sink
     let send_task = tokio::spawn(async move {
@@ -772,7 +946,7 @@ async fn handle_client_ws(
     }
 
     // Client disconnected — cleanup
-    info!("Tunnel relay: client '{client_id}' disconnected from device '{serial}'");
+    info!(client_id = %client_id, serial = %serial, "Client disconnected from device");
 
     // Remove from clients map
     clients.write().await.remove(&client_id);

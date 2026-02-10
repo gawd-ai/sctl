@@ -84,6 +84,7 @@ mod util;
 mod ws;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -139,6 +140,10 @@ pub struct AppState {
     /// Broadcast channel for session lifecycle events (created/destroyed/renamed).
     /// All connected WebSocket clients subscribe to receive real-time updates.
     pub session_events: broadcast::Sender<Value>,
+    /// Whether the tunnel client is currently connected to the relay.
+    pub tunnel_connected: Arc<AtomicBool>,
+    /// Number of tunnel reconnects since startup.
+    pub tunnel_reconnects: Arc<AtomicU64>,
 }
 
 #[tokio::main]
@@ -228,6 +233,8 @@ async fn run_server(config_path: Option<&str>) {
         config: Arc::new(config),
         start_time: Instant::now(),
         session_events,
+        tunnel_connected: Arc::new(AtomicBool::new(false)),
+        tunnel_reconnects: Arc::new(AtomicU64::new(0)),
     };
 
     // Build router
@@ -255,12 +262,18 @@ async fn run_server(config_path: Option<&str>) {
 
     // Tunnel: add relay routes if configured
     let tunnel_config = state.config.tunnel.clone();
+    let mut relay_state_opt: Option<tunnel::relay::RelayState> = None;
     if let Some(ref tc) = tunnel_config {
         if tc.relay {
             info!("Tunnel relay mode enabled");
-            let relay_state = tunnel::relay::RelayState::new(tc.tunnel_key.clone());
-            let relay_routes = tunnel::relay::relay_router(relay_state);
+            let relay_state = tunnel::relay::RelayState::new(
+                tc.tunnel_key.clone(),
+                tc.heartbeat_timeout_secs,
+                tc.tunnel_proxy_timeout_secs,
+            );
+            let relay_routes = tunnel::relay::relay_router(relay_state.clone());
             app = app.merge(relay_routes);
+            relay_state_opt = Some(relay_state);
         }
     }
 
@@ -314,6 +327,17 @@ async fn run_server(config_path: Option<&str>) {
         }
     });
 
+    // Tunnel relay: periodic sweep to evict dead devices
+    let relay_sweep_task = relay_state_opt.clone().map(|rs| {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                rs.sweep_dead_devices().await;
+            }
+        })
+    });
+
     // Graceful shutdown
     let shutdown = async {
         let ctrl_c = tokio::signal::ctrl_c();
@@ -342,6 +366,20 @@ async fn run_server(config_path: Option<&str>) {
     // Cleanup
     info!("Shutting down...");
     sweep_task.abort();
+    if let Some(task) = relay_sweep_task {
+        task.abort();
+    }
+
+    // Tunnel relay: notify devices and drain state before stopping
+    if let Some(ref rs) = relay_state_opt {
+        info!("Notifying tunnel devices of relay shutdown...");
+        rs.broadcast_to_devices(serde_json::json!({
+            "type": "tunnel.relay_shutdown",
+        }))
+        .await;
+        rs.drain_all().await;
+    }
+
     state.session_manager.kill_all().await;
     info!("Goodbye");
 }
