@@ -1,4 +1,4 @@
-import type { DeviceInfo, DirEntry, FileContent, ExecResult, ActivityEntry } from '../types/terminal.types';
+import type { DeviceInfo, DirEntry, FileContent, ExecResult, ActivityEntry, PlaybookSummary, PlaybookDetail } from '../types/terminal.types';
 
 export class SctlRestClient {
 	private baseUrl: string;
@@ -31,6 +31,11 @@ export class SctlRestClient {
 				throw new Error(`${res.status}: ${text}`);
 			}
 			return res;
+		} catch (e) {
+			if (e instanceof DOMException && e.name === 'AbortError') {
+				throw new Error(`Request timed out after 30s: ${path}`);
+			}
+			throw e;
 		} finally {
 			clearTimeout(timeout);
 		}
@@ -48,8 +53,10 @@ export class SctlRestClient {
 		return data.entries ?? data;
 	}
 
-	async readFile(path: string): Promise<FileContent> {
+	async readFile(path: string, opts?: { offset?: number; limit?: number }): Promise<FileContent> {
 		const params = new URLSearchParams({ path });
+		if (opts?.offset) params.set('offset', String(opts.offset));
+		if (opts?.limit) params.set('limit', String(opts.limit));
 		const res = await this.fetch(`/api/files?${params}`);
 		return res.json();
 	}
@@ -60,9 +67,17 @@ export class SctlRestClient {
 		opts?: { mode?: string; create_dirs?: boolean }
 	): Promise<void> {
 		await this.fetch('/api/files', {
-			method: 'POST',
+			method: 'PUT',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ path, content, ...opts })
+		});
+	}
+
+	async deleteFile(path: string): Promise<void> {
+		await this.fetch('/api/files', {
+			method: 'DELETE',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path })
 		});
 	}
 
@@ -86,5 +101,60 @@ export class SctlRestClient {
 		const res = await this.fetch(`/api/activity?${params}`);
 		const data = await res.json();
 		return data.entries ?? [];
+	}
+
+	async getHealth(): Promise<{ status: string; uptime: number; version: string }> {
+		const res = await this.fetch('/api/health');
+		return res.json();
+	}
+
+	async listPlaybooks(): Promise<PlaybookSummary[]> {
+		const res = await this.fetch('/api/playbooks');
+		const data = await res.json();
+		return data.playbooks ?? [];
+	}
+
+	async getPlaybook(name: string): Promise<PlaybookDetail> {
+		const res = await this.fetch(`/api/playbooks/${encodeURIComponent(name)}`);
+		return res.json();
+	}
+
+	async putPlaybook(name: string, content: string): Promise<void> {
+		await this.fetch(`/api/playbooks/${encodeURIComponent(name)}`, {
+			method: 'PUT',
+			headers: { 'Content-Type': 'text/markdown' },
+			body: content
+		});
+	}
+
+	async deletePlaybook(name: string): Promise<void> {
+		await this.fetch(`/api/playbooks/${encodeURIComponent(name)}`, {
+			method: 'DELETE'
+		});
+	}
+
+	downloadUrl(path: string): string {
+		const params = new URLSearchParams({ path });
+		return `${this.baseUrl}/api/files/raw?${params}`;
+	}
+
+	async downloadBlob(path: string): Promise<{ blob: Blob; filename: string }> {
+		const params = new URLSearchParams({ path });
+		const res = await this.fetch(`/api/files/raw?${params}`);
+		const blob = await res.blob();
+		const filename = path.split('/').pop() ?? 'download';
+		return { blob, filename };
+	}
+
+	async uploadFiles(dirPath: string, files: FileList | File[]): Promise<void> {
+		const form = new FormData();
+		for (const file of files) {
+			form.append('files', file, file.name);
+		}
+		const params = new URLSearchParams({ path: dirPath });
+		await this.fetch(`/api/files/upload?${params}`, {
+			method: 'POST',
+			body: form
+		});
 	}
 }

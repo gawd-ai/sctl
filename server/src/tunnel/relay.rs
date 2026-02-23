@@ -15,13 +15,13 @@ use axum::{
     extract::{Path as AxumPath, Query, State, WebSocketUpgrade},
     http::{Request, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock};
 use tracing::{info, info_span, warn, Instrument};
 
 /// State shared across all relay handlers.
@@ -35,6 +35,8 @@ pub struct RelayState {
     pub heartbeat_timeout_secs: u64,
     /// Default proxy request timeout in seconds (default 60).
     pub tunnel_proxy_timeout_secs: u64,
+    /// Process epoch for lock-free heartbeat timestamps.
+    pub epoch: Instant,
 }
 
 /// A device connected to the relay via its outbound WS tunnel.
@@ -49,12 +51,14 @@ pub struct ConnectedDevice {
     pub clients: Arc<RwLock<HashMap<String, mpsc::Sender<Value>>>>,
     /// Session subscriptions: `session_id` -> set of `client_ids` watching output.
     pub session_subscriptions: Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    /// Last heartbeat from device.
-    pub last_heartbeat: Arc<Mutex<Instant>>,
+    /// Last heartbeat timestamp as ms since relay epoch (lock-free).
+    pub last_heartbeat_ms: Arc<AtomicU64>,
     /// When this device connected.
     pub connected_since: Instant,
     /// Count of messages dropped due to client backpressure.
     pub dropped_messages: Arc<AtomicU64>,
+    /// Signal old device handler to shut down on duplicate serial reconnect.
+    pub shutdown_tx: watch::Sender<bool>,
 }
 
 /// Drain all pending requests for a device, sending error responses on each oneshot.
@@ -103,34 +107,34 @@ impl RelayState {
             tunnel_key,
             heartbeat_timeout_secs,
             tunnel_proxy_timeout_secs,
+            epoch: Instant::now(),
         }
     }
 
     /// Evict devices whose heartbeat is older than `heartbeat_timeout_secs`.
     /// Returns the serials of evicted devices.
+    ///
+    /// Uses a single write-lock pass with atomic heartbeat reads to avoid
+    /// TOCTOU races (device could send heartbeat between read-lock and write-lock).
     pub async fn sweep_dead_devices(&self) -> Vec<String> {
-        let timeout = Duration::from_secs(self.heartbeat_timeout_secs);
-        let now = Instant::now();
+        let timeout_ms = self.heartbeat_timeout_secs * 1000;
+        #[allow(clippy::cast_possible_truncation)]
+        let now_ms = self.epoch.elapsed().as_millis() as u64;
 
-        // First pass: identify dead devices and drain them (read lock)
+        let mut devices = self.devices.write().await;
         let mut dead_serials = Vec::new();
-        {
-            let devices = self.devices.read().await;
-            for (serial, device) in devices.iter() {
-                let last_hb = *device.last_heartbeat.lock().await;
-                if now.duration_since(last_hb) > timeout {
-                    drain_device(device, "heartbeat timeout").await;
-                    dead_serials.push(serial.clone());
-                }
-            }
-        }
 
-        // Second pass: remove dead devices (write lock)
-        if !dead_serials.is_empty() {
-            let mut devices = self.devices.write().await;
-            for serial in &dead_serials {
-                devices.remove(serial);
-                warn!(serial = %serial, "Evicted device (heartbeat timeout)");
+        // Collect serials first to avoid borrow conflict
+        let serials: Vec<String> = devices.keys().cloned().collect();
+        for serial in serials {
+            if let Some(device) = devices.get(&serial) {
+                let last_hb = device.last_heartbeat_ms.load(Ordering::Relaxed);
+                if now_ms.saturating_sub(last_hb) > timeout_ms {
+                    drain_device(device, "heartbeat timeout").await;
+                    devices.remove(&serial);
+                    warn!(serial = %serial, "Evicted device (heartbeat timeout)");
+                    dead_serials.push(serial);
+                }
             }
         }
 
@@ -173,9 +177,28 @@ pub fn relay_router(relay_state: RelayState) -> Router {
         .route("/d/{serial}/api/exec/batch", post(proxy_exec_batch))
         .route(
             "/d/{serial}/api/files",
-            get(proxy_file_read).put(proxy_file_write),
+            get(proxy_file_read)
+                .put(proxy_file_write)
+                .delete(proxy_file_delete),
         )
         .route("/d/{serial}/api/activity", get(proxy_activity))
+        .route("/d/{serial}/api/sessions", get(proxy_sessions))
+        .route(
+            "/d/{serial}/api/sessions/{id}",
+            delete(proxy_session_kill).patch(proxy_session_patch),
+        )
+        .route(
+            "/d/{serial}/api/sessions/{id}/signal",
+            post(proxy_session_signal),
+        )
+        .route("/d/{serial}/api/shells", get(proxy_shells))
+        .route("/d/{serial}/api/playbooks", get(proxy_playbooks_list))
+        .route(
+            "/d/{serial}/api/playbooks/{name}",
+            get(proxy_playbook_get)
+                .put(proxy_playbook_put)
+                .delete(proxy_playbook_delete),
+        )
         .route("/d/{serial}/api/ws", get(proxy_ws));
 
     tunnel_admin.merge(device_proxy).with_state(relay_state)
@@ -235,6 +258,10 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
         return;
     }
 
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+    #[allow(clippy::cast_possible_truncation)]
+    let now_ms = state.epoch.elapsed().as_millis() as u64;
     let device = ConnectedDevice {
         serial: serial.clone(),
         api_key,
@@ -242,18 +269,20 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
         pending_requests: Arc::new(Mutex::new(HashMap::new())),
         clients: Arc::new(RwLock::new(HashMap::new())),
         session_subscriptions: Arc::new(RwLock::new(HashMap::new())),
-        last_heartbeat: Arc::new(Mutex::new(Instant::now())),
+        last_heartbeat_ms: Arc::new(AtomicU64::new(now_ms)),
         connected_since: Instant::now(),
         dropped_messages: Arc::new(AtomicU64::new(0)),
+        shutdown_tx,
     };
 
     let pending_requests = device.pending_requests.clone();
     let clients = device.clients.clone();
     let session_subs = device.session_subscriptions.clone();
-    let heartbeat = device.last_heartbeat.clone();
+    let heartbeat_ms = device.last_heartbeat_ms.clone();
+    let relay_epoch = state.epoch;
     let dropped_messages = device.dropped_messages.clone();
 
-    // Handle duplicate serial: drain stale connection before replacing
+    // Handle duplicate serial: signal old handler to shut down, drain, then replace
     {
         let mut devices = state.devices.write().await;
         if let Some(old_device) = devices.get(&serial) {
@@ -261,6 +290,7 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                 serial = %serial,
                 "Device re-registering while stale connection exists, evicting old"
             );
+            let _ = old_device.shutdown_tx.send(true);
             drain_device(old_device, "replaced by new connection").await;
         }
         devices.insert(serial.clone(), device);
@@ -290,7 +320,17 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
     });
 
     // Process messages from the device
-    while let Some(Ok(msg)) = ws_stream.next().await {
+    loop {
+        let msg = tokio::select! {
+            msg = ws_stream.next() => {
+                let Some(Ok(msg)) = msg else { break };
+                msg
+            }
+            _ = shutdown_rx.changed() => {
+                info!(serial = %serial, "Device handler shutting down (replaced by new connection)");
+                break;
+            }
+        };
         match msg {
             axum::extract::ws::Message::Text(text) => {
                 let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
@@ -300,8 +340,10 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
 
                 match msg_type {
                     "tunnel.ping" => {
-                        // Device heartbeat — respond and update timestamp
-                        *heartbeat.lock().await = Instant::now();
+                        // Device heartbeat — respond and update timestamp (lock-free)
+                        #[allow(clippy::cast_possible_truncation)]
+                        let now_ms = relay_epoch.elapsed().as_millis() as u64;
+                        heartbeat_ms.store(now_ms, Ordering::Relaxed);
                         let _ = device_tx.send(json!({"type": "tunnel.pong"})).await;
                     }
                     t if t.ends_with(".result") => {
@@ -324,6 +366,13 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                                 let mut pending = pending_requests.lock().await;
                                 if let Some(sender) = pending.remove(request_id) {
                                     let _ = sender.send(parsed);
+                                } else {
+                                    warn!(
+                                        serial = %serial,
+                                        request_id,
+                                        msg_type,
+                                        "Response arrived for timed-out or unknown request (dropped)"
+                                    );
                                 }
                             }
                         }
@@ -374,7 +423,15 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                     | "session.ai_status.ack"
                     | "session.rename.ack"
                     | "shell.listed"
+                    | "activity.new"
                     | "error" => {
+                        // Clean up session subscriptions when session is destroyed/closed
+                        if msg_type == "session.destroyed" || msg_type == "session.closed" {
+                            if let Some(sid) = parsed["session_id"].as_str() {
+                                session_subs.write().await.remove(sid);
+                            }
+                        }
+
                         // Auto-subscribe client to session output on session.started
                         if msg_type == "session.started" {
                             if let (Some(rid), Some(sid)) =
@@ -456,14 +513,14 @@ async fn list_devices(
         return (StatusCode::FORBIDDEN, "Invalid tunnel key").into_response();
     }
 
-    let now = Instant::now();
     let devices = state.devices.read().await;
     let mut list: Vec<Value> = Vec::with_capacity(devices.len());
 
+    #[allow(clippy::cast_possible_truncation)]
+    let now_ms = state.epoch.elapsed().as_millis() as u64;
     for d in devices.values() {
-        let last_hb = *d.last_heartbeat.lock().await;
-        #[allow(clippy::cast_possible_truncation)]
-        let hb_ago_ms = now.duration_since(last_hb).as_millis() as u64;
+        let last_hb_ms = d.last_heartbeat_ms.load(Ordering::Relaxed);
+        let hb_ago_ms = now_ms.saturating_sub(last_hb_ms);
         let pending_count = d.pending_requests.lock().await.len();
         let clients_read = d.clients.read().await;
         let client_ids: Vec<&String> = clients_read.keys().collect();
@@ -473,7 +530,7 @@ async fn list_devices(
             .map(|(sid, cids)| (sid, cids.iter().collect()))
             .collect();
         #[allow(clippy::cast_possible_truncation)]
-        let connected_ms = now.duration_since(d.connected_since).as_millis() as u64;
+        let connected_ms = d.connected_since.elapsed().as_millis() as u64;
 
         list.push(json!({
             "serial": d.serial,
@@ -812,6 +869,50 @@ async fn proxy_file_write(
     proxy_response_to_http(&response)
 }
 
+/// `DELETE /d/{serial}/api/files` — proxied file delete.
+async fn proxy_file_delete(
+    State(state): State<RelayState>,
+    AxumPath(serial): AxumPath<String>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Failed to read request body"})),
+            )
+        })?;
+
+    let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Invalid JSON"})),
+        )
+    })?;
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "tunnel.file.delete",
+        "request_id": request_id,
+        "path": payload["path"],
+    });
+
+    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
+}
+
 /// Convert a tunnel response (with status + body) to an HTTP response.
 fn proxy_response_to_http(response: &Value) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let status = response["status"].as_u64().unwrap_or(200);
@@ -869,6 +970,308 @@ struct ActivityProxyQuery {
 
 fn default_activity_limit() -> usize {
     50
+}
+
+/// `GET /d/{serial}/api/sessions` — proxied session list.
+async fn proxy_sessions(
+    State(state): State<RelayState>,
+    AxumPath(serial): AxumPath<String>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "tunnel.sessions",
+        "request_id": request_id,
+    });
+
+    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
+}
+
+/// `GET /d/{serial}/api/shells` — proxied shell list.
+async fn proxy_shells(
+    State(state): State<RelayState>,
+    AxumPath(serial): AxumPath<String>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "tunnel.shells",
+        "request_id": request_id,
+    });
+
+    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
+}
+
+// ─── Session Control Proxy Endpoints ──────────────────────────────────────────
+
+/// `POST /d/{serial}/api/sessions/{id}/signal` — proxied session signal.
+async fn proxy_session_signal(
+    State(state): State<RelayState>,
+    AxumPath((serial, id)): AxumPath<(String, String)>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), 1024)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Failed to read request body"})),
+            )
+        })?;
+
+    let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Invalid JSON"})),
+        )
+    })?;
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "tunnel.session.signal",
+        "request_id": request_id,
+        "session_id": id,
+        "signal": payload["signal"],
+    });
+
+    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
+}
+
+/// `DELETE /d/{serial}/api/sessions/{id}` — proxied session kill.
+async fn proxy_session_kill(
+    State(state): State<RelayState>,
+    AxumPath((serial, id)): AxumPath<(String, String)>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "tunnel.session.kill",
+        "request_id": request_id,
+        "session_id": id,
+    });
+
+    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
+}
+
+/// `PATCH /d/{serial}/api/sessions/{id}` — proxied session patch.
+async fn proxy_session_patch(
+    State(state): State<RelayState>,
+    AxumPath((serial, id)): AxumPath<(String, String)>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), 10 * 1024)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Failed to read request body"})),
+            )
+        })?;
+
+    let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Invalid JSON"})),
+        )
+    })?;
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let mut msg = payload;
+    msg["type"] = json!("tunnel.session.patch");
+    msg["request_id"] = json!(request_id);
+    msg["session_id"] = json!(id);
+
+    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
+}
+
+// ─── Playbook Proxy Endpoints ─────────────────────────────────────────────────
+
+/// `GET /d/{serial}/api/playbooks` -- proxied playbook list.
+async fn proxy_playbooks_list(
+    State(state): State<RelayState>,
+    AxumPath(serial): AxumPath<String>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "tunnel.playbooks.list",
+        "request_id": request_id,
+    });
+
+    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
+}
+
+/// `GET /d/{serial}/api/playbooks/:name` -- proxied playbook get.
+async fn proxy_playbook_get(
+    State(state): State<RelayState>,
+    AxumPath((serial, name)): AxumPath<(String, String)>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "tunnel.playbooks.get",
+        "request_id": request_id,
+        "name": name,
+    });
+
+    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
+}
+
+/// `PUT /d/{serial}/api/playbooks/:name` -- proxied playbook write.
+async fn proxy_playbook_put(
+    State(state): State<RelayState>,
+    AxumPath((serial, name)): AxumPath<(String, String)>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Failed to read request body"})),
+            )
+        })?;
+
+    let content = String::from_utf8(body_bytes.to_vec()).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Invalid UTF-8"})),
+        )
+    })?;
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "tunnel.playbooks.put",
+        "request_id": request_id,
+        "name": name,
+        "content": content,
+    });
+
+    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
+}
+
+/// `DELETE /d/{serial}/api/playbooks/:name` -- proxied playbook delete.
+async fn proxy_playbook_delete(
+    State(state): State<RelayState>,
+    AxumPath((serial, name)): AxumPath<(String, String)>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "tunnel.playbooks.delete",
+        "request_id": request_id,
+        "name": name,
+    });
+
+    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
 }
 
 // ─── WS Proxy ────────────────────────────────────────────────────────────────

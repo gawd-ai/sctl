@@ -51,7 +51,7 @@ pub struct OutputBuffer {
     max_entries: usize,
     notify: Arc<Notify>,
     /// Optional channel to the journal writer task.
-    journal_tx: Option<mpsc::UnboundedSender<JournalEntry>>,
+    journal_tx: Option<mpsc::Sender<JournalEntry>>,
 }
 
 impl OutputBuffer {
@@ -68,7 +68,7 @@ impl OutputBuffer {
 
     /// Attach a journal writer channel. Entries pushed after this call will
     /// also be sent to the journal.
-    pub fn set_journal(&mut self, tx: mpsc::UnboundedSender<JournalEntry>) {
+    pub fn set_journal(&mut self, tx: mpsc::Sender<JournalEntry>) {
         self.journal_tx = Some(tx);
     }
 
@@ -94,9 +94,9 @@ impl OutputBuffer {
             timestamp_ms,
         };
 
-        // Send to journal (non-blocking, best-effort)
+        // Send to journal (non-blocking, best-effort — must not block under Mutex)
         if let Some(ref tx) = self.journal_tx {
-            let _ = tx.send(JournalEntry::from_output_entry(&entry));
+            let _ = tx.try_send(JournalEntry::from_output_entry(&entry));
         }
 
         self.entries.push_back(entry);

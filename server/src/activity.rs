@@ -34,6 +34,11 @@ pub enum ActivityType {
     SessionExec,
     SessionKill,
     SessionSignal,
+    FileDelete,
+    PlaybookList,
+    PlaybookRead,
+    PlaybookWrite,
+    PlaybookDelete,
 }
 
 /// Where the request originated.
@@ -56,6 +61,43 @@ pub struct ActivityEntry {
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+impl ActivityType {
+    /// Parse from the serde rename value (e.g. `"exec"`, `"file_read"`).
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "exec" => Some(Self::Exec),
+            "file_read" => Some(Self::FileRead),
+            "file_write" => Some(Self::FileWrite),
+            "file_list" => Some(Self::FileList),
+            "file_delete" => Some(Self::FileDelete),
+            "session_start" => Some(Self::SessionStart),
+            "session_exec" => Some(Self::SessionExec),
+            "session_kill" => Some(Self::SessionKill),
+            "session_signal" => Some(Self::SessionSignal),
+            "playbook_list" => Some(Self::PlaybookList),
+            "playbook_read" => Some(Self::PlaybookRead),
+            "playbook_write" => Some(Self::PlaybookWrite),
+            "playbook_delete" => Some(Self::PlaybookDelete),
+            _ => None,
+        }
+    }
+}
+
+impl ActivitySource {
+    /// Parse from the serde rename value (e.g. `"mcp"`, `"ws"`, `"rest"`).
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "mcp" => Some(Self::Mcp),
+            "ws" => Some(Self::Ws),
+            "rest" => Some(Self::Rest),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
 }
 
 /// In-memory ring buffer of activity entries with broadcast support.
@@ -84,6 +126,7 @@ impl ActivityLog {
         source: ActivitySource,
         summary: String,
         detail: Option<Value>,
+        request_id: Option<String>,
     ) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         #[allow(clippy::cast_possible_truncation)]
@@ -99,6 +142,7 @@ impl ActivityLog {
             source,
             summary,
             detail,
+            request_id,
         };
 
         // Broadcast before acquiring the write lock (non-blocking for readers)
@@ -126,6 +170,34 @@ impl ActivityLog {
             .cloned()
             .collect()
     }
+
+    /// Read entries with optional filters (AND logic). All filters are optional.
+    pub async fn read_since_filtered(
+        &self,
+        since_id: u64,
+        limit: usize,
+        activity_type: Option<ActivityType>,
+        source: Option<ActivitySource>,
+        session_id: Option<&str>,
+    ) -> Vec<ActivityEntry> {
+        let entries = self.entries.read().await;
+        entries
+            .iter()
+            .filter(|e| e.id > since_id)
+            .filter(|e| activity_type.map_or(true, |t| e.activity_type == t))
+            .filter(|e| source.map_or(true, |s| e.source == s))
+            .filter(|e| {
+                session_id.map_or(true, |sid| {
+                    e.detail
+                        .as_ref()
+                        .and_then(|d| d["session_id"].as_str())
+                        .is_some_and(|s| s == sid)
+                })
+            })
+            .take(limit)
+            .cloned()
+            .collect()
+    }
 }
 
 /// Determine the [`ActivitySource`] from HTTP request headers.
@@ -137,6 +209,14 @@ pub fn source_from_headers(headers: &HeaderMap) -> ActivitySource {
         Some("mcp") => ActivitySource::Mcp,
         _ => ActivitySource::Rest,
     }
+}
+
+/// Extract `X-Request-Id` header value for correlation.
+pub fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string)
 }
 
 /// Truncate a string to `max` chars, appending "..." if truncated.

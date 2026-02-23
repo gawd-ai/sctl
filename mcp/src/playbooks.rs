@@ -215,6 +215,15 @@ pub fn playbook_to_tool_definition(pb: &Playbook) -> Value {
         }),
     );
 
+    // Add timeout_ms param
+    properties.insert(
+        "timeout_ms".to_string(),
+        json!({
+            "type": "integer",
+            "description": "Execution timeout in milliseconds. Default is 30000 (30s)."
+        }),
+    );
+
     // Add playbook params
     for (name, def) in &pb.params {
         let mut prop = serde_json::Map::new();

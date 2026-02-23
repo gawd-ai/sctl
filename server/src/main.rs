@@ -18,34 +18,56 @@
 //!
 //! ## API surface
 //!
-//! | Method | Path              | Auth | Description                          |
-//! |--------|-------------------|------|--------------------------------------|
-//! | GET    | `/api/health`     | No   | Liveness probe                       |
-//! | GET    | `/api/info`       | Yes  | System info (IPs, CPU, mem, disk)    |
-//! | POST   | `/api/exec`       | Yes  | One-shot command execution           |
-//! | POST   | `/api/exec/batch` | Yes  | Batch command execution              |
-//! | GET    | `/api/files`      | Yes  | Read file or list directory          |
-//! | PUT    | `/api/files`      | Yes  | Write file (atomic)                  |
-//! | GET    | `/api/activity`   | Yes  | Activity journal (operation log)     |
-//! | GET    | `/api/ws`         | Yes* | WebSocket for interactive sessions   |
+//! | Method | Path                        | Auth | Description                          |
+//! |--------|-----------------------------|------|--------------------------------------|
+//! | GET    | `/api/health`               | No   | Liveness probe                       |
+//! | GET    | `/api/info`                 | Yes  | System info (IPs, CPU, mem, disk)    |
+//! | POST   | `/api/exec`                 | Yes  | One-shot command execution           |
+//! | POST   | `/api/exec/batch`           | Yes  | Batch command execution              |
+//! | GET    | `/api/files`                | Yes  | Read file or list directory          |
+//! | PUT    | `/api/files`                | Yes  | Write file (atomic)                  |
+//! | DELETE | `/api/files`                | Yes  | Delete a file                        |
+//! | GET    | `/api/activity`             | Yes  | Activity journal (with filters)      |
+//! | GET    | `/api/sessions`             | Yes  | List all sessions                    |
+//! | POST   | `/api/sessions/{id}/signal` | Yes  | Send POSIX signal to session         |
+//! | DELETE | `/api/sessions/{id}`        | Yes  | Kill a session                       |
+//! | PATCH  | `/api/sessions/{id}`        | Yes  | Rename / set AI permission & status  |
+//! | GET    | `/api/shells`               | Yes  | List available shells                |
+//! | GET    | `/api/events`               | Yes  | SSE event stream (real-time)         |
+//! | GET    | `/api/playbooks`            | Yes  | List playbooks                       |
+//! | GET    | `/api/playbooks/{name}`     | Yes  | Get playbook detail                  |
+//! | PUT    | `/api/playbooks/{name}`     | Yes  | Create/update playbook               |
+//! | DELETE | `/api/playbooks/{name}`     | Yes  | Delete playbook                      |
+//! | GET    | `/api/ws`                   | Yes* | WebSocket for interactive sessions   |
 //!
 //! *WebSocket auth is via `?token=<key>` query param (no `Authorization` header
 //! available during the upgrade handshake).
 //!
 //! ### Tunnel endpoints (when `tunnel.relay = true`)
 //!
-//! | Method | Path                          | Auth       | Description                 |
-//! |--------|-------------------------------|------------|-----------------------------|
-//! | GET    | `/api/tunnel/register`        | `tunnel_key` | Device WS registration      |
-//! | GET    | `/api/tunnel/devices`         | `tunnel_key` | List connected devices      |
-//! | GET    | `/d/{serial}/api/health`      | No           | Proxied device health       |
-//! | GET    | `/d/{serial}/api/info`        | `api_key`    | Proxied device info         |
-//! | POST   | `/d/{serial}/api/exec`        | `api_key`    | Proxied command execution   |
-//! | POST   | `/d/{serial}/api/exec/batch`  | `api_key`    | Proxied batch execution     |
-//! | GET    | `/d/{serial}/api/files`       | `api_key`    | Proxied file read/list      |
-//! | PUT    | `/d/{serial}/api/files`       | `api_key`    | Proxied file write          |
-//! | GET    | `/d/{serial}/api/activity`    | `api_key`    | Proxied activity journal    |
-//! | GET    | `/d/{serial}/api/ws`          | `api_key`    | Proxied WS sessions         |
+//! | Method | Path                                     | Auth         | Description                 |
+//! |--------|------------------------------------------|--------------|-----------------------------|
+//! | GET    | `/api/tunnel/register`                   | `tunnel_key` | Device WS registration      |
+//! | GET    | `/api/tunnel/devices`                    | `tunnel_key` | List connected devices      |
+//! | GET    | `/d/{serial}/api/health`                 | No           | Proxied device health       |
+//! | GET    | `/d/{serial}/api/info`                   | `api_key`    | Proxied device info         |
+//! | POST   | `/d/{serial}/api/exec`                   | `api_key`    | Proxied command execution   |
+//! | POST   | `/d/{serial}/api/exec/batch`             | `api_key`    | Proxied batch execution     |
+//! | GET    | `/d/{serial}/api/files`                  | `api_key`    | Proxied file read/list      |
+//! | PUT    | `/d/{serial}/api/files`                  | `api_key`    | Proxied file write          |
+//! | DELETE | `/d/{serial}/api/files`                  | `api_key`    | Proxied file delete         |
+//! | GET    | `/d/{serial}/api/activity`               | `api_key`    | Proxied activity journal    |
+//! | GET    | `/d/{serial}/api/sessions`               | `api_key`    | Proxied session list        |
+//! | POST   | `/d/{serial}/api/sessions/{id}/signal`   | `api_key`    | Proxied session signal      |
+//! | DELETE | `/d/{serial}/api/sessions/{id}`          | `api_key`    | Proxied session kill        |
+//! | PATCH  | `/d/{serial}/api/sessions/{id}`          | `api_key`    | Proxied session patch       |
+//! | GET    | `/d/{serial}/api/shells`                 | `api_key`    | Proxied shell list          |
+//! | GET    | `/d/{serial}/api/playbooks`              | `api_key`    | Proxied playbook list       |
+//! | *      | `/d/{serial}/api/playbooks/{name}`       | `api_key`    | Proxied playbook CRUD       |
+//! | GET    | `/d/{serial}/api/ws`                     | `api_key`    | Proxied WS sessions         |
+//!
+//! Note: SSE (`/api/events`) is not proxied through the tunnel (incompatible
+//! with REST-over-WS relay pattern). Tunneled devices use WS proxy for events.
 //!
 //! ## Architecture
 //!
@@ -59,8 +81,12 @@
 //!   health.rs      — GET /api/health
 //!   info.rs        — GET /api/info (system introspection)
 //!   exec.rs        — POST /api/exec, POST /api/exec/batch
-//!   files.rs       — GET/PUT /api/files (read, write, list)
-//!   activity.rs    — GET /api/activity (operation log)
+//!   files.rs       — GET/PUT/DELETE /api/files (read, write, list, delete)
+//!   activity.rs    — GET /api/activity (operation log, filtered)
+//!   sessions.rs    — GET/POST/DELETE/PATCH /api/sessions (list, signal, kill, patch)
+//!   shells.rs      — GET /api/shells (shell discovery)
+//!   events.rs      — GET /api/events (SSE event stream)
+//!   playbooks.rs   — CRUD /api/playbooks (list, get, put, delete)
 //! shell/
 //!   process.rs     — spawn_shell(), spawn_shell_pgroup(), exec_command()
 //!   pty.rs         — PTY allocation, spawn, resize
@@ -95,13 +121,14 @@ use std::time::Instant;
 
 use axum::{
     middleware,
-    routing::{get, post},
+    routing::{delete, get, post},
     Extension, Router,
 };
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
@@ -235,7 +262,10 @@ async fn run_server(config_path: Option<&str>) {
     }
 
     let (session_events, _) = broadcast::channel(256);
-    let activity_log = Arc::new(ActivityLog::new(200, session_events.clone()));
+    let activity_log = Arc::new(ActivityLog::new(
+        config.server.activity_log_max_entries,
+        session_events.clone(),
+    ));
 
     let state = AppState {
         session_manager,
@@ -256,19 +286,50 @@ async fn run_server(config_path: Option<&str>) {
         .route("/api/exec/batch", post(routes::exec::batch_exec))
         .route(
             "/api/files",
-            get(routes::files::get_file).put(routes::files::put_file),
+            get(routes::files::get_file)
+                .put(routes::files::put_file)
+                .delete(routes::files::delete_file),
         )
+        .route("/api/files/raw", get(routes::files::download_file))
+        .route("/api/files/upload", post(routes::files::upload_file))
         .route("/api/activity", get(routes::activity::get_activity))
+        .route("/api/sessions", get(routes::sessions::list_sessions))
+        .route(
+            "/api/sessions/{id}",
+            delete(routes::sessions::kill_session).patch(routes::sessions::patch_session),
+        )
+        .route(
+            "/api/sessions/{id}/signal",
+            post(routes::sessions::signal_session),
+        )
+        .route("/api/shells", get(routes::shells::list_shells))
+        .route("/api/events", get(routes::events::event_stream))
+        .route("/api/playbooks", get(routes::playbooks::list_playbooks))
+        .route(
+            "/api/playbooks/{name}",
+            get(routes::playbooks::get_playbook)
+                .put(routes::playbooks::put_playbook)
+                .delete(routes::playbooks::delete_playbook),
+        )
         .layer(middleware::from_fn(auth::require_api_key));
 
     let ws_route = Router::new().route("/api/ws", get(ws::ws_upgrade));
+
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
 
     let mut app = Router::new()
         .merge(public_routes)
         .merge(authed_routes)
         .merge(ws_route)
         .layer(Extension(ApiKey(state.config.auth.api_key.clone())))
+        .layer(cors)
         .layer(TraceLayer::new_for_http())
+        .layer(tower::limit::ConcurrencyLimitLayer::new(
+            state.config.server.max_connections,
+        ))
         .with_state(state.clone());
 
     // Tunnel: add relay routes if configured

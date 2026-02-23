@@ -60,12 +60,16 @@ pub struct SessionListItem {
     pub attached: bool,
     /// `"running"` or `"exited"`.
     pub status: String,
+    /// Exit code of the session's process (only set when status is `"exited"`).
+    pub exit_code: Option<i32>,
     /// Whether the session is considered idle (detached, no recent activity).
     pub idle: bool,
     /// Client-requested idle timeout in seconds (0 = never auto-kill).
     pub idle_timeout: u64,
     /// Optional human-readable name for the session.
     pub name: Option<String>,
+    /// Epoch milliseconds when the session was created.
+    pub created_at: u64,
     /// Whether the user permits AI to control this session.
     pub user_allows_ai: bool,
     /// Whether the AI is currently working in this session.
@@ -99,6 +103,8 @@ pub struct SessionEntry {
     pub idle_timeout: u64,
     /// Optional human-readable name for the session.
     pub name: Option<String>,
+    /// Epoch milliseconds when the session was created.
+    pub created_at: u64,
     /// Whether the user permits AI to control this session.
     pub user_allows_ai: bool,
     /// Whether the AI is currently working in this session.
@@ -209,12 +215,12 @@ impl SessionManager {
             let child = spawn_shell_pty(&pty_pair, shell, working_dir, Some(&pty_env))
                 .map_err(|e| format!("Failed to spawn PTY shell: {e}"))?;
 
-            ManagedSession::spawn_pty(session_id.clone(), child, pty_pair.master, self.buffer_size)
+            ManagedSession::spawn_pty(session_id.clone(), child, pty_pair.master, self.buffer_size)?
         } else {
             // Pipe-backed session
             let child = spawn_shell_pgroup(shell, working_dir, env)
                 .map_err(|e| format!("Failed to spawn shell: {e}"))?;
-            ManagedSession::spawn(session_id.clone(), child, self.buffer_size)
+            ManagedSession::spawn(session_id.clone(), child, self.buffer_size)?
         };
 
         let pid = session.pid;
@@ -242,6 +248,7 @@ impl SessionManager {
         }
 
         let now = Instant::now();
+        let created_at = journal::now_ms();
 
         let session_name = name.map(ToString::to_string);
 
@@ -254,6 +261,7 @@ impl SessionManager {
                 attached: true,
                 idle_timeout,
                 name: session_name,
+                created_at,
                 user_allows_ai: true,
                 ai_is_working: false,
                 ai_activity: None,
@@ -521,6 +529,11 @@ impl SessionManager {
         }
     }
 
+    /// Count of active sessions.
+    pub async fn session_count(&self) -> usize {
+        self.sessions.read().await.len()
+    }
+
     /// List all active sessions (used by the `session.list` WS message).
     pub async fn list_sessions(&self) -> Vec<SessionListItem> {
         let sessions = self.sessions.read().await;
@@ -528,6 +541,7 @@ impl SessionManager {
         let mut items = Vec::with_capacity(sessions.len());
         for (id, entry) in sessions.iter() {
             let status = *entry.session.status.lock().await;
+            let exit_code = *entry.session.exit_code.lock().await;
             let idle = !entry.attached && entry.last_activity.elapsed() > idle_threshold;
             items.push(SessionListItem {
                 session_id: id.clone(),
@@ -539,9 +553,11 @@ impl SessionManager {
                     session::SessionStatus::Running => "running".to_string(),
                     session::SessionStatus::Exited => "exited".to_string(),
                 },
+                exit_code,
                 idle,
                 idle_timeout: entry.idle_timeout,
                 name: entry.name.clone(),
+                created_at: entry.created_at,
                 user_allows_ai: entry.user_allows_ai,
                 ai_is_working: entry.ai_is_working,
                 ai_activity: entry.ai_activity.clone(),
@@ -591,6 +607,7 @@ impl SessionManager {
                     attached: false,
                     idle_timeout: 0,
                     name: None,
+                    created_at: arch.metadata.created,
                     user_allows_ai: true,
                     ai_is_working: false,
                     ai_activity: None,

@@ -59,8 +59,9 @@ pub async fn info(State(state): State<AppState>) -> Result<Json<Value>, StatusCo
         "cpu_model": cpu_model,
         "load_average": load,
         "memory": {
-            "total_kb": mem_total,
-            "available_kb": mem_available,
+            "total_bytes": mem_total * 1024,
+            "available_bytes": mem_available * 1024,
+            "used_bytes": mem_total.saturating_sub(mem_available) * 1024,
         },
         "disk": disk,
         "interfaces": interfaces,

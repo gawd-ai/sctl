@@ -87,6 +87,14 @@
 		>
 			KILL
 		</button>
+		<button
+			class="px-1.5 py-0.5 rounded transition-colors {disabled ? 'text-neutral-700 cursor-default' : 'hover:bg-yellow-900/60 hover:text-yellow-300 text-neutral-500'}"
+			onclick={() => onsignal?.(1)}
+			title="SIGHUP (reload)"
+			{disabled}
+		>
+			HUP
+		</button>
 	</div>
 
 	<!-- Spacer -->

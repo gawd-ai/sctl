@@ -14,6 +14,16 @@ export { default as SplitPane } from './components/SplitPane.svelte';
 export { default as FileBrowser } from './components/FileBrowser.svelte';
 export { default as CommandPalette } from './components/CommandPalette.svelte';
 export { default as ActivityFeed } from './components/ActivityFeed.svelte';
+export { default as HistoryViewer } from './components/HistoryViewer.svelte';
+export { default as PlaybookList } from './components/PlaybookList.svelte';
+export { default as PlaybookViewer } from './components/PlaybookViewer.svelte';
+export { default as PlaybookExecutor } from './components/PlaybookExecutor.svelte';
+
+// Widgets
+export { default as DeviceStatusWidget } from './widgets/DeviceStatusWidget.svelte';
+export { default as TerminalWidget } from './widgets/TerminalWidget.svelte';
+export { default as ActivityWidget } from './widgets/ActivityWidget.svelte';
+export { default as PlaybookWidget } from './widgets/PlaybookWidget.svelte';
 
 // Types
 export type {
@@ -39,6 +49,16 @@ export type {
 	WsSessionListedMsg,
 	WsShellListMsg,
 	WsShellListedMsg,
+	WsSessionRenameMsg,
+	WsSessionAllowAiMsg,
+	WsSessionRenameAckMsg,
+	WsSessionAllowAiAckMsg,
+	WsSessionCreatedBroadcast,
+	WsSessionDestroyedBroadcast,
+	WsSessionRenamedBroadcast,
+	WsSessionAiPermissionChangedBroadcast,
+	WsSessionAiStatusChangedBroadcast,
+	WsSessionListMsg,
 	RemoteSessionInfo,
 	ServerConfig,
 	DeviceInfo,
@@ -49,11 +69,18 @@ export type {
 	ActivityType,
 	ActivitySource,
 	ActivityEntry,
-	WsActivityNewMsg
+	WsActivityNewMsg,
+	HistoryFilter,
+	PlaybookParam,
+	PlaybookSummary,
+	PlaybookDetail
 } from './types/terminal.types';
+
+export type { DeviceConnectionConfig } from './types/widget.types';
 
 // Utilities
 export { SctlWsClient } from './utils/ws-client';
 export { createTerminal, applyTheme, DEFAULT_THEME, type XtermInstance } from './utils/xterm';
 export { SctlRestClient } from './utils/rest-client';
 export { KeyboardManager, type Shortcut } from './utils/keyboard';
+export { parsePlaybookFrontmatter, renderPlaybookScript, validatePlaybookName } from './utils/playbook-parser';

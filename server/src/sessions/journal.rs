@@ -5,6 +5,8 @@
 //! output entries. On startup, journals are scanned to recover archived sessions.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -90,7 +92,9 @@ pub struct ArchivedSession {
 /// Writes are sent via an mpsc channel to a background task that batches them
 /// to disk.
 pub struct SessionJournal {
-    tx: mpsc::UnboundedSender<JournalEntry>,
+    tx: mpsc::Sender<JournalEntry>,
+    /// Set to `false` if the background writer task exits due to an error.
+    alive: Arc<AtomicBool>,
 }
 
 impl SessionJournal {
@@ -115,20 +119,31 @@ impl SessionJournal {
         file.write_all(b"\n").await?;
         file.flush().await?;
 
-        let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(journal_writer_task(file, rx));
+        let (tx, rx) = mpsc::channel(10_000);
+        let alive = Arc::new(AtomicBool::new(true));
+        tokio::spawn(journal_writer_task(file, rx, Arc::clone(&alive)));
 
-        Ok(Self { tx })
+        Ok(Self { tx, alive })
     }
 
     /// Get a clone of the sender for use by the buffer hook.
-    pub fn sender(&self) -> mpsc::UnboundedSender<JournalEntry> {
+    pub fn sender(&self) -> mpsc::Sender<JournalEntry> {
         self.tx.clone()
+    }
+
+    /// Whether the background writer task is still alive.
+    #[allow(dead_code)]
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
     }
 }
 
 /// Background task that drains journal entries and writes them to disk.
-async fn journal_writer_task(mut file: fs::File, mut rx: mpsc::UnboundedReceiver<JournalEntry>) {
+async fn journal_writer_task(
+    mut file: fs::File,
+    mut rx: mpsc::Receiver<JournalEntry>,
+    alive: Arc<AtomicBool>,
+) {
     while let Some(entry) = rx.recv().await {
         let line = match serde_json::to_string(&entry) {
             Ok(l) => l,
@@ -139,10 +154,12 @@ async fn journal_writer_task(mut file: fs::File, mut rx: mpsc::UnboundedReceiver
         };
         if let Err(e) = file.write_all(line.as_bytes()).await {
             error!("Journal write error: {e}");
+            alive.store(false, Ordering::Relaxed);
             return;
         }
         if let Err(e) = file.write_all(b"\n").await {
             error!("Journal write error: {e}");
+            alive.store(false, Ordering::Relaxed);
             return;
         }
         // Batch: drain all remaining entries in channel before flushing
@@ -156,16 +173,19 @@ async fn journal_writer_task(mut file: fs::File, mut rx: mpsc::UnboundedReceiver
             };
             if let Err(e) = file.write_all(line.as_bytes()).await {
                 error!("Journal write error: {e}");
+                alive.store(false, Ordering::Relaxed);
                 return;
             }
             if let Err(e) = file.write_all(b"\n").await {
                 error!("Journal write error: {e}");
+                alive.store(false, Ordering::Relaxed);
                 return;
             }
         }
         // Flush after draining batch
         if let Err(e) = file.flush().await {
             error!("Journal flush error: {e}");
+            alive.store(false, Ordering::Relaxed);
             return;
         }
     }

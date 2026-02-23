@@ -5,25 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - Unreleased
 
-### sctl (server)
+### sctl (server) v0.4.0
 
 #### Added
 
+- **Playbook REST API** — dedicated `/api/playbooks` CRUD endpoints with server-side YAML frontmatter validation.
+  - `GET /api/playbooks` — list playbooks with name, description, params.
+  - `GET /api/playbooks/:name` — get full playbook detail (metadata, params, script, raw content).
+  - `PUT /api/playbooks/:name` — create/update with server-side validation.
+  - `DELETE /api/playbooks/:name` — delete playbook.
+- **Playbook activity types** — `PlaybookList`, `PlaybookRead`, `PlaybookWrite`, `PlaybookDelete` in activity journal.
+- **Tunnel proxy** — playbook endpoints proxied through relay at `/d/{serial}/api/playbooks*`.
+- **Tunnel client** — handles `tunnel.playbooks.*` messages for proxied playbook operations.
+- **Config** — added `playbooks_dir` setting (default: `/etc/sctl/playbooks`).
 - **Reverse tunnel** — built-in relay for CGNAT devices. Any sctl instance can act as a relay; devices connect outbound via WebSocket and clients reach them through standard API URLs (`/d/{serial}/api/*`).
 - **AI status tracking** — `session.allow_ai`, `session.ai_status`, and broadcast events for real-time AI/human collaboration UI.
 - **Session rename** — `session.rename` message with broadcast to all connected clients.
 - **TLS via rustls** — switched from native-tls to rustls for TLS support.
 - **Tunnel reliability** — drain pending requests on disconnect, heartbeat sweep, backpressure, structured logging.
 
-### mcp-sctl (MCP proxy)
+### mcp-sctl v0.2.0
 
 #### Added
 
+- **Playbook REST methods** — `list_playbooks()`, `get_playbook()`, `put_playbook()`, `delete_playbook()` on `SctlClient`.
+- **API-first playbook loading** — uses `/api/playbooks` endpoint when available, falls back to file-based approach for older servers.
 - **AI status auto-management** — MCP proxy auto-sets `working=true` before session commands (activity=write for exec/send, activity=read for read). Auto-cleared by server after 60s inactivity.
 - **Session auto-routing** — sessions automatically routed to the correct device.
 - **Config version 2** — `config_version` bumped to 2. Extra metadata fields (`host`, `serial`, `arch`, `sctl_version`, `added_at`) are accepted and ignored by mcp-sctl, used by `rundev.sh device` commands.
+
+### sctlin (web) v0.2.0
+
+#### Added
+
+- **HistoryViewer** — full-panel activity viewer with type/source filter chips, text search, multi-expand, load-more pagination.
+- **PlaybookList** — playbook browser with name, description, param count badge, select/delete/create/refresh actions.
+- **PlaybookViewer** — playbook detail view with metadata header, parameter table, script block, execute/edit buttons.
+- **PlaybookExecutor** — parameter form with auto-populated defaults, live script preview, execution output display.
+- **Widgets** — new `sctlin/widgets` export path with self-contained components:
+  - `TerminalWidget` — wraps `TerminalContainer` with simplified config.
+  - `DeviceStatusWidget` — device info with polling, loading/error states.
+  - `ActivityWidget` — activity feed with REST fetch + real-time WebSocket updates.
+  - `PlaybookWidget` — playbook browser + viewer + executor with REST client.
+- **REST client** — added `getHealth()`, `listPlaybooks()`, `getPlaybook()`, `putPlaybook()`, `deletePlaybook()`.
+- **Types** — `HistoryFilter`, `PlaybookParam`, `PlaybookSummary`, `PlaybookDetail`, `DeviceConnectionConfig`.
+- **playbook-parser.ts** — client-side playbook frontmatter parsing, script rendering, name validation.
+- **Vitest** — test infrastructure with `@testing-library/svelte`.
+
+#### Fixed
+
+- Exported 13 previously missing WS message types from barrel files.
+- Moved `flowbite-svelte`, `flowbite-svelte-icons`, `gawdux` to `devDependencies`.
+- Removed `@sveltejs/kit` from `peerDependencies` (library is pure Svelte 5).
+- Removed `gawdux` dependency from `ServerPanel.svelte` (inlined flyout as positioned div).
 
 ### rundev.sh
 

@@ -110,8 +110,16 @@
 	// Quick exec
 	let quickExecVisible = $state(false);
 
-	// File browser
-	let fileBrowserVisible = $state(false);
+	// File browser (per-session open state, shared width)
+	let fileBrowserOpen: Record<string, boolean> = $state({});
+	const FB_WIDTH_KEY = 'sctlin-filebrowser-width';
+	let fileBrowserWidth = $state(
+		(() => { try { return parseInt(localStorage.getItem(FB_WIDTH_KEY) ?? '') || 384; } catch { return 384; } })()
+	);
+	let animatingSessionKey: string | null = $state(null);
+
+	// Persist shared width
+	$effect(() => { try { localStorage.setItem(FB_WIDTH_KEY, String(fileBrowserWidth)); } catch {} });
 
 	// Command palette
 	let commandPaletteVisible = $state(false);
@@ -138,6 +146,23 @@
 	let activeServerStatus = $derived(
 		activeServerId ? connectionStatuses[activeServerId] ?? 'disconnected' : null
 	);
+
+	/** Active session key for the active server. */
+	let activeSessionKey = $derived(
+		activeServerId ? activeKeys[activeServerId] ?? null : null
+	);
+
+	let activeFileBrowserOpen = $derived(
+		activeSessionKey ? !!fileBrowserOpen[activeSessionKey] : false
+	);
+
+	function toggleFileBrowser(sessionKey?: string) {
+		const key = sessionKey ?? activeSessionKey;
+		if (!key) return;
+		animatingSessionKey = key;
+		fileBrowserOpen = { ...fileBrowserOpen, [key]: !fileBrowserOpen[key] };
+		setTimeout(() => { animatingSessionKey = null; }, 350);
+	}
 
 	function getActiveSessionId(): string | null {
 		if (!activeServerId) return null;
@@ -615,7 +640,7 @@
 		</AppSidebar>
 
 		<!-- Terminal area: unified tabs + stacked containers -->
-		<div class="flex-1 min-w-0 flex flex-col">
+		<div class="flex-1 min-w-0 flex flex-col relative">
 			<!-- Unified tab bar across all servers -->
 			{#if unifiedSessions.length > 0}
 				<div class="flex items-center border-b border-neutral-700 h-8 shrink-0">
@@ -649,40 +674,58 @@
 				</div>
 			{/if}
 
-			<!-- Container stack + file browser -->
-			<div class="flex-1 flex min-h-0">
-				<!-- Terminal containers -->
-				<div class="flex-1 relative min-h-0 min-w-0">
-					<!-- Logo in background -->
-					<div class="absolute inset-0 flex items-center justify-center bg-neutral-950 pointer-events-none">
-						<img src="/sctl-logo.png" alt="sctl" class="max-w-full max-h-full w-auto h-auto opacity-90" style="object-fit: contain;" />
-					</div>
-
-					{#each servers as server (server.id)}
-						{#if serverConfigs[server.id]}
-							<div
-								class="absolute inset-0"
-								style:visibility={server.id === activeServerId ? 'visible' : 'hidden'}
-							>
-								<TerminalContainer
-									config={serverConfigs[server.id]}
-									showTabs={false}
-									onToggleFileBrowser={() => { fileBrowserVisible = !fileBrowserVisible; }}
-									fileBrowserOpen={fileBrowserVisible}
-									bind:this={containerRefs[server.id]}
-								/>
-							</div>
-						{/if}
-					{/each}
+			<!-- Container stack (terminal area) -->
+			<div class="flex-1 relative min-h-0">
+				<!-- Logo in background -->
+				<div class="absolute inset-0 flex items-center justify-center bg-neutral-950 pointer-events-none">
+					<img src="/sctl-logo.png" alt="sctl" class="max-w-full max-h-full w-auto h-auto opacity-90" style="object-fit: contain;" />
 				</div>
 
-				<!-- File browser (right side panel) -->
-				<FileBrowser
-					visible={fileBrowserVisible}
-					restClient={activeServerId ? serverRestClients[activeServerId] ?? null : null}
-					onclose={() => { fileBrowserVisible = false; }}
-				/>
+				<!-- Terminal containers -->
+				{#each servers as server (server.id)}
+					{#if serverConfigs[server.id]}
+						<div
+							class="absolute inset-0"
+							style:visibility={server.id === activeServerId ? 'visible' : 'hidden'}
+						>
+							<TerminalContainer
+								config={serverConfigs[server.id]}
+								showTabs={false}
+								onToggleFileBrowser={() => { toggleFileBrowser(activeKeys[server.id] ?? undefined); }}
+								fileBrowserOpen={!!fileBrowserOpen[activeKeys[server.id] ?? '']}
+								rightInset={fileBrowserOpen[activeKeys[server.id] ?? ''] ? fileBrowserWidth : 0}
+								rightInsetAnimate={animatingSessionKey === activeKeys[server.id]}
+								bind:this={containerRefs[server.id]}
+							/>
+						</div>
+					{/if}
+				{/each}
 			</div>
+
+			<!-- File browser (per-session, overlays from top-right, stops above ControlBar) -->
+			{#each servers as server (server.id)}
+				{#if serverConfigs[server.id]}
+					{#each serverSessions[server.id] ?? [] as session (session.key)}
+						<div
+							class="absolute top-0 right-0 z-10"
+							style="bottom: 28px;"
+							style:visibility={server.id === activeServerId && session.key === activeKeys[server.id] ? 'visible' : 'hidden'}
+						>
+							<FileBrowser
+								visible={server.id === activeServerId && session.key === activeKeys[server.id] && !!fileBrowserOpen[session.key]}
+								width={fileBrowserWidth}
+								animate={animatingSessionKey === session.key}
+								restClient={serverRestClients[server.id] ?? null}
+								onclose={() => { toggleFileBrowser(session.key); }}
+								onwidthchange={(w) => { fileBrowserWidth = w; }}
+								onsynccd={(path) => {
+									containerRefs[server.id]?.execInActiveSession(`cd ${path}`);
+								}}
+							/>
+						</div>
+					{/each}
+				{/if}
+			{/each}
 		</div>
 	</div>
 </div>

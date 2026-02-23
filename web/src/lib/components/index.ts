@@ -10,3 +10,8 @@ export { default as QuickExecBar } from './QuickExecBar.svelte';
 export { default as SplitPane } from './SplitPane.svelte';
 export { default as FileBrowser } from './FileBrowser.svelte';
 export { default as CommandPalette } from './CommandPalette.svelte';
+export { default as ActivityFeed } from './ActivityFeed.svelte';
+export { default as HistoryViewer } from './HistoryViewer.svelte';
+export { default as PlaybookList } from './PlaybookList.svelte';
+export { default as PlaybookViewer } from './PlaybookViewer.svelte';
+export { default as PlaybookExecutor } from './PlaybookExecutor.svelte';

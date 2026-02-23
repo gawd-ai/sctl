@@ -37,5 +37,24 @@ export type {
 	ActivityType,
 	ActivitySource,
 	ActivityEntry,
-	WsActivityNewMsg
+	WsActivityNewMsg,
+	WsSessionRenameMsg,
+	WsSessionAllowAiMsg,
+	WsSessionRenameAckMsg,
+	WsSessionAllowAiAckMsg,
+	WsSessionCreatedBroadcast,
+	WsSessionDestroyedBroadcast,
+	WsSessionRenamedBroadcast,
+	WsSessionAiPermissionChangedBroadcast,
+	WsSessionAiStatusChangedBroadcast,
+	WsSessionListMsg,
+	WsSessionListedMsg,
+	WsShellListMsg,
+	WsShellListedMsg,
+	HistoryFilter,
+	PlaybookParam,
+	PlaybookSummary,
+	PlaybookDetail
 } from './terminal.types';
+
+export type { DeviceConnectionConfig } from './widget.types';

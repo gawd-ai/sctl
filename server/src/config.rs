@@ -37,7 +37,7 @@
 //! url = "wss://relay.example.com/api/tunnel/register"  # client mode only
 //! reconnect_delay_secs = 5                 # client mode, initial backoff
 //! reconnect_max_delay_secs = 60            # client mode, max backoff
-//! heartbeat_interval_secs = 30             # client mode, ping interval
+//! heartbeat_interval_secs = 15             # client mode, ping interval
 //! ```
 
 use serde::Deserialize;
@@ -68,7 +68,7 @@ pub struct ServerConfig {
     /// Socket address to bind (default `0.0.0.0:1337`).
     #[serde(default = "default_listen")]
     pub listen: String,
-    /// Maximum concurrent TCP connections (default 10). **Not currently enforced.**
+    /// Maximum concurrent TCP connections (default 10). Enforced via tower `ConcurrencyLimitLayer`.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
     /// Maximum concurrent WebSocket shell sessions (default 20).
@@ -98,6 +98,12 @@ pub struct ServerConfig {
     /// Auto-delete journals older than this many hours (default 72).
     #[serde(default = "default_journal_max_age_hours")]
     pub journal_max_age_hours: u64,
+    /// Directory containing playbook markdown files (default `/etc/sctl/playbooks`).
+    #[serde(default = "default_playbooks_dir")]
+    pub playbooks_dir: String,
+    /// Maximum entries in the in-memory activity log ring buffer (default 200).
+    #[serde(default = "default_activity_log_max_entries")]
+    pub activity_log_max_entries: usize,
     /// Default terminal rows for PTY sessions (default 24).
     #[serde(default = "default_terminal_rows")]
     pub default_terminal_rows: u16,
@@ -177,7 +183,7 @@ pub struct TunnelConfig {
     /// Seconds between heartbeat pings (client mode, default 30).
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval_secs: u64,
-    /// Seconds before a device is considered dead if no heartbeat (relay mode, default 90).
+    /// Seconds before a device is considered dead if no heartbeat (relay mode, default 45).
     #[serde(default = "default_heartbeat_timeout")]
     pub heartbeat_timeout_secs: u64,
     /// Default proxy request timeout in seconds (relay mode, default 60).
@@ -233,11 +239,17 @@ fn default_journal_fsync_interval_ms() -> u64 {
 fn default_journal_max_age_hours() -> u64 {
     72
 }
+fn default_activity_log_max_entries() -> usize {
+    200
+}
 fn default_terminal_rows() -> u16 {
     24
 }
 fn default_terminal_cols() -> u16 {
     80
+}
+fn default_playbooks_dir() -> String {
+    "/etc/sctl/playbooks".to_string()
 }
 fn default_supervisor_max_backoff() -> u64 {
     60
@@ -252,10 +264,10 @@ fn default_reconnect_max_delay() -> u64 {
     60
 }
 fn default_heartbeat_interval() -> u64 {
-    30
+    15
 }
 fn default_heartbeat_timeout() -> u64 {
-    90
+    45
 }
 fn default_tunnel_proxy_timeout() -> u64 {
     60
@@ -275,8 +287,10 @@ impl Default for ServerConfig {
             journal_enabled: default_journal_enabled(),
             journal_fsync_interval_ms: default_journal_fsync_interval_ms(),
             journal_max_age_hours: default_journal_max_age_hours(),
+            activity_log_max_entries: default_activity_log_max_entries(),
             default_terminal_rows: default_terminal_rows(),
             default_terminal_cols: default_terminal_cols(),
+            playbooks_dir: default_playbooks_dir(),
         }
     }
 }

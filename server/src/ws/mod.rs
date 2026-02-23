@@ -58,7 +58,7 @@ use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
-use tracing::info;
+use tracing::{error, info};
 
 use crate::activity::{ActivitySource, ActivityType};
 use crate::sessions::buffer::{OutputBuffer, OutputEntry, OutputStream};
@@ -164,7 +164,13 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
     // Task: forward channel messages to WebSocket sink
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            let text = serde_json::to_string(&msg).expect("Value serializes");
+            let text = match serde_json::to_string(&msg) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("WS send: failed to serialize message: {e}");
+                    continue;
+                }
+            };
             if ws_sink
                 .send(axum::extract::ws::Message::Text(text.into()))
                 .await
@@ -375,9 +381,13 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                                             "status": s.status,
                                             "idle": s.idle,
                                             "idle_timeout": s.idle_timeout,
+                                            "created_at": s.created_at,
                                             "user_allows_ai": s.user_allows_ai,
                                             "ai_is_working": s.ai_is_working,
                                         });
+                                        if let Some(exit_code) = s.exit_code {
+                                            obj["exit_code"] = json!(exit_code);
+                                        }
                                         if let Some(ref name) = s.name {
                                             obj["name"] = json!(name);
                                         }
@@ -708,6 +718,7 @@ async fn handle_session_start(
                 "persistent": persistent,
                 "pty": use_pty,
                 "user_allows_ai": allows_ai,
+                "created_at": crate::sessions::journal::now_ms(),
             });
             if let Some(n) = name {
                 resp["name"] = json!(n);
@@ -742,6 +753,7 @@ async fn handle_session_start(
                         "pty": use_pty,
                         "persistent": persistent,
                     })),
+                    None,
                 )
                 .await;
 
@@ -789,6 +801,7 @@ async fn handle_session_exec(
         let mut resp = json!({
             "type": "session.exec.ack",
             "session_id": session_id,
+            "command": command,
         });
         if let Some(rid) = request_id {
             resp["request_id"] = json!(rid);
@@ -802,6 +815,7 @@ async fn handle_session_exec(
                 ActivitySource::Ws,
                 crate::activity::truncate_str(command, 80),
                 Some(json!({ "session_id": session_id })),
+                None,
             )
             .await;
     }
@@ -855,6 +869,7 @@ async fn handle_session_kill(
                 ActivitySource::Ws,
                 format!("session {}", &session_id[..8.min(session_id.len())]),
                 Some(json!({ "session_id": session_id })),
+                None,
             )
             .await;
     } else {
@@ -906,6 +921,7 @@ async fn handle_session_signal(
                         &session_id[..8.min(session_id.len())]
                     ),
                     Some(json!({ "session_id": session_id, "signal": signal })),
+                    None,
                 )
                 .await;
         }

@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
-	import { SidebarFlyout } from 'gawdux';
 	import type {
 		ServerConfig,
 		SessionInfo,
@@ -836,28 +835,25 @@
 <!-- Flyout (collapsed mode) -->
 {#if collapsed && flyoutServerId && flyoutServer}
 	{@const flyoutSessions = getServerDisplaySessions(flyoutServerId)}
-	<SidebarFlyout
-		top={flyoutTop}
-		left={collapsedWidth}
-		duration={150}
-		onMouseEnter={keepFlyoutOpen}
-		onMouseLeave={handleMouseLeave}
-		class="!bg-neutral-900 !border-neutral-700"
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div
+		class="fixed z-50 bg-neutral-900 border border-neutral-700 rounded-md shadow-xl"
+		style="top: {flyoutTop}px; left: {collapsedWidth}px;"
+		onmouseenter={keepFlyoutOpen}
+		onmouseleave={handleMouseLeave}
 	>
-		{#snippet children()}
-			<div class="min-w-[180px]">
-				<!-- Header bar -->
-				<div class="flex items-center gap-2 px-2.5 py-1.5 border-b border-neutral-700/50">
-					<span class="text-xs text-neutral-300 font-mono truncate flex-1">{flyoutServer.name}</span>
-					{#if flyoutServer.sessionCount > 0}
-						<span class="text-[10px] text-neutral-600 tabular-nums">{flyoutServer.sessionCount}</span>
-					{/if}
-				</div>
-				<!-- Shared body -->
-				{@render serverBody(flyoutServer, flyoutSessions, 28, true)}
+		<div class="min-w-[180px]">
+			<!-- Header bar -->
+			<div class="flex items-center gap-2 px-2.5 py-1.5 border-b border-neutral-700/50">
+				<span class="text-xs text-neutral-300 font-mono truncate flex-1">{flyoutServer.name}</span>
+				{#if flyoutServer.sessionCount > 0}
+					<span class="text-[10px] text-neutral-600 tabular-nums">{flyoutServer.sessionCount}</span>
+				{/if}
 			</div>
-		{/snippet}
-	</SidebarFlyout>
+			<!-- Shared body -->
+			{@render serverBody(flyoutServer, flyoutSessions, 28, true)}
+		</div>
+	</div>
 {/if}
 </div>
 
@@ -867,14 +863,5 @@
 	}
 	.server-panel.collapsed .server-label {
 		opacity: 0;
-	}
-
-	/* Ensure flyout buttons are clickable */
-	:global(.flyout-menu) {
-		pointer-events: auto !important;
-	}
-	:global(.flyout-menu button),
-	:global(.flyout-menu [onclick]) {
-		pointer-events: auto !important;
 	}
 </style>

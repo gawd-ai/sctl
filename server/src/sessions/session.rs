@@ -62,14 +62,14 @@ impl ManagedSession {
     /// Takes ownership of the child's stdio handles and spawns four background
     /// tasks (stdin writer, stdout reader, stderr reader, exit watcher) that
     /// route I/O through the [`OutputBuffer`].
-    pub fn spawn(session_id: String, mut child: Child, buffer_size: usize) -> Self {
+    pub fn spawn(session_id: String, mut child: Child, buffer_size: usize) -> Result<Self, String> {
         let process_id = child.id().unwrap_or(0);
         // pgid = pid because the shell is the process group leader via setpgid(0,0)
         let process_group_id = process_id;
 
-        let stdin = child.stdin.take().expect("stdin piped");
-        let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take().expect("stderr piped");
+        let stdin = child.stdin.take().ok_or("Failed to take stdin pipe")?;
+        let stdout = child.stdout.take().ok_or("Failed to take stdout pipe")?;
+        let stderr = child.stderr.take().ok_or("Failed to take stderr pipe")?;
 
         let buffer = Arc::new(Mutex::new(OutputBuffer::new(buffer_size)));
         let status = Arc::new(Mutex::new(SessionStatus::Running));
@@ -153,7 +153,7 @@ impl ManagedSession {
             *status_exit.lock().await = SessionStatus::Exited;
         });
 
-        ManagedSession {
+        Ok(ManagedSession {
             pid: process_id,
             pgid: process_group_id,
             buffer,
@@ -162,7 +162,7 @@ impl ManagedSession {
             stdin_tx,
             tasks: vec![stdin_task, stdout_task, stderr_task, exit_task],
             pty_master: None,
-        }
+        })
     }
 
     /// Spawn a PTY-backed session. Output is a single merged stream.
@@ -174,7 +174,7 @@ impl ManagedSession {
         mut child: Child,
         pty_master: OwnedFd,
         buffer_size: usize,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let process_id = child.id().unwrap_or(0);
         // For PTY sessions the child is a session leader via setsid(), so
         // the pgid equals the pid.
@@ -188,9 +188,23 @@ impl ManagedSession {
 
         // Dup the master fd: one for writing, one for reading, one kept for resize
         let writer_fd: RawFd = unsafe { libc::dup(master_raw) };
-        assert!(writer_fd >= 0, "dup() failed for PTY master writer");
+        if writer_fd < 0 {
+            return Err(format!(
+                "dup() failed for PTY master writer: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
         let reader_fd: RawFd = unsafe { libc::dup(master_raw) };
-        assert!(reader_fd >= 0, "dup() failed for PTY master reader");
+        if reader_fd < 0 {
+            // Close the first dup'd fd before returning
+            unsafe {
+                libc::close(writer_fd);
+            }
+            return Err(format!(
+                "dup() failed for PTY master reader: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
 
         // Convert to tokio async file handles (File wraps std::fs::File → tokio)
         // SAFETY: we own these file descriptors via dup
@@ -261,7 +275,7 @@ impl ManagedSession {
 
         // pty_master OwnedFd stays alive for resize operations. The dup'd fds
         // for read/write are independent and will be closed when their tasks end.
-        ManagedSession {
+        Ok(ManagedSession {
             pid: process_id,
             pgid: process_group_id,
             buffer,
@@ -270,7 +284,7 @@ impl ManagedSession {
             stdin_tx,
             tasks: vec![stdin_task, output_task, exit_task],
             pty_master: Some(pty_master),
-        }
+        })
     }
 
     /// Create an archived (read-only) session from recovered journal data.

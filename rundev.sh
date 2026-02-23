@@ -1091,11 +1091,27 @@ EOF
                 log "  $rname ($rhost) — relay via $our_ip:8443"
             fi
 
+            # Build optional DNS fixup for external tunnel URLs
+            local dns_fixup=""
+            if [[ -n "$remote_relay_url" ]]; then
+                dns_fixup='
+# Ensure DNS can resolve external hostnames (dnsmasq may use a local
+# upstream that returns NXDOMAIN before the real DNS servers respond).
+# Uses dnsmasq conf-dir so the fix survives dnsmasq restarts.
+DNSMASQ_CONFDIR=$(grep -o "conf-dir=[^ ]*" /var/etc/dnsmasq.conf.* 2>/dev/null | head -1 | cut -d= -f2)
+if [ -n "$DNSMASQ_CONFDIR" ] && [ ! -f "$DNSMASQ_CONFDIR/tunnel-dns.conf" ]; then
+    echo "server=8.8.8.8" > "$DNSMASQ_CONFDIR/tunnel-dns.conf"
+    /etc/init.d/dnsmasq restart 2>/dev/null || killall -HUP dnsmasq 2>/dev/null || true
+    sleep 1
+fi'
+            fi
+
             # SSH in: stop init.d, create temp config, start sctl with tunnel
             local remote_script
             remote_script=$(cat <<REOF
 # Stop normal sctl
 /etc/init.d/sctl stop 2>/dev/null || true
+$dns_fixup
 
 # Copy config as base
 cp /etc/sctl/sctl.toml /tmp/sctl-relay.toml 2>/dev/null || true
@@ -1114,17 +1130,24 @@ tunnel_key = "$TUNNEL_KEY"
 url = "$device_tunnel_url"
 TEOF
 
-# Start sctl with tunnel config
-nohup /usr/bin/sctl serve --config /tmp/sctl-relay.toml >/tmp/sctl-relay.log 2>&1 &
+# Start sctl with tunnel config (no nohup on OpenWrt/ash)
+/usr/bin/sctl serve --config /tmp/sctl-relay.toml >/tmp/sctl-relay.log 2>&1 &
 echo \$!
 REOF
             )
 
-            local rpid
-            rpid=$(ssh $ssh_opts "root@$rhost" "$remote_script" 2>/dev/null) || {
-                warn "  Failed to start tunnel on $rname ($rhost)"
+            local rpid ssh_stderr ssh_exit
+            ssh_stderr=$(mktemp)
+            rpid=$(ssh $ssh_opts "root@$rhost" "$remote_script" 2>"$ssh_stderr") || {
+                ssh_exit=$?
+                warn "  Failed to start tunnel on $rname ($rhost) — SSH exit code: $ssh_exit"
+                if [[ -s "$ssh_stderr" ]]; then
+                    warn "  SSH stderr: $(cat "$ssh_stderr")"
+                fi
+                rm -f "$ssh_stderr"
                 continue
             }
+            rm -f "$ssh_stderr"
 
             remote_pids+=("$rpid")
             ok "  $rname: tunnel process started (remote PID $rpid)"
@@ -1248,9 +1271,9 @@ REOF
                 local rhost="${remote_hosts[$i]}"
                 local rpid="${remote_pids[$i]:-}"
                 (
-                    # Kill temp sctl process
+                    # Kill temp sctl process and clean up DNS fixup
                     if [[ -n "$rpid" ]]; then
-                        ssh $ssh_opts "root@$rhost" "kill $rpid 2>/dev/null; rm -f /tmp/sctl-relay.toml /tmp/sctl-relay.log" 2>/dev/null || true
+                        ssh $ssh_opts "root@$rhost" "kill $rpid 2>/dev/null; rm -f /tmp/sctl-relay.toml /tmp/sctl-relay.log; "'DNSMASQ_CONFDIR=$(grep -o "conf-dir=[^ ]*" /var/etc/dnsmasq.conf.* 2>/dev/null | head -1 | cut -d= -f2); if [ -n "$DNSMASQ_CONFDIR" ] && [ -f "$DNSMASQ_CONFDIR/tunnel-dns.conf" ]; then rm -f "$DNSMASQ_CONFDIR/tunnel-dns.conf"; /etc/init.d/dnsmasq restart 2>/dev/null || killall -HUP dnsmasq 2>/dev/null || true; fi' 2>/dev/null || true
                     fi
                     # Restart normal sctl
                     ssh $ssh_opts "root@$rhost" "/etc/init.d/sctl start" 2>/dev/null || true

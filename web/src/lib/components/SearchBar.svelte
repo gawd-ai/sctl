@@ -27,6 +27,12 @@
 		inputEl?.focus();
 	});
 
+	$effect(() => {
+		return () => {
+			clearTimeout(debounceTimer);
+		};
+	});
+
 	function handleInput() {
 		clearTimeout(debounceTimer);
 		debounceTimer = setTimeout(() => {

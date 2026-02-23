@@ -12,7 +12,11 @@ export type ActivityType =
 	| 'session_start'
 	| 'session_exec'
 	| 'session_kill'
-	| 'session_signal';
+	| 'session_signal'
+	| 'playbook_list'
+	| 'playbook_read'
+	| 'playbook_write'
+	| 'playbook_delete';
 
 export type ActivitySource = 'mcp' | 'ws' | 'rest' | 'unknown';
 
@@ -342,8 +346,9 @@ export interface NetworkInterface {
 
 export interface DirEntry {
 	name: string;
-	type: 'file' | 'directory' | 'symlink' | 'other';
+	type: 'file' | 'dir' | 'symlink' | 'other';
 	size: number;
+	mode?: string;
 	modified?: string;
 	symlink_target?: string;
 }
@@ -353,6 +358,7 @@ export interface FileContent {
 	encoding: string;
 	size: number;
 	path: string;
+	truncated?: boolean;
 }
 
 export interface ExecResult {
@@ -461,3 +467,34 @@ export type WsServerMsg =
 	| WsSessionAiStatusChangedBroadcast
 	| WsActivityNewMsg
 	| WsErrorMsg;
+
+// ── History/Activity filtering ─────────────────────────────────
+
+export interface HistoryFilter {
+	activityTypes?: ActivityType[];
+	sources?: ActivitySource[];
+	search?: string;
+}
+
+// ── Playbook types ─────────────────────────────────────────────
+
+export interface PlaybookParam {
+	type: string;
+	description: string;
+	default?: unknown;
+	enum?: unknown[];
+}
+
+export interface PlaybookSummary {
+	name: string;
+	description: string;
+	params: string[];
+}
+
+export interface PlaybookDetail {
+	name: string;
+	description: string;
+	params: Record<string, PlaybookParam>;
+	script: string;
+	raw_content: string;
+}

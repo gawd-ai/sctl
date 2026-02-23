@@ -5,7 +5,11 @@
 //! middleware.
 
 pub mod activity;
+pub mod events;
 pub mod exec;
 pub mod files;
 pub mod health;
 pub mod info;
+pub mod playbooks;
+pub mod sessions;
+pub mod shells;

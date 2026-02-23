@@ -215,6 +215,47 @@ fn builtin_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "device_file_delete",
+            "description": "Delete a file on a sctl device.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path to the file to delete."
+                    },
+                    "device": {
+                        "type": "string",
+                        "description": "Device name. Omit to use the default device."
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "device_activity",
+            "description": "Read the activity log from a sctl device. Returns recent operations (exec, file I/O, session lifecycle) with timestamps, sources, and details.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "device": {
+                        "type": "string",
+                        "description": "Device name. Omit to use the default device."
+                    },
+                    "since_id": {
+                        "type": "integer",
+                        "description": "Only return entries with id > since_id. Default 0 (all)."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum entries to return. Default 50."
+                    }
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "session_start",
             "description": "Start a persistent interactive shell session on a device. Returns a session_id for subsequent calls. Sessions are NEVER killed automatically unless you set idle_timeout. Use idle_timeout to control cleanup of sessions you may not return to.\n\nSession lifecycle:\n- idle_timeout=0 (default): session lives forever until explicitly killed via session_kill\n- idle_timeout=N: session is gracefully terminated after N seconds of inactivity while detached (no client connected)\n- For long-running work, use 0 or a high value (3600). For quick one-off commands, use a lower value (300-600).\n- Activity resets whenever you send input or re-attach.\n\nSet pty=true for full terminal emulation (TUI programs like nano, vi, htop).\n\nPTY workflow:\n1. session_exec to run commands — works in both shell prompts and TUI programs (auto-appends Enter)\n2. session_send for raw keystrokes without Enter (arrow keys, Ctrl combos, Escape sequences)\n3. session_read to see output (contains ANSI escape codes in PTY mode)\n\nSee session_send description for full list of control characters and escape sequences (arrow keys, function keys, navigation keys, etc.).\n\nPTY workflow for TUI programs (Claude Code, fzf, dialog, etc.):\n- Use session_send to type text (no Enter appended)\n- Use session_send with \\n to press Enter (auto-translated to \\r)\n- Do NOT use session_exec for TUI input fields — it sends text+Enter as one write, which TUIs may interpret as embedded newline rather than submit",
             "inputSchema": {
@@ -409,7 +450,7 @@ fn builtin_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "session_list",
-            "description": "List all sessions on a sctl device. Shows session IDs, status, PTY mode, idle time, and whether each session is currently attached. Returns all sessions on the server, including those created by other clients.",
+            "description": "List all sessions on a sctl device. Shows session IDs, status, PTY mode, idle time, and whether each session is currently attached. Returns all sessions on the server, including those created by other clients.\n\nResponse fields per session: id, name, status (running/exited), pty, shell, working_dir, idle_secs, attached, ai_is_working, ai_activity, ai_message, user_allows_ai, exit_code, created_at, idle_timeout.\n\nWhen device is omitted, iterates all configured devices and merges results.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -519,7 +560,7 @@ fn builtin_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "session_ai_status",
-            "description": "Report AI working status for a session. Call this to tell the terminal UI what you are doing.\n\nWorkflow:\n1. Before starting work: call with working=true, activity, and message.\n2. While working: call again to update activity or message as your task changes.\n3. When done: call with working=false to clear the status.\n\nEnforcement: working=true will fail if the user has not allowed AI for this session (via session_allow_ai). Always handle this error gracefully.\n\nVisual effect in the terminal UI:\n- activity='read' → blue border, 'AI Reading' badge (use for inspection, reading files, no side effects)\n- activity='write' → green border, 'AI Executing' badge (use when running commands, writing files, making changes)\n- message is shown in the status bar (e.g. 'Running tests', 'Reading config')\n\nWhile working=true, keyboard input from the human is blocked on that session.",
+            "description": "Report AI working status for a session. Call this to tell the terminal UI what you are doing.\n\nWorkflow:\n1. Before starting work: call with working=true, activity, and message.\n2. While working: call again to update activity or message as your task changes.\n3. When done: call with working=false to clear the status.\n\nEnforcement: working=true will fail if the user has not allowed AI for this session (via session_allow_ai). Always handle this error gracefully.\n\nVisual effect in the terminal UI:\n- activity='read' → blue border, 'AI Reading' badge (use for inspection, reading files, no side effects)\n- activity='write' → green border, 'AI Executing' badge (use when running commands, writing files, making changes)\n- message is shown in the status bar (e.g. 'Running tests', 'Reading config')\n\nWhile working=true, keyboard input from the human is blocked on that session.\n\nNote: If session_start returned user_allows_ai: false, do not call with working=true — it will be rejected. The user must grant AI access first via session_allow_ai or the terminal UI.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -629,6 +670,8 @@ pub async fn handle_tool_call(
         "device_exec_batch" => handle_device_exec_batch(args, registry).await,
         "device_file_read" => handle_device_file_read(args, registry).await,
         "device_file_write" => handle_device_file_write(args, registry).await,
+        "device_file_delete" => handle_device_file_delete(args, registry).await,
+        "device_activity" => handle_device_activity(args, registry).await,
         "session_start" => handle_session_start(args, registry).await,
         "session_exec" => handle_session_exec(args, registry).await,
         "session_send" => handle_session_send(args, registry).await,
@@ -824,6 +867,38 @@ async fn handle_device_file_write(args: &Value, registry: &DeviceRegistry) -> To
         .file_write(path, content, encoding, mode, create_dirs)
         .await
     {
+        Ok(v) => ToolResult::success(v),
+        Err(e) => ToolResult::error(e.to_string()),
+    }
+}
+
+async fn handle_device_file_delete(args: &Value, registry: &DeviceRegistry) -> ToolResult {
+    let client = match registry.resolve(get_device_param(args)) {
+        Ok(c) => c,
+        Err(e) => return ToolResult::error(e),
+    };
+
+    let path = match args.get("path").and_then(Value::as_str) {
+        Some(p) => p,
+        None => return ToolResult::error("Missing required parameter: path".into()),
+    };
+
+    match client.file_delete(path).await {
+        Ok(v) => ToolResult::success(v),
+        Err(e) => ToolResult::error(e.to_string()),
+    }
+}
+
+async fn handle_device_activity(args: &Value, registry: &DeviceRegistry) -> ToolResult {
+    let client = match registry.resolve(get_device_param(args)) {
+        Ok(c) => c,
+        Err(e) => return ToolResult::error(e),
+    };
+
+    let since_id = args.get("since_id").and_then(Value::as_u64).unwrap_or(0);
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50);
+
+    match client.activity(since_id, limit).await {
         Ok(v) => ToolResult::success(v),
         Err(e) => ToolResult::error(e.to_string()),
     }
@@ -1498,7 +1573,20 @@ async fn handle_playbook_list(
                 "description": pb.description,
                 "device": pb.source_device,
                 "path": pb.source_path,
-                "params": pb.params.keys().collect::<Vec<_>>(),
+                "params": pb.params.iter().map(|(k, v)| {
+                    let mut param = json!({
+                        "name": k,
+                        "type": v.param_type,
+                        "description": v.description,
+                    });
+                    if let Some(ref default) = v.default {
+                        param["default"] = default.clone();
+                    }
+                    if let Some(ref enum_vals) = v.enum_values {
+                        param["enum"] = json!(enum_vals);
+                    }
+                    param
+                }).collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -1527,6 +1615,28 @@ async fn handle_playbook_get(
         Err(e) => return ToolResult::error(e),
     };
 
+    // Try REST endpoint first, fall back to file-based.
+    match client.get_playbook(name).await {
+        Ok(v) => {
+            let content = v
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or_default();
+            let path = v.get("path").and_then(|p| p.as_str()).unwrap_or_default();
+            return ToolResult::success(json!({
+                "name": name,
+                "device": dev_name,
+                "path": path,
+                "content": content,
+            }));
+        }
+        Err(e) if e.is_not_found() => {
+            // Fall through to file-based approach
+        }
+        Err(e) => return ToolResult::error(format!("Cannot read playbook '{}': {}", name, e)),
+    }
+
+    // File-based fallback for older servers.
     let dir = get_playbooks_dir(dev_name, pb_reg);
     let path = format!("{}/{}.md", dir, name);
 
@@ -1570,11 +1680,30 @@ async fn handle_playbook_put(
         Err(e) => return ToolResult::error(e),
     };
 
-    let dir = get_playbooks_dir(dev_name, pb_reg);
-    let path = format!("{}/{}.md", dir, name);
-
     if content.is_empty() {
-        // Delete
+        // Delete — try REST first, fall back to file-based.
+        match client.delete_playbook(name).await {
+            Ok(_) => {
+                pb_reg.invalidate_device(dev_name).await;
+                let mut result = ToolResult::success(json!({
+                    "action": "deleted",
+                    "name": name,
+                    "device": dev_name,
+                }));
+                result.tools_changed = true;
+                return result;
+            }
+            Err(e) if e.is_not_found() => {
+                // Fall through to file-based approach
+            }
+            Err(e) => {
+                return ToolResult::error(format!("Cannot delete playbook '{}': {}", name, e))
+            }
+        }
+
+        // File-based fallback for delete.
+        let dir = get_playbooks_dir(dev_name, pb_reg);
+        let path = format!("{}/{}.md", dir, name);
         let rm_cmd = format!("rm -f '{}'", path);
         match client.exec(&rm_cmd, None, None, None).await {
             Ok(_) => {
@@ -1592,9 +1721,34 @@ async fn handle_playbook_put(
         }
     } else {
         // Validate before writing
-        if let Err(e) = playbooks::parse_playbook(content, dev_name, &path) {
+        let placeholder_path = format!("{}.md", name);
+        if let Err(e) = playbooks::parse_playbook(content, dev_name, &placeholder_path) {
             return ToolResult::error(format!("Invalid playbook: {}", e));
         }
+
+        // Create/update — try REST first, fall back to file-based.
+        match client.put_playbook(name, content).await {
+            Ok(v) => {
+                pb_reg.invalidate_device(dev_name).await;
+                let path = v.get("path").and_then(|p| p.as_str()).unwrap_or_default();
+                let mut result = ToolResult::success(json!({
+                    "action": "saved",
+                    "name": name,
+                    "device": dev_name,
+                    "path": path,
+                }));
+                result.tools_changed = true;
+                return result;
+            }
+            Err(e) if e.is_not_found() => {
+                // Fall through to file-based approach
+            }
+            Err(e) => return ToolResult::error(format!("Cannot write playbook '{}': {}", name, e)),
+        }
+
+        // File-based fallback for create/update.
+        let dir = get_playbooks_dir(dev_name, pb_reg);
+        let path = format!("{}/{}.md", dir, name);
 
         match client
             .file_write(&path, content, None, None, Some(true))
@@ -1644,7 +1798,9 @@ async fn handle_playbook_exec(
         Err(e) => return ToolResult::error(e),
     };
 
-    match client.exec(&script, None, None, None).await {
+    let timeout_ms = args.get("timeout_ms").and_then(Value::as_u64);
+
+    match client.exec(&script, timeout_ms, None, None).await {
         Ok(v) => ToolResult::success(json!({
             "playbook": pb.name,
             "device": device,

@@ -21,6 +21,7 @@
 
 	let containerEl: HTMLDivElement | undefined = $state();
 	let dragging = $state(false);
+	let dragCleanup: (() => void) | undefined;
 
 	function handleMouseDown(e: MouseEvent) {
 		e.preventDefault();
@@ -49,16 +50,24 @@
 			onratiochange?.(newRatio);
 		};
 
-		const onMouseUp = () => {
+		const cleanup = () => {
 			dragging = false;
 			document.body.style.userSelect = '';
 			window.removeEventListener('mousemove', onMouseMove);
-			window.removeEventListener('mouseup', onMouseUp);
+			window.removeEventListener('mouseup', cleanup);
+			dragCleanup = undefined;
 		};
 
+		dragCleanup = cleanup;
 		window.addEventListener('mousemove', onMouseMove);
-		window.addEventListener('mouseup', onMouseUp);
+		window.addEventListener('mouseup', cleanup);
 	}
+
+	$effect(() => {
+		return () => {
+			dragCleanup?.();
+		};
+	});
 
 	let gridTemplate = $derived(
 		direction === 'horizontal'

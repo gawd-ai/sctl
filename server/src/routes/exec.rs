@@ -16,7 +16,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::activity::{self, ActivityType};
+use crate::activity::{self, request_id_from_headers, ActivityType};
 use crate::shell::process;
 use crate::AppState;
 
@@ -68,6 +68,7 @@ pub async fn exec(
     Json(payload): Json<ExecRequest>,
 ) -> Result<Json<ExecResponse>, (StatusCode, Json<Value>)> {
     let source = activity::source_from_headers(&headers);
+    let req_id = request_id_from_headers(&headers);
     let timeout = payload
         .timeout_ms
         .unwrap_or(state.config.server.exec_timeout_ms);
@@ -104,6 +105,7 @@ pub async fn exec(
                         "stdout_preview": activity::truncate_str(&result.stdout, 200),
                         "stderr_preview": activity::truncate_str(&result.stderr, 200),
                     })),
+                    req_id.clone(),
                 )
                 .await;
             Ok(Json(ExecResponse {
@@ -196,6 +198,7 @@ pub async fn batch_exec(
     Json(payload): Json<BatchExecRequest>,
 ) -> Result<Json<BatchExecResponse>, (StatusCode, Json<Value>)> {
     let source = activity::source_from_headers(&headers);
+    let req_id = request_id_from_headers(&headers);
     if payload.commands.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -255,7 +258,7 @@ pub async fn batch_exec(
         .await
         {
             Ok(result) => {
-                log_batch_exec(&state, source, &cmd.command, &result).await;
+                log_batch_exec(&state, source, &cmd.command, &result, req_id.clone()).await;
                 ExecResponse {
                     exit_code: result.exit_code,
                     stdout: result.stdout,
@@ -293,6 +296,7 @@ async fn log_batch_exec(
     source: activity::ActivitySource,
     command: &str,
     result: &process::ExecResult,
+    request_id: Option<String>,
 ) {
     state
         .activity_log
@@ -305,6 +309,7 @@ async fn log_batch_exec(
                 "duration_ms": result.duration_ms,
                 "batch": true,
             })),
+            request_id,
         )
         .await;
 }

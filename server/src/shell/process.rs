@@ -104,8 +104,14 @@ pub async fn exec_command(
         .spawn()
         .map_err(|e| ExecError::SpawnFailed(e.to_string()))?;
 
-    let mut stdout = child.stdout.take().expect("stdout piped");
-    let mut stderr = child.stderr.take().expect("stderr piped");
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ExecError::ProcessFailed("Failed to take stdout pipe".to_string()))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ExecError::ProcessFailed("Failed to take stderr pipe".to_string()))?;
 
     let timeout = tokio::time::Duration::from_millis(timeout_ms);
     match Box::pin(tokio::time::timeout(timeout, async {

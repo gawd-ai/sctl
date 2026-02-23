@@ -24,9 +24,11 @@
 		showTabs?: boolean;
 		onToggleFileBrowser?: () => void;
 		fileBrowserOpen?: boolean;
+		rightInset?: number;
+		rightInsetAnimate?: boolean;
 	}
 
-	let { config, showTabs = true, onToggleFileBrowser = undefined, fileBrowserOpen = false }: Props = $props();
+	let { config, showTabs = true, onToggleFileBrowser = undefined, fileBrowserOpen = false, rightInset = 0, rightInsetAnimate = false }: Props = $props();
 
 	let sessions: SessionInfo[] = $state([]);
 	let activeKey: string | null = $state(null);
@@ -166,6 +168,10 @@
 			const since = seqMap.get(sessionId) ?? 0;
 
 			const result = await client.attachSession(sessionId, since);
+
+			// Guard: session may have been removed or marked dead during the await
+			const current = sessions.find((s) => s.sessionId === sessionId);
+			if (!current || current.dead) return;
 
 			if (existing) {
 				// Tab already exists — just subscribe and mark attached
@@ -610,6 +616,14 @@
 		}
 	}
 
+	/** Send a command to the active PTY session (e.g. `cd /path`). */
+	export function execInActiveSession(command: string): void {
+		if (!activeKey) return;
+		const sess = sessions.find((s) => s.key === activeKey);
+		if (!sess) return;
+		client.execCommand(sess.sessionId, command);
+	}
+
 	/** Run a one-shot command over the WS (temp non-PTY session). */
 	export async function exec(command: string): Promise<string> {
 		const sess = await client.startSession({ pty: false });
@@ -767,7 +781,9 @@
 	{/if}
 
 	<!-- Terminal area -->
-	<div class="flex-1 relative min-h-0">
+	<div class="flex-1 relative min-h-0"
+		 style:margin-right="{rightInset ?? 0}px"
+		 style:transition={rightInsetAnimate ? 'margin 300ms ease-in-out' : 'none'}>
 		{#if sessions.length > 0}
 			<div class="absolute inset-0 pointer-events-none" style="background: rgba(12, 12, 12, 0.85); z-index: 0;"></div>
 		{/if}

@@ -14,6 +14,7 @@
 //! parsing fails, the raw response body is returned as the error message.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// HTTP client for a single sctl device.
 pub struct SctlClient {
@@ -32,6 +33,8 @@ impl SctlClient {
         );
         let http = reqwest::Client::builder()
             .default_headers(default_headers)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .build()
             .expect("Failed to build HTTP client");
         // Strip trailing slash for consistent URL construction
@@ -138,14 +141,16 @@ impl SctlClient {
         path: &str,
         list: bool,
     ) -> Result<serde_json::Value, ClientError> {
-        let mut url = format!("{}/api/files?path={}", self.base_url, path);
+        let mut url = reqwest::Url::parse(&format!("{}/api/files", self.base_url))
+            .map_err(|e| ClientError::Protocol(format!("Invalid base URL: {e}")))?;
+        url.query_pairs_mut().append_pair("path", path);
         if list {
-            url.push_str("&list=true");
+            url.query_pairs_mut().append_pair("list", "true");
         }
 
         let resp = self
             .http
-            .get(&url)
+            .get(url)
             .bearer_auth(&self.api_key)
             .send()
             .await
@@ -187,6 +192,96 @@ impl SctlClient {
         Self::handle_response(resp).await
     }
 
+    /// `DELETE /api/files` — delete a file.
+    pub async fn file_delete(&self, path: &str) -> Result<serde_json::Value, ClientError> {
+        let body = serde_json::json!({ "path": path });
+        let resp = self
+            .http
+            .delete(format!("{}/api/files", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(ClientError::Request)?;
+        Self::handle_response(resp).await
+    }
+
+    /// `GET /api/activity` — read activity log.
+    pub async fn activity(
+        &self,
+        since_id: u64,
+        limit: u64,
+    ) -> Result<serde_json::Value, ClientError> {
+        let url = format!(
+            "{}/api/activity?since_id={}&limit={}",
+            self.base_url, since_id, limit
+        );
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .map_err(ClientError::Request)?;
+        Self::handle_response(resp).await
+    }
+
+    // --- Playbook REST endpoints ---
+
+    /// `GET /api/playbooks` — list available playbooks.
+    pub async fn list_playbooks(&self) -> Result<serde_json::Value, ClientError> {
+        let resp = self
+            .http
+            .get(format!("{}/api/playbooks", self.base_url))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .map_err(ClientError::Request)?;
+        Self::handle_response(resp).await
+    }
+
+    /// `GET /api/playbooks/:name` — get playbook detail.
+    pub async fn get_playbook(&self, name: &str) -> Result<serde_json::Value, ClientError> {
+        let resp = self
+            .http
+            .get(format!("{}/api/playbooks/{}", self.base_url, name))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .map_err(ClientError::Request)?;
+        Self::handle_response(resp).await
+    }
+
+    /// `PUT /api/playbooks/:name` — create/update a playbook.
+    pub async fn put_playbook(
+        &self,
+        name: &str,
+        content: &str,
+    ) -> Result<serde_json::Value, ClientError> {
+        let resp = self
+            .http
+            .put(format!("{}/api/playbooks/{}", self.base_url, name))
+            .bearer_auth(&self.api_key)
+            .header("content-type", "text/markdown")
+            .body(content.to_string())
+            .send()
+            .await
+            .map_err(ClientError::Request)?;
+        Self::handle_response(resp).await
+    }
+
+    /// `DELETE /api/playbooks/:name` — delete a playbook.
+    pub async fn delete_playbook(&self, name: &str) -> Result<serde_json::Value, ClientError> {
+        let resp = self
+            .http
+            .delete(format!("{}/api/playbooks/{}", self.base_url, name))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .map_err(ClientError::Request)?;
+        Self::handle_response(resp).await
+    }
+
     /// Parse an HTTP response — returns the JSON body on success, or a
     /// [`ClientError`] with the error message on failure.
     async fn handle_response(resp: reqwest::Response) -> Result<serde_json::Value, ClientError> {
@@ -219,6 +314,13 @@ pub enum ClientError {
     Device { status: u16, message: String },
     /// The response body was not valid JSON.
     Protocol(String),
+}
+
+impl ClientError {
+    /// Returns `true` if the error is an HTTP 404 Not Found response.
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, ClientError::Device { status: 404, .. })
+    }
 }
 
 impl std::fmt::Display for ClientError {

@@ -150,11 +150,80 @@ impl PlaybookRegistry {
     }
 }
 
-/// Fetch and parse all playbooks from a device's playbooks directory.
+/// Fetch and parse all playbooks from a device.
+///
+/// First tries the REST endpoint (`GET /api/playbooks`). If that returns a 404
+/// (server too old), falls back to the file-based approach (`file_read` on the
+/// playbooks directory).
 ///
 /// Graceful: returns an empty list on any error (device unreachable,
-/// directory missing, etc.). Malformed `.md` files are skipped.
+/// directory missing, etc.). Malformed playbooks are skipped.
 async fn fetch_device_playbooks(
+    client: &SctlClient,
+    dir: &str,
+    device_name: &str,
+) -> Vec<Playbook> {
+    // Try the REST endpoint first.
+    match fetch_device_playbooks_rest(client, device_name).await {
+        Ok(pbs) => return pbs,
+        Err(e) if e.is_not_found() => {
+            // Server doesn't have the playbook endpoint — fall back to file-based.
+            eprintln!(
+                "mcp-sctl: playbooks: {device_name}: REST endpoint not available, falling back to file-based"
+            );
+        }
+        Err(e) => {
+            eprintln!("mcp-sctl: playbooks: {device_name}: REST list failed: {e}");
+            return Vec::new();
+        }
+    }
+
+    fetch_device_playbooks_files(client, dir, device_name).await
+}
+
+/// Fetch playbooks via the REST endpoint (`GET /api/playbooks`).
+///
+/// The response is expected to have a `playbooks` array, where each entry has
+/// at least `name` and `content` fields.
+async fn fetch_device_playbooks_rest(
+    client: &SctlClient,
+    device_name: &str,
+) -> Result<Vec<Playbook>, crate::client::ClientError> {
+    let resp = client.list_playbooks().await?;
+
+    let items = resp
+        .get("playbooks")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut playbooks = Vec::new();
+    for item in &items {
+        let name = match item.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        let content = match item.get("content").and_then(|v| v.as_str()) {
+            Some(c) => c,
+            None => continue,
+        };
+        let path = item.get("path").and_then(|v| v.as_str()).unwrap_or(name);
+
+        match playbooks::parse_playbook(content, device_name, path) {
+            Ok(pb) => playbooks.push(pb),
+            Err(e) => {
+                eprintln!("mcp-sctl: playbooks: {device_name}: skip {name}: {e}");
+            }
+        }
+    }
+
+    Ok(playbooks)
+}
+
+/// Fetch playbooks via the file-based approach (legacy fallback).
+///
+/// Lists `.md` files in the playbooks directory, reads each one, and parses.
+async fn fetch_device_playbooks_files(
     client: &SctlClient,
     dir: &str,
     device_name: &str,

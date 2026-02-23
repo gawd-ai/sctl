@@ -9,7 +9,7 @@
 //! and re-attaches to all active sessions using `session.attach` with the last
 //! known sequence number, so no output is lost.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -33,9 +33,12 @@ pub struct OutputEntry {
     pub timestamp_ms: u64,
 }
 
+/// Max entries per session buffer to prevent unbounded memory growth.
+const MAX_BUFFER_ENTRIES: usize = 5000;
+
 /// Local buffer for a session's output, held in mcp-sctl's memory.
 struct SessionBuffer {
-    entries: Vec<OutputEntry>,
+    entries: VecDeque<OutputEntry>,
     status: SessionStatus,
     exit_code: Option<i32>,
     notify: Arc<Notify>,
@@ -52,7 +55,7 @@ struct SessionBuffer {
 impl SessionBuffer {
     fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: VecDeque::new(),
             status: SessionStatus::Running,
             exit_code: None,
             notify: Arc::new(Notify::new()),
@@ -72,7 +75,10 @@ impl SessionBuffer {
         if entry.seq > self.last_seq {
             self.last_seq = entry.seq;
         }
-        self.entries.push(entry);
+        if self.entries.len() >= MAX_BUFFER_ENTRIES {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(entry);
         self.notify.notify_waiters();
     }
 }
@@ -745,7 +751,20 @@ async fn ws_io_loop(
                     Some(value) => {
                         let text = serde_json::to_string(&value).unwrap_or_default();
                         if ws_sink.send(tokio_tungstenite::tungstenite::Message::Text(text)).await.is_err() {
-                            eprintln!("mcp-sctl: WS send failed");
+                            eprintln!("mcp-sctl: WS send failed, reconnecting...");
+                            connected.store(false, Ordering::SeqCst);
+
+                            if let Some((new_sink, new_reader)) = reconnect_loop(
+                                &ws_url,
+                                &sessions,
+                            ).await {
+                                ws_sink = new_sink;
+                                ws_reader = new_reader;
+                                connected.store(true, Ordering::SeqCst);
+                                eprintln!("mcp-sctl: WebSocket reconnected after send failure");
+                            } else {
+                                return;
+                            }
                         }
                     }
                     None => {
