@@ -133,7 +133,8 @@ fn handle_initialize(request: &Value) -> Value {
 
 /// Handle `tools/list` — return all tool definitions (triggers lazy playbook load).
 async fn handle_tools_list(registry: &DeviceRegistry, pb_reg: &PlaybookRegistry) -> Value {
-    pb_reg.ensure_loaded(registry.clients()).await;
+    let clients = registry.clients().await;
+    pb_reg.ensure_loaded(&clients).await;
     json!({
         "jsonrpc": "2.0",
         "result": {

@@ -370,7 +370,6 @@ impl DeviceWsConnection {
     }
 
     /// Check whether the WebSocket is currently connected.
-    #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
     }
@@ -510,7 +509,6 @@ impl DeviceWsConnection {
         command: &str,
         timeout_ms: u64,
     ) -> Result<ExecWaitResult, String> {
-        let is_pty = self.is_pty_session(session_id).await;
         let nonce = format!(
             "{:x}",
             std::time::SystemTime::now()
@@ -518,10 +516,15 @@ impl DeviceWsConnection {
                 .unwrap_or_default()
                 .as_nanos()
         );
-        let marker = format!("__SCTL_{}_DONE_", nonce);
+        let start_marker = format!("__SCTL_{}_START__", nonce);
+        let done_marker = format!("__SCTL_{}_DONE_", nonce);
 
-        // Wrap command: run it, then print marker with exit code
-        let wrapped = format!("{} ; printf '\\n{}%s__\\n' \"$?\"", command, marker);
+        // Wrap command with start and done markers.
+        // The start marker lets us reliably skip the PTY echo of the command.
+        let wrapped = format!(
+            "printf '{}\\n'; {} ; printf '\\n{}%s__\\n' \"$?\"",
+            start_marker, command, done_marker
+        );
 
         // Record current position before sending
         let start_seq = {
@@ -544,7 +547,6 @@ impl DeviceWsConnection {
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
         let mut accumulated = String::new();
         let mut last_read_seq = start_seq;
-        let marker_suffix = format!("{}__", marker); // e.g. __SCTL_<nonce>_DONE_0__
         let mut disconnected_since: Option<tokio::time::Instant> = None;
         const DISCONNECT_GRACE_SECS: u64 = 10;
 
@@ -592,28 +594,61 @@ impl DeviceWsConnection {
                 });
             }
 
-            // Scan for marker
-            if let Some(marker_pos) = accumulated.find(&marker_suffix) {
-                // Extract exit code from marker: __SCTL_<nonce>_DONE_<code>__
-                let after_marker = &accumulated[marker_pos + marker.len()..];
-                let exit_code = after_marker
-                    .split("__")
-                    .next()
-                    .and_then(|s| s.parse::<i32>().ok());
-
-                // Find the start of the marker line (the \n before it)
-                let marker_line_start = accumulated[..marker_pos].rfind('\n').unwrap_or(marker_pos);
-
-                let mut output = accumulated[..marker_line_start].to_string();
-
-                // PTY echo stripping: first line is the echoed command
-                if is_pty {
-                    if let Some(first_newline) = output.find('\n') {
-                        output = output[first_newline + 1..].to_string();
-                    } else {
-                        output.clear();
+            // Scan for done marker (e.g. __SCTL_<nonce>_DONE_0__)
+            // The PTY echo contains _DONE_%s__ (printf format specifier).
+            // We distinguish the real marker by checking that the char after
+            // the prefix is a digit (exit code), not '%' or other chars.
+            let done_pos = {
+                let mut end = accumulated.len();
+                loop {
+                    match accumulated[..end].rfind(&done_marker) {
+                        Some(pos) => {
+                            let after = pos + done_marker.len();
+                            if after < accumulated.len()
+                                && accumulated.as_bytes()[after].is_ascii_digit()
+                            {
+                                break Some(pos);
+                            }
+                            // Not the real marker (echo) — keep searching earlier
+                            end = pos;
+                        }
+                        None => break None,
                     }
                 }
+            };
+
+            if let Some(done_pos) = done_pos {
+                // Extract exit code: __SCTL_<nonce>_DONE_<code>__
+                let after_done = &accumulated[done_pos + done_marker.len()..];
+                let exit_code = after_done
+                    .split("__")
+                    .next()
+                    .and_then(|s| s.trim().parse::<i32>().ok());
+
+                // Find output boundaries using start marker.
+                // The start marker is printed BEFORE the command runs, so
+                // real output is between start_marker\n and \n before done_marker.
+                // Use rfind within the region before done_pos to skip the
+                // PTY echo (which also contains the start marker text).
+                let output_start = accumulated[..done_pos]
+                    .rfind(&start_marker)
+                    .map(|p| {
+                        // Skip past the start marker and its trailing \n
+                        let after = p + start_marker.len();
+                        accumulated[after..done_pos]
+                            .find('\n')
+                            .map(|nl| after + nl + 1)
+                            .unwrap_or(after)
+                    })
+                    .unwrap_or(0);
+
+                let output_end = accumulated[..done_pos].rfind('\n').unwrap_or(done_pos);
+
+                let output = if output_start <= output_end {
+                    accumulated[output_start..output_end].to_string()
+                } else {
+                    String::new()
+                };
 
                 return Ok(ExecWaitResult {
                     output,
@@ -863,18 +898,31 @@ async fn dispatch_message(
         }
         "error" => {
             let code = msg["code"].as_str().unwrap_or("");
+            let error_msg = msg["message"].as_str().unwrap_or("unknown");
+
             if code == "AI_NOT_ALLOWED" {
                 *n.ai_status_result.lock().await = Some(msg.clone());
                 n.ai_status_notify.notify_waiters();
-            } else if msg.get("session_id").is_none() {
+            } else if let Some(session_id) = msg.get("session_id").and_then(Value::as_str) {
+                // Error targeting a specific session (e.g. attach to a session
+                // that no longer exists after device reboot). Mark it dead.
+                let mut sessions = sessions.lock().await;
+                if let Some(buf) = sessions.get_mut(session_id) {
+                    buf.status = SessionStatus::Exited;
+                    buf.exit_code = None;
+                    buf.notify.notify_waiters();
+                    buf.attach_notify.notify_waiters();
+                }
+                eprintln!("mcp-sctl: session {session_id} error: {error_msg}");
+            } else {
                 // Likely a start error
                 *n.start_result.lock().await = Some(msg.clone());
                 n.start_notify.notify_waiters();
             }
-            eprintln!(
-                "mcp-sctl: WS error: {}",
-                msg["message"].as_str().unwrap_or("unknown")
-            );
+
+            if code != "AI_NOT_ALLOWED" {
+                eprintln!("mcp-sctl: WS error: {error_msg}");
+            }
         }
         "session.resize.ack" | "session.rename.ack" | "session.allow_ai.ack" => {
             // Acknowledged — no action needed, the tool already returned ok

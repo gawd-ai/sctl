@@ -47,6 +47,17 @@ use playbook_registry::PlaybookRegistry;
 async fn main() {
     let cli = Cli::parse();
 
+    // Determine config path for hot-reload support
+    let config_path = cli
+        .config
+        .as_ref()
+        .map(|p| config::expand_tilde(p))
+        .or_else(|| {
+            std::env::var("SCTL_CONFIG")
+                .ok()
+                .map(std::path::PathBuf::from)
+        });
+
     let resolved = match config::load_config(&cli) {
         Ok(c) => c,
         Err(e) => {
@@ -70,7 +81,10 @@ async fn main() {
         })
         .collect();
 
-    let registry = DeviceRegistry::from_config(resolved);
+    let registry = match config_path {
+        Some(path) => DeviceRegistry::from_config_file(resolved, path),
+        None => DeviceRegistry::from_config(resolved),
+    };
     let pb_registry = PlaybookRegistry::with_defaults(device_dirs);
 
     eprintln!(

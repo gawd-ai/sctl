@@ -65,7 +65,7 @@ pub fn load_config(cli: &Cli) -> Result<ResolvedConfig, String> {
 }
 
 /// Expand a leading `~` to `$HOME`.
-fn expand_tilde(path: &Path) -> PathBuf {
+pub fn expand_tilde(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     if let Some(rest) = s.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
@@ -73,6 +73,11 @@ fn expand_tilde(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+/// Load config from a specific file path (used by hot-reload).
+pub fn load_config_from_file(path: &Path) -> Result<ResolvedConfig, String> {
+    load_from_file(path)
 }
 
 fn load_from_file(path: &Path) -> Result<ResolvedConfig, String> {

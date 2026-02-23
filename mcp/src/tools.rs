@@ -663,7 +663,7 @@ pub async fn handle_tool_call(
     pb_reg: &PlaybookRegistry,
 ) -> ToolResult {
     match name {
-        "device_list" => handle_device_list(registry),
+        "device_list" => handle_device_list(registry).await,
         "device_health" => handle_device_health(args, registry).await,
         "device_info" => handle_device_info(args, registry).await,
         "device_exec" => handle_device_exec(args, registry).await,
@@ -726,21 +726,22 @@ fn get_device_param(args: &Value) -> Option<&str> {
     args.get("device").and_then(Value::as_str)
 }
 
-fn handle_device_list(registry: &DeviceRegistry) -> ToolResult {
+async fn handle_device_list(registry: &DeviceRegistry) -> ToolResult {
     let devices: Vec<Value> = registry
         .list()
+        .await
         .into_iter()
         .map(|d| json!({ "name": d.name, "url": d.url }))
         .collect();
 
     ToolResult::success(json!({
         "devices": devices,
-        "default_device": registry.default_device()
+        "default_device": registry.default_device().await
     }))
 }
 
 async fn handle_device_health(args: &Value, registry: &DeviceRegistry) -> ToolResult {
-    let client = match registry.resolve(get_device_param(args)) {
+    let client = match registry.resolve(get_device_param(args)).await {
         Ok(c) => c,
         Err(e) => return ToolResult::error(e),
     };
@@ -751,7 +752,7 @@ async fn handle_device_health(args: &Value, registry: &DeviceRegistry) -> ToolRe
 }
 
 async fn handle_device_info(args: &Value, registry: &DeviceRegistry) -> ToolResult {
-    let client = match registry.resolve(get_device_param(args)) {
+    let client = match registry.resolve(get_device_param(args)).await {
         Ok(c) => c,
         Err(e) => return ToolResult::error(e),
     };
@@ -762,7 +763,7 @@ async fn handle_device_info(args: &Value, registry: &DeviceRegistry) -> ToolResu
 }
 
 async fn handle_device_exec(args: &Value, registry: &DeviceRegistry) -> ToolResult {
-    let client = match registry.resolve(get_device_param(args)) {
+    let client = match registry.resolve(get_device_param(args)).await {
         Ok(c) => c,
         Err(e) => return ToolResult::error(e),
     };
@@ -788,7 +789,7 @@ async fn handle_device_exec(args: &Value, registry: &DeviceRegistry) -> ToolResu
 }
 
 async fn handle_device_exec_batch(args: &Value, registry: &DeviceRegistry) -> ToolResult {
-    let client = match registry.resolve(get_device_param(args)) {
+    let client = match registry.resolve(get_device_param(args)).await {
         Ok(c) => c,
         Err(e) => return ToolResult::error(e),
     };
@@ -825,7 +826,7 @@ async fn handle_device_exec_batch(args: &Value, registry: &DeviceRegistry) -> To
 }
 
 async fn handle_device_file_read(args: &Value, registry: &DeviceRegistry) -> ToolResult {
-    let client = match registry.resolve(get_device_param(args)) {
+    let client = match registry.resolve(get_device_param(args)).await {
         Ok(c) => c,
         Err(e) => return ToolResult::error(e),
     };
@@ -844,7 +845,7 @@ async fn handle_device_file_read(args: &Value, registry: &DeviceRegistry) -> Too
 }
 
 async fn handle_device_file_write(args: &Value, registry: &DeviceRegistry) -> ToolResult {
-    let client = match registry.resolve(get_device_param(args)) {
+    let client = match registry.resolve(get_device_param(args)).await {
         Ok(c) => c,
         Err(e) => return ToolResult::error(e),
     };
@@ -873,7 +874,7 @@ async fn handle_device_file_write(args: &Value, registry: &DeviceRegistry) -> To
 }
 
 async fn handle_device_file_delete(args: &Value, registry: &DeviceRegistry) -> ToolResult {
-    let client = match registry.resolve(get_device_param(args)) {
+    let client = match registry.resolve(get_device_param(args)).await {
         Ok(c) => c,
         Err(e) => return ToolResult::error(e),
     };
@@ -890,7 +891,7 @@ async fn handle_device_file_delete(args: &Value, registry: &DeviceRegistry) -> T
 }
 
 async fn handle_device_activity(args: &Value, registry: &DeviceRegistry) -> ToolResult {
-    let client = match registry.resolve(get_device_param(args)) {
+    let client = match registry.resolve(get_device_param(args)).await {
         Ok(c) => c,
         Err(e) => return ToolResult::error(e),
     };
@@ -921,13 +922,13 @@ async fn get_ws_connection(
             }
         }
     };
-    let (name, client) = match registry.resolve_with_name(device.as_deref()) {
+    let (name, client) = match registry.resolve_with_name(device.as_deref()).await {
         Ok(v) => v,
         Err(e) => return Err(ToolResult::error(e)),
     };
     registry
         .ws_pool
-        .get_or_connect(name, client)
+        .get_or_connect(&name, &client)
         .await
         .map_err(|e| ToolResult::error(format!("WebSocket connection failed: {e}")))
 }
@@ -980,7 +981,8 @@ async fn handle_session_start(args: &Value, registry: &DeviceRegistry) -> ToolRe
             } else {
                 // Register session→device mapping for auto-routing
                 if let Some(sid) = v["session_id"].as_str() {
-                    let device_name = get_device_param(args).unwrap_or(registry.default_device());
+                    let default = registry.default_device().await;
+                    let device_name = get_device_param(args).unwrap_or(&default);
                     registry.register_session(sid, device_name).await;
                 }
                 let mut result = json!({
@@ -1308,7 +1310,8 @@ async fn handle_session_list(args: &Value, registry: &DeviceRegistry) -> ToolRes
         }
     } else {
         // Iterate all configured devices (not just already-connected ones)
-        for (device_name, client) in registry.clients() {
+        let clients = registry.clients().await;
+        for (device_name, client) in &clients {
             let conn = match registry.ws_pool.get_or_connect(device_name, client).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -1555,13 +1558,14 @@ async fn handle_playbook_list(
     let device = get_device_param(args);
 
     let playbooks = if let Some(dev) = device {
-        let client = match registry.resolve(Some(dev)) {
+        let client = match registry.resolve(Some(dev)).await {
             Ok(c) => c,
             Err(e) => return ToolResult::error(e),
         };
-        pb_reg.refresh_device(dev, client).await
+        pb_reg.refresh_device(dev, &client).await
     } else {
-        pb_reg.refresh_all(registry.clients()).await
+        let clients = registry.clients().await;
+        pb_reg.refresh_all(&clients).await
     };
 
     let items: Vec<Value> = playbooks
@@ -1610,7 +1614,7 @@ async fn handle_playbook_get(
         return ToolResult::error(e);
     }
 
-    let (dev_name, client) = match registry.resolve_with_name(get_device_param(args)) {
+    let (dev_name, client) = match registry.resolve_with_name(get_device_param(args)).await {
         Ok(v) => v,
         Err(e) => return ToolResult::error(e),
     };
@@ -1625,7 +1629,7 @@ async fn handle_playbook_get(
             let path = v.get("path").and_then(|p| p.as_str()).unwrap_or_default();
             return ToolResult::success(json!({
                 "name": name,
-                "device": dev_name,
+                "device": &dev_name,
                 "path": path,
                 "content": content,
             }));
@@ -1637,7 +1641,7 @@ async fn handle_playbook_get(
     }
 
     // File-based fallback for older servers.
-    let dir = get_playbooks_dir(dev_name, pb_reg);
+    let dir = get_playbooks_dir(&dev_name, pb_reg);
     let path = format!("{}/{}.md", dir, name);
 
     match client.file_read(&path, false).await {
@@ -1648,7 +1652,7 @@ async fn handle_playbook_get(
                 .unwrap_or_default();
             ToolResult::success(json!({
                 "name": name,
-                "device": dev_name,
+                "device": &dev_name,
                 "path": path,
                 "content": content,
             }))
@@ -1675,7 +1679,7 @@ async fn handle_playbook_put(
         None => return ToolResult::error("Missing required parameter: content".into()),
     };
 
-    let (dev_name, client) = match registry.resolve_with_name(get_device_param(args)) {
+    let (dev_name, client) = match registry.resolve_with_name(get_device_param(args)).await {
         Ok(v) => v,
         Err(e) => return ToolResult::error(e),
     };
@@ -1684,11 +1688,11 @@ async fn handle_playbook_put(
         // Delete — try REST first, fall back to file-based.
         match client.delete_playbook(name).await {
             Ok(_) => {
-                pb_reg.invalidate_device(dev_name).await;
+                pb_reg.invalidate_device(&dev_name).await;
                 let mut result = ToolResult::success(json!({
                     "action": "deleted",
                     "name": name,
-                    "device": dev_name,
+                    "device": &dev_name,
                 }));
                 result.tools_changed = true;
                 return result;
@@ -1702,16 +1706,16 @@ async fn handle_playbook_put(
         }
 
         // File-based fallback for delete.
-        let dir = get_playbooks_dir(dev_name, pb_reg);
+        let dir = get_playbooks_dir(&dev_name, pb_reg);
         let path = format!("{}/{}.md", dir, name);
         let rm_cmd = format!("rm -f '{}'", path);
         match client.exec(&rm_cmd, None, None, None).await {
             Ok(_) => {
-                pb_reg.invalidate_device(dev_name).await;
+                pb_reg.invalidate_device(&dev_name).await;
                 let mut result = ToolResult::success(json!({
                     "action": "deleted",
                     "name": name,
-                    "device": dev_name,
+                    "device": &dev_name,
                     "path": path,
                 }));
                 result.tools_changed = true;
@@ -1722,19 +1726,19 @@ async fn handle_playbook_put(
     } else {
         // Validate before writing
         let placeholder_path = format!("{}.md", name);
-        if let Err(e) = playbooks::parse_playbook(content, dev_name, &placeholder_path) {
+        if let Err(e) = playbooks::parse_playbook(content, &dev_name, &placeholder_path) {
             return ToolResult::error(format!("Invalid playbook: {}", e));
         }
 
         // Create/update — try REST first, fall back to file-based.
         match client.put_playbook(name, content).await {
             Ok(v) => {
-                pb_reg.invalidate_device(dev_name).await;
+                pb_reg.invalidate_device(&dev_name).await;
                 let path = v.get("path").and_then(|p| p.as_str()).unwrap_or_default();
                 let mut result = ToolResult::success(json!({
                     "action": "saved",
                     "name": name,
-                    "device": dev_name,
+                    "device": &dev_name,
                     "path": path,
                 }));
                 result.tools_changed = true;
@@ -1747,7 +1751,7 @@ async fn handle_playbook_put(
         }
 
         // File-based fallback for create/update.
-        let dir = get_playbooks_dir(dev_name, pb_reg);
+        let dir = get_playbooks_dir(&dev_name, pb_reg);
         let path = format!("{}/{}.md", dir, name);
 
         match client
@@ -1755,11 +1759,11 @@ async fn handle_playbook_put(
             .await
         {
             Ok(_) => {
-                pb_reg.invalidate_device(dev_name).await;
+                pb_reg.invalidate_device(&dev_name).await;
                 let mut result = ToolResult::success(json!({
                     "action": "saved",
                     "name": name,
-                    "device": dev_name,
+                    "device": &dev_name,
                     "path": path,
                 }));
                 result.tools_changed = true;
@@ -1788,7 +1792,7 @@ async fn handle_playbook_exec(
 
     // Determine target device: explicit arg > playbook's source device
     let device = get_device_param(args).unwrap_or(&pb.source_device);
-    let client = match registry.resolve(Some(device)) {
+    let client = match registry.resolve(Some(device)).await {
         Ok(c) => c,
         Err(e) => return ToolResult::error(e),
     };

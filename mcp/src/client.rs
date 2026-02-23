@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 /// HTTP client for a single sctl device.
+#[derive(Clone)]
 pub struct SctlClient {
     http: reqwest::Client,
     base_url: String,
