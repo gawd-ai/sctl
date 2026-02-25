@@ -54,7 +54,24 @@ export type {
 	HistoryFilter,
 	PlaybookParam,
 	PlaybookSummary,
-	PlaybookDetail
+	PlaybookDetail,
+	SplitGroupInfo,
+	SidePanelTabDef,
+	ViewerTab,
+	ExecViewerData,
+	FileViewerData,
+	CachedExecResult,
+	TransferDirection,
+	StpInitDownloadResult,
+	StpInitUploadResult,
+	StpChunkAck,
+	StpResumeResult,
+	StpStatusResult,
+	StpListResult,
+	StpTransferSummary,
+	GxProgressMsg,
+	GxCompleteMsg,
+	GxErrorMsg
 } from './terminal.types';
 
 export type { DeviceConnectionConfig } from './widget.types';

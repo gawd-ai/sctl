@@ -85,14 +85,30 @@ export type {
 	ViewerTab,
 	ExecViewerData,
 	FileViewerData,
-	CachedExecResult
+	CachedExecResult,
+	TransferDirection,
+	StpInitDownloadResult,
+	StpInitUploadResult,
+	StpChunkAck,
+	StpResumeResult,
+	StpStatusResult,
+	StpListResult,
+	StpTransferSummary,
+	GxProgressMsg,
+	GxCompleteMsg,
+	GxErrorMsg
 } from './types/terminal.types';
 
 export type { DeviceConnectionConfig } from './types/widget.types';
 
 // Utilities
 export { SctlWsClient } from './utils/ws-client';
+export type { WsClientConfig } from './utils/ws-client';
 export { createTerminal, applyTheme, DEFAULT_THEME, type XtermInstance } from './utils/xterm';
 export { SctlRestClient } from './utils/rest-client';
+export type { RestClientConfig } from './utils/rest-client';
 export { KeyboardManager, type Shortcut } from './utils/keyboard';
 export { parsePlaybookFrontmatter, renderPlaybookScript, validatePlaybookName } from './utils/playbook-parser';
+export { TransferTracker, type ClientTransfer, type TransferProgress, type TransferState, type OnProgress, type OnComplete, type OnError } from './utils/transfer';
+export { ConnectionManager, type ConnectionManagerConfig, type ConnectionManagerEvents, type ServerConnection } from './utils/connection-manager';
+export { SctlError, ConnectionError, ServerError, TimeoutError, HttpError, TransferError } from './utils/errors';

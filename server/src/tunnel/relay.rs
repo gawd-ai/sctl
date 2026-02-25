@@ -1601,7 +1601,7 @@ async fn handle_client_ws(
             .read()
             .await
             .get(session_id)
-            .map_or(true, |ids| ids.is_empty());
+            .map_or(true, HashSet::is_empty);
         if still_subscribed {
             let _ = device_tx
                 .send(TunnelMessage::Text(json!({

@@ -7,6 +7,7 @@ export interface SidePanelTabDef {
 
 // ── Control & status enums ──────────────────────────────────────────
 
+/** WebSocket connection lifecycle state. */
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
 
 // ── Activity feed ───────────────────────────────────────────────────
@@ -27,12 +28,19 @@ export type ActivityType =
 
 export type ActivitySource = 'mcp' | 'ws' | 'rest' | 'unknown';
 
+/** A single entry in the device activity log. */
 export interface ActivityEntry {
+	/** Monotonic server-assigned ID (increases with each operation). */
 	id: number;
+	/** Unix epoch seconds when the activity occurred. */
 	timestamp: number;
+	/** The type of operation (exec, file_read, session_start, etc.). */
 	activity_type: ActivityType;
+	/** Which client interface triggered this activity. */
 	source: ActivitySource;
+	/** Human-readable one-line description of the activity. */
 	summary: string;
+	/** Additional structured data (command args, file paths, exit codes, etc.). */
 	detail?: Record<string, unknown>;
 }
 
@@ -43,7 +51,12 @@ export interface WsActivityNewMsg {
 
 // ── Theme ───────────────────────────────────────────────────────────
 
+/**
+ * xterm.js theme colors and font settings. All fields are optional —
+ * unset fields use xterm defaults.
+ */
 export interface TerminalTheme {
+	// UI colors
 	background?: string;
 	foreground?: string;
 	cursor?: string;
@@ -51,6 +64,7 @@ export interface TerminalTheme {
 	selectionBackground?: string;
 	selectionForeground?: string;
 	selectionInactiveBackground?: string;
+	// ANSI standard colors (0–7)
 	black?: string;
 	red?: string;
 	green?: string;
@@ -59,6 +73,7 @@ export interface TerminalTheme {
 	magenta?: string;
 	cyan?: string;
 	white?: string;
+	// ANSI bright colors (8–15)
 	brightBlack?: string;
 	brightRed?: string;
 	brightGreen?: string;
@@ -67,25 +82,44 @@ export interface TerminalTheme {
 	brightMagenta?: string;
 	brightCyan?: string;
 	brightWhite?: string;
+	// Font
 	fontFamily?: string;
 	fontSize?: number;
 }
 
 // ── Session ─────────────────────────────────────────────────────────
 
+/** Options for starting a new shell session. */
 export interface SessionStartOptions {
+	/** Initial working directory (e.g. `'~'` or `'/tmp'`). */
 	workingDir?: string;
+	/** Whether the session survives client disconnects. Default: true. */
 	persistent?: boolean;
+	/** Environment variables to set in the session. */
 	env?: Record<string, string>;
+	/** Shell binary to use (e.g. `'/bin/bash'`). Uses device default if omitted. */
 	shell?: string;
+	/** Enable PTY (terminal emulation). Default: true. */
 	pty?: boolean;
+	/** Initial terminal rows. */
 	rows?: number;
+	/** Initial terminal columns. */
 	cols?: number;
+	/** Human-readable session name. */
 	name?: string;
 }
 
+/**
+ * Client-side session state tracked by TerminalContainer.
+ *
+ * `key` is a client-generated unique identifier (UUID) used for tab/pane management.
+ * `sessionId` is the server-assigned session ID. Multiple keys can point to the same
+ * sessionId (e.g. split panes), but each key has its own xterm instance.
+ */
 export interface SessionInfo {
+	/** Client-generated unique key for this tab/pane (UUID). */
 	key: string;
+	/** Server-assigned session ID. */
 	sessionId: string;
 	pid?: number;
 	persistent: boolean;
@@ -94,10 +128,15 @@ export interface SessionInfo {
 	aiIsWorking: boolean;
 	aiActivity?: string;
 	aiStatusMessage?: string;
+	/** Last output sequence number seen (for attach replay). */
 	lastSeq: number;
+	/** Human-readable label (from server name or rename). */
 	label?: string;
+	/** Whether this session's output is being received. */
 	attached: boolean;
+	/** Server ID this session belongs to (set in multi-server mode). */
 	serverId?: string;
+	/** Server display name (set when multiple servers connected). */
 	serverName?: string;
 	/** Session no longer exists on the server (e.g. device rebooted). */
 	dead?: boolean;
@@ -105,10 +144,15 @@ export interface SessionInfo {
 
 // ── Reconnect ───────────────────────────────────────────────────────
 
+/** WebSocket reconnection behavior. Pass as `Partial<ReconnectConfig>` to override defaults. */
 export interface ReconnectConfig {
+	/** Whether automatic reconnection is enabled. Default: true. */
 	enabled: boolean;
+	/** Delay in ms before the first retry (doubles each attempt). Default: 100. */
 	initialDelay: number;
+	/** Maximum delay in ms between retries. Default: 2000. */
 	maxDelay: number;
+	/** Maximum number of reconnect attempts before giving up. Default: Infinity. */
 	maxAttempts: number;
 }
 
@@ -122,6 +166,7 @@ export interface SplitGroupInfo {
 
 // ── Callbacks ───────────────────────────────────────────────────────
 
+/** Callbacks from TerminalContainer to the consumer for state synchronization. */
 export interface SctlinCallbacks {
 	onConnectionChange?: (status: ConnectionStatus) => void;
 	onSessionStarted?: (session: SessionInfo) => void;
@@ -140,18 +185,34 @@ export interface SctlinCallbacks {
 
 // ── Config ──────────────────────────────────────────────────────────
 
+/**
+ * Configuration for a TerminalContainer instance.
+ *
+ * Pass `client` to reuse a pre-created `SctlWsClient` (avoids duplicate connections).
+ * Set `autoConnect: true` to connect immediately on mount.
+ */
 export interface SctlinConfig {
+	/** WebSocket URL for the sctl device (e.g. `'ws://host:1337/api/ws'`). */
 	wsUrl: string;
+	/** API key for authentication (sent as Bearer token and WS query param). */
 	apiKey: string;
+	/** Terminal color/font theme applied to all xterm instances. */
 	theme?: TerminalTheme;
+	/** Default terminal rows for new sessions. */
 	defaultRows?: number;
+	/** Default terminal columns for new sessions. */
 	defaultCols?: number;
+	/** Connect to the WebSocket immediately on mount. Default: true. */
 	autoConnect?: boolean;
+	/** Automatically start a session once connected. Default: true. */
 	autoStartSession?: boolean;
+	/** WebSocket reconnection behavior overrides. */
 	reconnect?: Partial<ReconnectConfig>;
+	/** Callbacks for state synchronization with the consumer. */
 	callbacks?: SctlinCallbacks;
+	/** Default options applied to every new session (shell, env, workingDir, etc.). */
 	sessionDefaults?: Partial<SessionStartOptions>;
-	/** Pre-created WS client — skips client creation, starts immediately. */
+	/** Pre-created WS client — skips client creation, reuses existing connection. */
 	client?: import('../utils/ws-client').SctlWsClient;
 }
 
@@ -343,16 +404,27 @@ export interface RemoteSessionInfo {
 
 // ── REST API types ─────────────────────────────────────────────────
 
+/** System information returned by the sctl device's `/api/info` endpoint. */
 export interface DeviceInfo {
+	/** Device serial identifier. */
 	serial: string;
+	/** System hostname. */
 	hostname: string;
+	/** Kernel version string (e.g. `'6.12.69'`). */
 	kernel: string;
+	/** System uptime in seconds. */
 	system_uptime_secs: number;
+	/** CPU model name. */
 	cpu_model: string;
+	/** 1/5/15-minute load averages. */
 	load_average: [number, number, number];
+	/** RAM usage in bytes. */
 	memory: { total_bytes: number; used_bytes: number; available_bytes: number };
+	/** Root filesystem usage in bytes. */
 	disk: { total_bytes: number; used_bytes: number; available_bytes: number; mount_point: string };
+	/** Network interfaces with addresses and link state. */
 	interfaces: NetworkInterface[];
+	/** Tunnel relay connection info, if configured. */
 	tunnel?: { url: string; connected: boolean };
 }
 
@@ -387,11 +459,17 @@ export interface ExecResult {
 	duration_ms: number;
 }
 
+/** Configuration for a server connection (persisted in localStorage). */
 export interface ServerConfig {
+	/** Unique identifier for this server entry. */
 	id: string;
+	/** Human-readable display name. */
 	name: string;
+	/** WebSocket URL (e.g. `'ws://host:1337/api/ws'`). */
 	wsUrl: string;
+	/** API key for authentication (Bearer token). */
 	apiKey: string;
+	/** Preferred shell binary (empty string = device default). */
 	shell: string;
 }
 
@@ -595,6 +673,7 @@ export interface GxErrorMsg {
 
 // ── Viewer tabs ────────────────────────────────────────────────
 
+/** A tab in the viewer panel (exec result or file content). */
 export interface ViewerTab {
 	key: string;
 	type: 'exec' | 'file';
@@ -603,6 +682,7 @@ export interface ViewerTab {
 	data: ExecViewerData | FileViewerData;
 }
 
+/** Data for an exec result viewer tab. */
 export interface ExecViewerData {
 	activityId: number;
 	command: string;
@@ -614,6 +694,7 @@ export interface ExecViewerData {
 	errorMessage?: string;
 }
 
+/** Data for a file content viewer tab. */
 export interface FileViewerData {
 	path: string;
 	content: string;

@@ -6,9 +6,13 @@
 	import PlaybookViewer from '../components/PlaybookViewer.svelte';
 	import PlaybookExecutor from '../components/PlaybookExecutor.svelte';
 
+	/** Playbook browser with viewer and executor. Lists playbooks, shows detail, runs with params. */
 	interface Props {
+		/** Connection details (wsUrl, apiKey). Required. */
 		config: DeviceConnectionConfig;
+		/** Show delete buttons for playbooks. Default: false. */
 		editable?: boolean;
+		/** Additional CSS classes on the wrapper div. */
 		class?: string;
 	}
 

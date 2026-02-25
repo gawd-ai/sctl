@@ -3,12 +3,11 @@
 	import { onMount } from 'svelte';
 	import { TerminalContainer, TerminalTabs, ServerPanel, ToastContainer, QuickExecBar, FileBrowser, CommandPalette, KeyboardShortcuts, TransferIndicator, PlaybookPanel, SidePanel, ServerDashboard } from '$lib';
 	import ExecViewer from '$lib/components/ExecViewer.svelte';
-	import { SctlRestClient } from '$lib/utils/rest-client';
-	import { SctlWsClient } from '$lib/utils/ws-client';
-	import { TransferTracker, type ClientTransfer } from '$lib/utils/transfer';
+	import { ConnectionManager } from '$lib/utils/connection-manager';
 	import { KeyboardManager } from '$lib/utils/keyboard';
 	import { AppSidebar } from 'gawdux';
 	import type { SidebarConfig } from 'gawdux';
+	import type { ClientTransfer } from '$lib/utils/transfer';
 	import type {
 		SctlinConfig,
 		SessionInfo,
@@ -153,12 +152,10 @@
 	let activeServerId: string | null = $state(null);
 	let activeKeys: Record<string, string | null> = $state({});
 
-	// REST clients + device info
-	let serverRestClients: Record<string, SctlRestClient> = {};
+	// Device info
 	let serverDeviceInfo: Record<string, DeviceInfo | null> = $state({});
 
-	// Transfer trackers (per-server)
-	let serverTransferTrackers: Record<string, TransferTracker> = {};
+	// Transfer lists (per-server, updated via manager events)
 	let serverTransferLists: Record<string, ClientTransfer[]> = $state({});
 
 	// Split groups (per-server, for tab/sidebar highlighting)
@@ -187,6 +184,39 @@
 
 	// Keyboard
 	const keyboard = new KeyboardManager();
+
+	// Connection manager (framework-agnostic orchestrator)
+	const manager = new ConnectionManager(
+		{ maxActivityEntries: 200 },
+		{
+			onConnectionChange: (id, status) => {
+				const prevStatus = connectionStatuses[id];
+				connectionStatuses = { ...connectionStatuses, [id]: status };
+				if (status === 'connected' && prevStatus !== 'connected') {
+					toastRef?.push(`Connected to ${servers.find(s => s.id === id)?.name ?? id}`, 'success');
+				} else if (status === 'reconnecting' && prevStatus === 'connected') {
+					toastRef?.push(`Reconnecting to ${servers.find(s => s.id === id)?.name ?? id}...`, 'warning');
+				} else if (status === 'disconnected' && prevStatus === 'connected') {
+					toastRef?.push(`Disconnected from ${servers.find(s => s.id === id)?.name ?? id}`, 'info');
+				}
+			},
+			onDeviceInfo: (id, info) => {
+				serverDeviceInfo = { ...serverDeviceInfo, [id]: info };
+			},
+			onActivity: (id, entries) => {
+				serverActivity = { ...serverActivity, [id]: entries };
+			},
+			onTransferChange: (id, transfers) => {
+				serverTransferLists = { ...serverTransferLists, [id]: transfers };
+			},
+			onTransferError: (_id, _ct, msg) => {
+				toastRef?.push(msg, 'error');
+			},
+			onError: (_id, err) => {
+				console.error('[sctlin]', err.message);
+			}
+		}
+	);
 
 	// Quick exec
 	let quickExecVisible = $state(false);
@@ -254,7 +284,7 @@
 	);
 
 	let activeTransferTracker = $derived(
-		activeServerId ? serverTransferTrackers[activeServerId] ?? null : null
+		activeServerId ? manager.get(activeServerId)?.transferTracker ?? null : null
 	);
 
 	let activeSplitGroups = $derived(
@@ -389,87 +419,6 @@
 		activeServerId ? activeKeys[activeServerId] ?? null : null
 	);
 
-	// ── Config builder ───────────────────────────────────────────────
-
-	function buildConfig(server: ServerConfig): SctlinConfig {
-		return {
-			wsUrl: server.wsUrl,
-			apiKey: server.apiKey,
-			autoConnect: true,
-			autoStartSession: false,
-			defaultRows: 24,
-			defaultCols: 80,
-			sessionDefaults: {
-				pty: true,
-				persistent: true,
-				shell: server.shell || undefined,
-				workingDir: '~'
-			},
-			callbacks: {
-				onConnectionChange: (status) => {
-					const prevStatus = connectionStatuses[server.id];
-					connectionStatuses = { ...connectionStatuses, [server.id]: status };
-
-					// Toast on connection status transitions
-					if (status === 'connected' && prevStatus !== 'connected') {
-						toastRef?.push(`Connected to ${server.name}`, 'success');
-						// Fetch device info + activity
-						fetchDeviceInfo(server.id);
-						fetchActivity(server.id);
-					} else if (status === 'reconnecting' && prevStatus === 'connected') {
-						toastRef?.push(`Reconnecting to ${server.name}...`, 'warning');
-					} else if (status === 'disconnected' && prevStatus === 'connected') {
-						toastRef?.push(`Disconnected from ${server.name}`, 'info');
-					}
-				},
-				onRemoteSessions: (sessions) => {
-					serverRemoteSessions = { ...serverRemoteSessions, [server.id]: sessions };
-				},
-				onSessionsChange: (sessions) => {
-					serverSessions = { ...serverSessions, [server.id]: sessions };
-				},
-				onActiveSessionChange: (key) => {
-					activeKeys = { ...activeKeys, [server.id]: key };
-				},
-				onSplitGroupsChange: (groups) => {
-					serverSplitGroups = { ...serverSplitGroups, [server.id]: groups };
-				},
-				onFocusedPaneChange: (pane) => {
-					focusedPanes = { ...focusedPanes, [server.id]: pane };
-				},
-				onActivity: (entry) => {
-					const current = serverActivity[server.id] ?? [];
-					// Deduplicate: REST fetch on connect may overlap with WS broadcast
-					if (current.some((e) => e.id === entry.id)) return;
-					const updated = [...current, entry];
-					// Cap at 200 entries
-					serverActivity = {
-						...serverActivity,
-						[server.id]: updated.length > 200 ? updated.slice(-200) : updated
-					};
-				},
-				onError: (err) => {
-					console.error(`[sctlin:${server.name}]`, err.message);
-					toastRef?.push(err.message, 'error');
-				}
-			}
-		};
-	}
-
-	// ── Device info ─────────────────────────────────────────────────
-
-	async function fetchDeviceInfo(serverId: string): Promise<void> {
-		const client = serverRestClients[serverId];
-		if (!client) return;
-		try {
-			const info = await client.getInfo();
-			serverDeviceInfo = { ...serverDeviceInfo, [serverId]: info };
-		} catch (err) {
-			console.error(`Failed to fetch device info for ${serverId}:`, err);
-			serverDeviceInfo = { ...serverDeviceInfo, [serverId]: null };
-		}
-	}
-
 	// ── Master AI toggle ────────────────────────────────────────────
 
 	async function toggleMasterAi(serverId: string): Promise<void> {
@@ -480,56 +429,49 @@
 		if (ref) await ref.setAllAi(newVal);
 	}
 
-	// ── Activity feed ───────────────────────────────────────────────
-
-	async function fetchActivity(serverId: string): Promise<void> {
-		const client = serverRestClients[serverId];
-		if (!client) return;
-		try {
-			const entries = await client.getActivity(0, 100);
-			serverActivity = { ...serverActivity, [serverId]: entries };
-		} catch (err) {
-			console.error(`Failed to fetch activity for ${serverId}:`, err);
-		}
-	}
-
 	// ── Server management ────────────────────────────────────────────
 
 	function connectServer(id: string): void {
 		const server = servers.find((s) => s.id === id);
 		if (!server || serverConfigs[id]) return;
-		// Pre-create WS client and start connecting immediately
-		// (don't wait for TerminalContainer to mount)
-		const wsClient = new SctlWsClient(server.wsUrl, server.apiKey);
-		wsClient.connect();
-		const cfg = buildConfig(server);
-		cfg.client = wsClient;
+
+		const conn = manager.connect(server);
+		const cfg = manager.buildSctlinConfig(server, {
+			onRemoteSessions: (sessions) => {
+				serverRemoteSessions = { ...serverRemoteSessions, [id]: sessions };
+			},
+			onSessionsChange: (sessions) => {
+				serverSessions = { ...serverSessions, [id]: sessions };
+			},
+			onActiveSessionChange: (key) => {
+				activeKeys = { ...activeKeys, [id]: key };
+			},
+			onSplitGroupsChange: (groups) => {
+				serverSplitGroups = { ...serverSplitGroups, [id]: groups };
+			},
+			onFocusedPaneChange: (pane) => {
+				focusedPanes = { ...focusedPanes, [id]: pane };
+			},
+			onError: (err) => {
+				console.error(`[sctlin:${server.name}]`, err.message);
+				toastRef?.push(err.message, 'error');
+			}
+		});
+
 		serverConfigs = { ...serverConfigs, [id]: cfg };
-		connectionStatuses = { ...connectionStatuses, [id]: 'connecting' };
-		// Create REST client + transfer tracker
-		const restClient = new SctlRestClient(server.wsUrl, server.apiKey);
-		serverRestClients[id] = restClient;
-		const tracker = new TransferTracker(restClient);
-		tracker.onchange = () => {
-			serverTransferLists = { ...serverTransferLists, [id]: tracker.activeTransfers };
-		};
-		tracker.onerror = (_ct, msg) => {
-			toastRef?.push(msg, 'error');
-		};
-		serverTransferTrackers[id] = tracker;
+		connectionStatuses = { ...connectionStatuses, [id]: conn.status };
 		activeServerId = id;
 		saveServers();
 	}
 
 	function disconnectServer(id: string): void {
+		manager.disconnect(id);
 		const { [id]: _, ...rest } = serverConfigs;
 		serverConfigs = rest;
 		connectionStatuses = { ...connectionStatuses, [id]: 'disconnected' };
 		serverSessions = { ...serverSessions, [id]: [] };
 		serverRemoteSessions = { ...serverRemoteSessions, [id]: [] };
 		delete containerRefs[id];
-		delete serverRestClients[id];
-		delete serverTransferTrackers[id];
 		const { [id]: _tl, ...restTl } = serverTransferLists;
 		serverTransferLists = restTl;
 		const { [id]: _di, ...restDi } = serverDeviceInfo;
@@ -854,6 +796,7 @@
 
 		return () => {
 			for (const fn of cleanups) fn();
+			manager.destroy();
 		};
 	});
 
@@ -891,9 +834,9 @@
 
 	async function handleQuickExec(command: string) {
 		if (!activeServerId) throw new Error('No server connected');
-		const client = serverRestClients[activeServerId];
-		if (!client) throw new Error('No REST client available');
-		return client.exec(command);
+		const conn = manager.get(activeServerId);
+		if (!conn) throw new Error('No REST client available');
+		return conn.restClient.exec(command);
 	}
 </script>
 
@@ -1180,8 +1123,8 @@
 								connectionStatus={connectionStatuses[server.id] ?? 'disconnected'}
 								deviceInfo={serverDeviceInfo[server.id] ?? null}
 								activity={serverActivity[server.id] ?? []}
-								restClient={serverRestClients[server.id] ?? null}
-								onrefreshinfo={() => fetchDeviceInfo(server.id)}
+								restClient={manager.get(server.id)?.restClient ?? null}
+								onrefreshinfo={() => manager.fetchDeviceInfo(server.id)}
 								onToggleFiles={() => { toggleSidePanel('files', dpk); }}
 								onTogglePlaybooks={() => { toggleSidePanel('playbooks', dpk); }}
 								onToggleAi={() => { toggleMasterAi(server.id); }}
@@ -1236,8 +1179,8 @@
 									<div class="h-full" style:display={panelTab === 'files' ? 'flex' : 'none'}>
 										<FileBrowser
 											visible={isFocused && (serverPanelOpen[server.id] ?? false) && panelTab === 'files'}
-											restClient={serverRestClients[server.id] ?? null}
-											tracker={serverTransferTrackers[server.id] ?? null}
+											restClient={manager.get(server.id)?.restClient ?? null}
+											tracker={manager.get(server.id)?.transferTracker ?? null}
 											onsynccd={(path) => {
 												containerRefs[server.id]?.execInActiveSession(`cd ${path}`);
 											}}
@@ -1246,7 +1189,7 @@
 									<div class="h-full" style:display={panelTab === 'playbooks' ? 'flex' : 'none'}>
 										<PlaybookPanel
 											visible={isFocused && (serverPanelOpen[server.id] ?? false) && panelTab === 'playbooks'}
-											restClient={serverRestClients[server.id] ?? null}
+											restClient={manager.get(server.id)?.restClient ?? null}
 											onRunInTerminal={(script: string) => {
 												containerRefs[server.id]?.execInActiveSession(script);
 											}}
@@ -1281,14 +1224,14 @@
 								<div class="h-full" style:display={dashTab === 'files' ? 'flex' : 'none'}>
 									<FileBrowser
 										visible={isDashFocused && (serverPanelOpen[server.id] ?? false) && dashTab === 'files'}
-										restClient={serverRestClients[server.id] ?? null}
-										tracker={serverTransferTrackers[server.id] ?? null}
+										restClient={manager.get(server.id)?.restClient ?? null}
+										tracker={manager.get(server.id)?.transferTracker ?? null}
 									/>
 								</div>
 								<div class="h-full" style:display={dashTab === 'playbooks' ? 'flex' : 'none'}>
 									<PlaybookPanel
 										visible={isDashFocused && (serverPanelOpen[server.id] ?? false) && dashTab === 'playbooks'}
-										restClient={serverRestClients[server.id] ?? null}
+										restClient={manager.get(server.id)?.restClient ?? null}
 									/>
 								</div>
 							{/snippet}

@@ -4,9 +4,13 @@
 	import { SctlRestClient } from '../utils/rest-client';
 	import DeviceInfoPanel from '../components/DeviceInfoPanel.svelte';
 
+	/** Displays device info (hostname, CPU, memory, disk, network) with periodic polling. */
 	interface Props {
+		/** Connection details (wsUrl, apiKey). Required. */
 		config: DeviceConnectionConfig;
+		/** Polling interval in ms. Default: 30000. Set 0 to disable polling. */
 		pollInterval?: number;
+		/** Additional CSS classes on the wrapper div. */
 		class?: string;
 	}
 

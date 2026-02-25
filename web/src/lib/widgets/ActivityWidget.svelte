@@ -5,10 +5,15 @@
 	import { SctlWsClient } from '../utils/ws-client';
 	import ActivityFeed from '../components/ActivityFeed.svelte';
 
+	/** Activity feed showing device operations with optional real-time WebSocket updates. */
 	interface Props {
+		/** Connection details (wsUrl, apiKey). Required. */
 		config: DeviceConnectionConfig;
+		/** Max entries to display. Default: 100. */
 		maxEntries?: number;
+		/** Subscribe to live updates via WebSocket. Default: true. */
 		realtime?: boolean;
+		/** Additional CSS classes on the wrapper div. */
 		class?: string;
 	}
 

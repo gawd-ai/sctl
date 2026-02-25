@@ -7,6 +7,7 @@
 
 import type { SctlRestClient } from './rest-client';
 import type { TransferDirection } from '../types/terminal.types';
+import { TransferError } from './errors';
 
 const MAX_CHUNK_RETRIES = 3;
 const DEFAULT_CHUNK_SIZE = 262_144; // 256 KiB
@@ -107,7 +108,7 @@ export class TransferTracker {
 						// Verify chunk hash
 						const actual = await sha256Hex(data);
 						if (actual !== hash) {
-							throw new Error(`Chunk ${i} hash mismatch: expected ${hash}, got ${actual}`);
+							throw new TransferError(`Chunk ${i} hash mismatch: expected ${hash}, got ${actual}`, transfer_id);
 						}
 
 						chunks[i] = data;
@@ -150,7 +151,7 @@ export class TransferTracker {
 
 			const actualHash = await sha256Hex(fullBuf.buffer);
 			if (actualHash !== file_hash) {
-				throw new Error(`File hash mismatch: expected ${file_hash}, got ${actualHash}`);
+				throw new TransferError(`File hash mismatch: expected ${file_hash}, got ${actualHash}`, transfer_id);
 			}
 
 			ct.state = 'complete';
@@ -224,7 +225,7 @@ export class TransferTracker {
 					try {
 						const ack = await this.restClient.stpSendChunk(transfer_id, i, buf, chunkHash, ac.signal);
 						if (!ack.ok) {
-							throw new Error(ack.error ?? `Chunk ${i} rejected`);
+							throw new TransferError(ack.error ?? `Chunk ${i} rejected`, transfer_id);
 						}
 						lastErr = null;
 						break;

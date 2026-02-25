@@ -93,35 +93,7 @@ pub async fn exec(
     .await
     {
         Ok(result) => {
-            let activity_id = state
-                .activity_log
-                .log(
-                    ActivityType::Exec,
-                    source,
-                    activity::truncate_str(&payload.command, 80),
-                    Some(json!({
-                        "exit_code": result.exit_code,
-                        "duration_ms": result.duration_ms,
-                        "stdout_preview": activity::truncate_str(&result.stdout, 200),
-                        "stderr_preview": activity::truncate_str(&result.stderr, 200),
-                        "has_full_output": true,
-                    })),
-                    req_id.clone(),
-                )
-                .await;
-            state
-                .exec_results_cache
-                .store(CachedExecResult {
-                    activity_id,
-                    exit_code: result.exit_code,
-                    stdout: result.stdout.clone(),
-                    stderr: result.stderr.clone(),
-                    duration_ms: result.duration_ms,
-                    command: payload.command.clone(),
-                    status: "ok".to_string(),
-                    error_message: None,
-                })
-                .await;
+            log_exec_ok(&state, source, &payload.command, &result, req_id).await;
             Ok(Json(ExecResponse {
                 exit_code: result.exit_code,
                 stdout: result.stdout,
@@ -131,34 +103,16 @@ pub async fn exec(
             }))
         }
         Err(process::ExecError::Timeout) => {
-            let activity_id = state
-                .activity_log
-                .log(
-                    ActivityType::Exec,
-                    source,
-                    activity::truncate_str(&payload.command, 80),
-                    Some(json!({
-                        "exit_code": -1,
-                        "duration_ms": timeout,
-                        "status": "timeout",
-                        "has_full_output": true,
-                    })),
-                    req_id.clone(),
-                )
-                .await;
-            state
-                .exec_results_cache
-                .store(CachedExecResult {
-                    activity_id,
-                    exit_code: -1,
-                    stdout: String::new(),
-                    stderr: "Command timed out".to_string(),
-                    duration_ms: timeout,
-                    command: payload.command.clone(),
-                    status: "timeout".to_string(),
-                    error_message: Some("Command timed out".to_string()),
-                })
-                .await;
+            log_exec_err(
+                &state,
+                source,
+                &payload.command,
+                "timeout",
+                "Command timed out",
+                timeout,
+                req_id,
+            )
+            .await;
             let mut err = json!({"error": "Command timed out", "code": "TIMEOUT"});
             if let Some(ref rid) = payload.request_id {
                 err["request_id"] = json!(rid);
@@ -167,35 +121,16 @@ pub async fn exec(
         }
         Err(e) => {
             let error_msg = e.to_string();
-            let activity_id = state
-                .activity_log
-                .log(
-                    ActivityType::Exec,
-                    source,
-                    activity::truncate_str(&payload.command, 80),
-                    Some(json!({
-                        "exit_code": -1,
-                        "duration_ms": 0,
-                        "status": "error",
-                        "error": &error_msg,
-                        "has_full_output": true,
-                    })),
-                    req_id.clone(),
-                )
-                .await;
-            state
-                .exec_results_cache
-                .store(CachedExecResult {
-                    activity_id,
-                    exit_code: -1,
-                    stdout: String::new(),
-                    stderr: error_msg.clone(),
-                    duration_ms: 0,
-                    command: payload.command.clone(),
-                    status: "error".to_string(),
-                    error_message: Some(error_msg.clone()),
-                })
-                .await;
+            log_exec_err(
+                &state,
+                source,
+                &payload.command,
+                "error",
+                &error_msg,
+                0,
+                req_id,
+            )
+            .await;
             let mut err = json!({"error": error_msg, "code": "EXEC_FAILED"});
             if let Some(ref rid) = payload.request_id {
                 err["request_id"] = json!(rid);
@@ -295,90 +230,21 @@ pub async fn batch_exec(
         .working_dir
         .as_deref()
         .unwrap_or(&state.config.shell.default_working_dir);
-
     let expanded_default_dir = crate::util::expand_tilde(default_dir);
 
     let mut results = Vec::with_capacity(payload.commands.len());
     for cmd in &payload.commands {
-        let shell = cmd.shell.as_deref().unwrap_or(default_shell);
-        let raw_cmd_dir = cmd.working_dir.as_deref().unwrap_or(&expanded_default_dir);
-        let expanded_cmd_dir = crate::util::expand_tilde(raw_cmd_dir);
-        let working_dir = expanded_cmd_dir.as_ref();
-        let timeout = cmd
-            .timeout_ms
-            .unwrap_or(state.config.server.exec_timeout_ms);
-
-        // Per-command env merges batch-level env with command-level env (command wins)
-        let merged_env = match (&payload.env, &cmd.env) {
-            (None, None) => None,
-            (Some(base), None) => Some(base.clone()),
-            (None, Some(over)) => Some(over.clone()),
-            (Some(base), Some(over)) => {
-                let mut merged = base.clone();
-                merged.extend(over.iter().map(|(k, v)| (k.clone(), v.clone())));
-                Some(merged)
-            }
-        };
-
-        let resp = match Box::pin(process::exec_command(
-            shell,
-            working_dir,
-            &cmd.command,
-            timeout,
+        let merged_env = merge_env(payload.env.as_ref(), cmd.env.as_ref());
+        let resp = run_batch_command(
+            &state,
+            source,
+            cmd,
+            default_shell,
+            &expanded_default_dir,
             merged_env.as_ref(),
-        ))
-        .await
-        {
-            Ok(result) => {
-                log_batch_exec(&state, source, &cmd.command, &result, req_id.clone()).await;
-                ExecResponse {
-                    exit_code: result.exit_code,
-                    stdout: result.stdout,
-                    stderr: result.stderr,
-                    duration_ms: result.duration_ms,
-                    request_id: None,
-                }
-            }
-            Err(process::ExecError::Timeout) => {
-                log_batch_exec_error(
-                    &state,
-                    source,
-                    &cmd.command,
-                    "timeout",
-                    "Command timed out",
-                    timeout,
-                    req_id.clone(),
-                )
-                .await;
-                ExecResponse {
-                    exit_code: -1,
-                    stdout: String::new(),
-                    stderr: "Command timed out".to_string(),
-                    duration_ms: timeout,
-                    request_id: None,
-                }
-            }
-            Err(e) => {
-                let error_msg = e.to_string();
-                log_batch_exec_error(
-                    &state,
-                    source,
-                    &cmd.command,
-                    "error",
-                    &error_msg,
-                    0,
-                    req_id.clone(),
-                )
-                .await;
-                ExecResponse {
-                    exit_code: -1,
-                    stdout: String::new(),
-                    stderr: error_msg,
-                    duration_ms: 0,
-                    request_id: None,
-                }
-            }
-        };
+            req_id.clone(),
+        )
+        .await;
         results.push(resp);
     }
 
@@ -388,7 +254,10 @@ pub async fn batch_exec(
     }))
 }
 
-async fn log_batch_exec(
+// ── Shared helpers ────────────────────────────────────────────────────
+
+/// Log a successful exec to the activity log and cache the result.
+async fn log_exec_ok(
     state: &AppState,
     source: activity::ActivitySource,
     command: &str,
@@ -406,7 +275,6 @@ async fn log_batch_exec(
                 "duration_ms": result.duration_ms,
                 "stdout_preview": activity::truncate_str(&result.stdout, 200),
                 "stderr_preview": activity::truncate_str(&result.stderr, 200),
-                "batch": true,
                 "has_full_output": true,
             })),
             request_id,
@@ -427,7 +295,8 @@ async fn log_batch_exec(
         .await;
 }
 
-async fn log_batch_exec_error(
+/// Log a failed exec (timeout or spawn error) to the activity log and cache the result.
+async fn log_exec_err(
     state: &AppState,
     source: activity::ActivitySource,
     command: &str,
@@ -447,7 +316,6 @@ async fn log_batch_exec_error(
                 "duration_ms": duration_ms,
                 "status": status,
                 "error": error_msg,
-                "batch": true,
                 "has_full_output": true,
             })),
             request_id,
@@ -466,4 +334,91 @@ async fn log_batch_exec_error(
             error_message: Some(error_msg.to_string()),
         })
         .await;
+}
+
+/// Merge batch-level and per-command env vars (command-level wins on conflict).
+fn merge_env(
+    batch_env: Option<&HashMap<String, String>>,
+    cmd_env: Option<&HashMap<String, String>>,
+) -> Option<HashMap<String, String>> {
+    match (batch_env, cmd_env) {
+        (None, None) => None,
+        (Some(base), None) => Some(base.clone()),
+        (None, Some(over)) => Some(over.clone()),
+        (Some(base), Some(over)) => {
+            let mut merged = base.clone();
+            merged.extend(over.iter().map(|(k, v)| (k.clone(), v.clone())));
+            Some(merged)
+        }
+    }
+}
+
+/// Execute a single command within a batch, logging the result.
+async fn run_batch_command(
+    state: &AppState,
+    source: activity::ActivitySource,
+    cmd: &BatchCommand,
+    default_shell: &str,
+    default_dir: &str,
+    env: Option<&HashMap<String, String>>,
+    req_id: Option<String>,
+) -> ExecResponse {
+    let shell = cmd.shell.as_deref().unwrap_or(default_shell);
+    let raw_dir = cmd.working_dir.as_deref().unwrap_or(default_dir);
+    let expanded_dir = crate::util::expand_tilde(raw_dir);
+    let working_dir = expanded_dir.as_ref();
+    let timeout = cmd
+        .timeout_ms
+        .unwrap_or(state.config.server.exec_timeout_ms);
+
+    match Box::pin(process::exec_command(
+        shell,
+        working_dir,
+        &cmd.command,
+        timeout,
+        env,
+    ))
+    .await
+    {
+        Ok(result) => {
+            log_exec_ok(state, source, &cmd.command, &result, req_id).await;
+            ExecResponse {
+                exit_code: result.exit_code,
+                stdout: result.stdout,
+                stderr: result.stderr,
+                duration_ms: result.duration_ms,
+                request_id: None,
+            }
+        }
+        Err(process::ExecError::Timeout) => {
+            log_exec_err(
+                state,
+                source,
+                &cmd.command,
+                "timeout",
+                "Command timed out",
+                timeout,
+                req_id,
+            )
+            .await;
+            ExecResponse {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: "Command timed out".to_string(),
+                duration_ms: timeout,
+                request_id: None,
+            }
+        }
+        Err(e) => {
+            let error_msg = e.to_string();
+            log_exec_err(state, source, &cmd.command, "error", &error_msg, 0, req_id).await;
+            ExecResponse {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: error_msg,
+                duration_ms: 0,
+                request_id: None,
+            }
+        }
+    }
 }

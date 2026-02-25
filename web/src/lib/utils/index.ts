@@ -1,5 +1,10 @@
 export { SctlWsClient } from './ws-client';
+export type { WsClientConfig } from './ws-client';
 export { createTerminal, applyTheme, DEFAULT_THEME, type XtermInstance } from './xterm';
 export { SctlRestClient } from './rest-client';
+export type { RestClientConfig } from './rest-client';
 export { KeyboardManager, type Shortcut } from './keyboard';
 export { parsePlaybookFrontmatter, renderPlaybookScript, validatePlaybookName } from './playbook-parser';
+export { TransferTracker, type ClientTransfer, type TransferProgress, type TransferState, type OnProgress, type OnComplete, type OnError } from './transfer';
+export { ConnectionManager, type ConnectionManagerConfig, type ConnectionManagerEvents, type ServerConnection } from './connection-manager';
+export { SctlError, ConnectionError, ServerError, TimeoutError, HttpError, TransferError } from './errors';

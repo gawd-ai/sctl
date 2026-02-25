@@ -16,6 +16,7 @@ import type {
 	WsSessionListedMsg,
 	WsShellListedMsg
 } from '../types/terminal.types';
+import { ConnectionError, ServerError, TimeoutError } from './errors';
 
 type ServerMsgType = WsServerMsg['type'];
 type MsgOfType<T extends ServerMsgType> = Extract<WsServerMsg, { type: T }>;
@@ -28,7 +29,16 @@ const DEFAULT_RECONNECT: ReconnectConfig = {
 	maxAttempts: Infinity
 };
 
-const ACK_TIMEOUT_MS = 10_000;
+const DEFAULT_ACK_TIMEOUT_MS = 10_000;
+const DEFAULT_PING_INTERVAL_MS = 30_000;
+
+/** Configuration for WebSocket client behavior. */
+export interface WsClientConfig {
+	/** Interval in ms between keepalive pings. Default: 30000. */
+	pingInterval?: number;
+	/** Timeout in ms to wait for an ack response. Default: 10000. */
+	ackTimeout?: number;
+}
 
 /**
  * Framework-agnostic WebSocket client for sctl.
@@ -53,11 +63,15 @@ export class SctlWsClient {
 	readonly wsUrl: string;
 	readonly apiKey: string;
 	readonly reconnectConfig: ReconnectConfig;
+	private readonly ackTimeoutMs: number;
+	private readonly pingIntervalMs: number;
 
-	constructor(wsUrl: string, apiKey: string, reconnect?: Partial<ReconnectConfig>) {
+	constructor(wsUrl: string, apiKey: string, reconnect?: Partial<ReconnectConfig>, config?: WsClientConfig) {
 		this.wsUrl = wsUrl;
 		this.apiKey = apiKey;
 		this.reconnectConfig = { ...DEFAULT_RECONNECT, ...reconnect };
+		this.ackTimeoutMs = config?.ackTimeout ?? DEFAULT_ACK_TIMEOUT_MS;
+		this.pingIntervalMs = config?.pingInterval ?? DEFAULT_PING_INTERVAL_MS;
 		// Immediately retry when tab becomes visible during reconnect
 		this.visibilityHandler = () => {
 			if (document.visibilityState === 'visible' && this._status === 'reconnecting') {
@@ -75,6 +89,7 @@ export class SctlWsClient {
 
 	// ── Connection ──────────────────────────────────────────────────
 
+	/** Current connection status (`'disconnected'`, `'connecting'`, `'connected'`, `'reconnecting'`). */
 	get status(): ConnectionStatus {
 		return this._status;
 	}
@@ -84,6 +99,7 @@ export class SctlWsClient {
 		return this._reconnectCount;
 	}
 
+	/** Open the WebSocket connection. No-op if already connecting or connected. */
 	connect(): void {
 		if (this.ws && (this.ws.readyState === WebSocket.CONNECTING || this.ws.readyState === WebSocket.OPEN)) {
 			return;
@@ -131,6 +147,7 @@ export class SctlWsClient {
 		this.ws = ws;
 	}
 
+	/** Close the WebSocket connection, cancel reconnect, and reject all pending acks. */
 	disconnect(): void {
 		this.intentionalClose = true;
 		this.stopPing();
@@ -148,7 +165,7 @@ export class SctlWsClient {
 		// Reject all pending acks
 		for (const [, pending] of this.pendingAcks) {
 			clearTimeout(pending.timer);
-			pending.reject(new Error('Connection closed'));
+			pending.reject(new ConnectionError('Connection closed'));
 		}
 		this.pendingAcks.clear();
 	}
@@ -179,6 +196,7 @@ export class SctlWsClient {
 		for (const cb of this.statusListeners) cb(s);
 	}
 
+	/** Register a callback for connection status changes. Returns an unsubscribe function. */
 	onStatusChange(cb: (s: ConnectionStatus) => void): () => void {
 		this.statusListeners.add(cb);
 		return () => this.statusListeners.delete(cb);
@@ -194,7 +212,8 @@ export class SctlWsClient {
 				clearTimeout(pending.timer);
 				this.pendingAcks.delete(msg.request_id);
 				if (msg.type === 'error') {
-					pending.reject(new Error((msg as WsErrorMsg).message));
+					const errMsg = msg as WsErrorMsg;
+					pending.reject(new ServerError(errMsg.code, errMsg.message));
 				} else {
 					pending.resolve(msg);
 				}
@@ -240,7 +259,7 @@ export class SctlWsClient {
 
 	private send(msg: WsClientMsg): void {
 		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-			throw new Error('WebSocket not connected');
+			throw new ConnectionError('WebSocket not connected');
 		}
 		this.ws.send(JSON.stringify(msg));
 	}
@@ -256,8 +275,8 @@ export class SctlWsClient {
 		return new Promise<T>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.pendingAcks.delete(requestId);
-				reject(new Error(`Ack timeout for ${msg.type} (${requestId})`));
-			}, ACK_TIMEOUT_MS);
+				reject(new TimeoutError(`Ack timeout for ${msg.type} (${requestId})`));
+			}, this.ackTimeoutMs);
 
 			this.pendingAcks.set(requestId, {
 				resolve: resolve as (msg: WsServerMsg) => void,
@@ -277,6 +296,7 @@ export class SctlWsClient {
 
 	// ── Session operations ──────────────────────────────────────────
 
+	/** Start a new shell session on the device. Returns the session ID and metadata. */
 	async startSession(opts?: SessionStartOptions): Promise<WsSessionStartedMsg> {
 		return this.sendWithAck<WsSessionStartedMsg>({
 			type: 'session.start',
@@ -291,6 +311,7 @@ export class SctlWsClient {
 		});
 	}
 
+	/** Attach to an existing session, replaying output since the given sequence number. */
 	async attachSession(sessionId: string, since?: number): Promise<WsSessionAttachedMsg> {
 		return this.sendWithAck<WsSessionAttachedMsg>({
 			type: 'session.attach',
@@ -299,6 +320,7 @@ export class SctlWsClient {
 		});
 	}
 
+	/** Kill a session and its process group. */
 	async killSession(sessionId: string): Promise<WsSessionClosedMsg> {
 		return this.sendWithAck<WsSessionClosedMsg>({
 			type: 'session.kill',
@@ -319,6 +341,7 @@ export class SctlWsClient {
 		}
 	}
 
+	/** Execute a command in a session (sends command + Enter). */
 	async execCommand(sessionId: string, command: string): Promise<void> {
 		await this.sendWithAck({
 			type: 'session.exec',
@@ -327,6 +350,7 @@ export class SctlWsClient {
 		});
 	}
 
+	/** Send a POSIX signal to a session's process group (e.g. 2 for SIGINT). */
 	async sendSignal(sessionId: string, signal: number): Promise<void> {
 		await this.sendWithAck({
 			type: 'session.signal',
@@ -335,6 +359,7 @@ export class SctlWsClient {
 		});
 	}
 
+	/** Resize a session's terminal (PTY dimensions). */
 	async resizeSession(sessionId: string, rows: number, cols: number): Promise<WsSessionResizeAckMsg> {
 		return this.sendWithAck<WsSessionResizeAckMsg>({
 			type: 'session.resize',
@@ -344,18 +369,21 @@ export class SctlWsClient {
 		});
 	}
 
+	/** List all sessions on the device. */
 	async listSessions(): Promise<WsSessionListedMsg> {
 		return this.sendWithAck<WsSessionListedMsg>({
 			type: 'session.list'
 		});
 	}
 
+	/** List available shells on the device. */
 	async listShells(): Promise<WsShellListedMsg> {
 		return this.sendWithAck<WsShellListedMsg>({
 			type: 'shell.list'
 		});
 	}
 
+	/** Rename a session (human-readable label). */
 	async renameSession(sessionId: string, name: string): Promise<WsSessionRenameAckMsg> {
 		return this.sendWithAck<WsSessionRenameAckMsg>({
 			type: 'session.rename',
@@ -364,6 +392,7 @@ export class SctlWsClient {
 		});
 	}
 
+	/** Set whether AI agents are permitted to control a session. */
 	async setUserAllowsAi(sessionId: string, allowed: boolean): Promise<WsSessionAllowAiAckMsg> {
 		return this.sendWithAck<WsSessionAllowAiAckMsg>({
 			type: 'session.allow_ai',
@@ -393,7 +422,7 @@ export class SctlWsClient {
 			} catch {
 				// Connection lost — onclose will handle reconnect
 			}
-		}, 30_000);
+		}, this.pingIntervalMs);
 	}
 
 	private stopPing(): void {

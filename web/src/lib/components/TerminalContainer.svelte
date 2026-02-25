@@ -20,13 +20,21 @@
 
 
 	interface Props {
+		/** The SctlinConfig controlling connection, session defaults, and callbacks. Required. */
 		config: SctlinConfig;
+		/** Show the session tab bar. Default: true. Set false for single-session embeds. */
 		showTabs?: boolean;
+		/** Callback when user clicks the file browser toggle. Wired by parent for side panel control. */
 		onToggleFiles?: () => void;
+		/** Callback when user clicks the playbooks toggle. */
 		onTogglePlaybooks?: () => void;
+		/** Whether a side panel is currently open. Adjusts terminal layout. */
 		sidePanelOpen?: boolean;
+		/** Which side panel tab is active (e.g. `'files'`, `'playbooks'`). */
 		sidePanelTab?: string;
+		/** Pixels to inset from the right edge (for side panel width). */
 		rightInset?: number;
+		/** Whether the right inset transition is animated. */
 		rightInsetAnimate?: boolean;
 	}
 
@@ -157,11 +165,13 @@
 
 	// ── Session management ──────────────────────────────────────────
 
+	/** Query the server for available shells. Returns the list and the device default. */
 	export async function listShells(): Promise<{ shells: string[]; defaultShell: string }> {
 		const result = await client.listShells();
 		return { shells: result.shells, defaultShell: result.default_shell };
 	}
 
+	/** Start a new PTY session, optionally specifying a shell path. Opens a new tab. */
 	export async function startSession(shell?: string): Promise<void> {
 		containerError = null;
 		try {
@@ -367,10 +377,12 @@
 	// ── Public methods (key-based) ──────────────────────────────────
 	// All accept session.key (globally unique UUID).
 
+	/** Switch the active tab to the session identified by its local key. */
 	export function selectSession(key: string): void {
 		if (sessions.some((s) => s.key === key)) setActiveKey(key);
 	}
 
+	/** Close a session tab and kill the server-side session. */
 	export async function closeSession(key: string): Promise<void> {
 		const sid = sessionIdFor(key);
 		if (!sid) return;
@@ -394,6 +406,7 @@
 		fetchRemoteSessions();
 	}
 
+	/** Close the local tab but leave the server-side session running (can re-attach later). */
 	export function detachSession(key: string): void {
 		const sid = sessionIdFor(key);
 		if (!sid) return;
@@ -404,6 +417,7 @@
 		fetchRemoteSessions();
 	}
 
+	/** Close a tab without killing the server-side session. */
 	export function closeTab(key: string): void {
 		const sid = sessionIdFor(key);
 		if (!sid) return;
@@ -414,6 +428,7 @@
 
 	const renameTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+	/** Rename a session's display label (updates both local state and server-side, debounced 500ms). */
 	export function renameSession(key: string, label: string): void {
 		const sid = sessionIdFor(key);
 		if (!sid) return;
@@ -638,12 +653,14 @@
 
 	// ── Search ──────────────────────────────────────────────────────
 
+	/** Toggle the terminal search bar on the active session. */
 	export function toggleSearch(): void {
 		searchVisible = !searchVisible;
 	}
 
 	// ── Split panes ────────────────────────────────────────────────
 
+	/** Split the current session into a horizontal split group (or toggle direction/unsplit). */
 	export function splitHorizontal(): void {
 		const g = currentGroup();
 		if (g) {
@@ -657,6 +674,7 @@
 		splitPickerDirection = splitPickerDirection === 'horizontal' ? null : 'horizontal';
 	}
 
+	/** Split the current session into a vertical split group (or toggle direction/unsplit). */
 	export function splitVertical(): void {
 		const g = currentGroup();
 		if (g) {
@@ -668,6 +686,7 @@
 		splitPickerDirection = splitPickerDirection === 'vertical' ? null : 'vertical';
 	}
 
+	/** Remove the split, keeping only the focused pane as the active session. */
 	export function unsplit(): void {
 		if (!activeKey) return;
 		const g = splitGroups[activeKey];
@@ -834,6 +853,7 @@
 		window.addEventListener('mouseup', cleanup);
 	}
 
+	/** Toggle keyboard focus between split panes (primary ↔ secondary). */
 	export function toggleSplitFocus(): void {
 		const g = currentGroup();
 		if (!g) return;
@@ -843,10 +863,12 @@
 		if (key) terminalRefs[key]?.focus();
 	}
 
+	/** Get the local key of the secondary (bottom/right) split pane, or null if not split. */
 	export function getSplitSecondaryKey(): string | null {
 		return currentGroup()?.secondaryKey ?? null;
 	}
 
+	/** Get the local key of the primary (top/left) split pane, or null if not split. */
 	export function getSplitPrimaryKey(): string | null {
 		return isSplitVisible() ? activeKey : null;
 	}
@@ -862,10 +884,12 @@
 
 	// ── Public accessors ────────────────────────────────────────────
 
+	/** Get the current list of all session tabs as `SessionInfo[]`. */
 	export function getSessionList(): SessionInfo[] {
 		return sessions.map((s) => ({ ...s, lastSeq: seqMap.get(s.sessionId) ?? s.lastSeq }));
 	}
 
+	/** Get the local key of the currently active session tab, or null if no sessions. */
 	export function getActiveKey(): string | null {
 		return activeKey;
 	}
