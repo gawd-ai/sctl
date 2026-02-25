@@ -96,8 +96,8 @@ pub struct SessionEntry {
     pub persistent: bool,
     /// Last time the session received input or was attached.
     pub last_activity: Instant,
-    /// Whether a WebSocket subscriber is currently attached.
-    pub attached: bool,
+    /// Number of WebSocket subscribers currently attached.
+    pub attached_count: u32,
     /// Seconds of idle (detached + no activity) before the session is
     /// gracefully killed by sweep. 0 = never auto-kill.
     pub idle_timeout: u64,
@@ -258,7 +258,7 @@ impl SessionManager {
                 session,
                 persistent,
                 last_activity: now,
-                attached: true,
+                attached_count: 1,
                 idle_timeout,
                 name: session_name,
                 created_at,
@@ -394,7 +394,7 @@ impl SessionManager {
     pub async fn attach(&self, session_id: &str) -> Option<Arc<tokio::sync::Mutex<OutputBuffer>>> {
         let mut sessions = self.sessions.write().await;
         if let Some(entry) = sessions.get_mut(session_id) {
-            entry.attached = true;
+            entry.attached_count = entry.attached_count.saturating_add(1);
             entry.last_activity = Instant::now();
             Some(Arc::clone(&entry.session.buffer))
         } else {
@@ -406,7 +406,7 @@ impl SessionManager {
     pub async fn detach(&self, session_id: &str) {
         let mut sessions = self.sessions.write().await;
         if let Some(entry) = sessions.get_mut(session_id) {
-            entry.attached = false;
+            entry.attached_count = entry.attached_count.saturating_sub(1);
             entry.last_activity = Instant::now();
         }
     }
@@ -416,7 +416,7 @@ impl SessionManager {
         let mut sessions = self.sessions.write().await;
         for id in session_ids {
             if let Some(entry) = sessions.get_mut(id) {
-                entry.attached = false;
+                entry.attached_count = entry.attached_count.saturating_sub(1);
                 entry.last_activity = Instant::now();
             }
         }
@@ -542,13 +542,14 @@ impl SessionManager {
         for (id, entry) in sessions.iter() {
             let status = *entry.session.status.lock().await;
             let exit_code = *entry.session.exit_code.lock().await;
-            let idle = !entry.attached && entry.last_activity.elapsed() > idle_threshold;
+            let attached = entry.attached_count > 0;
+            let idle = !attached && entry.last_activity.elapsed() > idle_threshold;
             items.push(SessionListItem {
                 session_id: id.clone(),
                 pid: entry.session.pid,
                 persistent: entry.persistent,
                 pty: entry.session.is_pty(),
-                attached: entry.attached,
+                attached,
                 status: match status {
                     session::SessionStatus::Running => "running".to_string(),
                     session::SessionStatus::Exited => "exited".to_string(),
@@ -588,6 +589,7 @@ impl SessionManager {
             return;
         }
 
+        let recovered_count = archived.len();
         let mut sessions = self.sessions.write().await;
         for arch in archived {
             let mut buf = OutputBuffer::new(self.buffer_size);
@@ -604,7 +606,7 @@ impl SessionManager {
                     session,
                     persistent: arch.metadata.persistent,
                     last_activity: now,
-                    attached: false,
+                    attached_count: 0,
                     idle_timeout: 0,
                     name: None,
                     created_at: arch.metadata.created,
@@ -621,9 +623,25 @@ impl SessionManager {
                 arch.session_id, arch.exit_code
             );
         }
+        // Cap recovered sessions against max_sessions — trim oldest if over limit
+        if sessions.len() > self.max_sessions {
+            let excess = sessions.len() - self.max_sessions;
+            let mut ids_by_created: Vec<(String, u64)> = sessions
+                .iter()
+                .map(|(id, entry)| (id.clone(), entry.created_at))
+                .collect();
+            ids_by_created.sort_by_key(|(_, ts)| *ts);
+            for (id, _) in ids_by_created.into_iter().take(excess) {
+                sessions.remove(&id);
+            }
+            warn!(
+                "Trimmed {excess} oldest recovered session(s) to stay within max_sessions ({})",
+                self.max_sessions
+            );
+        }
+
         info!(
-            "Recovered {} archived session(s), total: {}",
-            sessions.len(),
+            "Recovered {recovered_count} archived session(s), total: {}",
             sessions.len()
         );
     }
@@ -669,10 +687,15 @@ impl SessionManager {
         }
 
         // --- Collect exited sessions (process dead) — remove immediately ---
+        // Use try_lock() to avoid blocking the entire session map on a contested
+        // status lock (e.g. an output handler holding it). Contested sessions
+        // will be caught on the next sweep cycle.
         let mut dead: Vec<String> = Vec::new();
         for (id, entry) in sessions.iter() {
-            if *entry.session.status.lock().await == session::SessionStatus::Exited {
-                dead.push(id.clone());
+            if let Ok(status) = entry.session.status.try_lock() {
+                if *status == session::SessionStatus::Exited {
+                    dead.push(id.clone());
+                }
             }
         }
 
@@ -692,7 +715,7 @@ impl SessionManager {
             .iter()
             .filter(|(_, entry)| {
                 entry.idle_timeout > 0
-                    && !entry.attached
+                    && entry.attached_count == 0
                     && entry.last_activity.elapsed()
                         > std::time::Duration::from_secs(entry.idle_timeout)
             })

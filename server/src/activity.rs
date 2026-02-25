@@ -14,7 +14,7 @@
 //!   the existing `broadcast::Sender<Value>` — the WS event loop already forwards
 //!   all broadcast messages to connected clients.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::http::HeaderMap;
@@ -217,6 +217,66 @@ pub fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string)
+}
+
+// ---------------------------------------------------------------------------
+// Exec results cache
+// ---------------------------------------------------------------------------
+
+/// Full exec result cached in memory, keyed by activity ID.
+#[derive(Debug, Clone, Serialize)]
+pub struct CachedExecResult {
+    pub activity_id: u64,
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u64,
+    pub command: String,
+    /// `"ok"`, `"timeout"`, or `"error"`.
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+/// FIFO cache of recent exec results, keyed by activity ID.
+pub struct ExecResultsCache {
+    inner: RwLock<ExecResultsCacheInner>,
+    max_entries: usize,
+}
+
+struct ExecResultsCacheInner {
+    order: VecDeque<u64>,
+    map: HashMap<u64, CachedExecResult>,
+}
+
+impl ExecResultsCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            inner: RwLock::new(ExecResultsCacheInner {
+                order: VecDeque::with_capacity(max_entries),
+                map: HashMap::with_capacity(max_entries),
+            }),
+            max_entries,
+        }
+    }
+
+    /// Store a result, evicting the oldest entry if at capacity.
+    pub async fn store(&self, result: CachedExecResult) {
+        let mut inner = self.inner.write().await;
+        if inner.order.len() >= self.max_entries {
+            if let Some(old_id) = inner.order.pop_front() {
+                inner.map.remove(&old_id);
+            }
+        }
+        inner.order.push_back(result.activity_id);
+        inner.map.insert(result.activity_id, result);
+    }
+
+    /// Retrieve a cached result by activity ID, if it hasn't been evicted.
+    pub async fn get(&self, activity_id: u64) -> Option<CachedExecResult> {
+        let inner = self.inner.read().await;
+        inner.map.get(&activity_id).cloned()
+    }
 }
 
 /// Truncate a string to `max` chars, appending "..." if truncated.

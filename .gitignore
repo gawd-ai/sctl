@@ -24,6 +24,7 @@ web/node_modules/
 web/.svelte-kit/
 web/dist/
 web/build/
+web/static/sctlin-seed.json
 node_modules/
 
 # Environment files

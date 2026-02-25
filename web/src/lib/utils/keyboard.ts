@@ -21,14 +21,17 @@ export class KeyboardManager {
 	}
 
 	handleKeydown(e: KeyboardEvent): void {
-		// Ignore events from form elements
-		const tag = (e.target as HTMLElement)?.tagName;
-		if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+		// Ignore events from form elements (but not xterm's internal textarea)
+		const target = e.target as HTMLElement;
+		const tag = target?.tagName;
+		if (tag === 'INPUT' || tag === 'SELECT') return;
+		if (tag === 'TEXTAREA' && !target.closest('.xterm')) return;
 
 		for (const shortcut of this.shortcuts.values()) {
 			if (this.matches(e, shortcut)) {
 				if (shortcut.when && !shortcut.when()) continue;
 				e.preventDefault();
+				e.stopImmediatePropagation();
 				shortcut.action();
 				return;
 			}

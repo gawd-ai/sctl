@@ -30,7 +30,7 @@
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <div class="playbook-list flex flex-col h-full">
 	<!-- Header -->
-	<div class="flex items-center gap-1 px-2 py-1.5 border-b border-neutral-800 shrink-0">
+	<div class="flex items-center gap-1 px-1.5 h-8 border-b border-neutral-700 shrink-0">
 		<span class="text-[11px] text-neutral-300 font-mono font-semibold flex-1">Playbooks</span>
 		<span class="text-[9px] text-neutral-600 tabular-nums">{playbooks.length}</span>
 		{#if onrefresh}

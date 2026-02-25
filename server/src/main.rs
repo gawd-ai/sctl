@@ -56,6 +56,8 @@
 //! | GET    | `/d/{serial}/api/files`                  | `api_key`    | Proxied file read/list      |
 //! | PUT    | `/d/{serial}/api/files`                  | `api_key`    | Proxied file write          |
 //! | DELETE | `/d/{serial}/api/files`                  | `api_key`    | Proxied file delete         |
+//! | GET    | `/d/{serial}/api/files/raw`              | `api_key`    | Proxied file download       |
+//! | POST   | `/d/{serial}/api/files/upload`           | `api_key`    | Proxied file upload         |
 //! | GET    | `/d/{serial}/api/activity`               | `api_key`    | Proxied activity journal    |
 //! | GET    | `/d/{serial}/api/sessions`               | `api_key`    | Proxied session list        |
 //! | POST   | `/d/{serial}/api/sessions/{id}/signal`   | `api_key`    | Proxied session signal      |
@@ -106,6 +108,7 @@
 mod activity;
 mod auth;
 mod config;
+mod gawdxfer;
 mod routes;
 mod sessions;
 mod shell;
@@ -115,9 +118,12 @@ mod util;
 mod ws;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::Arc;
 use std::time::Instant;
+
+use gawdxfer::manager::TransferManager;
+use gawdxfer::types::TransferConfig;
 
 use axum::{
     middleware,
@@ -132,7 +138,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
-use activity::ActivityLog;
+use activity::{ActivityLog, ExecResultsCache};
 use auth::ApiKey;
 use config::Config;
 use sessions::SessionManager;
@@ -175,10 +181,16 @@ pub struct AppState {
     pub session_events: broadcast::Sender<Value>,
     /// In-memory activity journal for REST/WS operation tracking.
     pub activity_log: Arc<ActivityLog>,
+    /// In-memory cache of full exec results, keyed by activity ID.
+    pub exec_results_cache: Arc<ExecResultsCache>,
     /// Whether the tunnel client is currently connected to the relay.
     pub tunnel_connected: Arc<AtomicBool>,
     /// Number of tunnel reconnects since startup.
     pub tunnel_reconnects: Arc<AtomicU64>,
+    /// Chunked file transfer manager (gawdxfer).
+    pub transfer_manager: Arc<TransferManager>,
+    /// Current number of SSE connections (for connection limiting).
+    pub sse_connections: Arc<AtomicU32>,
 }
 
 #[tokio::main]
@@ -222,6 +234,15 @@ async fn run_server(config_path: Option<&str>) {
     // Initialize tracing
     let log_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| config.logging.level.clone());
     tracing_subscriber::fmt().with_env_filter(log_filter).init();
+
+    // Validate config before proceeding
+    let validation_errors = config.validate();
+    if !validation_errors.is_empty() {
+        for err in &validation_errors {
+            tracing::error!("Config error: {err}");
+        }
+        std::process::exit(1);
+    }
 
     info!("sctl v{} starting", env!("CARGO_PKG_VERSION"));
     info!("Device serial: {}", config.device.serial);
@@ -267,14 +288,30 @@ async fn run_server(config_path: Option<&str>) {
         session_events.clone(),
     ));
 
+    let exec_results_cache = Arc::new(ExecResultsCache::new(config.server.exec_result_cache_size));
+
+    let transfer_config = TransferConfig::new(
+        config.server.max_concurrent_transfers,
+        config.server.transfer_chunk_size,
+        config.server.transfer_max_file_size,
+        config.server.transfer_stale_timeout_secs,
+    );
+    let transfer_manager = Arc::new(TransferManager::new(
+        transfer_config,
+        session_events.clone(),
+    ));
+
     let state = AppState {
         session_manager,
         config: Arc::new(config),
         start_time: Instant::now(),
         session_events,
         activity_log,
+        exec_results_cache,
         tunnel_connected: Arc::new(AtomicBool::new(false)),
         tunnel_reconnects: Arc::new(AtomicU64::new(0)),
+        transfer_manager,
+        sse_connections: Arc::new(AtomicU32::new(0)),
     };
 
     // Build router
@@ -293,6 +330,10 @@ async fn run_server(config_path: Option<&str>) {
         .route("/api/files/raw", get(routes::files::download_file))
         .route("/api/files/upload", post(routes::files::upload_file))
         .route("/api/activity", get(routes::activity::get_activity))
+        .route(
+            "/api/activity/{id}/result",
+            get(routes::activity::get_exec_result),
+        )
         .route("/api/sessions", get(routes::sessions::list_sessions))
         .route(
             "/api/sessions/{id}",
@@ -304,6 +345,16 @@ async fn run_server(config_path: Option<&str>) {
         )
         .route("/api/shells", get(routes::shells::list_shells))
         .route("/api/events", get(routes::events::event_stream))
+        .route("/api/stp/download", post(routes::stp::init_download))
+        .route("/api/stp/upload", post(routes::stp::init_upload))
+        .route(
+            "/api/stp/chunk/{xfer}/{idx}",
+            get(routes::stp::get_chunk).post(routes::stp::post_chunk),
+        )
+        .route("/api/stp/resume/{xfer}", post(routes::stp::resume_transfer))
+        .route("/api/stp/status/{xfer}", get(routes::stp::transfer_status))
+        .route("/api/stp/transfers", get(routes::stp::list_transfers))
+        .route("/api/stp/{xfer}", delete(routes::stp::abort_transfer))
         .route("/api/playbooks", get(routes::playbooks::list_playbooks))
         .route(
             "/api/playbooks/{name}",
@@ -315,24 +366,33 @@ async fn run_server(config_path: Option<&str>) {
 
     let ws_route = Router::new().route("/api/ws", get(ws::ws_upgrade));
 
+    // GUARD: Headers must be listed explicitly — `allow_headers(Any)` works in
+    // Chrome but Firefox rejects credentialed requests without explicit listing.
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_headers([
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::ACCEPT,
+            axum::http::HeaderName::from_static("x-gx-chunk-hash"),
+            axum::http::HeaderName::from_static("x-gx-chunk-index"),
+            axum::http::HeaderName::from_static("x-gx-transfer-id"),
+        ])
+        .expose_headers([
+            axum::http::HeaderName::from_static("x-gx-chunk-hash"),
+            axum::http::HeaderName::from_static("x-gx-chunk-index"),
+            axum::http::HeaderName::from_static("x-gx-transfer-id"),
+        ]);
 
     let mut app = Router::new()
         .merge(public_routes)
         .merge(authed_routes)
         .merge(ws_route)
         .layer(Extension(ApiKey(state.config.auth.api_key.clone())))
-        .layer(cors)
-        .layer(TraceLayer::new_for_http())
-        .layer(tower::limit::ConcurrencyLimitLayer::new(
-            state.config.server.max_connections,
-        ))
         .with_state(state.clone());
 
-    // Tunnel: add relay routes if configured
+    // Tunnel: add relay routes if configured (before global layers so CORS/tracing apply)
     let tunnel_config = state.config.tunnel.clone();
     let mut relay_state_opt: Option<tunnel::relay::RelayState> = None;
     if let Some(ref tc) = tunnel_config {
@@ -348,6 +408,13 @@ async fn run_server(config_path: Option<&str>) {
             relay_state_opt = Some(relay_state);
         }
     }
+
+    // GUARD: .layer() only applies to routes merged BEFORE the call.
+    // All routes (including relay) MUST be merged above this point, otherwise
+    // CORS/tracing headers won't be added and browsers will block requests.
+    let app = app.layer(cors).layer(TraceLayer::new_for_http()).layer(
+        tower::limit::ConcurrencyLimitLayer::new(state.config.server.max_connections),
+    );
 
     let listener = TcpListener::bind(&state.config.server.listen)
         .await
@@ -370,9 +437,10 @@ async fn run_server(config_path: Option<&str>) {
         None
     };
 
-    // Periodic sweep: clean up sessions whose process has exited
+    // Periodic sweep: clean up sessions whose process has exited + stale transfers
     let mgr = state.session_manager.clone();
     let sweep_tx = state.session_events.clone();
+    let sweep_transfers = state.transfer_manager.clone();
     let sweep_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
         loop {
@@ -396,13 +464,15 @@ async fn run_server(config_path: Option<&str>) {
                     }
                 }
             }
+            // Sweep stale gawdxfer transfers
+            sweep_transfers.sweep_stale().await;
         }
     });
 
     // Tunnel relay: periodic sweep to evict dead devices
     let relay_sweep_task = relay_state_opt.clone().map(|rs| {
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
             loop {
                 interval.tick().await;
                 rs.sweep_dead_devices().await;

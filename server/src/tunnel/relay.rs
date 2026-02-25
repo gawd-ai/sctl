@@ -24,6 +24,8 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock};
 use tracing::{info, info_span, warn, Instrument};
 
+use super::{decode_binary_frame, encode_binary_frame, TunnelMessage, TunnelResponse};
+
 /// State shared across all relay handlers.
 #[derive(Clone)]
 pub struct RelayState {
@@ -44,9 +46,9 @@ pub struct ConnectedDevice {
     pub serial: String,
     pub api_key: String,
     /// Send messages to the device over the tunnel WS.
-    pub device_tx: mpsc::Sender<Value>,
+    pub device_tx: mpsc::Sender<TunnelMessage>,
     /// Pending REST-over-WS requests awaiting responses, keyed by `request_id`.
-    pub pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
+    pub pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<TunnelResponse>>>>,
     /// Connected WS clients, keyed by `client_id`.
     pub clients: Arc<RwLock<HashMap<String, mpsc::Sender<Value>>>>,
     /// Session subscriptions: `session_id` -> set of `client_ids` watching output.
@@ -68,11 +70,11 @@ async fn drain_device(device: &ConnectedDevice, reason: &str) {
     let mut pending = device.pending_requests.lock().await;
     let count = pending.len();
     for (_, sender) in pending.drain() {
-        let _ = sender.send(json!({
+        let _ = sender.send(TunnelResponse::Json(json!({
             "type": "error",
             "status": 502,
             "body": {"error": reason, "code": "DEVICE_DISCONNECTED"},
-        }));
+        })));
     }
     if count > 0 {
         info!(
@@ -142,11 +144,32 @@ impl RelayState {
     }
 
     /// Send a message to all connected devices (e.g., for relay shutdown).
+    /// Devices that fail to receive are collected for eviction.
     pub async fn broadcast_to_devices(&self, msg: Value) {
-        let devices = self.devices.read().await;
-        for (serial, device) in devices.iter() {
-            if device.device_tx.send(msg.clone()).await.is_err() {
-                warn!(serial = %serial, "Failed to send broadcast to device");
+        let mut dead_serials = Vec::new();
+        {
+            let devices = self.devices.read().await;
+            for (serial, device) in devices.iter() {
+                if device
+                    .device_tx
+                    .send(TunnelMessage::Text(msg.clone()))
+                    .await
+                    .is_err()
+                {
+                    warn!(serial = %serial, "Failed to send broadcast to device, marking for eviction");
+                    dead_serials.push(serial.clone());
+                }
+            }
+        }
+        // Evict devices with dead WS connections
+        if !dead_serials.is_empty() {
+            let mut devices = self.devices.write().await;
+            for serial in &dead_serials {
+                if let Some(device) = devices.get(serial) {
+                    drain_device(device, "broadcast send failed").await;
+                }
+                devices.remove(serial);
+                warn!(serial = %serial, "Evicted device (broadcast send failed)");
             }
         }
     }
@@ -181,6 +204,20 @@ pub fn relay_router(relay_state: RelayState) -> Router {
                 .put(proxy_file_write)
                 .delete(proxy_file_delete),
         )
+        // gawdxfer STP proxy endpoints (replaces old /api/files/raw and /api/files/upload proxy)
+        .route(
+            "/d/{serial}/api/stp/download",
+            post(proxy_stp_download_init),
+        )
+        .route("/d/{serial}/api/stp/upload", post(proxy_stp_upload_init))
+        .route(
+            "/d/{serial}/api/stp/chunk/{xfer}/{idx}",
+            get(proxy_stp_download_chunk).post(proxy_stp_upload_chunk),
+        )
+        .route("/d/{serial}/api/stp/resume/{xfer}", post(proxy_stp_resume))
+        .route("/d/{serial}/api/stp/status/{xfer}", get(proxy_stp_status))
+        .route("/d/{serial}/api/stp/transfers", get(proxy_stp_list))
+        .route("/d/{serial}/api/stp/{xfer}", delete(proxy_stp_abort))
         .route("/d/{serial}/api/activity", get(proxy_activity))
         .route("/d/{serial}/api/sessions", get(proxy_sessions))
         .route(
@@ -213,6 +250,17 @@ struct RegisterQuery {
     serial: String,
 }
 
+/// Validate serial format: alphanumeric, dash, underscore, dot, 1-64 chars.
+fn is_valid_serial(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// Maximum concurrent WS clients per device.
+const MAX_CLIENTS_PER_DEVICE: usize = 32;
+
 /// `GET /api/tunnel/register?token=<tunnel_key>&serial=<serial>` — device WS registration.
 async fn device_register_ws(
     State(state): State<RelayState>,
@@ -221,6 +269,10 @@ async fn device_register_ws(
 ) -> Response {
     if !crate::auth::constant_time_eq(state.tunnel_key.as_bytes(), query.token.as_bytes()) {
         return (StatusCode::FORBIDDEN, "Invalid tunnel key").into_response();
+    }
+
+    if !is_valid_serial(&query.serial) {
+        return (StatusCode::BAD_REQUEST, "Invalid serial format").into_response();
     }
 
     let serial = query.serial.clone();
@@ -236,7 +288,7 @@ async fn device_register_ws(
 #[allow(clippy::too_many_lines)]
 async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayState, serial: String) {
     let (mut ws_sink, mut ws_stream) = socket.split();
-    let (device_tx, mut device_rx) = mpsc::channel::<Value>(256);
+    let (device_tx, mut device_rx) = mpsc::channel::<TunnelMessage>(256);
 
     // Wait for the registration message which contains the api_key
     let Some(Ok(axum::extract::ws::Message::Text(text))) = ws_stream.next().await else {
@@ -308,12 +360,14 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
     // Forward device_tx messages to the WS sink
     let send_task = tokio::spawn(async move {
         while let Some(msg) = device_rx.recv().await {
-            let text = serde_json::to_string(&msg).expect("Value serializes");
-            if ws_sink
-                .send(axum::extract::ws::Message::Text(text.into()))
-                .await
-                .is_err()
-            {
+            let ws_msg = match msg {
+                TunnelMessage::Text(val) => {
+                    let text = serde_json::to_string(&val).expect("Value serializes");
+                    axum::extract::ws::Message::Text(text.into())
+                }
+                TunnelMessage::Binary(data) => axum::extract::ws::Message::Binary(data.into()),
+            };
+            if ws_sink.send(ws_msg).await.is_err() {
                 break;
             }
         }
@@ -338,16 +392,56 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                 };
                 let msg_type = parsed["type"].as_str().unwrap_or("");
 
+                // Fast path: session output (hot path, bulk of traffic).
+                // These come from the device's tunnel_subscriber_task and are NEVER
+                // tagged with client_id prefixes — the subscriber doesn't know about
+                // client_ids. So we skip the request_id untag check entirely.
+                if matches!(
+                    msg_type,
+                    "session.stdout" | "session.stderr" | "session.system"
+                ) {
+                    if let Some(session_id) = parsed["session_id"].as_str() {
+                        let subs = session_subs.read().await;
+                        if let Some(client_ids) = subs.get(session_id) {
+                            let clients_read = clients.read().await;
+                            let count = client_ids.len();
+                            if count == 1 {
+                                // Single-subscriber fast path: move instead of clone
+                                if let Some(cid) = client_ids.iter().next() {
+                                    if let Some(client_tx) = clients_read.get(cid) {
+                                        if client_tx.try_send(parsed).is_err() {
+                                            dropped_messages.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                }
+                            } else {
+                                for cid in client_ids {
+                                    if let Some(client_tx) = clients_read.get(cid) {
+                                        if client_tx.try_send(parsed.clone()).is_err() {
+                                            dropped_messages.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 match msg_type {
                     "tunnel.ping" => {
                         // Device heartbeat — respond and update timestamp (lock-free)
                         #[allow(clippy::cast_possible_truncation)]
                         let now_ms = relay_epoch.elapsed().as_millis() as u64;
                         heartbeat_ms.store(now_ms, Ordering::Relaxed);
-                        let _ = device_tx.send(json!({"type": "tunnel.pong"})).await;
+                        let _ = device_tx
+                            .send(TunnelMessage::Text(json!({"type": "tunnel.pong"})))
+                            .await;
                     }
-                    t if t.ends_with(".result") => {
-                        // Response to a REST-over-WS request
+                    // Response routing: matches .result (REST responses) and .ack (gx.chunk.ack, etc.)
+                    // GUARD: New message types with non-.result/.ack suffixes need explicit handling.
+                    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+                    t if t.ends_with(".result") || t.ends_with(".ack") => {
                         if let Some(request_id) = parsed["request_id"].as_str() {
                             // Check if this is a client-tagged request (contains ':')
                             if let Some(colon_pos) = request_id.find(':') {
@@ -365,7 +459,7 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                                 // REST proxy request — resolve the oneshot
                                 let mut pending = pending_requests.lock().await;
                                 if let Some(sender) = pending.remove(request_id) {
-                                    let _ = sender.send(parsed);
+                                    let _ = sender.send(TunnelResponse::Json(parsed));
                                 } else {
                                     warn!(
                                         serial = %serial,
@@ -373,34 +467,6 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                                         msg_type,
                                         "Response arrived for timed-out or unknown request (dropped)"
                                     );
-                                }
-                            }
-                        }
-                    }
-                    // Session output messages — route to subscribed clients (backpressure-aware)
-                    "session.stdout" | "session.stderr" | "session.system" => {
-                        if let Some(session_id) = parsed["session_id"].as_str() {
-                            let subs = session_subs.read().await;
-                            if let Some(client_ids) = subs.get(session_id) {
-                                let clients_read = clients.read().await;
-                                for cid in client_ids {
-                                    if let Some(client_tx) = clients_read.get(cid) {
-                                        // Restore original request_id if tagged
-                                        let mut msg = parsed.clone();
-                                        if let Some(rid) = msg["request_id"].as_str() {
-                                            if let Some(colon_pos) = rid.find(':') {
-                                                msg["request_id"] = json!(&rid[colon_pos + 1..]);
-                                            }
-                                        }
-                                        if client_tx.try_send(msg).is_err() {
-                                            dropped_messages.fetch_add(1, Ordering::Relaxed);
-                                            warn!(
-                                                serial = %serial,
-                                                client_id = %cid,
-                                                "Dropped session output message (client backpressure)"
-                                            );
-                                        }
-                                    }
                                 }
                             }
                         }
@@ -424,6 +490,9 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                     | "session.rename.ack"
                     | "shell.listed"
                     | "activity.new"
+                    | "gx.progress"
+                    | "gx.complete"
+                    | "gx.error"
                     | "error" => {
                         // Clean up session subscriptions when session is destroyed/closed
                         if msg_type == "session.destroyed" || msg_type == "session.closed" {
@@ -479,6 +548,20 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                     }
                     _ => {
                         warn!(serial = %serial, msg_type, "Unknown message from device");
+                    }
+                }
+            }
+            axum::extract::ws::Message::Binary(data) => {
+                // Binary frame from device — decode header and route to pending request
+                if let Some((header, payload)) = decode_binary_frame(&data) {
+                    if let Some(request_id) = header["request_id"].as_str() {
+                        let mut pending = pending_requests.lock().await;
+                        if let Some(sender) = pending.remove(request_id) {
+                            let _ = sender.send(TunnelResponse::Binary {
+                                header,
+                                data: payload.to_vec(),
+                            });
+                        }
                     }
                 }
             }
@@ -555,7 +638,7 @@ async fn tunnel_request(
     serial: &str,
     msg: Value,
     timeout_secs: u64,
-) -> Result<Value, (StatusCode, Json<Value>)> {
+) -> Result<TunnelResponse, (StatusCode, Json<Value>)> {
     let devices = state.devices.read().await;
     let device = devices.get(serial).ok_or_else(|| {
         (
@@ -573,7 +656,12 @@ async fn tunnel_request(
         .await
         .insert(request_id.clone(), tx);
 
-    if device.device_tx.send(msg).await.is_err() {
+    if device
+        .device_tx
+        .send(TunnelMessage::Text(msg))
+        .await
+        .is_err()
+    {
         device.pending_requests.lock().await.remove(&request_id);
         return Err((
             StatusCode::BAD_GATEWAY,
@@ -594,6 +682,76 @@ async fn tunnel_request(
             // Timeout — remove pending request
             if let Some(device) = state.devices.read().await.get(serial) {
                 device.pending_requests.lock().await.remove(&request_id);
+            }
+            Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(json!({"error": "Device did not respond in time", "code": "TIMEOUT"})),
+            ))
+        }
+    }
+}
+
+/// Send a tunnel request expecting a JSON response.
+async fn tunnel_request_json(
+    state: &RelayState,
+    serial: &str,
+    msg: Value,
+    timeout_secs: u64,
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    let response = tunnel_request(state, serial, msg, timeout_secs).await?;
+    match response {
+        TunnelResponse::Json(v) => Ok(v),
+        TunnelResponse::Binary { .. } => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                json!({"error": "Expected JSON response, got binary", "code": "UNEXPECTED_BINARY"}),
+            ),
+        )),
+    }
+}
+
+/// Send a binary tunnel request to a device and await the response.
+async fn tunnel_request_binary(
+    state: &RelayState,
+    serial: &str,
+    msg: TunnelMessage,
+    request_id: &str,
+    timeout_secs: u64,
+) -> Result<TunnelResponse, (StatusCode, Json<Value>)> {
+    let devices = state.devices.read().await;
+    let device = devices.get(serial).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Device '{serial}' not connected"), "code": "DEVICE_NOT_FOUND"})),
+        )
+    })?;
+
+    let (tx, rx) = oneshot::channel();
+    device
+        .pending_requests
+        .lock()
+        .await
+        .insert(request_id.to_string(), tx);
+
+    if device.device_tx.send(msg).await.is_err() {
+        device.pending_requests.lock().await.remove(request_id);
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "Failed to send to device", "code": "DEVICE_SEND_FAILED"})),
+        ));
+    }
+
+    drop(devices);
+
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(_)) => Err((
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "Device connection lost", "code": "DEVICE_DISCONNECTED"})),
+        )),
+        Err(_) => {
+            if let Some(device) = state.devices.read().await.get(serial) {
+                device.pending_requests.lock().await.remove(request_id);
             }
             Err((
                 StatusCode::GATEWAY_TIMEOUT,
@@ -649,7 +807,7 @@ async fn proxy_health(
         "request_id": request_id,
     });
 
-    let response = tunnel_request(&state, &serial, msg, 10).await?;
+    let response = tunnel_request_json(&state, &serial, msg, 10).await?;
     let status = response["status"].as_u64().unwrap_or(200);
     let body = response["body"].clone();
 
@@ -687,7 +845,8 @@ async fn proxy_info(
         "request_id": request_id,
     });
 
-    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -733,7 +892,7 @@ async fn proxy_exec(
     msg["type"] = json!("tunnel.exec");
     msg["request_id"] = json!(request_id);
 
-    let response = tunnel_request(&state, &serial, msg, timeout_secs).await?;
+    let response = tunnel_request_json(&state, &serial, msg, timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -786,7 +945,7 @@ async fn proxy_exec_batch(
     msg["type"] = json!("tunnel.exec_batch");
     msg["request_id"] = json!(request_id);
 
-    let response = tunnel_request(&state, &serial, msg, timeout_secs).await?;
+    let response = tunnel_request_json(&state, &serial, msg, timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -823,7 +982,8 @@ async fn proxy_file_read(
         "list": query.list,
     });
 
-    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -865,7 +1025,8 @@ async fn proxy_file_write(
     msg["type"] = json!("tunnel.file.write");
     msg["request_id"] = json!(request_id);
 
-    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -909,7 +1070,8 @@ async fn proxy_file_delete(
         "path": payload["path"],
     });
 
-    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -955,7 +1117,8 @@ async fn proxy_activity(
         "limit": query.limit,
     });
 
-    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -995,7 +1158,8 @@ async fn proxy_sessions(
         "request_id": request_id,
     });
 
-    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -1022,7 +1186,8 @@ async fn proxy_shells(
         "request_id": request_id,
     });
 
-    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -1069,7 +1234,8 @@ async fn proxy_session_signal(
         "signal": payload["signal"],
     });
 
-    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -1097,7 +1263,8 @@ async fn proxy_session_kill(
         "session_id": id,
     });
 
-    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -1140,7 +1307,8 @@ async fn proxy_session_patch(
     msg["request_id"] = json!(request_id);
     msg["session_id"] = json!(id);
 
-    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -1169,7 +1337,8 @@ async fn proxy_playbooks_list(
         "request_id": request_id,
     });
 
-    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -1197,7 +1366,8 @@ async fn proxy_playbook_get(
         "name": name,
     });
 
-    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -1242,7 +1412,8 @@ async fn proxy_playbook_put(
         "content": content,
     });
 
-    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -1270,7 +1441,8 @@ async fn proxy_playbook_delete(
         "name": name,
     });
 
-    let response = tunnel_request(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
     proxy_response_to_http(&response)
 }
 
@@ -1299,6 +1471,15 @@ async fn proxy_ws(
         return (StatusCode::FORBIDDEN, "Invalid API key").into_response();
     }
 
+    // Enforce per-device client connection limit
+    if device.clients.read().await.len() >= MAX_CLIENTS_PER_DEVICE {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many clients for this device",
+        )
+            .into_response();
+    }
+
     let device_tx = device.device_tx.clone();
     let clients = device.clients.clone();
     let session_subs = device.session_subscriptions.clone();
@@ -1315,7 +1496,7 @@ async fn handle_client_ws(
     socket: axum::extract::ws::WebSocket,
     _state: RelayState,
     serial: String,
-    device_tx: mpsc::Sender<Value>,
+    device_tx: mpsc::Sender<TunnelMessage>,
     clients: Arc<RwLock<HashMap<String, mpsc::Sender<Value>>>>,
     session_subs: Arc<RwLock<HashMap<String, HashSet<String>>>>,
 ) {
@@ -1383,7 +1564,7 @@ async fn handle_client_ws(
                 }
 
                 // Forward to device
-                if device_tx.send(parsed).await.is_err() {
+                if device_tx.send(TunnelMessage::Text(parsed)).await.is_err() {
                     break; // Device disconnected
                 }
             }
@@ -1398,14 +1579,369 @@ async fn handle_client_ws(
     // Remove from clients map
     clients.write().await.remove(&client_id);
 
-    // Remove from all session subscriptions
-    let mut subs = session_subs.write().await;
-    for (_, client_ids) in subs.iter_mut() {
-        client_ids.remove(&client_id);
+    // Collect sessions this client was subscribed to, then remove from subscriptions
+    let detach_sessions: Vec<String>;
+    {
+        let mut subs = session_subs.write().await;
+        detach_sessions = subs
+            .iter()
+            .filter(|(_, ids)| ids.contains(&client_id))
+            .map(|(sid, _)| sid.clone())
+            .collect();
+        for (_, client_ids) in subs.iter_mut() {
+            client_ids.remove(&client_id);
+        }
+        // Remove empty subscription sets
+        subs.retain(|_, v| !v.is_empty());
     }
-    // Remove empty subscription sets
-    subs.retain(|_, v| !v.is_empty());
-    drop(subs);
+
+    // Tell the device to detach sessions that no longer have any subscribers
+    for session_id in &detach_sessions {
+        let still_subscribed = session_subs
+            .read()
+            .await
+            .get(session_id)
+            .map_or(true, |ids| ids.is_empty());
+        if still_subscribed {
+            let _ = device_tx
+                .send(TunnelMessage::Text(json!({
+                    "type": "session.detach",
+                    "session_id": session_id,
+                })))
+                .await;
+        }
+    }
 
     send_task.abort();
+}
+
+// ─── STP (gawdxfer) Proxy Endpoints ──────────────────────────────────────────
+
+/// `POST /d/{serial}/api/stp/download` — proxied download init.
+async fn proxy_stp_download_init(
+    State(state): State<RelayState>,
+    AxumPath(serial): AxumPath<String>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Failed to read request body"})),
+            )
+        })?;
+
+    let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Invalid JSON"})),
+        )
+    })?;
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "gx.download.init",
+        "request_id": request_id,
+        "path": payload["path"],
+        "chunk_size": payload["chunk_size"],
+    });
+
+    let response = tunnel_request_json(&state, &serial, msg, 30).await?;
+    proxy_response_to_http(&response)
+}
+
+/// `POST /d/{serial}/api/stp/upload` — proxied upload init.
+async fn proxy_stp_upload_init(
+    State(state): State<RelayState>,
+    AxumPath(serial): AxumPath<String>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Failed to read request body"})),
+            )
+        })?;
+
+    let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Invalid JSON"})),
+        )
+    })?;
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let mut msg = payload;
+    msg["type"] = json!("gx.upload.init");
+    msg["request_id"] = json!(request_id);
+
+    let response = tunnel_request_json(&state, &serial, msg, 30).await?;
+    proxy_response_to_http(&response)
+}
+
+/// `GET /d/{serial}/api/stp/chunk/{xfer}/{idx}` — proxy download chunk.
+async fn proxy_stp_download_chunk(
+    State(state): State<RelayState>,
+    AxumPath((serial, xfer, idx)): AxumPath<(String, String, u32)>,
+    request: Request<Body>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "gx.chunk.request",
+        "request_id": request_id,
+        "transfer_id": xfer,
+        "chunk_index": idx,
+    });
+
+    let response = tunnel_request(&state, &serial, msg, 60).await?;
+
+    match response {
+        TunnelResponse::Binary { header, data } => {
+            let chunk_hash = header["chunk_hash"].as_str().unwrap_or("");
+            #[allow(clippy::cast_possible_truncation)]
+            let chunk_index = header["chunk_index"].as_u64().unwrap_or(0) as u32;
+            let transfer_id = header["transfer_id"].as_str().unwrap_or("");
+
+            Ok(Response::builder()
+                .header("Content-Type", "application/octet-stream")
+                .header("X-Gx-Chunk-Hash", chunk_hash)
+                .header("X-Gx-Chunk-Index", chunk_index.to_string())
+                .header("X-Gx-Transfer-Id", transfer_id)
+                .header("Content-Length", data.len())
+                .body(Body::from(data))
+                .unwrap())
+        }
+        TunnelResponse::Json(v) => {
+            let status = v["status"].as_u64().unwrap_or(500);
+            let body = v["body"].clone();
+            #[allow(clippy::cast_possible_truncation)]
+            Err((
+                StatusCode::from_u16(status as u16).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                Json(body),
+            ))
+        }
+    }
+}
+
+/// `POST /d/{serial}/api/stp/chunk/{xfer}/{idx}` — proxy upload chunk.
+async fn proxy_stp_upload_chunk(
+    State(state): State<RelayState>,
+    AxumPath((serial, xfer, idx)): AxumPath<(String, String, u32)>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let chunk_hash = headers
+        .get("X-Gx-Chunk-Hash")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    if chunk_hash.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Missing X-Gx-Chunk-Hash header", "code": "INVALID_REQUEST"})),
+        ));
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let header = json!({
+        "type": "gx.chunk",
+        "request_id": request_id,
+        "transfer_id": xfer,
+        "chunk_index": idx,
+        "chunk_hash": chunk_hash,
+    });
+    let frame = encode_binary_frame(&header, &body);
+
+    let response = tunnel_request_binary(
+        &state,
+        &serial,
+        TunnelMessage::Binary(frame),
+        &request_id,
+        60,
+    )
+    .await?;
+
+    match response {
+        TunnelResponse::Json(v) => {
+            let status = v["status"].as_u64().unwrap_or(200);
+            if status >= 400 {
+                let body = v["body"].clone();
+                #[allow(clippy::cast_possible_truncation)]
+                return Err((
+                    StatusCode::from_u16(status as u16)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    Json(body),
+                ));
+            }
+            let body = v.get("body").cloned().unwrap_or(json!({"ok": true}));
+            Ok(Json(body))
+        }
+        TunnelResponse::Binary { .. } => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Unexpected binary response for chunk upload"})),
+        )),
+    }
+}
+
+/// `POST /d/{serial}/api/stp/resume/{xfer}` — proxied resume.
+async fn proxy_stp_resume(
+    State(state): State<RelayState>,
+    AxumPath((serial, xfer)): AxumPath<(String, String)>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "gx.resume",
+        "request_id": request_id,
+        "transfer_id": xfer,
+    });
+
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
+}
+
+/// `GET /d/{serial}/api/stp/status/{xfer}` — proxied status.
+async fn proxy_stp_status(
+    State(state): State<RelayState>,
+    AxumPath((serial, xfer)): AxumPath<(String, String)>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "gx.status",
+        "request_id": request_id,
+        "transfer_id": xfer,
+    });
+
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
+}
+
+/// `GET /d/{serial}/api/stp/transfers` — proxied transfer list.
+async fn proxy_stp_list(
+    State(state): State<RelayState>,
+    AxumPath(serial): AxumPath<String>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "gx.list",
+        "request_id": request_id,
+    });
+
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
+}
+
+/// `DELETE /d/{serial}/api/stp/{xfer}` — proxied abort.
+async fn proxy_stp_abort(
+    State(state): State<RelayState>,
+    AxumPath((serial, xfer)): AxumPath<(String, String)>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "gx.abort",
+        "request_id": request_id,
+        "transfer_id": xfer,
+        "reason": "client abort",
+    });
+
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
 }

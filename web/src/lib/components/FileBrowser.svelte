@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { SctlRestClient } from '../utils/rest-client';
 	import type { DirEntry } from '../types/terminal.types';
+	import { TransferTracker } from '../utils/transfer';
 	import FileToolbar from './FileToolbar.svelte';
 	import FileTree from './FileTree.svelte';
 	import FileEditor from './FileEditor.svelte';
@@ -8,40 +9,34 @@
 
 	interface Props {
 		restClient: SctlRestClient | null;
+		tracker?: TransferTracker | null;
 		visible?: boolean;
 		readonly?: boolean;
 		showHidden?: boolean;
 		initialPath?: string;
-		width?: number;
-		animate?: boolean;
 		class?: string;
-		onclose?: () => void;
 		onfileopen?: (path: string, content: string) => void;
 		onfilesave?: (path: string) => void;
 		onfiledelete?: (path: string) => void;
 		onpathchange?: (path: string) => void;
 		onsynccd?: (path: string) => void;
 		onerror?: (error: string) => void;
-		onwidthchange?: (width: number) => void;
 	}
 
 	let {
 		restClient,
+		tracker: trackerProp = null,
 		visible = true,
 		readonly: readonlyProp = false,
 		showHidden: showHiddenProp = false,
 		initialPath = '/',
 		class: className = '',
-		onclose,
 		onfileopen,
 		onfilesave,
 		onfiledelete,
 		onpathchange,
 		onsynccd,
-		onerror,
-		onwidthchange,
-		width: widthProp = 384,
-		animate = false
+		onerror
 	}: Props = $props();
 
 	// ── Directory state ────────────────────────────────────────────
@@ -91,48 +86,31 @@
 	let confirmingDelete = $state(false);
 	let deleteTimer: ReturnType<typeof setTimeout> | null = null;
 
-	// ── Resize state ───────────────────────────────────────────────
-	const MIN_WIDTH = 240;
-	const MAX_WIDTH = 800;
-	const DEFAULT_WIDTH = 384; // 24rem
-	let panelWidth = $state(widthProp);
-	let resizing = $state(false);
+	// ── Transfer tracker state ─────────────────────────────────────
+	// Use externally-provided tracker if available, else create one internally
+	let internalTracker: TransferTracker | null = $state(null);
+	let tracker = $derived(trackerProp ?? internalTracker);
 
-	// Sync from parent prop (e.g., another file browser was resized) — skip during our own drag
-	$effect(() => { if (!resizing) panelWidth = widthProp; });
+	$effect(() => {
+		if (!trackerProp && restClient) {
+			const t = new TransferTracker(restClient);
+			t.onerror = (_ct, msg) => { onerror?.(msg); };
+			internalTracker = t;
+		} else if (!trackerProp) {
+			internalTracker = null;
+		}
+	});
 
-	function handleResizeStart(e: MouseEvent) {
-		e.preventDefault();
-		resizing = true;
-		document.body.style.userSelect = 'none';
-		document.body.style.cursor = 'col-resize';
-
-		const onMouseMove = (ev: MouseEvent) => {
-			if (!rootEl) return;
-			// Panel is on the right, so width = right edge - mouse x
-			const parentRect = rootEl.parentElement?.getBoundingClientRect();
-			if (!parentRect) return;
-			const newWidth = parentRect.right - ev.clientX;
-			panelWidth = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, newWidth));
-			onwidthchange?.(panelWidth);
+	// Clean up timers on unmount
+	$effect(() => {
+		return () => {
+			if (deleteTimer) clearTimeout(deleteTimer);
 		};
-
-		const onMouseUp = () => {
-			resizing = false;
-			document.body.style.userSelect = '';
-			document.body.style.cursor = '';
-			window.removeEventListener('mousemove', onMouseMove);
-			window.removeEventListener('mouseup', onMouseUp);
-		};
-
-		window.addEventListener('mousemove', onMouseMove);
-		window.addEventListener('mouseup', onMouseUp);
-	}
+	});
 
 	// ── Track restClient changes ───────────────────────────────────
 	let lastRestClient: typeof restClient = null;
 	let lastLoadedPath: string | null = null;
-	let rootEl: HTMLDivElement | undefined = $state();
 
 	let unsaved = $derived(editing && editContent !== savedContent);
 
@@ -742,11 +720,11 @@
 	}
 
 	async function downloadFile(entry: DirEntry) {
-		if (!restClient) return;
+		if (!tracker) return;
 		const fullPath = currentPath === '/' ? `/${entry.name}` : `${currentPath}/${entry.name}`;
 		try {
-			const { blob, filename } = await restClient.downloadBlob(fullPath);
-			triggerBrowserDownload(blob, filename);
+			const blob = await tracker.download(fullPath);
+			triggerBrowserDownload(blob, entry.name);
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : 'Download failed';
 			onerror?.(msg);
@@ -769,19 +747,22 @@
 	}
 
 	function triggerUpload() {
-		if (!restClient) return;
+		if (!tracker) return;
 		const input = document.createElement('input');
 		input.type = 'file';
 		input.multiple = true;
 		input.onchange = async () => {
 			if (!input.files || input.files.length === 0) return;
-			try {
-				await restClient!.uploadFiles(currentPath, input.files);
-				await refreshDir();
-			} catch (err) {
-				const msg = err instanceof Error ? err.message : 'Upload failed';
-				onerror?.(msg);
+			const dir = currentPath;
+			for (const file of input.files) {
+				try {
+					await tracker!.upload(dir, file);
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : 'Upload failed';
+					onerror?.(msg);
+				}
 			}
+			await refreshDir();
 		};
 		input.click();
 	}
@@ -845,30 +826,12 @@
 	}
 </script>
 
-<!-- Outer: transitions width, clips during animation -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
-	bind:this={rootEl}
-	class="h-full shrink-0 overflow-hidden {className}"
-	style="width: {visible ? panelWidth : 0}px;"
-	style:transition={!resizing && animate ? 'width 300ms ease-in-out' : 'none'}
+	class="flex-1 min-w-0 bg-neutral-900 flex flex-col h-full {className}"
+	onkeydown={handleKeydown}
+	tabindex="-1"
 >
-	<!-- Inner: maintains full width so content doesn't reflow during slide -->
-	<div class="flex h-full shrink-0" style="width: {panelWidth}px;">
-		<!-- Resize handle -->
-		<div
-			class="w-1 shrink-0 cursor-col-resize transition-colors
-				{resizing ? 'bg-neutral-500' : 'bg-neutral-700 hover:bg-neutral-500'}"
-			onmousedown={handleResizeStart}
-			role="separator"
-			aria-orientation="vertical"
-		></div>
-		<!-- Panel content -->
-		<div
-			class="flex-1 min-w-0 bg-neutral-900 flex flex-col"
-			onkeydown={handleKeydown}
-			tabindex="-1"
-		>
 		<FileToolbar
 			{currentPath}
 			{filterText}
@@ -1160,6 +1123,4 @@
 			onaction={handleContextAction}
 			onclose={() => { ctxVisible = false; }}
 		/>
-		</div>
-	</div>
 </div>

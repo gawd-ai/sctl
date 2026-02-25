@@ -23,8 +23,8 @@ type Listener<T extends ServerMsgType> = (msg: MsgOfType<T>) => void;
 
 const DEFAULT_RECONNECT: ReconnectConfig = {
 	enabled: true,
-	initialDelay: 500,
-	maxDelay: 10_000,
+	initialDelay: 100,
+	maxDelay: 2_000,
 	maxAttempts: Infinity
 };
 
@@ -48,6 +48,7 @@ export class SctlWsClient {
 	private intentionalClose = false;
 	private pingInterval: ReturnType<typeof setInterval> | null = null;
 	private _reconnectCount = 0;
+	private visibilityHandler: (() => void) | null = null;
 
 	readonly wsUrl: string;
 	readonly apiKey: string;
@@ -57,6 +58,19 @@ export class SctlWsClient {
 		this.wsUrl = wsUrl;
 		this.apiKey = apiKey;
 		this.reconnectConfig = { ...DEFAULT_RECONNECT, ...reconnect };
+		// Immediately retry when tab becomes visible during reconnect
+		this.visibilityHandler = () => {
+			if (document.visibilityState === 'visible' && this._status === 'reconnecting') {
+				if (this.reconnectTimer) {
+					clearTimeout(this.reconnectTimer);
+					this.reconnectTimer = null;
+				}
+				this.connect();
+			}
+		};
+		if (typeof document !== 'undefined') {
+			document.addEventListener('visibilitychange', this.visibilityHandler);
+		}
 	}
 
 	// ── Connection ──────────────────────────────────────────────────
@@ -123,6 +137,10 @@ export class SctlWsClient {
 		if (this.reconnectTimer) {
 			clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = null;
+		}
+		if (this.visibilityHandler && typeof document !== 'undefined') {
+			document.removeEventListener('visibilitychange', this.visibilityHandler);
+			this.visibilityHandler = null;
 		}
 		this.ws?.close();
 		this.ws = null;

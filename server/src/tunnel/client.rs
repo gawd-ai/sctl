@@ -21,6 +21,11 @@ use crate::config::TunnelConfig;
 use crate::sessions::buffer::{OutputBuffer, OutputEntry};
 use crate::AppState;
 
+use super::{decode_binary_frame, encode_binary_frame};
+
+/// Static heartbeat message — avoids serde allocation on every heartbeat tick.
+const PING_TEXT: &str = r#"{"type":"tunnel.ping"}"#;
+
 /// Type alias for the WS sink to reduce verbosity.
 type WsSink = Arc<
     Mutex<
@@ -50,15 +55,17 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
 
     loop {
         info!("Tunnel: connecting to relay at {relay_url}");
+        let mut escalate_backoff = false;
         match connect_and_run(&state, &config, relay_url).await {
             Ok(DisconnectReason::RelayShutdown) => {
-                // Relay sent intentional shutdown — skip backoff
+                // Relay sent intentional shutdown — reconnect immediately
                 info!("Tunnel: relay shutting down, reconnecting immediately...");
-                delay = Duration::from_secs(config.reconnect_delay_secs);
+                delay = Duration::ZERO;
             }
             Ok(DisconnectReason::Clean) => {
+                // Normal close — reconnect immediately
                 info!("Tunnel: connection closed cleanly, reconnecting...");
-                delay = Duration::from_secs(config.reconnect_delay_secs);
+                delay = Duration::ZERO;
             }
             Err(ConnectError::Permanent(msg)) => {
                 error!("Tunnel: permanent error: {msg} — stopping tunnel client");
@@ -72,6 +79,7 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
                     "Tunnel: connection error: {e}, reconnecting in {}s",
                     delay.as_secs()
                 );
+                escalate_backoff = true;
             }
         }
         reconnects += 1;
@@ -82,7 +90,11 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
             .tunnel_connected
             .store(false, std::sync::atomic::Ordering::Relaxed);
         tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(max_delay);
+        if escalate_backoff {
+            delay = (delay * 2).min(max_delay);
+        } else {
+            delay = Duration::from_secs(config.reconnect_delay_secs);
+        }
     }
 }
 
@@ -360,7 +372,7 @@ async fn connect_and_run(
     // Heartbeat failure notification channel
     let (heartbeat_cancel_tx, mut heartbeat_cancel_rx) = watch::channel(false);
 
-    // Heartbeat task
+    // Heartbeat task — uses a static string to avoid serde allocation per tick
     let heartbeat_sink = ws_sink.clone();
     let heartbeat_interval = Duration::from_secs(config.heartbeat_interval_secs);
     let heartbeat_task = tokio::spawn(async move {
@@ -368,11 +380,10 @@ async fn connect_and_run(
         loop {
             interval.tick().await;
             let mut sink = heartbeat_sink.lock().await;
-            let msg = json!({"type": "tunnel.ping"});
-            let text = serde_json::to_string(&msg)
-                .unwrap_or_else(|_| r#"{"type":"tunnel.ping"}"#.to_string());
             if sink
-                .send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    PING_TEXT.into(),
+                ))
                 .await
                 .is_err()
             {
@@ -440,6 +451,11 @@ async fn connect_and_run(
                         }
                         handle_relay_message(state, &ws_sink, &subscriber_tasks, parsed).await;
                     }
+                    tokio_tungstenite::tungstenite::Message::Binary(data) => {
+                        if let Some((header, payload)) = decode_binary_frame(&data) {
+                            handle_relay_binary(state, &ws_sink, header, payload).await;
+                        }
+                    }
                     tokio_tungstenite::tungstenite::Message::Close(_) => break,
                     _ => {}
                 }
@@ -468,6 +484,9 @@ async fn connect_and_run(
     for (_, task) in tasks.iter() {
         task.abort();
     }
+
+    // Pause all active transfers on tunnel disconnect
+    state.transfer_manager.pause_all().await;
 
     Ok(disconnect_reason)
 }
@@ -537,10 +556,37 @@ async fn handle_relay_message(
         "tunnel.playbooks.delete" => {
             handle_tunnel_playbooks_delete(state, ws_sink, &msg, request_id.as_deref()).await;
         }
-        // Forwarded session.* messages from clients via relay
-        t if t.starts_with("session.") => {
+        // gawdxfer transfer protocol messages
+        "gx.download.init" => {
+            handle_gx_download_init(state, ws_sink, &msg, request_id.as_deref()).await;
+        }
+        "gx.upload.init" => {
+            handle_gx_upload_init(state, ws_sink, &msg, request_id.as_deref()).await;
+        }
+        "gx.chunk.request" => {
+            handle_gx_chunk_request(state, ws_sink, &msg, request_id.as_deref()).await;
+        }
+        "gx.resume" => {
+            handle_gx_resume(state, ws_sink, &msg, request_id.as_deref()).await;
+        }
+        "gx.abort" => {
+            handle_gx_abort(state, ws_sink, &msg, request_id.as_deref()).await;
+        }
+        "gx.status" => {
+            handle_gx_status(state, ws_sink, &msg, request_id.as_deref()).await;
+        }
+        "gx.list" => {
+            handle_gx_list(state, ws_sink, request_id.as_deref()).await;
+        }
+        // Forwarded session.* and shell.* messages from clients via relay.
+        // GUARD: Any new WS message prefix (e.g. "foo.*") requires adding it here,
+        // otherwise tunnel clients won't handle those messages and they'll fall
+        // through to the "Unknown tunnel message type" warning below.
+        t if t.starts_with("session.") || t.starts_with("shell.") => {
             handle_forwarded_session_message(state, ws_sink, subscriber_tasks, &msg).await;
         }
+        // Client WS keep-alive ping — ignore
+        "ping" => {}
         _ => {
             warn!(msg_type, "Unknown tunnel message type");
         }
@@ -788,6 +834,7 @@ async fn handle_tunnel_file_read(
     let list = msg["list"].as_bool().unwrap_or(false);
 
     let offset = msg["offset"].as_u64();
+    #[allow(clippy::cast_possible_truncation)]
     let limit = msg["limit"].as_u64().map(|l| l as usize);
 
     let query = crate::routes::files::FilesQuery {
@@ -1126,6 +1173,307 @@ async fn handle_tunnel_file_delete(
     }
 }
 
+/// Handle a binary frame from the relay (gx.chunk for upload).
+async fn handle_relay_binary(state: &AppState, ws_sink: &WsSink, header: Value, payload: &[u8]) {
+    let msg_type = header["type"].as_str().unwrap_or("");
+
+    match msg_type {
+        "gx.chunk" => {
+            handle_gx_chunk_receive(state, ws_sink, &header, payload).await;
+        }
+        _ => {
+            warn!(msg_type, "Unknown binary tunnel message type");
+        }
+    }
+}
+
+// ─── gawdxfer tunnel handlers ────────────────────────────────────────────────
+
+/// Handle gx.download.init — init a chunked download.
+async fn handle_gx_download_init(
+    state: &AppState,
+    ws_sink: &WsSink,
+    msg: &Value,
+    request_id: Option<&str>,
+) {
+    let path = msg["path"].as_str().unwrap_or("");
+    #[allow(clippy::cast_possible_truncation)]
+    let chunk_size = msg["chunk_size"].as_u64().map(|v| v as u32);
+
+    match state.transfer_manager.init_download(path, chunk_size).await {
+        Ok(result) => {
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "gx.download.init.result",
+                    "request_id": request_id,
+                    "status": 200,
+                    "body": serde_json::to_value(&result).unwrap_or_default(),
+                }),
+            )
+            .await;
+        }
+        Err(e) => {
+            send_response(
+                ws_sink,
+                gx_error_response("gx.download.init.result", request_id, &e),
+            )
+            .await;
+        }
+    }
+}
+
+/// Handle gx.upload.init — init a chunked upload.
+async fn handle_gx_upload_init(
+    state: &AppState,
+    ws_sink: &WsSink,
+    msg: &Value,
+    request_id: Option<&str>,
+) {
+    let req = crate::gawdxfer::types::InitUpload {
+        path: msg["path"].as_str().unwrap_or("").to_string(),
+        filename: msg["filename"].as_str().unwrap_or("").to_string(),
+        file_size: msg["file_size"].as_u64().unwrap_or(0),
+        file_hash: msg["file_hash"].as_str().unwrap_or("").to_string(),
+        #[allow(clippy::cast_possible_truncation)]
+        chunk_size: msg["chunk_size"].as_u64().unwrap_or(0) as u32,
+        #[allow(clippy::cast_possible_truncation)]
+        total_chunks: msg["total_chunks"].as_u64().unwrap_or(0) as u32,
+        mode: msg["mode"].as_str().map(ToString::to_string),
+    };
+
+    match state.transfer_manager.init_upload(req).await {
+        Ok(result) => {
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "gx.upload.init.result",
+                    "request_id": request_id,
+                    "status": 200,
+                    "body": serde_json::to_value(&result).unwrap_or_default(),
+                }),
+            )
+            .await;
+        }
+        Err(e) => {
+            send_response(
+                ws_sink,
+                gx_error_response("gx.upload.init.result", request_id, &e),
+            )
+            .await;
+        }
+    }
+}
+
+/// Handle gx.chunk.request — serve a chunk for download (binary response).
+async fn handle_gx_chunk_request(
+    state: &AppState,
+    ws_sink: &WsSink,
+    msg: &Value,
+    request_id: Option<&str>,
+) {
+    let transfer_id = msg["transfer_id"].as_str().unwrap_or("");
+    #[allow(clippy::cast_possible_truncation)]
+    let chunk_index = msg["chunk_index"].as_u64().unwrap_or(0) as u32;
+
+    match state
+        .transfer_manager
+        .serve_chunk(transfer_id, chunk_index)
+        .await
+    {
+        Ok((chunk_header, data)) => {
+            // Send as binary frame with chunk metadata in header
+            let header = json!({
+                "type": "gx.chunk",
+                "request_id": request_id,
+                "transfer_id": chunk_header.transfer_id,
+                "chunk_index": chunk_header.chunk_index,
+                "chunk_hash": chunk_header.chunk_hash,
+            });
+            let frame = encode_binary_frame(&header, &data);
+            let mut sink = ws_sink.lock().await;
+            let _ = sink
+                .send(tokio_tungstenite::tungstenite::Message::Binary(
+                    frame.into(),
+                ))
+                .await;
+        }
+        Err(e) => {
+            send_response(ws_sink, gx_error_response("gx.chunk.ack", request_id, &e)).await;
+        }
+    }
+}
+
+/// Handle gx.chunk (binary) — receive a chunk for upload.
+async fn handle_gx_chunk_receive(
+    state: &AppState,
+    ws_sink: &WsSink,
+    header: &Value,
+    payload: &[u8],
+) {
+    let request_id = header["request_id"].as_str();
+    let transfer_id = header["transfer_id"].as_str().unwrap_or("");
+    #[allow(clippy::cast_possible_truncation)]
+    let chunk_index = header["chunk_index"].as_u64().unwrap_or(0) as u32;
+    let chunk_hash = header["chunk_hash"].as_str().unwrap_or("");
+
+    match state
+        .transfer_manager
+        .receive_chunk(transfer_id, chunk_index, chunk_hash, payload)
+        .await
+    {
+        Ok(ack) => {
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "gx.chunk.ack",
+                    "request_id": request_id,
+                    "body": serde_json::to_value(&ack).unwrap_or_default(),
+                }),
+            )
+            .await;
+        }
+        Err(e) => {
+            send_response(ws_sink, gx_error_response("gx.chunk.ack", request_id, &e)).await;
+        }
+    }
+}
+
+/// Handle gx.resume — resume a paused transfer.
+async fn handle_gx_resume(
+    state: &AppState,
+    ws_sink: &WsSink,
+    msg: &Value,
+    request_id: Option<&str>,
+) {
+    let transfer_id = msg["transfer_id"].as_str().unwrap_or("");
+    match state.transfer_manager.resume(transfer_id).await {
+        Ok(result) => {
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "gx.resume.result",
+                    "request_id": request_id,
+                    "status": 200,
+                    "body": serde_json::to_value(&result).unwrap_or_default(),
+                }),
+            )
+            .await;
+        }
+        Err(e) => {
+            send_response(
+                ws_sink,
+                gx_error_response("gx.resume.result", request_id, &e),
+            )
+            .await;
+        }
+    }
+}
+
+/// Handle gx.abort — abort a transfer.
+async fn handle_gx_abort(
+    state: &AppState,
+    ws_sink: &WsSink,
+    msg: &Value,
+    request_id: Option<&str>,
+) {
+    let transfer_id = msg["transfer_id"].as_str().unwrap_or("");
+    let reason = msg["reason"].as_str().unwrap_or("remote abort");
+    match state.transfer_manager.abort(transfer_id, reason).await {
+        Ok(()) => {
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "gx.abort.result",
+                    "request_id": request_id,
+                    "status": 200,
+                    "body": {"ok": true, "transfer_id": transfer_id},
+                }),
+            )
+            .await;
+        }
+        Err(e) => {
+            send_response(
+                ws_sink,
+                gx_error_response("gx.abort.result", request_id, &e),
+            )
+            .await;
+        }
+    }
+}
+
+/// Handle gx.status — get transfer status.
+async fn handle_gx_status(
+    state: &AppState,
+    ws_sink: &WsSink,
+    msg: &Value,
+    request_id: Option<&str>,
+) {
+    let transfer_id = msg["transfer_id"].as_str().unwrap_or("");
+    match state.transfer_manager.status(transfer_id).await {
+        Ok(result) => {
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "gx.status.result",
+                    "request_id": request_id,
+                    "status": 200,
+                    "body": serde_json::to_value(&result).unwrap_or_default(),
+                }),
+            )
+            .await;
+        }
+        Err(e) => {
+            send_response(
+                ws_sink,
+                gx_error_response("gx.status.result", request_id, &e),
+            )
+            .await;
+        }
+    }
+}
+
+/// Handle gx.list — list all transfers.
+async fn handle_gx_list(state: &AppState, ws_sink: &WsSink, request_id: Option<&str>) {
+    let result = state.transfer_manager.list().await;
+    send_response(
+        ws_sink,
+        json!({
+            "type": "gx.list.result",
+            "request_id": request_id,
+            "status": 200,
+            "body": serde_json::to_value(&result).unwrap_or_default(),
+        }),
+    )
+    .await;
+}
+
+/// Build a JSON error response for gx.* messages.
+fn gx_error_response(
+    result_type: &str,
+    request_id: Option<&str>,
+    e: &crate::gawdxfer::types::TransferError,
+) -> Value {
+    let status = match e.code.as_str() {
+        "FILE_NOT_FOUND" | "TRANSFER_NOT_FOUND" => 404,
+        "PERMISSION_DENIED" => 403,
+        "DISK_FULL" => 507,
+        "MAX_TRANSFERS" => 429,
+        _ => 400,
+    };
+    json!({
+        "type": result_type,
+        "request_id": request_id,
+        "status": status,
+        "body": {
+            "error": e.message,
+            "code": e.code,
+            "transfer_id": e.transfer_id,
+            "recoverable": e.recoverable,
+        },
+    })
+}
+
 /// Handle forwarded `session.*` messages from clients through the relay.
 ///
 /// These are the same message types as in `ws/mod.rs` but forwarded over the tunnel.
@@ -1432,6 +1780,16 @@ async fn handle_forwarded_session_message(
                     }
                     send_response(ws_sink, resp).await;
                 }
+            }
+        }
+        "session.detach" => {
+            let session_id = msg["session_id"].as_str().unwrap_or("");
+            if !session_id.is_empty() {
+                // Abort subscriber for this session
+                if let Some(task) = subscriber_tasks.lock().await.remove(session_id) {
+                    task.abort();
+                }
+                state.session_manager.detach(session_id).await;
             }
         }
         "session.list" => {
@@ -1851,12 +2209,20 @@ async fn handle_tunnel_playbooks_delete(
 
 /// Background task that reads from a session's `OutputBuffer` and forwards
 /// entries as WS messages through the tunnel. Similar to `ws/mod.rs` `subscriber_task`.
+///
+/// Uses feed+flush batching: holds the WS sink lock once per batch, feeds all
+/// entries, and flushes periodically (every ~50 entries) to coalesce TCP writes.
+/// This avoids per-entry lock acquisition + syscall overhead on the slow RISC-V CPU.
 async fn tunnel_subscriber_task(
     session_id: String,
     buffer: Arc<tokio::sync::Mutex<OutputBuffer>>,
     ws_sink: WsSink,
     since: u64,
 ) {
+    /// Flush every N entries to keep output streaming on slow links.
+    /// ~50 entries ≈ 1 screenful — prevents multi-second stalls on `cat hugefile.txt`.
+    const FLUSH_INTERVAL: usize = 50;
+
     let mut cursor = since;
     loop {
         let (entries, notify) = {
@@ -1868,19 +2234,30 @@ async fn tunnel_subscriber_task(
                 (vec![], Some(buf.notifier()))
             }
         };
-        for entry in &entries {
-            let msg = entry_to_ws_message(&session_id, entry);
-            let text = serde_json::to_string(&msg)
-                .unwrap_or_else(|_| r#"{"type":"error","message":"serialize failed"}"#.to_string());
+        if !entries.is_empty() {
             let mut sink = ws_sink.lock().await;
-            if sink
-                .send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
-                .await
-                .is_err()
-            {
+            for (i, entry) in entries.iter().enumerate() {
+                let msg = entry_to_ws_message(&session_id, entry);
+                let text = serde_json::to_string(&msg).unwrap_or_else(|_| {
+                    r#"{"type":"error","message":"serialize failed"}"#.to_string()
+                });
+                if sink
+                    .feed(tokio_tungstenite::tungstenite::Message::Text(text.into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if (i + 1) % FLUSH_INTERVAL == 0 && sink.flush().await.is_err() {
+                    return;
+                }
+            }
+            if sink.flush().await.is_err() {
                 return;
             }
-            cursor = entry.seq;
+            if let Some(last) = entries.last() {
+                cursor = last.seq;
+            }
         }
         if let Some(n) = notify {
             n.notified().await;

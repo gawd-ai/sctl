@@ -9,17 +9,27 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub mod process;
 pub mod pty;
 
-/// Detect available shells on this system.
+/// Cached shell list — shells don't change at runtime on embedded devices.
+/// Avoids repeated blocking filesystem I/O (`read_to_string` + stat + canonicalize)
+/// which costs 50-200ms per call on BPI's slow SPI flash.
+static SHELL_CACHE: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Detect available shells on this system (cached after first call).
 ///
 /// Reads `/etc/shells` first (filtering comments and blank lines), then falls
 /// back to probing a hardcoded list of common paths.  Results are deduplicated
 /// by canonical path (so `/bin/bash` and `/usr/bin/bash` don't both appear when
 /// one is a symlink) and sorted by "elite" rank: zsh > fish > bash > dash > ash > sh.
 pub fn detect_shells() -> Vec<String> {
+    SHELL_CACHE.get_or_init(detect_shells_uncached).clone()
+}
+
+fn detect_shells_uncached() -> Vec<String> {
     let candidates = if let Ok(contents) = std::fs::read_to_string("/etc/shells") {
         let from_file: Vec<String> = contents
             .lines()

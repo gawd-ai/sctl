@@ -8,9 +8,10 @@
 		restClient: SctlRestClient | null;
 		onclose?: () => void;
 		onresult?: (result: ExecResult) => void;
+		onRunInTerminal?: (script: string) => void;
 	}
 
-	let { playbook, restClient, onclose, onresult }: Props = $props();
+	let { playbook, restClient, onclose, onresult, onRunInTerminal }: Props = $props();
 
 	// Parameter values
 	let paramValues: Record<string, string> = $state({});
@@ -75,11 +76,24 @@
 				<div class="text-xs text-neutral-200 font-semibold truncate">{playbook.name}</div>
 				<div class="text-[10px] text-neutral-500">Execute playbook</div>
 			</div>
+			{#if onRunInTerminal}
+				<button
+					class="px-2 py-1 rounded text-[10px] transition-colors bg-green-900/40 text-green-400 hover:bg-green-900/60 flex items-center gap-1"
+					onclick={() => onRunInTerminal?.(previewScript)}
+					title="Send script to active terminal session"
+				>
+					<svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+						<polyline points="4 17 10 11 4 5" />
+						<line x1="12" y1="19" x2="20" y2="19" />
+					</svg>
+					Terminal
+				</button>
+			{/if}
 			<button
 				class="px-2 py-1 rounded text-[10px] transition-colors
 					{executing
 						? 'bg-neutral-800 text-neutral-500 cursor-wait'
-						: 'bg-green-900/40 text-green-400 hover:bg-green-900/60'}"
+						: 'bg-neutral-800 text-neutral-400 hover:text-neutral-200 hover:bg-neutral-700'}"
 				disabled={executing}
 				onclick={execute}
 			>{executing ? 'Running...' : 'Execute'}</button>

@@ -18,6 +18,11 @@ export { default as HistoryViewer } from './components/HistoryViewer.svelte';
 export { default as PlaybookList } from './components/PlaybookList.svelte';
 export { default as PlaybookViewer } from './components/PlaybookViewer.svelte';
 export { default as PlaybookExecutor } from './components/PlaybookExecutor.svelte';
+export { default as TransferIndicator } from './components/TransferIndicator.svelte';
+export { default as PlaybookPanel } from './components/PlaybookPanel.svelte';
+export { default as SidePanel } from './components/SidePanel.svelte';
+export { default as ServerDashboard } from './components/ServerDashboard.svelte';
+export { default as ExecViewer } from './components/ExecViewer.svelte';
 
 // Widgets
 export { default as DeviceStatusWidget } from './widgets/DeviceStatusWidget.svelte';
@@ -73,7 +78,13 @@ export type {
 	HistoryFilter,
 	PlaybookParam,
 	PlaybookSummary,
-	PlaybookDetail
+	PlaybookDetail,
+	SplitGroupInfo,
+	SidePanelTabDef,
+	ViewerTab,
+	ExecViewerData,
+	FileViewerData,
+	CachedExecResult
 } from './types/terminal.types';
 
 export type { DeviceConnectionConfig } from './types/widget.types';

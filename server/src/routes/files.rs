@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 /// Monotonic counter to uniquify temp file names across concurrent writes.
-static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 use axum::{
     body::Body,
@@ -147,7 +147,7 @@ pub struct FileWriteRequest {
 
 /// Validate that a user-supplied path is absolute, has no `..` traversal, and
 /// contains no null bytes.
-fn validate_path(path: &str) -> Result<PathBuf, (StatusCode, Json<Value>)> {
+pub(crate) fn validate_path(path: &str) -> Result<PathBuf, (StatusCode, Json<Value>)> {
     let p = Path::new(path);
     if !p.is_absolute() {
         return Err((
@@ -241,6 +241,7 @@ pub async fn get_file(
 /// (seek + bounded read) and sets `truncated: true` if the file extends
 /// beyond the returned bytes.  Without range parameters the original
 /// behaviour is preserved: files larger than `max_size` are rejected.
+#[allow(clippy::too_many_lines)]
 async fn read_file(
     path: &Path,
     max_size: usize,
@@ -278,7 +279,7 @@ async fn read_file(
 
     let file_size = metadata.len();
     let read_offset = offset.unwrap_or(0);
-    let read_limit = limit.map(|l| l.min(max_size)).unwrap_or(max_size);
+    let read_limit = limit.map_or(max_size, |l| l.min(max_size));
 
     // Without range params, enforce the old behaviour: reject oversized files.
     #[allow(clippy::cast_possible_truncation)]
@@ -325,6 +326,7 @@ async fn read_file(
                 })?;
         }
 
+        #[allow(clippy::cast_possible_truncation)]
         let remaining = file_size.saturating_sub(read_offset) as usize;
         let to_read = read_limit.min(remaining);
         let mut buf = vec![0u8; to_read];
@@ -343,8 +345,7 @@ async fn read_file(
     // Try to interpret as UTF-8; fall back to base64 for binary files.
     let path_str = path.to_string_lossy().into_owned();
     if std::str::from_utf8(&bytes).is_ok() {
-        // SAFETY: we just validated UTF-8 above.
-        let text = unsafe { String::from_utf8_unchecked(bytes) };
+        let text = String::from_utf8(bytes).expect("validated UTF-8 above");
         Ok(Json(
             serde_json::to_value(FileReadResponse {
                 path: path_str,
@@ -579,7 +580,7 @@ pub async fn put_file(
     })))
 }
 
-async fn rename_temp_to_final(
+pub(crate) async fn rename_temp_to_final(
     temp_path: &Path,
     final_path: &Path,
 ) -> Result<(), (StatusCode, Json<Value>)> {
@@ -714,10 +715,10 @@ pub async fn download_file(
     })?;
 
     let file_size = metadata.len();
-    let basename = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "download".to_string());
+    let basename = path.file_name().map_or_else(
+        || "download".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
 
     state
         .activity_log
@@ -853,7 +854,7 @@ pub async fn upload_file(
             .activity_log
             .log(
                 ActivityType::FileWrite,
-                source.clone(),
+                source,
                 activity::truncate_str(&full_path_str, 80),
                 Some(json!({"size": size, "upload": true})),
                 req_id.clone(),

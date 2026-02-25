@@ -1,0 +1,25 @@
+[Unit]
+Description=sctl Device Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sctl supervise --config /etc/sctl/sctl.toml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+WorkingDirectory=/var/lib/sctl
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sctl
+LimitNOFILE=65536
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sctl /etc/sctl/playbooks /tmp
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

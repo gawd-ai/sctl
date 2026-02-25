@@ -1,3 +1,10 @@
+// ── Side panel ──────────────────────────────────────────────────────
+
+export interface SidePanelTabDef {
+	id: string;
+	label: string;
+}
+
 // ── Control & status enums ──────────────────────────────────────────
 
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
@@ -105,6 +112,14 @@ export interface ReconnectConfig {
 	maxAttempts: number;
 }
 
+// ── Split groups ────────────────────────────────────────────────────
+
+export interface SplitGroupInfo {
+	primaryKey: string;
+	secondaryKey: string;
+	direction: 'horizontal' | 'vertical';
+}
+
 // ── Callbacks ───────────────────────────────────────────────────────
 
 export interface SctlinCallbacks {
@@ -118,6 +133,8 @@ export interface SctlinCallbacks {
 	onRemoteSessions?: (sessions: RemoteSessionInfo[]) => void;
 	onSessionsChange?: (sessions: SessionInfo[]) => void;
 	onActiveSessionChange?: (sessionId: string | null) => void;
+	onSplitGroupsChange?: (groups: SplitGroupInfo[]) => void;
+	onFocusedPaneChange?: (pane: 'primary' | 'secondary') => void;
 	onActivity?: (entry: ActivityEntry) => void;
 }
 
@@ -134,6 +151,8 @@ export interface SctlinConfig {
 	reconnect?: Partial<ReconnectConfig>;
 	callbacks?: SctlinCallbacks;
 	sessionDefaults?: Partial<SessionStartOptions>;
+	/** Pre-created WS client — skips client creation, starts immediately. */
+	client?: import('../utils/ws-client').SctlWsClient;
 }
 
 // ── Wire protocol: client → server ─────────────────────────────────
@@ -466,7 +485,151 @@ export type WsServerMsg =
 	| WsSessionAiPermissionChangedBroadcast
 	| WsSessionAiStatusChangedBroadcast
 	| WsActivityNewMsg
+	| GxProgressMsg
+	| GxCompleteMsg
+	| GxErrorMsg
 	| WsErrorMsg;
+
+// ── Transfer (gawdxfer / STP) types ────────────────────────────
+
+export type TransferDirection = 'upload' | 'download';
+
+export interface StpInitDownloadResult {
+	transfer_id: string;
+	file_size: number;
+	file_hash: string;
+	chunk_size: number;
+	total_chunks: number;
+	filename: string;
+}
+
+export interface StpInitUploadResult {
+	transfer_id: string;
+	chunk_size: number;
+	total_chunks: number;
+}
+
+export interface StpChunkAck {
+	transfer_id: string;
+	chunk_index: number;
+	ok: boolean;
+	error?: string;
+}
+
+export interface StpResumeResult {
+	transfer_id: string;
+	direction: TransferDirection;
+	chunks_received: number[];
+	total_chunks: number;
+	chunk_size: number;
+	file_size: number;
+	file_hash: string;
+}
+
+export interface StpStatusResult {
+	transfer_id: string;
+	direction: TransferDirection;
+	phase: string;
+	filename: string;
+	file_size: number;
+	chunks_done: number;
+	total_chunks: number;
+	bytes_transferred: number;
+	elapsed_ms: number;
+	error_count: number;
+}
+
+export interface StpTransferSummary {
+	transfer_id: string;
+	direction: TransferDirection;
+	filename: string;
+	file_size: number;
+	phase: string;
+	chunks_done: number;
+	total_chunks: number;
+	bytes_transferred: number;
+}
+
+export interface StpListResult {
+	transfers: StpTransferSummary[];
+}
+
+export interface GxProgressMsg {
+	type: 'gx.progress';
+	data: {
+		transfer_id: string;
+		direction: TransferDirection;
+		path: string;
+		filename: string;
+		chunks_done: number;
+		total_chunks: number;
+		bytes_transferred: number;
+		file_size: number;
+		elapsed_ms: number;
+		rate_bps: number;
+	};
+}
+
+export interface GxCompleteMsg {
+	type: 'gx.complete';
+	data: {
+		transfer_id: string;
+		direction: TransferDirection;
+		path: string;
+		filename: string;
+		file_size: number;
+		file_hash: string;
+		elapsed_ms: number;
+	};
+}
+
+export interface GxErrorMsg {
+	type: 'gx.error';
+	data: {
+		transfer_id: string;
+		code: string;
+		message: string;
+		recoverable: boolean;
+	};
+}
+
+// ── Viewer tabs ────────────────────────────────────────────────
+
+export interface ViewerTab {
+	key: string;
+	type: 'exec' | 'file';
+	label: string;
+	icon: string;
+	data: ExecViewerData | FileViewerData;
+}
+
+export interface ExecViewerData {
+	activityId: number;
+	command: string;
+	exitCode: number;
+	stdout: string;
+	stderr: string;
+	durationMs: number;
+	status: string;
+	errorMessage?: string;
+}
+
+export interface FileViewerData {
+	path: string;
+	content: string;
+	size: number;
+}
+
+export interface CachedExecResult {
+	activity_id: number;
+	exit_code: number;
+	stdout: string;
+	stderr: string;
+	duration_ms: number;
+	command: string;
+	status: string;
+	error_message?: string;
+}
 
 // ── History/Activity filtering ─────────────────────────────────
 

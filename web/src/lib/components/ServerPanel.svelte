@@ -5,11 +5,8 @@
 		SessionInfo,
 		RemoteSessionInfo,
 		ConnectionStatus,
-		DeviceInfo,
-		ActivityEntry
+		SplitGroupInfo
 	} from '../types/terminal.types';
-	import DeviceInfoPanel from './DeviceInfoPanel.svelte';
-	import ActivityFeed from './ActivityFeed.svelte';
 
 	interface Props {
 		servers: ServerConfig[];
@@ -32,9 +29,8 @@
 		onaddserver?: (config: Omit<ServerConfig, 'id'>) => void;
 		onremoveserver?: (serverId: string) => void;
 		oneditserver?: (serverId: string, updates: Partial<ServerConfig>) => void;
-		serverDeviceInfo?: Record<string, DeviceInfo | null>;
-		onrefreshinfo?: (serverId: string) => void;
-		serverActivity?: Record<string, ActivityEntry[]>;
+		serverSplitGroups?: Record<string, SplitGroupInfo[]>;
+		focusedPanes?: Record<string, 'primary' | 'secondary'>;
 	}
 
 	let {
@@ -58,9 +54,8 @@
 		onaddserver,
 		onremoveserver,
 		oneditserver,
-		serverDeviceInfo = {},
-		onrefreshinfo,
-		serverActivity = {}
+		serverSplitGroups = {},
+		focusedPanes = {}
 	}: Props = $props();
 
 	// ── Internal types ──────────────────────────────────────────────
@@ -85,13 +80,13 @@
 		idle?: boolean;
 		exitCode?: number;
 		idleTimeout?: number;
+		splitRole?: 'primary' | 'secondary';
+		splitFocused?: boolean;
 	}
 
 	// ── State ────────────────────────────────────────────────────────
 
 	let expandedServers: Record<string, boolean> = $state({});
-	let infoExpanded: Record<string, boolean> = $state({});
-	let activityExpanded: Record<string, boolean> = $state({});
 	let flyoutServerId: string | null = $state(null);
 	let flyoutTop = $state(0);
 	let hoverTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -124,6 +119,7 @@
 	// Confirmation states (reset on mouse leave)
 	let confirmingRemoveId: string | null = $state(null);
 	let confirmingKillId: string | null = $state(null);
+	let killingIds: Set<string> = $state(new Set());
 
 	// Auto-expand tracking (#1) — plain Map to avoid reactive churn
 	const prevStatuses = new Map<string, ConnectionStatus>();
@@ -151,6 +147,20 @@
 		}
 	});
 
+	// Clear killing state when session disappears from remote list
+	$effect(() => {
+		if (killingIds.size === 0) return;
+		const allRemoteIds = new Set(
+			Object.entries(serverRemoteSessions).flatMap(([sid, list]) =>
+				list.map((r) => `${sid}/${r.session_id}`)
+			)
+		);
+		const stillAlive = new Set([...killingIds].filter((k) => allRemoteIds.has(k)));
+		if (stillAlive.size < killingIds.size) {
+			killingIds = stillAlive;
+		}
+	});
+
 	// ── Dismiss flyout on collapse/expand (#2) ──────────────────────
 
 	$effect(() => {
@@ -170,32 +180,64 @@
 		}
 	}
 
+	// Pre-compute session lists reactively so both displayServers and the template
+	// use the same reactive source (avoids stale {#each} blocks when split state changes).
+	let serverSessionLists: Record<string, SessionDisplay[]> = $derived(
+		Object.fromEntries(servers.map(s => [s.id, getServerDisplaySessions(s.id)]))
+	);
+
 	let displayServers: ServerDisplay[] = $derived(
-		servers.map((s) => {
-			const sessions = getServerDisplaySessions(s.id);
-			return {
-				id: s.id,
-				name: s.name,
-				host: extractHost(s.wsUrl),
-				status: connectionStatuses[s.id] ?? 'disconnected',
-				sessionCount: sessions.length,
-				isActive: s.id === activeServerId
-			};
-		})
+		servers.map((s) => ({
+			id: s.id,
+			name: s.name,
+			host: extractHost(s.wsUrl),
+			status: connectionStatuses[s.id] ?? 'disconnected',
+			sessionCount: (serverSessionLists[s.id] ?? []).length,
+			isActive: s.id === activeServerId
+		}))
 	);
 
 	function getServerDisplaySessions(serverId: string): SessionDisplay[] {
 		const local = serverSessions[serverId] ?? [];
 		const remote = serverRemoteSessions[serverId] ?? [];
+		const groups = serverSplitGroups?.[serverId] ?? [];
+		const serverFocusedPane = focusedPanes?.[serverId] ?? 'primary';
 
-		const localDisplay: SessionDisplay[] = local.map((s) => ({
-			id: s.sessionId,
-			serverId,
-			label: s.label || shortId(s.sessionId),
-			pid: s.pid,
-			status: s.attached ? 'attached' as const : 'open' as const,
-			isActive: serverId === activeServerId && s.sessionId === activeSessionId
-		}));
+		// Build key→sessionId lookup for split group matching
+		const keyToSessionId = new Map(local.map(s => [s.key, s.sessionId]));
+		const sessionIdToKey = new Map(local.map(s => [s.sessionId, s.key]));
+
+		// Find the active session's key to identify the active split group
+		const activeKey = activeSessionId ? sessionIdToKey.get(activeSessionId) : null;
+		const activeGroup = activeKey ? groups.find(g => g.primaryKey === activeKey) : null;
+
+		const localDisplay: SessionDisplay[] = local.map((s) => {
+			let splitRole: 'primary' | 'secondary' | undefined;
+			let splitFocused = false;
+			for (const g of groups) {
+				if (s.key === g.primaryKey) {
+					splitRole = 'primary';
+					// Only highlight if this is the active group
+					splitFocused = serverId === activeServerId && g === activeGroup && serverFocusedPane === 'primary';
+					break;
+				}
+				if (s.key === g.secondaryKey) {
+					splitRole = 'secondary';
+					splitFocused = serverId === activeServerId && g === activeGroup && serverFocusedPane === 'secondary';
+					break;
+				}
+			}
+			return {
+				id: s.sessionId,
+				serverId,
+				label: s.label || shortId(s.sessionId),
+				pid: s.pid,
+				status: s.attached ? 'attached' as const : 'open' as const,
+				isActive: serverId === activeServerId && s.sessionId === activeSessionId,
+				splitRole,
+				splitFocused
+			};
+		});
 
 		const unattached: SessionDisplay[] = remote
 			.filter((rs) => !local.some((s) => s.sessionId === rs.session_id))
@@ -212,7 +254,47 @@
 				idleTimeout: rs.idle_timeout
 			}));
 
-		return [...localDisplay, ...unattached];
+		// Sort: split pairs grouped, killing sessions last
+		const all = [...localDisplay, ...unattached];
+		const alive = all.filter(s => !killingIds.has(`${serverId}/${s.id}`));
+		const dying = all.filter(s => killingIds.has(`${serverId}/${s.id}`));
+
+		// Group split pairs together (primary immediately followed by secondary)
+		if (groups.length > 0) {
+			const ordered: SessionDisplay[] = [];
+			const placed = new Set<string>();
+			// Collect secondary IDs so we skip them in the first pass
+			const secondaryIds = new Set<string>();
+			for (const g of groups) {
+				const secSid = keyToSessionId.get(g.secondaryKey);
+				if (secSid) secondaryIds.add(secSid);
+			}
+			for (const s of alive) {
+				if (placed.has(s.id)) continue;
+				if (secondaryIds.has(s.id)) continue; // placed after its primary
+				ordered.push(s);
+				placed.add(s.id);
+				// If this is a primary, insert its secondary right after
+				if (s.splitRole === 'primary') {
+					const key = sessionIdToKey.get(s.id);
+					const group = key ? groups.find(g => g.primaryKey === key) : null;
+					if (group) {
+						const secSid = keyToSessionId.get(group.secondaryKey);
+						const sec = secSid ? alive.find(x => x.id === secSid) : null;
+						if (sec && !placed.has(sec.id)) {
+							ordered.push(sec);
+							placed.add(sec.id);
+						}
+					}
+				}
+			}
+			// Add any orphaned secondaries that weren't placed
+			for (const s of alive) {
+				if (!placed.has(s.id)) ordered.push(s);
+			}
+			return [...ordered, ...dying];
+		}
+		return [...alive, ...dying];
 	}
 
 	let flyoutServer = $derived(
@@ -351,8 +433,18 @@
 			// Has a tab — just switch to it
 			onselectsession?.(session.serverId, session.id);
 		} else {
-			// Remote-only — open tab with history (readonly, not attached)
+			// Remote-only — open tab (no server auto-connect; dot handles that)
 			onopensession?.(session.serverId, session.id);
+		}
+	}
+
+	function handleDotToggle(session: SessionDisplay, inFlyout: boolean) {
+		if (inFlyout) flyoutServerId = null;
+		if (session.status === 'attached') {
+			ondetachsession?.(session.serverId, session.id);
+		} else {
+			// For anything not attached (open/detached) — attach it
+			onattachsession?.(session.serverId, session.id);
 		}
 	}
 
@@ -373,6 +465,7 @@
 		const key = `${serverId}/${sessionId}`;
 		if (confirmingKillId === key) {
 			confirmingKillId = null;
+			killingIds = new Set([...killingIds, key]);
 			onkillsession?.(serverId, sessionId);
 		} else {
 			confirmingKillId = key;
@@ -500,7 +593,7 @@
 	<!-- Server rows -->
 	{#each displayServers as server (server.id)}
 		{@const isExpanded = !collapsed && !!expandedServers[server.id]}
-		{@const sessions = getServerDisplaySessions(server.id)}
+		{@const sessions = serverSessionLists[server.id] ?? []}
 
 		<div
 			class="server-row flex items-center h-8 cursor-pointer transition-colors
@@ -521,7 +614,7 @@
 				></button>
 			</div>
 			<span class="server-label font-mono text-[11px] truncate whitespace-nowrap flex-1
-				{server.isActive ? 'text-neutral-200' : 'text-neutral-400'}"
+				{server.isActive ? 'text-green-400/80' : 'text-green-600/60'}"
 			>{server.name}</span>
 			{#if !collapsed}
 				<span class="server-label text-[10px] text-neutral-600 tabular-nums mr-1.5">
@@ -657,22 +750,6 @@
 			{/if}
 		</div>
 		{#if !inFlyout}
-			<!-- Device info toggle -->
-			{#if server.status === 'connected' && serverDeviceInfo?.[server.id]}
-				<button
-					class="w-5 h-5 flex items-center justify-center rounded transition-colors
-						{infoExpanded[server.id]
-							? 'text-neutral-200 bg-neutral-800'
-							: 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}"
-					title="Device info"
-					onclick={(e) => { e.stopPropagation(); infoExpanded = { ...infoExpanded, [server.id]: !infoExpanded[server.id] }; }}
-				>
-					<svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-						<rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
-						<path d="M8 21h8M12 17v4" />
-					</svg>
-				</button>
-			{/if}
 			<!-- Settings — aligned with kill buttons -->
 			<button
 				class="mr-1.5 w-5 h-5 flex items-center justify-center rounded transition-colors
@@ -746,50 +823,18 @@
 		</div>
 	{/if}
 
-	<!-- Device info panel -->
-	{#if !inFlyout && infoExpanded[server.id] && serverDeviceInfo?.[server.id]}
-		{@const devInfo = serverDeviceInfo[server.id]}
-		{#if devInfo}
-			<div class="border-b border-neutral-800/30">
-				<DeviceInfoPanel info={devInfo} onrefresh={() => onrefreshinfo?.(server.id)} />
-			</div>
-		{/if}
-	{/if}
-
-	<!-- Activity feed -->
-	{#if !inFlyout && server.status === 'connected' && (serverActivity?.[server.id]?.length ?? 0) > 0}
-		{@const actEntries = serverActivity[server.id] ?? []}
-		<div
-			class="flex items-center h-5 cursor-pointer hover:bg-neutral-800/40 transition-colors"
-			style="padding-left: {dotW}px"
-			onclick={() => { activityExpanded = { ...activityExpanded, [server.id]: !activityExpanded[server.id] }; }}
-		>
-			<span class="text-neutral-500 mr-1">
-				{#if activityExpanded[server.id]}
-					<svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-						<path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" />
-					</svg>
-				{:else}
-					<svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-						<path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
-					</svg>
-				{/if}
-			</span>
-			<span class="text-[10px] text-neutral-500 font-mono">activity</span>
-			<span class="ml-1 text-[9px] text-neutral-600 tabular-nums">{actEntries.length}</span>
-		</div>
-		{#if activityExpanded[server.id]}
-			<div class="max-h-48 overflow-y-auto border-b border-neutral-800/30">
-				<ActivityFeed entries={actEntries} />
-			</div>
-		{/if}
-	{/if}
-
 	<!-- Sessions -->
-	{#each sessions as session (session.id)}
+	{#each sessions as session, i (session.id)}
+		{@const isKilling = killingIds.has(`${session.serverId}/${session.id}`)}
+		{@const prevSession = i > 0 ? sessions[i - 1] : null}
+		{@const isNewGroup = session.splitRole === 'primary' && prevSession?.splitRole === 'secondary'}
 		<div
-			class="group flex items-center h-7 cursor-pointer transition-colors hover:bg-neutral-800/40
-				{session.isActive ? 'bg-neutral-800/60' : ''}"
+			class="group flex items-center h-7 transition-colors border-l-2
+				{isKilling ? 'opacity-40 pointer-events-none' : 'cursor-pointer hover:bg-neutral-800/40'}
+				{session.splitFocused || (session.isActive && !session.splitRole) ? 'bg-neutral-800/60' : ''}
+				{session.splitRole ? 'bg-blue-500/5' : ''}
+				{session.splitFocused ? 'border-l-blue-400' : session.splitRole ? 'border-l-blue-400/40' : 'border-l-transparent'}
+				{isNewGroup ? 'mt-1' : ''}"
 			onclick={() => { if (inFlyout) flyoutServerId = null; handleSessionClick(session); }}
 		>
 			<div class="shrink-0 flex items-center justify-center" style="width: {dotW}px">
@@ -800,15 +845,15 @@
 						: session.idleTimeout
 							? `Auto-kill in ${session.idleTimeout}s`
 							: session.status === 'attached' ? 'Detach session' : 'Attach session'}
-					onclick={(e: MouseEvent) => { e.stopPropagation(); const serverId = session.serverId; const sessionId = session.id; if (inFlyout) flyoutServerId = null; if (session.status === 'attached') ondetachsession?.(serverId, sessionId); else onattachsession?.(serverId, sessionId); }}
+					onclick={(e: MouseEvent) => { e.stopPropagation(); handleDotToggle(session, inFlyout); }}
 				>
 					<span class="w-1.5 h-1.5 rounded-full shrink-0
 						{session.sessionStatus === 'exited' ? 'bg-neutral-500' : session.idle ? 'bg-neutral-600' : session.status === 'attached' ? 'bg-green-500' : 'bg-yellow-500'}
-						{session.isActive ? 'ring-2 ring-green-400/40 ring-offset-1 ring-offset-neutral-950' : ''}"></span>
+						{session.splitFocused || (session.isActive && !session.splitRole) ? 'ring-[1.5px] ring-green-400/30 ring-offset-1 ring-offset-neutral-950' : ''}"></span>
 				</button>
 			</div>
 			<span class="font-mono text-[10px] truncate flex-1
-				{session.sessionStatus === 'exited' ? 'text-neutral-600' : session.isActive ? 'text-neutral-200' : 'text-neutral-500'}"
+				{isKilling ? 'text-neutral-600 line-through' : session.sessionStatus === 'exited' ? 'text-neutral-600' : session.splitFocused ? 'text-neutral-100 font-medium' : (session.isActive && !session.splitRole) ? 'text-neutral-200' : 'text-neutral-500'}"
 			>{session.label}</span>
 			{#if session.status !== 'attached'}
 				<button
@@ -845,7 +890,7 @@
 		<div class="min-w-[180px]">
 			<!-- Header bar -->
 			<div class="flex items-center gap-2 px-2.5 py-1.5 border-b border-neutral-700/50">
-				<span class="text-xs text-neutral-300 font-mono truncate flex-1">{flyoutServer.name}</span>
+				<span class="text-xs text-green-400/80 font-mono truncate flex-1">{flyoutServer.name}</span>
 				{#if flyoutServer.sessionCount > 0}
 					<span class="text-[10px] text-neutral-600 tabular-nums">{flyoutServer.sessionCount}</span>
 				{/if}

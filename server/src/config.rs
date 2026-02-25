@@ -15,7 +15,11 @@
 //! max_sessions = 20
 //! exec_timeout_ms = 30000
 //! max_batch_size = 20
-//! max_file_size = 2097152  # 2 MB
+//! max_file_size = 52428800  # 50 MB
+//! max_concurrent_transfers = 4
+//! transfer_chunk_size = 262144  # 256 KiB
+//! transfer_max_file_size = 1073741824  # 1 GiB
+//! transfer_stale_timeout_secs = 3600
 //!
 //! [auth]
 //! api_key = "your-secret-key"
@@ -35,8 +39,8 @@
 //! relay = false                            # true = relay mode, false = client mode
 //! tunnel_key = "shared-secret"             # device<->relay auth
 //! url = "wss://relay.example.com/api/tunnel/register"  # client mode only
-//! reconnect_delay_secs = 5                 # client mode, initial backoff
-//! reconnect_max_delay_secs = 60            # client mode, max backoff
+//! reconnect_delay_secs = 2                 # client mode, initial backoff
+//! reconnect_max_delay_secs = 30            # client mode, max backoff
 //! heartbeat_interval_secs = 15             # client mode, ping interval
 //! ```
 
@@ -104,12 +108,27 @@ pub struct ServerConfig {
     /// Maximum entries in the in-memory activity log ring buffer (default 200).
     #[serde(default = "default_activity_log_max_entries")]
     pub activity_log_max_entries: usize,
+    /// Maximum cached exec results kept in memory (default 100).
+    #[serde(default = "default_exec_result_cache_size")]
+    pub exec_result_cache_size: usize,
     /// Default terminal rows for PTY sessions (default 24).
     #[serde(default = "default_terminal_rows")]
     pub default_terminal_rows: u16,
     /// Default terminal columns for PTY sessions (default 80).
     #[serde(default = "default_terminal_cols")]
     pub default_terminal_cols: u16,
+    /// Max concurrent gawdxfer transfers (default 4).
+    #[serde(default = "default_max_concurrent_transfers")]
+    pub max_concurrent_transfers: usize,
+    /// Chunk size in bytes for gawdxfer (default 256 KiB).
+    #[serde(default = "default_transfer_chunk_size")]
+    pub transfer_chunk_size: u32,
+    /// Max file size for gawdxfer transfers in bytes (default 1 GiB).
+    #[serde(default = "default_transfer_max_file_size")]
+    pub transfer_max_file_size: u64,
+    /// Stale transfer timeout in seconds (default 3600).
+    #[serde(default = "default_transfer_stale_timeout")]
+    pub transfer_stale_timeout_secs: u64,
 }
 
 /// Supervisor settings for `sctl supervise`.
@@ -174,13 +193,13 @@ pub struct TunnelConfig {
     pub tunnel_key: String,
     /// Relay URL for client mode (e.g. `wss://relay.example.com/api/tunnel/register`).
     pub url: Option<String>,
-    /// Seconds between reconnect attempts (client mode, default 5).
+    /// Seconds between reconnect attempts (client mode, default 2).
     #[serde(default = "default_reconnect_delay")]
     pub reconnect_delay_secs: u64,
-    /// Max seconds between reconnect attempts (client mode, default 60).
+    /// Max seconds between reconnect attempts (client mode, default 30).
     #[serde(default = "default_reconnect_max_delay")]
     pub reconnect_max_delay_secs: u64,
-    /// Seconds between heartbeat pings (client mode, default 30).
+    /// Seconds between heartbeat pings (client mode, default 15).
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval_secs: u64,
     /// Seconds before a device is considered dead if no heartbeat (relay mode, default 45).
@@ -207,7 +226,7 @@ fn default_max_batch_size() -> usize {
     20
 }
 fn default_max_file_size() -> usize {
-    2 * 1024 * 1024 // 2 MB
+    50 * 1024 * 1024 // 50 MB
 }
 fn default_session_buffer_size() -> usize {
     1000
@@ -242,6 +261,9 @@ fn default_journal_max_age_hours() -> u64 {
 fn default_activity_log_max_entries() -> usize {
     200
 }
+fn default_exec_result_cache_size() -> usize {
+    100
+}
 fn default_terminal_rows() -> u16 {
     24
 }
@@ -257,11 +279,23 @@ fn default_supervisor_max_backoff() -> u64 {
 fn default_supervisor_stable_threshold() -> u64 {
     60
 }
+fn default_max_concurrent_transfers() -> usize {
+    4
+}
+fn default_transfer_chunk_size() -> u32 {
+    256 * 1024 // 256 KiB
+}
+fn default_transfer_max_file_size() -> u64 {
+    1024 * 1024 * 1024 // 1 GiB
+}
+fn default_transfer_stale_timeout() -> u64 {
+    3600 // 1 hour
+}
 fn default_reconnect_delay() -> u64 {
-    5
+    2
 }
 fn default_reconnect_max_delay() -> u64 {
-    60
+    30
 }
 fn default_heartbeat_interval() -> u64 {
     15
@@ -288,9 +322,14 @@ impl Default for ServerConfig {
             journal_fsync_interval_ms: default_journal_fsync_interval_ms(),
             journal_max_age_hours: default_journal_max_age_hours(),
             activity_log_max_entries: default_activity_log_max_entries(),
+            exec_result_cache_size: default_exec_result_cache_size(),
             default_terminal_rows: default_terminal_rows(),
             default_terminal_cols: default_terminal_cols(),
             playbooks_dir: default_playbooks_dir(),
+            max_concurrent_transfers: default_max_concurrent_transfers(),
+            transfer_chunk_size: default_transfer_chunk_size(),
+            transfer_max_file_size: default_transfer_max_file_size(),
+            transfer_stale_timeout_secs: default_transfer_stale_timeout(),
         }
     }
 }
@@ -338,6 +377,77 @@ impl Default for LoggingConfig {
 }
 
 impl Config {
+    /// Validate configuration values after loading. Returns a list of errors.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+
+        // Validate listen address parses as SocketAddr
+        if self.server.listen.parse::<std::net::SocketAddr>().is_err() {
+            errors.push(format!(
+                "server.listen '{}' is not a valid socket address",
+                self.server.listen
+            ));
+        }
+
+        if !(1..=500).contains(&self.server.default_terminal_rows) {
+            errors.push(format!(
+                "server.default_terminal_rows {} out of range [1, 500]",
+                self.server.default_terminal_rows
+            ));
+        }
+        if !(1..=500).contains(&self.server.default_terminal_cols) {
+            errors.push(format!(
+                "server.default_terminal_cols {} out of range [1, 500]",
+                self.server.default_terminal_cols
+            ));
+        }
+
+        if self.server.max_sessions > 10_000 {
+            errors.push(format!(
+                "server.max_sessions {} exceeds limit of 10000",
+                self.server.max_sessions
+            ));
+        }
+
+        if self.server.max_file_size < 1024 {
+            errors.push(format!(
+                "server.max_file_size {} is too small (min 1024)",
+                self.server.max_file_size
+            ));
+        }
+
+        if self.server.transfer_chunk_size < 1024 {
+            errors.push(format!(
+                "server.transfer_chunk_size {} is too small (min 1024)",
+                self.server.transfer_chunk_size
+            ));
+        }
+
+        if self.server.max_concurrent_transfers < 1 {
+            errors.push("server.max_concurrent_transfers must be >= 1".to_string());
+        }
+
+        if let Some(ref tc) = self.tunnel {
+            if !tc.relay {
+                if let Some(ref url) = tc.url {
+                    if !url.starts_with("ws://") && !url.starts_with("wss://") {
+                        errors.push(format!(
+                            "tunnel.url '{url}' must start with ws:// or wss://"
+                        ));
+                    }
+                }
+            }
+            if tc.relay && tc.tunnel_key.len() < 8 {
+                errors.push(format!(
+                    "tunnel.tunnel_key length {} is too short (min 8)",
+                    tc.tunnel_key.len()
+                ));
+            }
+        }
+
+        errors
+    }
+
     /// Load configuration with the precedence chain: env vars > file > defaults.
     ///
     /// If `path` is `Some`, reads that file (panics on failure). Otherwise looks
@@ -372,6 +482,12 @@ impl Config {
         }
         if let Ok(serial) = std::env::var("SCTL_DEVICE_SERIAL") {
             config.device.serial = serial;
+        }
+        if let Ok(dir) = std::env::var("SCTL_DATA_DIR") {
+            config.server.data_dir = dir;
+        }
+        if let Ok(dir) = std::env::var("SCTL_PLAYBOOKS_DIR") {
+            config.server.playbooks_dir = dir;
         }
 
         config

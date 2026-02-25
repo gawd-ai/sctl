@@ -13,3 +13,4 @@ pub mod info;
 pub mod playbooks;
 pub mod sessions;
 pub mod shells;
+pub mod stp;

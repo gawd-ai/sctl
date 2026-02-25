@@ -20,6 +20,10 @@
 #   ./rundev.sh device deploy <name>       # full deploy (binary + config + init)
 #   ./rundev.sh device upgrade <name>      # binary-only upgrade
 #
+# Playbook library:
+#   ./rundev.sh playbook ls                          # list playbooks in library
+#   ./rundev.sh playbook deploy <device|all> [cat]   # deploy playbooks to device(s)
+#
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -319,6 +323,49 @@ do_status() {
     fi
 }
 
+# ─── sctlin seed ─────────────────────────────────────────────────
+# Generate web/static/sctlin-seed.json from MCP config so sctlin
+# auto-discovers devices without manual entry.
+
+generate_sctlin_seed() {
+    require_jq
+    local seed_file="$WEB_DIR/static/sctlin-seed.json"
+
+    # Build serial map: device name → serial (from config metadata or known defaults)
+    # The relay proxy path is /d/{serial}/api/ws
+    local serial_map="{\"local\": \"$DEVICE_SERIAL\"}"
+    # Add serials from device metadata in config
+    serial_map=$(jq -r --argjson base "$serial_map" '
+        [.devices | to_entries[] | select(.value.serial) | {(.key): .value.serial}]
+        | reduce .[] as $item ($base; . + $item)
+    ' "$CONFIG_FILE")
+
+    # Convert MCP device config → sctlin server entries (direct + relay)
+    jq --argjson serials "$serial_map" '[
+        .devices | to_entries[] |
+        # Direct entry
+        {
+            id: .key,
+            name: .key,
+            wsUrl: (.value.url | sub("^https://"; "wss://") | sub("^http://"; "ws://") | . + "/api/ws"),
+            apiKey: .value.api_key,
+            shell: "",
+            connected: false
+        },
+        # Relay entry (only if serial is known)
+        if $serials[.key] then {
+            id: (.key + "-relay"),
+            name: (.key + " (relay)"),
+            wsUrl: ("ws://127.0.0.1:8443/d/" + $serials[.key] + "/api/ws"),
+            apiKey: .value.api_key,
+            shell: "",
+            connected: false
+        } else empty end
+    ]' "$CONFIG_FILE" > "$seed_file"
+
+    ok "sctlin seed generated: $seed_file ($(jq length "$seed_file") servers)"
+}
+
 # ─── launch (shared: stop existing, start all services, register MCP) ─
 
 do_launch() {
@@ -350,6 +397,8 @@ EOF
         ok "Config created: $CONFIG_FILE"
     fi
 
+    generate_sctlin_seed
+
     # Stop any running instances (clean slate)
     do_kill
 
@@ -358,6 +407,7 @@ EOF
     SCTL_API_KEY="$API_KEY" \
     SCTL_LISTEN="$LISTEN" \
     SCTL_DATA_DIR="$DATA_DIR" \
+    SCTL_PLAYBOOKS_DIR="$PLAYBOOKS_DIR" \
     RUST_LOG=info \
         "$SCTL_BIN" serve &>"$DATA_DIR/sctl.log" &
     sctl_pid=$!
@@ -372,8 +422,8 @@ EOF
     log "Registering mcp-sctl with Claude Code..."
     claude mcp remove "$MCP_NAME" 2>/dev/null || true
     claude mcp add --transport stdio \
-        "$MCP_NAME" -- "$MCP_BIN" --config "$CONFIG_FILE"
-    ok "MCP server '$MCP_NAME' registered"
+        "$MCP_NAME" -- "$MCP_BIN" --supervisor --config "$CONFIG_FILE"
+    ok "MCP server '$MCP_NAME' registered (supervisor mode)"
 
     echo ""
     echo "============================================"
@@ -431,6 +481,9 @@ do_build() {
     (cd "$MCP_DIR" && cargo build --release -v 2>&1)
     ok "mcp-sctl built: $MCP_BIN"
 
+    # Signal supervisor to hot-reload if running (binary watcher will also detect it)
+    pkill -USR1 -f "mcp-sctl.*--supervisor" 2>/dev/null && ok "Sent SIGUSR1 to mcp-sctl supervisor" || true
+
     log "Installing web dependencies..."
     (cd "$WEB_DIR" && npm install 2>&1)
     ok "Web dependencies installed"
@@ -469,11 +522,13 @@ EOF
         ok "Config created: $CONFIG_FILE"
     fi
 
+    generate_sctlin_seed
+
     log "Registering mcp-sctl with Claude Code..."
     claude mcp remove "$MCP_NAME" 2>/dev/null || true
     claude mcp add --transport stdio \
-        "$MCP_NAME" -- "$MCP_BIN" --config "$CONFIG_FILE"
-    ok "MCP server '$MCP_NAME' registered"
+        "$MCP_NAME" -- "$MCP_BIN" --supervisor --config "$CONFIG_FILE"
+    ok "MCP server '$MCP_NAME' registered (supervisor mode)"
     echo ""
     echo "  Restart Claude Code or start a new conversation"
     echo "  to pick up the MCP server. Run /mcp to verify."
@@ -876,6 +931,138 @@ do_device_upgrade() {
     fi
 }
 
+# ─── playbook library ────────────────────────────────────────────────
+
+PLAYBOOKS_LIBRARY_DIR="$REPO_DIR/playbooks"
+
+do_playbook_ls() {
+    log "Playbook library ($PLAYBOOKS_LIBRARY_DIR):"
+    echo ""
+    local found=false
+    for category_dir in "$PLAYBOOKS_LIBRARY_DIR"/*/; do
+        [[ -d "$category_dir" ]] || continue
+        local category
+        category=$(basename "$category_dir")
+        for pb_file in "$category_dir"*.md; do
+            [[ -f "$pb_file" ]] || continue
+            found=true
+            local pb_name desc
+            pb_name=$(basename "$pb_file" .md)
+            desc=$(sed -n '/^description:/{ s/^description: *//; s/\r$//; p; q }' "$pb_file")
+            printf "  \033[1;36m%-12s\033[0m / %-24s  %s\n" "$category" "$pb_name" "$desc"
+        done
+    done
+    if [[ "$found" == "false" ]]; then
+        echo "  (no playbooks found)"
+    fi
+}
+
+do_playbook_deploy() {
+    local target="${1:-}"
+    local category="${2:-}"
+
+    if [[ -z "$target" ]]; then
+        err "Usage: $0 playbook deploy <device|all> [category]"
+        err ""
+        err "Categories: $(ls -1 "$PLAYBOOKS_LIBRARY_DIR" 2>/dev/null | tr '\n' ' ')"
+        err "Omit category to deploy ALL playbooks to the device."
+        exit 1
+    fi
+
+    require_jq
+    ensure_config
+
+    # Build list of devices to deploy to
+    local devices=()
+    if [[ "$target" == "all" ]]; then
+        while IFS= read -r name; do
+            [[ -n "$name" ]] && devices+=("$name")
+        done < <(cfg_device_names)
+    else
+        if ! cfg_device_exists "$target"; then
+            err "Device '$target' not found"
+            exit 1
+        fi
+        devices+=("$target")
+    fi
+
+    if [[ ${#devices[@]} -eq 0 ]]; then
+        err "No devices configured"
+        exit 1
+    fi
+
+    # Build list of playbook files to deploy
+    local pb_files=()
+    if [[ -n "$category" ]]; then
+        local cat_dir="$PLAYBOOKS_LIBRARY_DIR/$category"
+        if [[ ! -d "$cat_dir" ]]; then
+            err "Category '$category' not found in $PLAYBOOKS_LIBRARY_DIR"
+            exit 1
+        fi
+        for f in "$cat_dir"/*.md; do
+            [[ -f "$f" ]] && pb_files+=("$f")
+        done
+    else
+        for cat_dir in "$PLAYBOOKS_LIBRARY_DIR"/*/; do
+            [[ -d "$cat_dir" ]] || continue
+            for f in "$cat_dir"*.md; do
+                [[ -f "$f" ]] && pb_files+=("$f")
+            done
+        done
+    fi
+
+    if [[ ${#pb_files[@]} -eq 0 ]]; then
+        err "No playbook files found"
+        exit 1
+    fi
+
+    log "Deploying ${#pb_files[@]} playbook(s) to ${#devices[@]} device(s)..."
+
+    local total=0 success=0 failed=0
+    for dev_name in "${devices[@]}"; do
+        local url api_key
+        url=$(cfg_device_get "$dev_name" "url")
+        api_key=$(cfg_device_get "$dev_name" "api_key")
+
+        if [[ -z "$url" || -z "$api_key" ]]; then
+            warn "Skipping '$dev_name': missing url or api_key"
+            continue
+        fi
+
+        for pb_file in "${pb_files[@]}"; do
+            local pb_name
+            pb_name=$(basename "$pb_file" .md)
+            total=$((total + 1))
+
+            # Extract the playbook name from frontmatter (may differ from filename)
+            local fm_name
+            fm_name=$(sed -n '/^name:/{ s/^name: *//; s/\r$//; p; q }' "$pb_file")
+            if [[ -z "$fm_name" ]]; then
+                fm_name="$pb_name"
+            fi
+
+            local status_code
+            status_code=$(curl -sf -o /dev/null -w "%{http_code}" \
+                -X PUT \
+                -H "Authorization: Bearer $api_key" \
+                -H "Content-Type: text/plain" \
+                --data-binary "@$pb_file" \
+                "$url/api/playbooks/$fm_name" 2>/dev/null) || status_code="000"
+
+            if [[ "$status_code" =~ ^2 ]]; then
+                ok "  $dev_name ← $fm_name"
+                success=$((success + 1))
+            else
+                err "  $dev_name ← $fm_name (HTTP $status_code)"
+                failed=$((failed + 1))
+            fi
+        done
+    done
+
+    echo ""
+    log "Done: $success/$total deployed ($failed failed)"
+}
+
 # ─── tunnel (build + start tunnel dev env with relay) ─────────────────
 
 do_tunnel() {
@@ -970,6 +1157,7 @@ EOF
 [server]
 listen = "$LISTEN"
 data_dir = "$DATA_DIR"
+playbooks_dir = "$PLAYBOOKS_DIR"
 
 [auth]
 api_key = "$API_KEY"
@@ -1119,8 +1307,10 @@ cp /etc/sctl/sctl.toml /tmp/sctl-relay.toml 2>/dev/null || true
 # Strip any existing [tunnel] section and everything after it
 sed -i '/^\[tunnel\]/,\$d' /tmp/sctl-relay.toml 2>/dev/null || true
 
-# Override listen to avoid conflict (pick a random high port)
-sed -i 's/^listen = .*/listen = "127.0.0.1:0"/' /tmp/sctl-relay.toml 2>/dev/null || true
+# Keep the original listen address from sctl.toml (e.g. 0.0.0.0:1337) so the
+# device is reachable both directly (LAN/WAN) AND via the tunnel relay. The
+# server code supports both simultaneously — the HTTP listener runs alongside
+# the outbound tunnel WS connection.
 
 # Append tunnel config
 cat >> /tmp/sctl-relay.toml <<TEOF
@@ -1210,6 +1400,8 @@ REOF
     echo "$relay_config" | jq '.' > "$CONFIG_FILE"
     ok "MCP config updated for relay routing"
 
+    generate_sctlin_seed
+
     # Start web dev server
     start_web_dev_server
 
@@ -1217,8 +1409,8 @@ REOF
     log "Registering mcp-sctl with Claude Code (via relay)..."
     claude mcp remove "$MCP_NAME" 2>/dev/null || true
     claude mcp add --transport stdio \
-        "$MCP_NAME" -- "$MCP_BIN" --config "$CONFIG_FILE"
-    ok "MCP server '$MCP_NAME' registered"
+        "$MCP_NAME" -- "$MCP_BIN" --supervisor --config "$CONFIG_FILE"
+    ok "MCP server '$MCP_NAME' registered (supervisor mode)"
 
     echo ""
     echo "============================================"
@@ -1353,6 +1545,20 @@ case "${1:-setup}" in
                 ;;
         esac
         ;;
+    playbook)
+        case "${2:-ls}" in
+            ls)     do_playbook_ls ;;
+            deploy) do_playbook_deploy "${3:-}" "${4:-}" ;;
+            *)
+                echo "Usage: $0 playbook <command>"
+                echo ""
+                echo "Commands:"
+                echo "  ls                              list playbooks in library (default)"
+                echo "  deploy <device|all> [category]  deploy playbooks to device(s) via API"
+                exit 1
+                ;;
+        esac
+        ;;
     *)
         echo "Usage: $0 <command>"
         echo ""
@@ -1373,6 +1579,10 @@ case "${1:-setup}" in
         echo "  device rm <name>           remove a device"
         echo "  device deploy <name>       full deploy (binary + config + init script)"
         echo "  device upgrade <name>      binary-only upgrade"
+        echo ""
+        echo "Playbook library:"
+        echo "  playbook ls                              list playbooks in library"
+        echo "  playbook deploy <device|all> [category]  deploy playbooks to device(s)"
         exit 1
         ;;
 esac

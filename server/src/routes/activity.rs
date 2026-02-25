@@ -3,7 +3,8 @@
 //! `GET /api/activity?since_id=N&limit=N&activity_type=exec&source=mcp&session_id=abc`
 //! — returns recent activity entries with optional filtering.
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -58,4 +59,24 @@ pub async fn get_activity(
         )
         .await;
     Json(json!({ "entries": entries }))
+}
+
+/// `GET /api/activity/{id}/result` — retrieve a cached full exec result.
+///
+/// Returns the full stdout/stderr/exit-code for the given activity ID, or 404
+/// if the result has been evicted from the cache.
+pub async fn get_exec_result(
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match state.exec_results_cache.get(id).await {
+        Some(result) => Ok(Json(json!(result))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "Exec result not found or evicted",
+                "code": "NOT_FOUND",
+            })),
+        )),
+    }
 }

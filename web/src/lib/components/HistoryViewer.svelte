@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { ActivityEntry, ActivityType, ActivitySource } from '../types/terminal.types';
+	import type { ActivityEntry, ActivityType, ActivitySource, ViewerTab } from '../types/terminal.types';
 	import type { SctlRestClient } from '../utils/rest-client';
 
 	interface Props {
@@ -7,9 +7,12 @@
 		restClient: SctlRestClient | null;
 		onloadmore?: () => void;
 		onclose?: () => void;
+		onOpenViewer?: (tab: ViewerTab) => void;
 	}
 
-	let { entries, restClient, onloadmore, onclose }: Props = $props();
+	let { entries, restClient, onloadmore, onclose, onOpenViewer }: Props = $props();
+
+	let loadingResult: number | null = $state(null);
 
 	// ── Filter state ────────────────────────────────────────────────
 	let activeTypes: Set<ActivityType> = $state(new Set());
@@ -155,23 +158,53 @@
 		return value === 0 ? 'text-green-400/80' : 'text-red-400/80';
 	}
 
+	async function openExecResult(entry: ActivityEntry) {
+		if (!restClient || !onOpenViewer) return;
+		loadingResult = entry.id;
+		try {
+			const result = await restClient.getExecResult(entry.id);
+			const tab: ViewerTab = {
+				key: crypto.randomUUID(),
+				type: 'exec',
+				label: result.command.length > 24
+					? result.command.slice(0, 24) + '...'
+					: result.command,
+				icon: '$',
+				data: {
+					activityId: result.activity_id,
+					command: result.command,
+					exitCode: result.exit_code,
+					stdout: result.stdout,
+					stderr: result.stderr,
+					durationMs: result.duration_ms,
+					status: result.status,
+					errorMessage: result.error_message,
+				}
+			};
+			onOpenViewer(tab);
+		} catch (err) {
+			console.error('Failed to fetch exec result:', err);
+		} finally {
+			loadingResult = null;
+		}
+	}
+
 	let hasActiveFilters = $derived(activeTypes.size > 0 || activeSources.size > 0 || searchQuery.trim() !== '');
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <!-- svelte-ignore a11y_click_events_have_key_events -->
-<div class="history-viewer flex flex-col h-full bg-neutral-900 font-mono text-[11px]">
+<div class="history-viewer flex flex-col h-full bg-neutral-950 font-mono text-[11px]">
 	<!-- Header -->
 	<div class="flex items-center gap-2 px-3 py-2 border-b border-neutral-800 shrink-0">
 		<span class="text-neutral-300 text-xs font-semibold">Activity History</span>
 		<span class="text-[9px] text-neutral-600 tabular-nums">{filtered.length} / {entries.length}</span>
 		<div class="flex-1"></div>
-		{#if hasActiveFilters}
-			<button
-				class="px-1.5 py-0.5 rounded text-[9px] text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors"
-				onclick={clearFilters}
-			>clear</button>
-		{/if}
+		<button
+			class="px-1.5 py-0.5 rounded text-[9px] text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors"
+			style:visibility={hasActiveFilters ? 'visible' : 'hidden'}
+			onclick={clearFilters}
+		>clear</button>
 		{#if onclose}
 			<button
 				class="w-5 h-5 flex items-center justify-center rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors"
@@ -184,18 +217,8 @@
 		{/if}
 	</div>
 
-	<!-- Filter bar: type chips -->
+	<!-- Filter bar: source chips first, then type chips -->
 	<div class="flex flex-wrap gap-1 px-3 py-1.5 border-b border-neutral-800/50 shrink-0">
-		{#each allTypes as t}
-			<button
-				class="px-1.5 py-0.5 rounded text-[9px] transition-colors
-					{activeTypes.has(t)
-						? 'bg-neutral-700 text-neutral-200'
-						: 'text-neutral-600 hover:text-neutral-400 hover:bg-neutral-800'}"
-				onclick={() => toggleType(t)}
-			>{typeLabel(t)}</button>
-		{/each}
-		<span class="w-px h-4 bg-neutral-800 mx-0.5"></span>
 		{#each allSources as s}
 			<button
 				class="px-1.5 py-0.5 rounded text-[9px] transition-colors
@@ -204,6 +227,16 @@
 						: 'text-neutral-600 hover:text-neutral-400 hover:bg-neutral-800'}"
 				onclick={() => toggleSource(s)}
 			>{s}</button>
+		{/each}
+		<span class="w-px h-4 bg-neutral-800 mx-0.5"></span>
+		{#each allTypes as t}
+			<button
+				class="px-1.5 py-0.5 rounded text-[9px] transition-colors
+					{activeTypes.has(t)
+						? 'bg-neutral-700 text-neutral-200'
+						: 'text-neutral-600 hover:text-neutral-400 hover:bg-neutral-800'}"
+				onclick={() => toggleType(t)}
+			>{typeLabel(t)}</button>
 		{/each}
 	</div>
 
@@ -244,7 +277,7 @@
 			{#if expandedIds.has(entry.id) && entry.detail}
 				<div class="px-3 py-1.5 ml-5 mb-0.5 bg-neutral-800/30 rounded text-[9px] text-neutral-500 border-b border-neutral-800/20">
 					{#each Object.entries(entry.detail) as [key, value]}
-						{#if value !== null && value !== undefined && value !== ''}
+						{#if value !== null && value !== undefined && value !== '' && key !== 'has_full_output'}
 							<div class="flex gap-1">
 								<span class="text-neutral-600 shrink-0">{key}:</span>
 								<span class="break-all {key === 'exit_code' ? exitCodeColor(value) : 'text-neutral-400'}"
@@ -252,6 +285,13 @@
 							</div>
 						{/if}
 					{/each}
+					{#if entry.detail.has_full_output && onOpenViewer}
+						<button
+							class="mt-1 px-2 py-0.5 rounded text-[9px] bg-blue-500/15 text-blue-400 hover:bg-blue-500/25 transition-colors disabled:opacity-50"
+							disabled={loadingResult === entry.id}
+							onclick={(e) => { e.stopPropagation(); openExecResult(entry); }}
+						>{loadingResult === entry.id ? 'loading...' : 'view full output'}</button>
+					{/if}
 				</div>
 			{/if}
 		{/each}

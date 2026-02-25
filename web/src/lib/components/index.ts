@@ -15,3 +15,8 @@ export { default as HistoryViewer } from './HistoryViewer.svelte';
 export { default as PlaybookList } from './PlaybookList.svelte';
 export { default as PlaybookViewer } from './PlaybookViewer.svelte';
 export { default as PlaybookExecutor } from './PlaybookExecutor.svelte';
+export { default as TransferIndicator } from './TransferIndicator.svelte';
+export { default as PlaybookPanel } from './PlaybookPanel.svelte';
+export { default as SidePanel } from './SidePanel.svelte';
+export { default as ServerDashboard } from './ServerDashboard.svelte';
+export { default as ExecViewer } from './ExecViewer.svelte';

@@ -1,4 +1,4 @@
-import type { DeviceInfo, DirEntry, FileContent, ExecResult, ActivityEntry, PlaybookSummary, PlaybookDetail } from '../types/terminal.types';
+import type { DeviceInfo, DirEntry, FileContent, ExecResult, ActivityEntry, PlaybookSummary, PlaybookDetail, StpInitDownloadResult, StpInitUploadResult, StpChunkAck, StpResumeResult, StpStatusResult, StpListResult, CachedExecResult } from '../types/terminal.types';
 
 export class SctlRestClient {
 	private baseUrl: string;
@@ -156,5 +156,109 @@ export class SctlRestClient {
 			method: 'POST',
 			body: form
 		});
+	}
+
+	async getExecResult(activityId: number): Promise<CachedExecResult> {
+		const res = await this.fetch(`/api/activity/${activityId}/result`);
+		return res.json();
+	}
+
+	// ── STP (chunked transfer) methods ────────────────────────────
+
+	async stpInitDownload(path: string, chunkSize?: number): Promise<StpInitDownloadResult> {
+		const body: Record<string, unknown> = { path };
+		if (chunkSize) body.chunk_size = chunkSize;
+		const res = await this.fetch('/api/stp/download', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+		return res.json();
+	}
+
+	async stpInitUpload(req: {
+		path: string; filename: string; file_size: number;
+		file_hash: string; chunk_size: number; total_chunks: number; mode?: string;
+	}): Promise<StpInitUploadResult> {
+		const res = await this.fetch('/api/stp/upload', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(req)
+		});
+		return res.json();
+	}
+
+	async stpGetChunk(transferId: string, index: number, signal?: AbortSignal): Promise<{ data: ArrayBuffer; hash: string }> {
+		const url = `${this.baseUrl}/api/stp/chunk/${encodeURIComponent(transferId)}/${index}`;
+		const headers: Record<string, string> = {};
+		if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`;
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), 60000);
+		signal?.addEventListener('abort', () => controller.abort(), { once: true });
+		try {
+			const res = await fetch(url, { headers, signal: controller.signal });
+			if (!res.ok) {
+				const text = await res.text().catch(() => res.statusText);
+				throw new Error(`${res.status}: ${text}`);
+			}
+			const hash = res.headers.get('X-Gx-Chunk-Hash') ?? '';
+			const data = await res.arrayBuffer();
+			return { data, hash };
+		} catch (e) {
+			if (e instanceof DOMException && e.name === 'AbortError') {
+				if (signal?.aborted) throw new Error('Transfer aborted');
+				throw new Error('Chunk download timed out after 60s');
+			}
+			throw e;
+		} finally {
+			clearTimeout(timeout);
+		}
+	}
+
+	async stpSendChunk(transferId: string, index: number, data: ArrayBuffer, hash: string, signal?: AbortSignal): Promise<StpChunkAck> {
+		const url = `${this.baseUrl}/api/stp/chunk/${encodeURIComponent(transferId)}/${index}`;
+		const headers: Record<string, string> = {
+			'Content-Type': 'application/octet-stream',
+			'X-Gx-Chunk-Hash': hash
+		};
+		if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`;
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), 60000);
+		signal?.addEventListener('abort', () => controller.abort(), { once: true });
+		try {
+			const res = await fetch(url, { method: 'POST', headers, body: data, signal: controller.signal });
+			if (!res.ok) {
+				const text = await res.text().catch(() => res.statusText);
+				throw new Error(`${res.status}: ${text}`);
+			}
+			return res.json();
+		} catch (e) {
+			if (e instanceof DOMException && e.name === 'AbortError') {
+				if (signal?.aborted) throw new Error('Transfer aborted');
+				throw new Error('Chunk upload timed out after 60s');
+			}
+			throw e;
+		} finally {
+			clearTimeout(timeout);
+		}
+	}
+
+	async stpResume(transferId: string): Promise<StpResumeResult> {
+		const res = await this.fetch(`/api/stp/resume/${encodeURIComponent(transferId)}`, { method: 'POST' });
+		return res.json();
+	}
+
+	async stpAbort(transferId: string): Promise<void> {
+		await this.fetch(`/api/stp/${encodeURIComponent(transferId)}`, { method: 'DELETE' });
+	}
+
+	async stpStatus(transferId: string): Promise<StpStatusResult> {
+		const res = await this.fetch(`/api/stp/status/${encodeURIComponent(transferId)}`);
+		return res.json();
+	}
+
+	async stpList(): Promise<StpListResult> {
+		const res = await this.fetch('/api/stp/transfers');
+		return res.json();
 	}
 }

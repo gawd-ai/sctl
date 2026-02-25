@@ -183,8 +183,9 @@ async fn fetch_device_playbooks(
 
 /// Fetch playbooks via the REST endpoint (`GET /api/playbooks`).
 ///
-/// The response is expected to have a `playbooks` array, where each entry has
-/// at least `name` and `content` fields.
+/// The list endpoint only returns summary info (`name`, `description`, `params`),
+/// so we fetch each playbook individually via `GET /api/playbooks/:name` to get
+/// the full `raw_content` needed for parsing.
 async fn fetch_device_playbooks_rest(
     client: &SctlClient,
     device_name: &str,
@@ -203,13 +204,27 @@ async fn fetch_device_playbooks_rest(
             Some(n) => n,
             None => continue,
         };
-        let content = match item.get("content").and_then(|v| v.as_str()) {
-            Some(c) => c,
-            None => continue,
-        };
-        let path = item.get("path").and_then(|v| v.as_str()).unwrap_or(name);
 
-        match playbooks::parse_playbook(content, device_name, path) {
+        // Fetch full content for each playbook individually.
+        let detail = match client.get_playbook(name).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("mcp-sctl: playbooks: {device_name}: failed to fetch {name}: {e}");
+                continue;
+            }
+        };
+
+        let raw_content = match detail.get("raw_content").and_then(|v| v.as_str()) {
+            Some(c) => c,
+            None => {
+                eprintln!(
+                    "mcp-sctl: playbooks: {device_name}: skip {name}: no raw_content in response"
+                );
+                continue;
+            }
+        };
+
+        match playbooks::parse_playbook(raw_content, device_name, name) {
             Ok(pb) => playbooks.push(pb),
             Err(e) => {
                 eprintln!("mcp-sctl: playbooks: {device_name}: skip {name}: {e}");

@@ -30,6 +30,9 @@ max_file_size = 2097152
 # default_terminal_rows = 24
 # default_terminal_cols = 80
 
+# Directory containing playbook markdown files (default /etc/sctl/playbooks)
+# playbooks_dir = "/etc/sctl/playbooks"
+
 [auth]
 # Pre-shared API key for all authenticated endpoints.
 # STRONGLY recommended: set via SCTL_API_KEY env var instead of
@@ -51,3 +54,13 @@ serial = "SCTL-0000-DEV-001"
 # Log level filter (env: RUST_LOG)
 # Examples: "info", "debug", "sctl=debug,tower_http=info"
 level = "info"
+
+# [tunnel]
+# Connect to a relay server for NAT traversal (CGNAT, LTE, etc.)
+# relay = false
+# tunnel_key = "shared-secret-with-relay"
+# url = "wss://relay.example.com/api/tunnel/register"
+#
+# To run AS a relay instead of a client:
+# relay = true
+# tunnel_key = "shared-secret-for-devices"

@@ -16,7 +16,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::activity::{self, request_id_from_headers, ActivityType};
+use crate::activity::{self, request_id_from_headers, ActivityType, CachedExecResult};
 use crate::shell::process;
 use crate::AppState;
 
@@ -93,7 +93,7 @@ pub async fn exec(
     .await
     {
         Ok(result) => {
-            state
+            let activity_id = state
                 .activity_log
                 .log(
                     ActivityType::Exec,
@@ -104,9 +104,23 @@ pub async fn exec(
                         "duration_ms": result.duration_ms,
                         "stdout_preview": activity::truncate_str(&result.stdout, 200),
                         "stderr_preview": activity::truncate_str(&result.stderr, 200),
+                        "has_full_output": true,
                     })),
                     req_id.clone(),
                 )
+                .await;
+            state
+                .exec_results_cache
+                .store(CachedExecResult {
+                    activity_id,
+                    exit_code: result.exit_code,
+                    stdout: result.stdout.clone(),
+                    stderr: result.stderr.clone(),
+                    duration_ms: result.duration_ms,
+                    command: payload.command.clone(),
+                    status: "ok".to_string(),
+                    error_message: None,
+                })
                 .await;
             Ok(Json(ExecResponse {
                 exit_code: result.exit_code,
@@ -117,6 +131,34 @@ pub async fn exec(
             }))
         }
         Err(process::ExecError::Timeout) => {
+            let activity_id = state
+                .activity_log
+                .log(
+                    ActivityType::Exec,
+                    source,
+                    activity::truncate_str(&payload.command, 80),
+                    Some(json!({
+                        "exit_code": -1,
+                        "duration_ms": timeout,
+                        "status": "timeout",
+                        "has_full_output": true,
+                    })),
+                    req_id.clone(),
+                )
+                .await;
+            state
+                .exec_results_cache
+                .store(CachedExecResult {
+                    activity_id,
+                    exit_code: -1,
+                    stdout: String::new(),
+                    stderr: "Command timed out".to_string(),
+                    duration_ms: timeout,
+                    command: payload.command.clone(),
+                    status: "timeout".to_string(),
+                    error_message: Some("Command timed out".to_string()),
+                })
+                .await;
             let mut err = json!({"error": "Command timed out", "code": "TIMEOUT"});
             if let Some(ref rid) = payload.request_id {
                 err["request_id"] = json!(rid);
@@ -124,7 +166,37 @@ pub async fn exec(
             Err((StatusCode::GATEWAY_TIMEOUT, Json(err)))
         }
         Err(e) => {
-            let mut err = json!({"error": e.to_string(), "code": "EXEC_FAILED"});
+            let error_msg = e.to_string();
+            let activity_id = state
+                .activity_log
+                .log(
+                    ActivityType::Exec,
+                    source,
+                    activity::truncate_str(&payload.command, 80),
+                    Some(json!({
+                        "exit_code": -1,
+                        "duration_ms": 0,
+                        "status": "error",
+                        "error": &error_msg,
+                        "has_full_output": true,
+                    })),
+                    req_id.clone(),
+                )
+                .await;
+            state
+                .exec_results_cache
+                .store(CachedExecResult {
+                    activity_id,
+                    exit_code: -1,
+                    stdout: String::new(),
+                    stderr: error_msg.clone(),
+                    duration_ms: 0,
+                    command: payload.command.clone(),
+                    status: "error".to_string(),
+                    error_message: Some(error_msg.clone()),
+                })
+                .await;
+            let mut err = json!({"error": error_msg, "code": "EXEC_FAILED"});
             if let Some(ref rid) = payload.request_id {
                 err["request_id"] = json!(rid);
             }
@@ -267,20 +339,45 @@ pub async fn batch_exec(
                     request_id: None,
                 }
             }
-            Err(process::ExecError::Timeout) => ExecResponse {
-                exit_code: -1,
-                stdout: String::new(),
-                stderr: "Command timed out".to_string(),
-                duration_ms: timeout,
-                request_id: None,
-            },
-            Err(e) => ExecResponse {
-                exit_code: -1,
-                stdout: String::new(),
-                stderr: e.to_string(),
-                duration_ms: 0,
-                request_id: None,
-            },
+            Err(process::ExecError::Timeout) => {
+                log_batch_exec_error(
+                    &state,
+                    source,
+                    &cmd.command,
+                    "timeout",
+                    "Command timed out",
+                    timeout,
+                    req_id.clone(),
+                )
+                .await;
+                ExecResponse {
+                    exit_code: -1,
+                    stdout: String::new(),
+                    stderr: "Command timed out".to_string(),
+                    duration_ms: timeout,
+                    request_id: None,
+                }
+            }
+            Err(e) => {
+                let error_msg = e.to_string();
+                log_batch_exec_error(
+                    &state,
+                    source,
+                    &cmd.command,
+                    "error",
+                    &error_msg,
+                    0,
+                    req_id.clone(),
+                )
+                .await;
+                ExecResponse {
+                    exit_code: -1,
+                    stdout: String::new(),
+                    stderr: error_msg,
+                    duration_ms: 0,
+                    request_id: None,
+                }
+            }
         };
         results.push(resp);
     }
@@ -298,7 +395,7 @@ async fn log_batch_exec(
     result: &process::ExecResult,
     request_id: Option<String>,
 ) {
-    state
+    let activity_id = state
         .activity_log
         .log(
             ActivityType::Exec,
@@ -307,9 +404,66 @@ async fn log_batch_exec(
             Some(json!({
                 "exit_code": result.exit_code,
                 "duration_ms": result.duration_ms,
+                "stdout_preview": activity::truncate_str(&result.stdout, 200),
+                "stderr_preview": activity::truncate_str(&result.stderr, 200),
                 "batch": true,
+                "has_full_output": true,
             })),
             request_id,
         )
+        .await;
+    state
+        .exec_results_cache
+        .store(CachedExecResult {
+            activity_id,
+            exit_code: result.exit_code,
+            stdout: result.stdout.clone(),
+            stderr: result.stderr.clone(),
+            duration_ms: result.duration_ms,
+            command: command.to_string(),
+            status: "ok".to_string(),
+            error_message: None,
+        })
+        .await;
+}
+
+async fn log_batch_exec_error(
+    state: &AppState,
+    source: activity::ActivitySource,
+    command: &str,
+    status: &str,
+    error_msg: &str,
+    duration_ms: u64,
+    request_id: Option<String>,
+) {
+    let activity_id = state
+        .activity_log
+        .log(
+            ActivityType::Exec,
+            source,
+            activity::truncate_str(command, 80),
+            Some(json!({
+                "exit_code": -1,
+                "duration_ms": duration_ms,
+                "status": status,
+                "error": error_msg,
+                "batch": true,
+                "has_full_output": true,
+            })),
+            request_id,
+        )
+        .await;
+    state
+        .exec_results_cache
+        .store(CachedExecResult {
+            activity_id,
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: error_msg.to_string(),
+            duration_ms,
+            command: command.to_string(),
+            status: status.to_string(),
+            error_message: Some(error_msg.to_string()),
+        })
         .await;
 }

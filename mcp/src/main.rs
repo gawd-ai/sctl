@@ -33,6 +33,7 @@ mod devices;
 mod mcp;
 mod playbook_registry;
 mod playbooks;
+mod supervisor;
 mod tools;
 mod websocket;
 
@@ -45,6 +46,13 @@ use playbook_registry::PlaybookRegistry;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // Supervisor mode: transparent proxy with hot-reload
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if raw_args.iter().any(|a| a == "--supervisor") {
+        supervisor::run(raw_args).await;
+        return;
+    }
+
     let cli = Cli::parse();
 
     // Determine config path for hot-reload support

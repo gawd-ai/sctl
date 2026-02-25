@@ -1,0 +1,40 @@
+# sctl Relay Configuration
+#
+# A relay server acts as a rendezvous point for devices behind NAT/CGNAT.
+# It does not run shells or manage files — it only proxies API requests
+# to connected tunnel devices.
+#
+# Install: cp relay.toml.example /etc/sctl/relay.toml
+# Start:   systemctl start sctl-relay
+
+[server]
+# Bind address — use 0.0.0.0 for public-facing relay
+listen = "0.0.0.0:8443"
+
+# Relay doesn't need data_dir, playbooks, or shell config.
+# Journal is disabled since the relay doesn't run commands.
+journal_enabled = false
+
+[auth]
+# API key for the relay's own /api/health endpoint.
+# Device authentication uses tunnel_key below.
+api_key = "change-me-relay-admin"
+
+[device]
+# Identifier for the relay itself (shown in /api/info)
+serial = "RELAY-001"
+
+[tunnel]
+# Enable relay mode — accept inbound device tunnel connections
+relay = true
+
+# Shared secret that devices must present to register.
+# Must be at least 8 characters. Set a strong random value.
+# Devices configure this same key in their [tunnel] section.
+tunnel_key = "change-me-at-least-32-chars-for-production"
+
+# Seconds before a device is considered dead if no heartbeat (default 90)
+# heartbeat_timeout_secs = 90
+
+# Default proxy request timeout in seconds (default 60)
+# tunnel_proxy_timeout_secs = 60
