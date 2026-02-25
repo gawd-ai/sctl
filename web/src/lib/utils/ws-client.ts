@@ -159,10 +159,13 @@ export class SctlWsClient {
 			return;
 		}
 		this.setStatus('reconnecting');
-		const delay = Math.min(
-			this.reconnectConfig.initialDelay * Math.pow(2, this.reconnectAttempt),
-			this.reconnectConfig.maxDelay
-		);
+		// First attempt is immediate, then exponential backoff
+		const delay = this.reconnectAttempt === 0
+			? 0
+			: Math.min(
+				this.reconnectConfig.initialDelay * Math.pow(2, this.reconnectAttempt - 1),
+				this.reconnectConfig.maxDelay
+			);
 		this.reconnectAttempt++;
 		this.reconnectTimer = setTimeout(() => {
 			this.reconnectTimer = null;

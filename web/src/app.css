@@ -16,6 +16,11 @@
 	font-display: swap;
 }
 
+@keyframes fadeIn {
+	from { opacity: 0; }
+	to { opacity: 1; }
+}
+
 /* Dark scrollbars for the entire UI */
 * {
 	scrollbar-width: thin;

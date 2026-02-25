@@ -1,7 +1,7 @@
 <script lang="ts">
 	import '../app.css';
 	import { onMount } from 'svelte';
-	import { TerminalContainer, TerminalTabs, ServerPanel, ToastContainer, QuickExecBar, FileBrowser, CommandPalette, TransferIndicator, PlaybookPanel, SidePanel, ServerDashboard } from '$lib';
+	import { TerminalContainer, TerminalTabs, ServerPanel, ToastContainer, QuickExecBar, FileBrowser, CommandPalette, KeyboardShortcuts, TransferIndicator, PlaybookPanel, SidePanel, ServerDashboard } from '$lib';
 	import ExecViewer from '$lib/components/ExecViewer.svelte';
 	import { SctlRestClient } from '$lib/utils/rest-client';
 	import { SctlWsClient } from '$lib/utils/ws-client';
@@ -18,7 +18,8 @@
 		DeviceInfo,
 		ActivityEntry,
 		SplitGroupInfo,
-		ViewerTab
+		ViewerTab,
+		ExecViewerData
 	} from '$lib';
 
 	// ── Persistence ──────────────────────────────────────────────────
@@ -212,11 +213,19 @@
 	// Command palette
 	let commandPaletteVisible = $state(false);
 
+	// Keyboard shortcuts panel (shown in sidebar)
+	let shortcutsVisible = $state(false);
+	let sidebarToggleFn: (() => void) | null = null;
+	let shortcutsAutoExpanded = false; // true if Alt+/ auto-expanded the sidebar
+
+	// Reset button two-click confirmation
+	let resetConfirming = $state(false);
+
 	const sidebarConfig: SidebarConfig = {
 		storageKey: 'sctlin-sidebar',
 		defaultCollapsed: true,
 		expandedWidth: 256,
-		collapsedWidth: 48,
+		collapsedWidth: 36,
 		showToggleAll: false
 	};
 
@@ -287,6 +296,7 @@
 		if (!serverId) return;
 		const key = sessionKey ?? focusedSessionKey;
 		if (!key) return;
+		shortcutsVisible = false;
 
 		const isOpen = serverPanelOpen[serverId] ?? false;
 		const currentTab = sessionPanelTab[key] ?? 'files';
@@ -324,7 +334,7 @@
 		// Deduplicate: if a viewer for the same content exists, just focus it
 		const existing = tabs.find(t => {
 			if (t.type !== tab.type) return false;
-			if (t.type === 'exec' && tab.type === 'exec') return t.data.activityId === tab.data.activityId;
+			if (t.type === 'exec' && tab.type === 'exec') return (t.data as ExecViewerData).activityId === (tab.data as ExecViewerData).activityId;
 			return t.label === tab.label;
 		});
 		if (existing) {
@@ -754,6 +764,29 @@
 		}));
 
 		cleanups.push(keyboard.register({
+			key: '/', alt: true,
+			description: 'Keyboard shortcuts',
+			action: () => {
+				const willShow = !shortcutsVisible;
+				if (willShow) {
+					shortcutsVisible = true;
+					// Expand sidebar if collapsed
+					if (localStorage.getItem('sctlin-sidebar') === 'false' && sidebarToggleFn) {
+						sidebarToggleFn();
+						shortcutsAutoExpanded = true;
+					}
+				} else {
+					shortcutsVisible = false;
+					// Re-collapse if we auto-expanded
+					if (shortcutsAutoExpanded && sidebarToggleFn) {
+						sidebarToggleFn();
+						shortcutsAutoExpanded = false;
+					}
+				}
+			}
+		}));
+
+		cleanups.push(keyboard.register({
 			key: 'e', alt: true,
 			description: 'Toggle file browser',
 			action: () => {
@@ -876,58 +909,110 @@
 		<!-- Sidebar -->
 		<AppSidebar config={sidebarConfig} class="bg-neutral-950 border-neutral-800">
 			{#snippet header(ctx)}
-				<ServerPanel
-					{servers}
-					{connectionStatuses}
-					{serverSessions}
-					{serverRemoteSessions}
-					{activeServerId}
-					activeSessionId={getActiveSessionId()}
-					collapsed={ctx.collapsed}
-					collapsedWidth={ctx.collapsedWidth}
-					{serverSplitGroups}
-					{focusedPanes}
-					onconnect={connectServer}
-					ondisconnect={disconnectServer}
-					onselectsession={selectSession}
-					onattachsession={attachSession}
-					onkillsession={killSession}
-					ondetachsession={detachSession}
-					onopensession={openSession}
-					onnewsession={newSession}
-					onlistshells={listShells}
-					onaddserver={addServer}
-					onremoveserver={removeServer}
-					oneditserver={editServer}
-				/>
+				{#if shortcutsVisible && !ctx.collapsed}
+					<div class="animate-[fadeIn_250ms_ease-out_150ms_both]">
+						<KeyboardShortcuts shortcuts={keyboard.getAll()} expandedWidth={ctx.expandedWidth} />
+					</div>
+				{:else}
+					<ServerPanel
+						{servers}
+						{connectionStatuses}
+						{serverSessions}
+						{serverRemoteSessions}
+						{activeServerId}
+						activeSessionId={getActiveSessionId()}
+						collapsed={ctx.collapsed}
+						collapsedWidth={ctx.collapsedWidth}
+						{serverSplitGroups}
+						{focusedPanes}
+						onconnect={connectServer}
+						ondisconnect={disconnectServer}
+						onselectsession={selectSession}
+						onattachsession={attachSession}
+						onkillsession={killSession}
+						ondetachsession={detachSession}
+						onopensession={openSession}
+						onnewsession={newSession}
+						onlistshells={listShells}
+						onaddserver={addServer}
+						onremoveserver={removeServer}
+						oneditserver={editServer}
+					/>
+				{/if}
 			{/snippet}
 			{#snippet toggleBar({ collapsed, toggle })}
-				<div class="flex items-center border-t border-neutral-800 bg-neutral-950 py-1 text-[10px] h-7">
-					<button
-						class="w-12 flex items-center justify-center text-neutral-600 hover:text-neutral-400 transition-colors"
-						onclick={toggle}
-						aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+				{@const _ = (sidebarToggleFn = toggle)}
+				<div class="border-t border-neutral-800 bg-neutral-950">
+					<!-- ? button row — slides in above chevron when collapsed, hidden when expanded -->
+					<div class="overflow-hidden transition-[max-height] duration-300 ease-in-out"
+						style="max-height: {collapsed ? '28px' : '0px'}"
 					>
-						<svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-							{#if collapsed}
-								<path stroke-linecap="round" stroke-linejoin="round" d="M13 5l7 7-7 7M5 5l7 7-7 7" />
-							{:else}
-								<path stroke-linecap="round" stroke-linejoin="round" d="M11 19l-7-7 7-7M19 19l-7-7 7-7" />
-							{/if}
-						</svg>
-					</button>
-					{#if !collapsed}
-						<div class="flex-1"></div>
-						<button
-							class="mr-2 text-neutral-600 hover:text-red-400 transition-colors"
-							title="Reset to defaults"
-							onclick={resetState}
+						<div class="flex items-center justify-center h-7">
+							<button
+								class="w-5 h-5 flex items-center justify-center transition-colors
+									{shortcutsVisible ? 'text-green-400' : 'text-neutral-600 hover:text-green-400'}"
+								title="Keyboard shortcuts (Alt+/)"
+								onclick={() => { const willShow = !shortcutsVisible; toggle(); shortcutsVisible = willShow; shortcutsAutoExpanded = willShow; }}
+							>
+								<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+									<circle cx="12" cy="12" r="10" />
+									<path stroke-linecap="round" d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3M12 17h.01" />
+								</svg>
+							</button>
+						</div>
+					</div>
+					<!-- Main bottom row — chevron always in dot column, ? and reset fade out/in -->
+					<div class="flex items-center h-7">
+						<div class="shrink-0 flex items-center justify-center" style="width: 36px">
+							<button
+								class="w-5 h-5 flex items-center justify-center text-neutral-600 hover:text-neutral-400 transition-colors"
+								onclick={() => { if (!collapsed) { shortcutsVisible = false; } toggle(); shortcutsAutoExpanded = false; resetConfirming = false; }}
+								aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+							>
+								<svg
+									class="w-3.5 h-3.5 transition-transform duration-300"
+									style="transform: rotate({collapsed ? 0 : -180}deg)"
+									fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"
+								>
+									<path stroke-linecap="round" stroke-linejoin="round" d="M13 5l7 7-7 7M5 5l7 7-7 7" />
+								</svg>
+							</button>
+						</div>
+						<!-- Inline ? + reset — fade out immediately on collapse, fade in after expand -->
+						<div class="flex-1 flex items-center justify-center transition-opacity {collapsed ? 'pointer-events-none' : ''}"
+							style="opacity: {collapsed ? 0 : 1}; transition-duration: {collapsed ? '100ms' : '200ms'}; transition-delay: {collapsed ? '0ms' : '200ms'};"
 						>
-							<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-								<path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h5M20 20v-5h-5M4 9a9 9 0 0115.36-5.36M20 15a9 9 0 01-15.36 5.36" />
-							</svg>
-						</button>
-					{/if}
+							<button
+								class="w-5 h-5 flex items-center justify-center transition-colors
+									{shortcutsVisible ? 'text-green-400' : 'text-neutral-600 hover:text-green-400'}"
+								title="Keyboard shortcuts (Alt+/)"
+								onclick={() => { shortcutsVisible = !shortcutsVisible; shortcutsAutoExpanded = false; }}
+							>
+								<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+									<circle cx="12" cy="12" r="10" />
+									<path stroke-linecap="round" d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3M12 17h.01" />
+								</svg>
+							</button>
+						</div>
+						<div class="transition-opacity {collapsed ? 'pointer-events-none' : ''}"
+							style="opacity: {collapsed ? 0 : 1}; transition-duration: {collapsed ? '100ms' : '200ms'}; transition-delay: {collapsed ? '0ms' : '200ms'};"
+						>
+							<button
+								class="mr-2 w-5 h-5 flex items-center justify-center transition-colors
+									{resetConfirming ? 'text-red-400' : 'text-neutral-600 hover:text-yellow-500'}"
+								title={resetConfirming ? 'Click again to reset' : 'Reset to defaults'}
+								onclick={() => {
+									if (resetConfirming) { resetState(); resetConfirming = false; }
+									else { resetConfirming = true; }
+								}}
+								onmouseleave={() => { resetConfirming = false; }}
+							>
+								<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+									<path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h5M20 20v-5h-5M4 9a9 9 0 0115.36-5.36M20 15a9 9 0 01-15.36 5.36" />
+								</svg>
+							</button>
+						</div>
+					</div>
 				</div>
 			{/snippet}
 		</AppSidebar>
@@ -1121,7 +1206,7 @@
 								style:visibility={isViewerVisible ? 'visible' : 'hidden'}
 							>
 								{#if viewer.type === 'exec'}
-									<ExecViewer data={viewer.data} onclose={() => closeViewerTab(server.id, viewer.key)} />
+									<ExecViewer data={viewer.data as ExecViewerData} onclose={() => closeViewerTab(server.id, viewer.key)} />
 								{/if}
 							</div>
 						{/each}
@@ -1232,3 +1317,4 @@
 	shortcuts={keyboard.getAll()}
 	onclose={() => { commandPaletteVisible = false; }}
 />
+

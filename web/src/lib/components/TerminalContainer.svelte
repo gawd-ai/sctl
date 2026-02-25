@@ -463,7 +463,7 @@
 		config.callbacks?.onSessionClosed?.(sessionId, 'closed');
 
 		// Re-fit after split collapse
-		if (!splitDirection) {
+		if (!currentGroup()?.direction) {
 			fitAfterLayout();
 		}
 	}

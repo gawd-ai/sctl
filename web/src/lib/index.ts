@@ -13,6 +13,7 @@ export { default as QuickExecBar } from './components/QuickExecBar.svelte';
 export { default as SplitPane } from './components/SplitPane.svelte';
 export { default as FileBrowser } from './components/FileBrowser.svelte';
 export { default as CommandPalette } from './components/CommandPalette.svelte';
+export { default as KeyboardShortcuts } from './components/KeyboardShortcuts.svelte';
 export { default as ActivityFeed } from './components/ActivityFeed.svelte';
 export { default as HistoryViewer } from './components/HistoryViewer.svelte';
 export { default as PlaybookList } from './components/PlaybookList.svelte';

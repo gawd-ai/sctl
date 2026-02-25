@@ -837,7 +837,7 @@
 				{isNewGroup ? 'mt-1' : ''}"
 			onclick={() => { if (inFlyout) flyoutServerId = null; handleSessionClick(session); }}
 		>
-			<div class="shrink-0 flex items-center justify-center" style="width: {dotW}px">
+			<div class="shrink-0 flex items-center justify-center" style="width: {dotW - 2}px">
 				<button
 					class="w-5 h-5 flex items-center justify-center rounded transition-colors hover:bg-neutral-600/50"
 					title={session.sessionStatus === 'exited'
