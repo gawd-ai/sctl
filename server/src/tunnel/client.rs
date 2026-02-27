@@ -4,21 +4,25 @@
 //! WebSocket to the relay with exponential-backoff reconnect, heartbeat, and
 //! handles proxied requests by calling local route handlers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tracing::{error, info, warn};
 
+use crate::activity::{self, ActivityType, CachedExecResult};
 use crate::config::TunnelConfig;
 use crate::sessions::buffer::{OutputBuffer, OutputEntry};
+use crate::state::TunnelEventType;
 use crate::AppState;
 
 use super::{decode_binary_frame, encode_binary_frame};
@@ -26,17 +30,62 @@ use super::{decode_binary_frame, encode_binary_frame};
 /// Static heartbeat message — avoids serde allocation on every heartbeat tick.
 const PING_TEXT: &str = r#"{"type":"tunnel.ping"}"#;
 
-/// Type alias for the WS sink to reduce verbosity.
-type WsSink = Arc<
-    Mutex<
-        futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            tokio_tungstenite::tungstenite::Message,
-        >,
-    >,
->;
+/// Resolve a `bind_address` config value to a concrete IP address.
+///
+/// Accepts either:
+/// - A literal IP address (e.g. `"10.180.41.231"`) — returned as-is
+/// - A network interface name (e.g. `"wwan0"`) — resolved to its current IPv4
+///
+/// Returns `None` if an interface name was given but the interface is down,
+/// missing, or has no IPv4 address assigned.
+#[cfg(unix)]
+fn resolve_bind_address(value: &str) -> Option<std::net::IpAddr> {
+    if let Ok(ip) = value.parse::<std::net::IpAddr>() {
+        return Some(ip);
+    }
+
+    unsafe {
+        let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&raw mut ifaddrs) != 0 {
+            return None;
+        }
+
+        let mut current = ifaddrs;
+        let mut result = None;
+
+        while !current.is_null() {
+            let ifa = &*current;
+            if !ifa.ifa_name.is_null() && !ifa.ifa_addr.is_null() {
+                let name = std::ffi::CStr::from_ptr(ifa.ifa_name);
+                if let Ok(name_str) = name.to_str() {
+                    if name_str == value && i32::from((*ifa.ifa_addr).sa_family) == libc::AF_INET {
+                        #[allow(clippy::cast_ptr_alignment)]
+                        let addr = &*(ifa.ifa_addr.cast::<libc::sockaddr_in>());
+                        let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+                        result = Some(std::net::IpAddr::V4(ip));
+                        break;
+                    }
+                }
+            }
+            current = ifa.ifa_next;
+        }
+
+        libc::freeifaddrs(ifaddrs);
+        result
+    }
+}
+
+/// Probe whether a local IP address is currently available for binding.
+async fn is_local_address_available(addr: &std::net::IpAddr) -> bool {
+    tokio::net::UdpSocket::bind(SocketAddr::new(*addr, 0))
+        .await
+        .is_ok()
+}
+
+/// Channel-based WS sender — eliminates mutex contention between subscriber
+/// tasks, heartbeat, and response handlers.  All writers push messages into
+/// this channel; a dedicated writer task drains it to the actual WS sink.
+type WsSink = mpsc::Sender<tokio_tungstenite::tungstenite::Message>;
 
 /// Spawn the tunnel client task. Returns a `JoinHandle` that runs until cancelled.
 pub fn spawn(state: AppState, tunnel_config: TunnelConfig) -> tokio::task::JoinHandle<()> {
@@ -45,6 +94,12 @@ pub fn spawn(state: AppState, tunnel_config: TunnelConfig) -> tokio::task::JoinH
 
 /// Main loop: connect, handle messages, reconnect on failure.
 async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
+    // Flap detection: track last N connection durations. If recent connections
+    // are all short-lived, extend backoff to avoid hammering the relay.
+    const FLAP_WINDOW: usize = 10;
+    const FLAP_THRESHOLD_SECS: u64 = 30;
+    const FLAP_CHECK_COUNT: usize = 3;
+
     let relay_url = config
         .url
         .as_deref()
@@ -52,43 +107,109 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
     let mut delay = Duration::from_secs(config.reconnect_delay_secs);
     let max_delay = Duration::from_secs(config.reconnect_max_delay_secs);
     let mut reconnects: u64 = 0;
+    let mut connection_durations: VecDeque<u64> = VecDeque::with_capacity(FLAP_WINDOW);
 
     loop {
         info!("Tunnel: connecting to relay at {relay_url}");
+        state
+            .tunnel_stats
+            .push_event(
+                TunnelEventType::ReconnectAttempt,
+                format!("attempt #{reconnects}"),
+            )
+            .await;
         let mut escalate_backoff = false;
+        let connect_start = Instant::now();
         match connect_and_run(&state, &config, relay_url).await {
             Ok(DisconnectReason::RelayShutdown) => {
-                // Relay sent intentional shutdown — reconnect immediately
                 info!("Tunnel: relay shutting down, reconnecting immediately...");
+                state
+                    .tunnel_stats
+                    .push_event(TunnelEventType::Disconnected, "relay shutdown".into())
+                    .await;
                 delay = Duration::ZERO;
             }
             Ok(DisconnectReason::Clean) => {
-                // Normal close — reconnect immediately
                 info!("Tunnel: connection closed cleanly, reconnecting...");
+                state
+                    .tunnel_stats
+                    .push_event(TunnelEventType::Disconnected, "clean close".into())
+                    .await;
                 delay = Duration::ZERO;
             }
             Err(ConnectError::Permanent(msg)) => {
                 error!("Tunnel: permanent error: {msg} — stopping tunnel client");
                 state
-                    .tunnel_connected
+                    .tunnel_stats
+                    .push_event(TunnelEventType::Disconnected, format!("permanent: {msg}"))
+                    .await;
+                state
+                    .tunnel_stats
+                    .connected
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
             Err(ConnectError::Transient(e)) => {
-                warn!(
-                    "Tunnel: connection error: {e}, reconnecting in {}s",
-                    delay.as_secs()
-                );
-                escalate_backoff = true;
+                let msg = e.to_string();
+                state
+                    .tunnel_stats
+                    .push_event(TunnelEventType::Disconnected, msg.clone())
+                    .await;
+                if msg.contains("bind_address") && msg.contains("not available")
+                    || msg.contains("Address not available")
+                    || msg.contains("os error 99")
+                {
+                    // Interface is down (EADDRNOTAVAIL) — use fixed 5s retry, no escalation.
+                    warn!("Tunnel: bind address unavailable ({msg}), retrying in 5s");
+                    delay = Duration::from_secs(5);
+                } else {
+                    warn!(
+                        "Tunnel: connection error: {msg}, reconnecting in {}s",
+                        delay.as_secs()
+                    );
+                    escalate_backoff = true;
+                }
             }
         }
         reconnects += 1;
         state
-            .tunnel_reconnects
+            .tunnel_stats
+            .reconnects
             .store(reconnects, std::sync::atomic::Ordering::Relaxed);
         state
-            .tunnel_connected
+            .tunnel_stats
+            .connected
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        // Reset uptime on disconnect
+        state
+            .tunnel_stats
+            .current_uptime_ms
+            .store(0, Ordering::Relaxed);
+
+        // Track connection duration for flap detection
+        let duration_secs = connect_start.elapsed().as_secs();
+        if connection_durations.len() >= FLAP_WINDOW {
+            connection_durations.pop_front();
+        }
+        connection_durations.push_back(duration_secs);
+
+        // Flap detection: if last N connections all lasted < threshold, extend backoff
+        if connection_durations.len() >= FLAP_CHECK_COUNT {
+            let recent: Vec<&u64> = connection_durations
+                .iter()
+                .rev()
+                .take(FLAP_CHECK_COUNT)
+                .collect();
+            let all_short = recent.iter().all(|&&d| d < FLAP_THRESHOLD_SECS);
+            if all_short {
+                warn!(
+                    "Tunnel: flap detected ({FLAP_CHECK_COUNT} connections lasted <{FLAP_THRESHOLD_SECS}s), extending backoff to 60s"
+                );
+                delay = Duration::from_secs(60);
+                escalate_backoff = false; // don't double-escalate
+            }
+        }
+
         tokio::time::sleep(delay).await;
         if escalate_backoff {
             delay = (delay * 2).min(max_delay);
@@ -179,6 +300,7 @@ fn set_tcp_keepalive(stream: &TcpStream, idle: u32, interval: u32, count: u32) {
 /// avoid the delay.
 async fn connect_tcp_ipv4_preferred(
     url: &str,
+    bind_address: Option<&str>,
 ) -> Result<TcpStream, Box<dyn std::error::Error + Send + Sync>> {
     // Parse host:port from wss:// or ws:// URL
     let without_scheme = url
@@ -214,15 +336,106 @@ async fn connect_tcp_ipv4_preferred(
         return Err(format!("DNS resolution failed for {host}").into());
     }
 
+    // Resolve bind address (accepts IP or interface name like "wwan0")
+    // We track the interface name separately for SO_BINDTODEVICE — bind() alone
+    // only sets the source IP but doesn't control the output interface (routing
+    // table still picks the lowest-metric route, usually eth/LAN not wwan/LTE).
+    #[cfg(unix)]
+    let (bind_addr, bind_iface): (Option<std::net::IpAddr>, Option<String>) = match bind_address {
+        Some(s) => {
+            let is_iface = s.parse::<std::net::IpAddr>().is_err();
+            match resolve_bind_address(s) {
+                Some(ip) => {
+                    let iface = if is_iface {
+                        info!("Tunnel: bind_address '{s}' (interface) resolved to {ip}");
+                        Some(s.to_string())
+                    } else {
+                        info!("Tunnel: bind_address '{s}' (IP literal)");
+                        None
+                    };
+                    (Some(ip), iface)
+                }
+                None => {
+                    return Err(format!(
+                        "bind_address '{s}' not available (interface down or no IPv4?)"
+                    )
+                    .into());
+                }
+            }
+        }
+        None => (None, None),
+    };
+    #[cfg(not(unix))]
+    let (bind_addr, _bind_iface): (Option<std::net::IpAddr>, Option<String>) = {
+        let addr = bind_address
+            .map(|s| {
+                s.parse::<std::net::IpAddr>()
+                    .map_err(|e| format!("invalid bind_address '{s}': {e}"))
+            })
+            .transpose()?;
+        (addr, None)
+    };
+
+    if let Some(ref ba) = bind_addr {
+        if !is_local_address_available(ba).await {
+            return Err(format!("bind_address {ba} not available (interface down?)").into());
+        }
+    }
+
     // Try each address with a short timeout
     let mut last_err = None;
     for addr in &addrs {
-        match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr)).await {
+        let connect_fut = async {
+            if let Some(ba) = bind_addr {
+                let socket = if addr.is_ipv4() {
+                    tokio::net::TcpSocket::new_v4()?
+                } else {
+                    tokio::net::TcpSocket::new_v6()?
+                };
+
+                // SO_BINDTODEVICE forces ALL packets through the named interface,
+                // regardless of routing table metrics. Without this, bind() only
+                // sets the source IP — the kernel still routes via the lowest-metric
+                // interface (typically eth/LAN), causing asymmetric routing failures.
+                #[cfg(unix)]
+                if let Some(ref iface) = bind_iface {
+                    let fd = socket.as_raw_fd();
+                    let c_iface = std::ffi::CString::new(iface.as_str())
+                        .map_err(|_| std::io::Error::other("invalid interface name"))?;
+                    let ret = unsafe {
+                        libc::setsockopt(
+                            fd,
+                            libc::SOL_SOCKET,
+                            libc::SO_BINDTODEVICE,
+                            c_iface.as_ptr().cast(),
+                            c_iface.as_bytes_with_nul().len() as libc::socklen_t,
+                        )
+                    };
+                    if ret != 0 {
+                        let err = std::io::Error::last_os_error();
+                        warn!("Tunnel: SO_BINDTODEVICE({iface}) failed: {err}");
+                        return Err(err);
+                    }
+                    info!("Tunnel: SO_BINDTODEVICE({iface}) set on socket");
+                }
+
+                socket.bind(SocketAddr::new(ba, 0))?;
+                socket.connect(*addr).await
+            } else {
+                TcpStream::connect(addr).await
+            }
+        };
+
+        match tokio::time::timeout(Duration::from_secs(10), connect_fut).await {
             Ok(Ok(stream)) => {
                 // TCP keepalive: probe after 15s idle, every 5s, 3 probes before dead.
                 // Keeps LTE NAT mappings alive and detects dead connections in ~30s.
                 #[cfg(unix)]
                 set_tcp_keepalive(&stream, 15, 5, 3);
+                // Disable Nagle — send small WS frames (heartbeat pings) immediately
+                // rather than buffering. Critical on LTE where delayed pings cause
+                // relay heartbeat timeouts.
+                let _ = stream.set_nodelay(true);
                 info!("Tunnel: TCP connected to {addr}");
                 return Ok(stream);
             }
@@ -256,7 +469,7 @@ async fn connect_and_run(
     let connect_start = Instant::now();
 
     // DNS + TCP with IPv4 preference (avoids long IPv6 timeouts on LTE/CGNAT)
-    let tcp_stream = connect_tcp_ipv4_preferred(&url)
+    let tcp_stream = connect_tcp_ipv4_preferred(&url, config.bind_address.as_deref())
         .await
         .map_err(ConnectError::Transient)?;
     let tcp_elapsed = connect_start.elapsed();
@@ -272,25 +485,24 @@ async fn connect_and_run(
     .map_err(|e| ConnectError::Transient(e.into()))?;
     let tls_elapsed = tls_start.elapsed();
 
-    let (ws_sink, mut ws_stream) = ws_stream.split();
-    let ws_sink = Arc::new(Mutex::new(ws_sink));
+    let (mut raw_ws_sink, mut ws_stream) = ws_stream.split();
 
-    // Send registration and validate ack before marking connected
+    // Send registration directly on the raw sink (before spawning writer task)
     let reg_start = Instant::now();
     {
-        let mut sink = ws_sink.lock().await;
         let reg = json!({
             "type": "tunnel.register",
             "serial": state.config.device.serial,
             "api_key": state.config.auth.api_key,
         });
-        sink.send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::to_string(&reg)
-                .map_err(|e| ConnectError::Transient(e.into()))?
-                .into(),
-        ))
-        .await
-        .map_err(|e| ConnectError::Transient(e.into()))?;
+        raw_ws_sink
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(&reg)
+                    .map_err(|e| ConnectError::Transient(e.into()))?
+                    .into(),
+            ))
+            .await
+            .map_err(|e| ConnectError::Transient(e.into()))?;
     }
 
     // Wait for registration ack with timeout
@@ -311,8 +523,16 @@ async fn connect_and_run(
                                 total.as_millis(),
                             );
                             state
-                                .tunnel_connected
+                                .tunnel_stats
+                                .connected
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
+                            state
+                                .tunnel_stats
+                                .push_event(
+                                    TunnelEventType::Connected,
+                                    format!("latency {}ms", total.as_millis()),
+                                )
+                                .await;
                         }
                         "error" => {
                             let code = msg["code"].as_str().unwrap_or("");
@@ -362,6 +582,27 @@ async fn connect_and_run(
         }
     }
 
+    // Channel-based writer: all tasks send through ws_sink (channel sender),
+    // a dedicated writer task drains to the real WS sink. This eliminates
+    // mutex contention between subscriber tasks, heartbeat, and responses.
+    let (ws_sink, mut ws_out_rx) = mpsc::channel::<tokio_tungstenite::tungstenite::Message>(512);
+    let (writer_exit_tx, mut writer_exit_rx) = oneshot::channel::<()>();
+    let writer_stats = state.tunnel_stats.clone();
+    let writer_task = tokio::spawn(async move {
+        while let Some(msg) = ws_out_rx.recv().await {
+            if raw_ws_sink.send(msg).await.is_err() {
+                warn!("Tunnel: writer task WS send failed, exiting");
+                writer_stats
+                    .push_event(TunnelEventType::WriterFailed, "WS send error".into())
+                    .await;
+                break;
+            }
+            writer_stats.messages_sent.fetch_add(1, Ordering::Relaxed);
+        }
+        warn!("Tunnel: writer task exited");
+        let _ = writer_exit_tx.send(());
+    });
+
     // Subscribe to session lifecycle broadcasts so we can forward them
     let mut broadcast_rx = state.session_events.subscribe();
 
@@ -372,15 +613,69 @@ async fn connect_and_run(
     // Heartbeat failure notification channel
     let (heartbeat_cancel_tx, mut heartbeat_cancel_rx) = watch::channel(false);
 
-    // Heartbeat task — uses a static string to avoid serde allocation per tick
+    // Pong watchdog — detects one-way TCP failures where sends succeed
+    // (data enters local TCP buffer) but never reach the relay.
+    let connection_epoch = Instant::now();
+    let last_pong_ms = Arc::new(AtomicU64::new(0));
+    // Timestamp of last ping sent (ms since connection_epoch), for RTT computation
+    let last_ping_sent_ms = Arc::new(AtomicU64::new(0));
+
+    // Heartbeat task — uses a static string to avoid serde allocation per tick.
+    // Includes pong watchdog: if no pong arrives within 3× heartbeat interval,
+    // the connection is assumed dead and we force a reconnect.
     let heartbeat_sink = ws_sink.clone();
     let heartbeat_interval = Duration::from_secs(config.heartbeat_interval_secs);
+    let pong_timeout_ms = config.heartbeat_interval_secs * 3 * 1000;
+    let heartbeat_epoch = connection_epoch;
+    let heartbeat_last_pong = last_pong_ms.clone();
+    let heartbeat_ping_sent = last_ping_sent_ms.clone();
+    let heartbeat_stats = state.tunnel_stats.clone();
+    let heartbeat_ws_sink = ws_sink.clone();
     let heartbeat_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(heartbeat_interval);
         loop {
             interval.tick().await;
-            let mut sink = heartbeat_sink.lock().await;
-            if sink
+
+            // Update uptime counter
+            #[allow(clippy::cast_possible_truncation)]
+            let uptime_ms = heartbeat_epoch.elapsed().as_millis() as u64;
+            heartbeat_stats
+                .current_uptime_ms
+                .store(uptime_ms, Ordering::Relaxed);
+
+            // Pong watchdog: check if relay is actually responding
+            let last = heartbeat_last_pong.load(Ordering::Relaxed);
+            // Update pong age for health endpoint
+            #[allow(clippy::cast_possible_truncation)]
+            let pong_age = heartbeat_epoch.elapsed().as_millis() as u64;
+            heartbeat_stats
+                .last_pong_age_ms
+                .store(pong_age.saturating_sub(last), Ordering::Relaxed);
+            #[allow(clippy::cast_possible_truncation)]
+            let now_ms = heartbeat_epoch.elapsed().as_millis() as u64;
+            if last > 0 && now_ms.saturating_sub(last) > pong_timeout_ms {
+                warn!(
+                    "Tunnel: no pong for {}ms (limit {}ms), forcing reconnect",
+                    now_ms.saturating_sub(last),
+                    pong_timeout_ms
+                );
+                heartbeat_stats
+                    .push_event(
+                        TunnelEventType::PongTimeout,
+                        format!("no pong for {}ms", now_ms.saturating_sub(last)),
+                    )
+                    .await;
+                let _ = heartbeat_cancel_tx.send(true);
+                break;
+            }
+
+            // 3.4: Monitor writer channel capacity — early congestion indicator
+            let capacity = heartbeat_ws_sink.capacity();
+            if capacity < 128 {
+                warn!("Tunnel: writer channel backpressure ({capacity}/512 slots free)");
+            }
+
+            if heartbeat_sink
                 .send(tokio_tungstenite::tungstenite::Message::Text(
                     PING_TEXT.into(),
                 ))
@@ -391,8 +686,22 @@ async fn connect_and_run(
                 let _ = heartbeat_cancel_tx.send(true);
                 break;
             }
+            // Record ping timestamp for RTT calculation on pong
+            #[allow(clippy::cast_possible_truncation)]
+            heartbeat_ping_sent.store(
+                heartbeat_epoch.elapsed().as_millis() as u64,
+                Ordering::Relaxed,
+            );
+            tracing::debug!(
+                "Tunnel: ping sent (pong age: {}ms)",
+                now_ms.saturating_sub(last)
+            );
         }
     });
+
+    // Periodic reaping of finished subscriber tasks (30s interval)
+    let mut reap_interval = tokio::time::interval(Duration::from_secs(30));
+    reap_interval.tick().await; // consume the immediate first tick
 
     let mut disconnect_reason = DisconnectReason::Clean;
 
@@ -444,16 +753,60 @@ async fn connect_and_run(
                                 continue;
                             }
                         };
-                        if parsed["type"].as_str() == Some("tunnel.relay_shutdown") {
-                            info!("Tunnel: relay sent shutdown notification");
-                            disconnect_reason = DisconnectReason::RelayShutdown;
-                            break;
+                        state.tunnel_stats.messages_received.fetch_add(1, Ordering::Relaxed);
+                        let msg_type = parsed["type"].as_str().unwrap_or("");
+                        match msg_type {
+                            "tunnel.relay_shutdown" => {
+                                info!("Tunnel: relay sent shutdown notification");
+                                disconnect_reason = DisconnectReason::RelayShutdown;
+                                break;
+                            }
+                            // Pong: handle inline — must never be blocked by slow handlers
+                            "tunnel.pong" => {
+                                #[allow(clippy::cast_possible_truncation)]
+                                let ms = connection_epoch.elapsed().as_millis() as u64;
+                                last_pong_ms.store(ms, Ordering::Relaxed);
+                                state.tunnel_stats.last_pong_age_ms.store(0, Ordering::Relaxed);
+                                // Compute RTT from last ping timestamp
+                                let ping_ms = last_ping_sent_ms.load(Ordering::Relaxed);
+                                if ping_ms > 0 {
+                                    let rtt = ms.saturating_sub(ping_ms);
+                                    state.tunnel_stats.record_rtt(rtt).await;
+                                    tracing::debug!("Tunnel: pong received (RTT {}ms)", rtt);
+                                } else {
+                                    tracing::debug!("Tunnel: pong received (epoch +{}ms)", ms);
+                                }
+                            }
+                            "tunnel.register.ack" | "ping" => {}
+                            // Everything else: spawn as task to keep the read loop responsive.
+                            // This prevents slow handlers (exec, file I/O) from blocking
+                            // pong reads, which would trigger the pong watchdog.
+                            _ => {
+                                let st = state.clone();
+                                let tx = ws_sink.clone();
+                                let tasks = subscriber_tasks.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = AssertUnwindSafe(
+                                        handle_relay_message(&st, &tx, &tasks, parsed)
+                                    ).catch_unwind().await {
+                                        error!("Panic in tunnel message handler: {e:?}");
+                                    }
+                                });
+                            }
                         }
-                        handle_relay_message(state, &ws_sink, &subscriber_tasks, parsed).await;
                     }
                     tokio_tungstenite::tungstenite::Message::Binary(data) => {
                         if let Some((header, payload)) = decode_binary_frame(&data) {
-                            handle_relay_binary(state, &ws_sink, header, payload).await;
+                            let st = state.clone();
+                            let tx = ws_sink.clone();
+                            let payload = payload.to_vec();
+                            tokio::spawn(async move {
+                                if let Err(e) = AssertUnwindSafe(
+                                    handle_relay_binary(&st, &tx, header, &payload)
+                                ).catch_unwind().await {
+                                    error!("Panic in tunnel binary handler: {e:?}");
+                                }
+                            });
                         }
                     }
                     tokio_tungstenite::tungstenite::Message::Close(_) => break,
@@ -463,16 +816,22 @@ async fn connect_and_run(
             broadcast_msg = broadcast_rx.recv() => {
                 if let Ok(event) = broadcast_msg {
                     // Forward session lifecycle events to relay
-                    let mut sink = ws_sink.lock().await;
                     let text = serde_json::to_string(&event)
                         .unwrap_or_else(|_| r#"{"type":"error","message":"serialize failed"}"#.to_string());
-                    let _ = sink.send(tokio_tungstenite::tungstenite::Message::Text(
+                    let _ = ws_sink.send(tokio_tungstenite::tungstenite::Message::Text(
                         text.into(),
                     )).await;
                 }
             }
+            _ = reap_interval.tick() => {
+                subscriber_tasks.lock().await.retain(|_, h| !h.is_finished());
+            }
             _ = heartbeat_cancel_rx.changed() => {
                 warn!("Tunnel: heartbeat failure detected, disconnecting");
+                break;
+            }
+            _ = &mut writer_exit_rx => {
+                warn!("Tunnel: writer task exited, disconnecting");
                 break;
             }
         }
@@ -480,6 +839,7 @@ async fn connect_and_run(
 
     // Cleanup
     heartbeat_task.abort();
+    writer_task.abort();
     let tasks = subscriber_tasks.lock().await;
     for (_, task) in tasks.iter() {
         task.abort();
@@ -502,9 +862,6 @@ async fn handle_relay_message(
     let request_id = msg["request_id"].as_str().map(ToString::to_string);
 
     match msg_type {
-        "tunnel.pong" | "tunnel.register.ack" => {
-            // Heartbeat response / registration ack — ignore
-        }
         "tunnel.exec" => {
             handle_tunnel_exec(state, ws_sink, &msg, request_id.as_deref()).await;
         }
@@ -545,7 +902,7 @@ async fn handle_relay_message(
             handle_tunnel_file_delete(state, ws_sink, &msg, request_id.as_deref()).await;
         }
         "tunnel.playbooks.list" => {
-            handle_tunnel_playbooks_list(state, ws_sink, request_id.as_deref()).await;
+            handle_tunnel_playbooks_list(state, ws_sink, &msg, request_id.as_deref()).await;
         }
         "tunnel.playbooks.get" => {
             handle_tunnel_playbooks_get(state, ws_sink, &msg, request_id.as_deref()).await;
@@ -555,6 +912,12 @@ async fn handle_relay_message(
         }
         "tunnel.playbooks.delete" => {
             handle_tunnel_playbooks_delete(state, ws_sink, &msg, request_id.as_deref()).await;
+        }
+        "tunnel.exec_result" => {
+            handle_tunnel_exec_result(state, ws_sink, &msg, request_id.as_deref()).await;
+        }
+        "tunnel.gps" => {
+            handle_tunnel_gps(state, ws_sink, request_id.as_deref()).await;
         }
         // gawdxfer transfer protocol messages
         "gx.download.init" => {
@@ -593,13 +956,105 @@ async fn handle_relay_message(
     }
 }
 
-/// Send a JSON response back through the tunnel WS.
+/// Build a `HeaderMap` with `x-sctl-client` from the tunnel message's `_source` field.
+///
+/// If the relay forwarded a `_source` (e.g. `"mcp"`), use that. Otherwise default
+/// to `"tunnel"` so route handlers attribute activity to the tunnel.
+fn tunnel_headers(msg: &Value) -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    let source = msg["_source"].as_str().unwrap_or("tunnel");
+    if let Ok(val) = axum::http::HeaderValue::from_str(source) {
+        headers.insert("x-sctl-client", val);
+    }
+    headers
+}
+
+/// Send a JSON response back through the tunnel WS channel.
 async fn send_response(ws_sink: &WsSink, msg: Value) {
-    let mut sink = ws_sink.lock().await;
     let text = serde_json::to_string(&msg)
         .unwrap_or_else(|_| r#"{"type":"error","message":"serialize failed"}"#.to_string());
-    let _ = sink
+    let _ = ws_sink
         .send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
+        .await;
+}
+
+/// Log a successful exec from a tunnel request (mirrors `routes::exec::log_exec_ok`).
+async fn log_tunnel_exec_ok(
+    state: &AppState,
+    source: activity::ActivitySource,
+    command: &str,
+    result: &crate::shell::process::ExecResult,
+    request_id: Option<String>,
+) {
+    let activity_id = state
+        .activity_log
+        .log(
+            ActivityType::Exec,
+            source,
+            activity::truncate_str(command, 80),
+            Some(json!({
+                "exit_code": result.exit_code,
+                "duration_ms": result.duration_ms,
+                "stdout_preview": activity::truncate_str(&result.stdout, 200),
+                "stderr_preview": activity::truncate_str(&result.stderr, 200),
+                "has_full_output": true,
+            })),
+            request_id,
+        )
+        .await;
+    state
+        .exec_results_cache
+        .store(CachedExecResult {
+            activity_id,
+            exit_code: result.exit_code,
+            stdout: result.stdout.clone(),
+            stderr: result.stderr.clone(),
+            duration_ms: result.duration_ms,
+            command: command.to_string(),
+            status: "ok".to_string(),
+            error_message: None,
+        })
+        .await;
+}
+
+/// Log a failed exec from a tunnel request (mirrors `routes::exec::log_exec_err`).
+async fn log_tunnel_exec_err(
+    state: &AppState,
+    source: activity::ActivitySource,
+    command: &str,
+    status: &str,
+    error_msg: &str,
+    duration_ms: u64,
+    request_id: Option<String>,
+) {
+    let activity_id = state
+        .activity_log
+        .log(
+            ActivityType::Exec,
+            source,
+            activity::truncate_str(command, 80),
+            Some(json!({
+                "exit_code": -1,
+                "duration_ms": duration_ms,
+                "status": status,
+                "error": error_msg,
+                "has_full_output": true,
+            })),
+            request_id,
+        )
+        .await;
+    state
+        .exec_results_cache
+        .store(CachedExecResult {
+            activity_id,
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: error_msg.to_string(),
+            duration_ms,
+            command: command.to_string(),
+            status: status.to_string(),
+            error_message: Some(error_msg.to_string()),
+        })
         .await;
 }
 
@@ -626,6 +1081,9 @@ async fn handle_tunnel_exec(
         .get("env")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
+    let source = activity::source_from_headers(&tunnel_headers(msg));
+    let req_id = request_id.map(ToString::to_string);
+
     let result = match Box::pin(crate::shell::process::exec_command(
         shell,
         working_dir,
@@ -635,29 +1093,47 @@ async fn handle_tunnel_exec(
     ))
     .await
     {
-        Ok(r) => json!({
-            "type": "tunnel.exec.result",
-            "request_id": request_id,
-            "status": 200,
-            "body": {
-                "exit_code": r.exit_code,
-                "stdout": r.stdout,
-                "stderr": r.stderr,
-                "duration_ms": r.duration_ms,
-            }
-        }),
-        Err(crate::shell::process::ExecError::Timeout) => json!({
-            "type": "tunnel.exec.result",
-            "request_id": request_id,
-            "status": 504,
-            "body": {"error": "Command timed out", "code": "TIMEOUT"}
-        }),
-        Err(e) => json!({
-            "type": "tunnel.exec.result",
-            "request_id": request_id,
-            "status": 500,
-            "body": {"error": e.to_string(), "code": "EXEC_FAILED"}
-        }),
+        Ok(r) => {
+            log_tunnel_exec_ok(state, source, command, &r, req_id).await;
+            json!({
+                "type": "tunnel.exec.result",
+                "request_id": request_id,
+                "status": 200,
+                "body": {
+                    "exit_code": r.exit_code,
+                    "stdout": r.stdout,
+                    "stderr": r.stderr,
+                    "duration_ms": r.duration_ms,
+                }
+            })
+        }
+        Err(crate::shell::process::ExecError::Timeout) => {
+            log_tunnel_exec_err(
+                state,
+                source,
+                command,
+                "timeout",
+                "Command timed out",
+                timeout_ms,
+                req_id,
+            )
+            .await;
+            json!({
+                "type": "tunnel.exec.result",
+                "request_id": request_id,
+                "status": 504,
+                "body": {"error": "Command timed out", "code": "TIMEOUT"}
+            })
+        }
+        Err(e) => {
+            log_tunnel_exec_err(state, source, command, "error", &e.to_string(), 0, req_id).await;
+            json!({
+                "type": "tunnel.exec.result",
+                "request_id": request_id,
+                "status": 500,
+                "body": {"error": e.to_string(), "code": "EXEC_FAILED"}
+            })
+        }
     };
 
     send_response(ws_sink, result).await;
@@ -709,6 +1185,9 @@ async fn handle_tunnel_exec_batch(
         .get("env")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
+    let source = activity::source_from_headers(&tunnel_headers(msg));
+    let req_id = request_id.map(ToString::to_string);
+
     let mut results = Vec::with_capacity(commands.len());
     for cmd in commands {
         let command = cmd["command"].as_str().unwrap_or("");
@@ -744,24 +1223,51 @@ async fn handle_tunnel_exec_batch(
         ))
         .await
         {
-            Ok(r) => results.push(json!({
-                "exit_code": r.exit_code,
-                "stdout": r.stdout,
-                "stderr": r.stderr,
-                "duration_ms": r.duration_ms,
-            })),
-            Err(crate::shell::process::ExecError::Timeout) => results.push(json!({
-                "exit_code": -1,
-                "stdout": "",
-                "stderr": "Command timed out",
-                "duration_ms": timeout,
-            })),
-            Err(e) => results.push(json!({
-                "exit_code": -1,
-                "stdout": "",
-                "stderr": e.to_string(),
-                "duration_ms": 0,
-            })),
+            Ok(r) => {
+                log_tunnel_exec_ok(state, source, command, &r, req_id.clone()).await;
+                results.push(json!({
+                    "exit_code": r.exit_code,
+                    "stdout": r.stdout,
+                    "stderr": r.stderr,
+                    "duration_ms": r.duration_ms,
+                }));
+            }
+            Err(crate::shell::process::ExecError::Timeout) => {
+                log_tunnel_exec_err(
+                    state,
+                    source,
+                    command,
+                    "timeout",
+                    "Command timed out",
+                    timeout,
+                    req_id.clone(),
+                )
+                .await;
+                results.push(json!({
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": "Command timed out",
+                    "duration_ms": timeout,
+                }));
+            }
+            Err(e) => {
+                log_tunnel_exec_err(
+                    state,
+                    source,
+                    command,
+                    "error",
+                    &e.to_string(),
+                    0,
+                    req_id.clone(),
+                )
+                .await;
+                results.push(json!({
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": e.to_string(),
+                    "duration_ms": 0,
+                }));
+            }
         }
     }
 
@@ -846,7 +1352,7 @@ async fn handle_tunnel_file_read(
 
     match crate::routes::files::get_file(
         axum::extract::State(state.clone()),
-        axum::http::HeaderMap::new(),
+        tunnel_headers(msg),
         axum::extract::Query(query),
     )
     .await
@@ -901,7 +1407,7 @@ async fn handle_tunnel_file_write(
 
     match crate::routes::files::put_file(
         axum::extract::State(state.clone()),
-        axum::http::HeaderMap::new(),
+        tunnel_headers(msg),
         axum::Json(payload),
     )
     .await
@@ -959,6 +1465,43 @@ async fn handle_tunnel_activity(
     .await;
 }
 
+/// Handle tunnel.exec_result — cached exec result lookup
+async fn handle_tunnel_exec_result(
+    state: &AppState,
+    ws_sink: &WsSink,
+    msg: &Value,
+    request_id: Option<&str>,
+) {
+    let activity_id = msg["activity_id"].as_u64().unwrap_or(0);
+
+    match state.exec_results_cache.get(activity_id).await {
+        Some(result) => {
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "tunnel.exec_result.result",
+                    "request_id": request_id,
+                    "status": 200,
+                    "body": result,
+                }),
+            )
+            .await;
+        }
+        None => {
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "tunnel.exec_result.result",
+                    "request_id": request_id,
+                    "status": 404,
+                    "body": {"error": "Exec result not found or evicted", "code": "NOT_FOUND"},
+                }),
+            )
+            .await;
+        }
+    }
+}
+
 /// Handle tunnel.sessions — REST session list
 async fn handle_tunnel_sessions(state: &AppState, ws_sink: &WsSink, request_id: Option<&str>) {
     let axum::Json(body) =
@@ -1006,7 +1549,7 @@ async fn handle_tunnel_session_signal(
     match crate::routes::sessions::signal_session(
         axum::extract::State(state.clone()),
         axum::extract::Path(session_id.to_string()),
-        axum::http::HeaderMap::new(),
+        tunnel_headers(msg),
         axum::Json(payload),
     )
     .await
@@ -1049,7 +1592,7 @@ async fn handle_tunnel_session_kill(
     match crate::routes::sessions::kill_session(
         axum::extract::State(state.clone()),
         axum::extract::Path(session_id.to_string()),
-        axum::http::HeaderMap::new(),
+        tunnel_headers(msg),
     )
     .await
     {
@@ -1141,7 +1684,7 @@ async fn handle_tunnel_file_delete(
 
     match crate::routes::files::delete_file(
         axum::extract::State(state.clone()),
-        axum::http::HeaderMap::new(),
+        tunnel_headers(msg),
         axum::Json(crate::routes::files::FileDeleteRequest { path }),
     )
     .await
@@ -1291,8 +1834,7 @@ async fn handle_gx_chunk_request(
                 "chunk_hash": chunk_header.chunk_hash,
             });
             let frame = encode_binary_frame(&header, &data);
-            let mut sink = ws_sink.lock().await;
-            let _ = sink
+            let _ = ws_sink
                 .send(tokio_tungstenite::tungstenite::Message::Binary(
                     frame.into(),
                 ))
@@ -1544,19 +2086,9 @@ async fn handle_forwarded_session_message(
                             .await;
                     }
 
-                    // Start subscriber for output forwarding
-                    if let Some(buffer) = state.session_manager.get_buffer(&session_id).await {
-                        let sink_clone = ws_sink.clone();
-                        let sid = session_id.clone();
-                        let task = tokio::spawn(tunnel_subscriber_task(
-                            sid.clone(),
-                            buffer,
-                            sink_clone,
-                            0,
-                        ));
-                        subscriber_tasks.lock().await.insert(sid, task);
-                    }
-
+                    // Send session.started BEFORE spawning subscriber to avoid
+                    // a race where the subscriber grabs ws_sink first and blocks
+                    // this response (the subscriber immediately sends shell prompt).
                     let mut resp = json!({
                         "type": "session.started",
                         "session_id": session_id,
@@ -1572,6 +2104,19 @@ async fn handle_forwarded_session_message(
                         resp["request_id"] = json!(rid);
                     }
                     send_response(ws_sink, resp).await;
+
+                    // Now start subscriber for output forwarding
+                    if let Some(buffer) = state.session_manager.get_buffer(&session_id).await {
+                        let sink_clone = ws_sink.clone();
+                        let sid = session_id.clone();
+                        let task = tokio::spawn(tunnel_subscriber_task(
+                            sid.clone(),
+                            buffer,
+                            sink_clone,
+                            0,
+                        ));
+                        subscriber_tasks.lock().await.insert(sid, task);
+                    }
 
                     // Broadcast
                     let mut broadcast = json!({
@@ -2044,11 +2589,12 @@ fn entry_to_ws_message(session_id: &str, entry: &OutputEntry) -> Value {
 async fn handle_tunnel_playbooks_list(
     state: &AppState,
     ws_sink: &WsSink,
+    msg: &Value,
     request_id: Option<&str>,
 ) {
     match crate::routes::playbooks::list_playbooks(
         axum::extract::State(state.clone()),
-        axum::http::HeaderMap::new(),
+        tunnel_headers(msg),
     )
     .await
     {
@@ -2090,7 +2636,7 @@ async fn handle_tunnel_playbooks_get(
     match crate::routes::playbooks::get_playbook(
         axum::extract::State(state.clone()),
         axum::extract::Path(name),
-        axum::http::HeaderMap::new(),
+        tunnel_headers(msg),
     )
     .await
     {
@@ -2133,7 +2679,7 @@ async fn handle_tunnel_playbooks_put(
     match crate::routes::playbooks::put_playbook(
         axum::extract::State(state.clone()),
         axum::extract::Path(name),
-        axum::http::HeaderMap::new(),
+        tunnel_headers(msg),
         content,
     )
     .await
@@ -2176,7 +2722,7 @@ async fn handle_tunnel_playbooks_delete(
     match crate::routes::playbooks::delete_playbook(
         axum::extract::State(state.clone()),
         axum::extract::Path(name),
-        axum::http::HeaderMap::new(),
+        tunnel_headers(msg),
     )
     .await
     {
@@ -2207,6 +2753,36 @@ async fn handle_tunnel_playbooks_delete(
     }
 }
 
+/// Handle `tunnel.gps` — GPS location data.
+async fn handle_tunnel_gps(state: &AppState, ws_sink: &WsSink, request_id: Option<&str>) {
+    match crate::routes::gps::gps(axum::extract::State(state.clone())).await {
+        Ok(axum::Json(body)) => {
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "tunnel.gps.result",
+                    "request_id": request_id,
+                    "status": 200,
+                    "body": body,
+                }),
+            )
+            .await;
+        }
+        Err((status, axum::Json(body))) => {
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "tunnel.gps.result",
+                    "request_id": request_id,
+                    "status": status.as_u16(),
+                    "body": body,
+                }),
+            )
+            .await;
+        }
+    }
+}
+
 /// Background task that reads from a session's `OutputBuffer` and forwards
 /// entries as WS messages through the tunnel. Similar to `ws/mod.rs` `subscriber_task`.
 ///
@@ -2219,10 +2795,6 @@ async fn tunnel_subscriber_task(
     ws_sink: WsSink,
     since: u64,
 ) {
-    /// Flush every N entries to keep output streaming on slow links.
-    /// ~50 entries ≈ 1 screenful — prevents multi-second stalls on `cat hugefile.txt`.
-    const FLUSH_INTERVAL: usize = 50;
-
     let mut cursor = since;
     loop {
         let (entries, notify) = {
@@ -2235,25 +2807,18 @@ async fn tunnel_subscriber_task(
             }
         };
         if !entries.is_empty() {
-            let mut sink = ws_sink.lock().await;
-            for (i, entry) in entries.iter().enumerate() {
+            for entry in &entries {
                 let msg = entry_to_ws_message(&session_id, entry);
                 let text = serde_json::to_string(&msg).unwrap_or_else(|_| {
                     r#"{"type":"error","message":"serialize failed"}"#.to_string()
                 });
-                if sink
-                    .feed(tokio_tungstenite::tungstenite::Message::Text(text.into()))
+                if ws_sink
+                    .send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
                     .await
                     .is_err()
                 {
                     return;
                 }
-                if (i + 1) % FLUSH_INTERVAL == 0 && sink.flush().await.is_err() {
-                    return;
-                }
-            }
-            if sink.flush().await.is_err() {
-                return;
             }
             if let Some(last) = entries.last() {
                 cursor = last.seq;

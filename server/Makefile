@@ -1,11 +1,13 @@
 TARGET_ARM := armv7-unknown-linux-musleabihf
 TARGET_RISCV := riscv64gc-unknown-linux-musl
+TARGET_X86 := x86_64-unknown-linux-musl
 BINARY := sctl
 RELEASE_DIR := target/release
 ARM_RELEASE_DIR := target/$(TARGET_ARM)/release
 RISCV_RELEASE_DIR := target/$(TARGET_RISCV)/release
+X86_RELEASE_DIR := target/$(TARGET_X86)/release
 
-.PHONY: build build-arm build-riscv dev clean deploy deploy-riscv upgrade upgrade-riscv fmt lint test doc doc-open check
+.PHONY: build build-arm build-riscv build-x86 dev clean deploy deploy-riscv upgrade upgrade-riscv fmt lint test doc doc-open check
 
 ## Build for local development
 build:
@@ -22,6 +24,12 @@ build-riscv:
 	cross build --release --target $(TARGET_RISCV)
 	@echo "Binary: $(RISCV_RELEASE_DIR)/$(BINARY)"
 	@ls -lh $(RISCV_RELEASE_DIR)/$(BINARY)
+
+## Build for x86_64 (VPS relay) — no cross needed, host is x86_64
+build-x86:
+	cargo build --release --target $(TARGET_X86)
+	@echo "Binary: $(X86_RELEASE_DIR)/$(BINARY)"
+	@ls -lh $(X86_RELEASE_DIR)/$(BINARY)
 
 ## Run locally for development
 dev:

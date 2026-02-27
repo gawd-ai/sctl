@@ -33,8 +33,8 @@ relay = true
 # Devices configure this same key in their [tunnel] section.
 tunnel_key = "change-me-at-least-32-chars-for-production"
 
-# Seconds before a device is considered dead if no heartbeat (default 90)
-# heartbeat_timeout_secs = 90
+# Seconds before a device is considered dead if no heartbeat (default 45)
+# heartbeat_timeout_secs = 45
 
 # Default proxy request timeout in seconds (default 60)
 # tunnel_proxy_timeout_secs = 60

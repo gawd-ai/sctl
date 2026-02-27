@@ -426,6 +426,35 @@ export interface DeviceInfo {
 	interfaces: NetworkInterface[];
 	/** Tunnel relay connection info, if configured. */
 	tunnel?: { url: string; connected: boolean };
+	/** GPS location data, if GPS is configured on the device. */
+	gps?: {
+		status: 'active' | 'searching' | 'error' | 'disabled';
+		latitude?: number;
+		longitude?: number;
+		altitude?: number;
+		satellites?: number;
+		speed_kmh?: number;
+		hdop?: number;
+		fix_age_secs?: number;
+	} | null;
+	/** LTE signal quality, if LTE monitoring is configured on the device. */
+	lte?: {
+		rssi_dbm: number;
+		rsrp?: number;
+		rsrq?: number;
+		sinr?: number;
+		band?: string;
+		operator?: string;
+		technology?: string;
+		cell_id?: string;
+		signal_bars: number;
+		modem?: {
+			model?: string;
+			firmware?: string;
+			imei?: string;
+			iccid?: string;
+		};
+	} | null;
 }
 
 export interface NetworkInterface {

@@ -71,10 +71,62 @@ pub async fn info(State(state): State<AppState>) -> Result<Json<Value>, StatusCo
     if let Some(ref tc) = state.config.tunnel {
         if tc.url.is_some() && !tc.relay {
             response["tunnel"] = json!({
-                "connected": state.tunnel_connected.load(std::sync::atomic::Ordering::Relaxed),
+                "connected": state.tunnel_stats.connected.load(std::sync::atomic::Ordering::Relaxed),
                 "relay_url": tc.url,
-                "reconnects": state.tunnel_reconnects.load(std::sync::atomic::Ordering::Relaxed),
+                "reconnects": state.tunnel_stats.reconnects.load(std::sync::atomic::Ordering::Relaxed),
             });
+        }
+    }
+
+    // Include GPS data if configured
+    if let Some(ref gps_state) = state.gps_state {
+        let gs = gps_state.lock().await;
+        let fix_age_secs = gs.last_fix_at.map(|t| t.elapsed().as_secs());
+        if let Some(ref fix) = gs.last_fix {
+            response["gps"] = json!({
+                "status": gs.status,
+                "latitude": fix.latitude,
+                "longitude": fix.longitude,
+                "altitude": fix.altitude,
+                "satellites": fix.satellites,
+                "speed_kmh": fix.speed_kmh,
+                "hdop": fix.hdop,
+                "fix_age_secs": fix_age_secs,
+            });
+        } else {
+            response["gps"] = json!({
+                "status": gs.status,
+            });
+        }
+    }
+
+    // Include LTE signal + modem data if configured
+    if let Some(ref lte_state) = state.lte_state {
+        let ls = lte_state.lock().await;
+        let mut lte = json!({});
+        if let Some(ref sig) = ls.signal {
+            lte = json!({
+                "rssi_dbm": sig.rssi_dbm,
+                "rsrp": sig.rsrp,
+                "rsrq": sig.rsrq,
+                "sinr": sig.sinr,
+                "band": sig.band,
+                "operator": sig.operator,
+                "technology": sig.technology,
+                "cell_id": sig.cell_id,
+                "signal_bars": sig.signal_bars,
+            });
+        }
+        if let Some(ref modem) = ls.modem {
+            lte["modem"] = json!({
+                "model": modem.model,
+                "firmware": modem.firmware,
+                "imei": modem.imei,
+                "iccid": modem.iccid,
+            });
+        }
+        if !lte.as_object().is_none_or(serde_json::Map::is_empty) {
+            response["lte"] = lte;
         }
     }
 

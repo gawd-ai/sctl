@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
-use crate::config::SupervisorConfig;
+use sctl::config::SupervisorConfig;
 
 /// Run the supervisor loop. Does not return unless the child exits cleanly.
 pub async fn run_supervisor(config_path: Option<&str>, sup_config: &SupervisorConfig) -> ! {

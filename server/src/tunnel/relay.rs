@@ -219,6 +219,10 @@ pub fn relay_router(relay_state: RelayState) -> Router {
         .route("/d/{serial}/api/stp/transfers", get(proxy_stp_list))
         .route("/d/{serial}/api/stp/{xfer}", delete(proxy_stp_abort))
         .route("/d/{serial}/api/activity", get(proxy_activity))
+        .route(
+            "/d/{serial}/api/activity/{id}/result",
+            get(proxy_exec_result),
+        )
         .route("/d/{serial}/api/sessions", get(proxy_sessions))
         .route(
             "/d/{serial}/api/sessions/{id}",
@@ -236,6 +240,7 @@ pub fn relay_router(relay_state: RelayState) -> Router {
                 .put(proxy_playbook_put)
                 .delete(proxy_playbook_delete),
         )
+        .route("/d/{serial}/api/gps", get(proxy_gps))
         .route("/d/{serial}/api/ws", get(proxy_ws));
 
     tunnel_admin.merge(device_proxy).with_state(relay_state)
@@ -314,13 +319,39 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
 
     #[allow(clippy::cast_possible_truncation)]
     let now_ms = state.epoch.elapsed().as_millis() as u64;
+    // Reuse the old device's clients + session_subscriptions Arcs (if any).
+    // When a device reconnects (LTE flap, etc.), WS clients are still connected
+    // to the relay. By sharing the same Arcs, client handlers' references stay
+    // valid — cleanup (remove on disconnect) works regardless of tunnel reconnects.
+    let (shared_clients, shared_subs) = {
+        let devices = state.devices.read().await;
+        if let Some(old_device) = devices.get(&serial) {
+            let clients = old_device.clients.clone();
+            let subs = old_device.session_subscriptions.clone();
+            let n = clients.read().await.len();
+            if n > 0 {
+                info!(
+                    serial = %serial,
+                    clients = n,
+                    "Preserving {n} WS clients across device reconnect"
+                );
+            }
+            (clients, subs)
+        } else {
+            (
+                Arc::new(RwLock::new(HashMap::new())),
+                Arc::new(RwLock::new(HashMap::new())),
+            )
+        }
+    };
+
     let device = ConnectedDevice {
         serial: serial.clone(),
         api_key,
         device_tx: device_tx.clone(),
         pending_requests: Arc::new(Mutex::new(HashMap::new())),
-        clients: Arc::new(RwLock::new(HashMap::new())),
-        session_subscriptions: Arc::new(RwLock::new(HashMap::new())),
+        clients: shared_clients,
+        session_subscriptions: shared_subs,
         last_heartbeat_ms: Arc::new(AtomicU64::new(now_ms)),
         connected_since: Instant::now(),
         dropped_messages: Arc::new(AtomicU64::new(0)),
@@ -334,7 +365,8 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
     let relay_epoch = state.epoch;
     let dropped_messages = device.dropped_messages.clone();
 
-    // Handle duplicate serial: signal old handler to shut down, drain, then replace
+    // Handle duplicate serial: signal old handler to shut down, drain pending
+    // REST requests, then replace. Don't notify WS clients — they were migrated above.
     {
         let mut devices = state.devices.write().await;
         if let Some(old_device) = devices.get(&serial) {
@@ -343,7 +375,19 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                 "Device re-registering while stale connection exists, evicting old"
             );
             let _ = old_device.shutdown_tx.send(true);
-            drain_device(old_device, "replaced by new connection").await;
+            // Only drain pending REST requests — clients were already migrated
+            let mut pending = old_device.pending_requests.lock().await;
+            let count = pending.len();
+            for (_, sender) in pending.drain() {
+                let _ = sender.send(TunnelResponse::Json(json!({
+                    "type": "error",
+                    "status": 502,
+                    "body": {"error": "device reconnecting", "code": "DEVICE_RECONNECTING"},
+                })));
+            }
+            if count > 0 {
+                info!(serial = %serial, count, "Drained {count} pending REST requests");
+            }
         }
         devices.insert(serial.clone(), device);
     }
@@ -374,6 +418,7 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
     });
 
     // Process messages from the device
+    let mut replaced = false;
     loop {
         let msg = tokio::select! {
             msg = ws_stream.next() => {
@@ -382,6 +427,7 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
             }
             _ = shutdown_rx.changed() => {
                 info!(serial = %serial, "Device handler shutting down (replaced by new connection)");
+                replaced = true;
                 break;
             }
         };
@@ -401,6 +447,7 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                     "session.stdout" | "session.stderr" | "session.system"
                 ) {
                     if let Some(session_id) = parsed["session_id"].as_str() {
+                        let session_id_owned = session_id.to_string();
                         let subs = session_subs.read().await;
                         if let Some(client_ids) = subs.get(session_id) {
                             let clients_read = clients.read().await;
@@ -411,6 +458,18 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                                     if let Some(client_tx) = clients_read.get(cid) {
                                         if client_tx.try_send(parsed).is_err() {
                                             dropped_messages.fetch_add(1, Ordering::Relaxed);
+                                            warn!(
+                                                serial = %serial,
+                                                session_id = %session_id_owned,
+                                                client_id = %cid,
+                                                "Dropped session output (backpressure)"
+                                            );
+                                            // Notify client about the gap so it can re-attach
+                                            let _ = client_tx.try_send(json!({
+                                                "type": "session.gap",
+                                                "session_id": session_id_owned,
+                                                "reason": "backpressure",
+                                            }));
                                         }
                                     }
                                 }
@@ -419,6 +478,17 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                                     if let Some(client_tx) = clients_read.get(cid) {
                                         if client_tx.try_send(parsed.clone()).is_err() {
                                             dropped_messages.fetch_add(1, Ordering::Relaxed);
+                                            warn!(
+                                                serial = %serial,
+                                                session_id = %session_id_owned,
+                                                client_id = %cid,
+                                                "Dropped session output (backpressure)"
+                                            );
+                                            let _ = client_tx.try_send(json!({
+                                                "type": "session.gap",
+                                                "session_id": session_id_owned,
+                                                "reason": "backpressure",
+                                            }));
                                         }
                                     }
                                 }
@@ -570,15 +640,20 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
         }
     }
 
-    // Device disconnected — drain pending requests and notify clients before removing
-    {
-        let devices = state.devices.read().await;
-        if let Some(device) = devices.get(&serial) {
-            drain_device(device, "device disconnected").await;
+    // Only drain and remove if this handler wasn't replaced by a new connection.
+    // When replaced, the new handler already owns the device entry in the map —
+    // draining/removing here would destroy the new connection's state.
+    if replaced {
+        info!(serial = %serial, "Device handler exiting (replaced, skipping cleanup)");
+    } else {
+        // Single write lock: remove then drain. Avoids TOCTOU between read→write
+        // and prevents holding a read lock across the async drain_device call.
+        let removed = state.devices.write().await.remove(&serial);
+        if let Some(device) = removed {
+            drain_device(&device, "device disconnected").await;
         }
+        info!(serial = %serial, "Device disconnected");
     }
-    info!(serial = %serial, "Device disconnected");
-    state.devices.write().await.remove(&serial);
     send_task.abort();
 }
 
@@ -633,7 +708,7 @@ async fn list_devices(
 // ─── REST Proxy Helpers ──────────────────────────────────────────────────────
 
 /// Send a tunnel request to a device and await the response.
-async fn tunnel_request(
+pub async fn tunnel_request(
     state: &RelayState,
     serial: &str,
     msg: Value,
@@ -692,7 +767,7 @@ async fn tunnel_request(
 }
 
 /// Send a tunnel request expecting a JSON response.
-async fn tunnel_request_json(
+pub async fn tunnel_request_json(
     state: &RelayState,
     serial: &str,
     msg: Value,
@@ -711,7 +786,7 @@ async fn tunnel_request_json(
 }
 
 /// Send a binary tunnel request to a device and await the response.
-async fn tunnel_request_binary(
+pub async fn tunnel_request_binary(
     state: &RelayState,
     serial: &str,
     msg: TunnelMessage,
@@ -861,6 +936,11 @@ async fn proxy_exec(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
+    let sctl_client = request
+        .headers()
+        .get("x-sctl-client")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
 
     let body_bytes = axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024)
         .await
@@ -891,6 +971,9 @@ async fn proxy_exec(
     let mut msg = payload;
     msg["type"] = json!("tunnel.exec");
     msg["request_id"] = json!(request_id);
+    if let Some(ref client) = sctl_client {
+        msg["_source"] = json!(client);
+    }
 
     let response = tunnel_request_json(&state, &serial, msg, timeout_secs).await?;
     proxy_response_to_http(&response)
@@ -905,6 +988,11 @@ async fn proxy_exec_batch(
     let auth_header = request
         .headers()
         .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+    let sctl_client = request
+        .headers()
+        .get("x-sctl-client")
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
 
@@ -944,6 +1032,9 @@ async fn proxy_exec_batch(
     let mut msg = payload;
     msg["type"] = json!("tunnel.exec_batch");
     msg["request_id"] = json!(request_id);
+    if let Some(ref client) = sctl_client {
+        msg["_source"] = json!(client);
+    }
 
     let response = tunnel_request_json(&state, &serial, msg, timeout_secs).await?;
     proxy_response_to_http(&response)
@@ -968,6 +1059,11 @@ async fn proxy_file_read(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
+    let sctl_client = request
+        .headers()
+        .get("x-sctl-client")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
 
     {
         let devices = state.devices.read().await;
@@ -975,12 +1071,15 @@ async fn proxy_file_read(
     }
 
     let request_id = uuid::Uuid::new_v4().to_string();
-    let msg = json!({
+    let mut msg = json!({
         "type": "tunnel.file.read",
         "request_id": request_id,
         "path": query.path,
         "list": query.list,
     });
+    if let Some(ref client) = sctl_client {
+        msg["_source"] = json!(client);
+    }
 
     let response =
         tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
@@ -996,6 +1095,11 @@ async fn proxy_file_write(
     let auth_header = request
         .headers()
         .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+    let sctl_client = request
+        .headers()
+        .get("x-sctl-client")
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
 
@@ -1024,6 +1128,9 @@ async fn proxy_file_write(
     let mut msg = payload;
     msg["type"] = json!("tunnel.file.write");
     msg["request_id"] = json!(request_id);
+    if let Some(ref client) = sctl_client {
+        msg["_source"] = json!(client);
+    }
 
     let response =
         tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
@@ -1039,6 +1146,11 @@ async fn proxy_file_delete(
     let auth_header = request
         .headers()
         .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+    let sctl_client = request
+        .headers()
+        .get("x-sctl-client")
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
 
@@ -1064,11 +1176,14 @@ async fn proxy_file_delete(
     }
 
     let request_id = uuid::Uuid::new_v4().to_string();
-    let msg = json!({
+    let mut msg = json!({
         "type": "tunnel.file.delete",
         "request_id": request_id,
         "path": payload["path"],
     });
+    if let Some(ref client) = sctl_client {
+        msg["_source"] = json!(client);
+    }
 
     let response =
         tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
@@ -1076,7 +1191,7 @@ async fn proxy_file_delete(
 }
 
 /// Convert a tunnel response (with status + body) to an HTTP response.
-fn proxy_response_to_http(response: &Value) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub fn proxy_response_to_http(response: &Value) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let status = response["status"].as_u64().unwrap_or(200);
     let body = response["body"].clone();
 
@@ -1133,6 +1248,35 @@ struct ActivityProxyQuery {
 
 fn default_activity_limit() -> usize {
     50
+}
+
+/// `GET /d/{serial}/api/activity/{id}/result` — proxied exec result lookup.
+async fn proxy_exec_result(
+    State(state): State<RelayState>,
+    AxumPath((serial, id)): AxumPath<(String, u64)>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "tunnel.exec_result",
+        "request_id": request_id,
+        "activity_id": id,
+    });
+
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
 }
 
 /// `GET /d/{serial}/api/sessions` — proxied session list.
@@ -1325,6 +1469,11 @@ async fn proxy_playbooks_list(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
+    let sctl_client = request
+        .headers()
+        .get("x-sctl-client")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
 
     {
         let devices = state.devices.read().await;
@@ -1332,10 +1481,13 @@ async fn proxy_playbooks_list(
     }
 
     let request_id = uuid::Uuid::new_v4().to_string();
-    let msg = json!({
+    let mut msg = json!({
         "type": "tunnel.playbooks.list",
         "request_id": request_id,
     });
+    if let Some(ref client) = sctl_client {
+        msg["_source"] = json!(client);
+    }
 
     let response =
         tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
@@ -1353,6 +1505,11 @@ async fn proxy_playbook_get(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
+    let sctl_client = request
+        .headers()
+        .get("x-sctl-client")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
 
     {
         let devices = state.devices.read().await;
@@ -1360,11 +1517,14 @@ async fn proxy_playbook_get(
     }
 
     let request_id = uuid::Uuid::new_v4().to_string();
-    let msg = json!({
+    let mut msg = json!({
         "type": "tunnel.playbooks.get",
         "request_id": request_id,
         "name": name,
     });
+    if let Some(ref client) = sctl_client {
+        msg["_source"] = json!(client);
+    }
 
     let response =
         tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
@@ -1380,6 +1540,11 @@ async fn proxy_playbook_put(
     let auth_header = request
         .headers()
         .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+    let sctl_client = request
+        .headers()
+        .get("x-sctl-client")
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
 
@@ -1405,12 +1570,15 @@ async fn proxy_playbook_put(
     }
 
     let request_id = uuid::Uuid::new_v4().to_string();
-    let msg = json!({
+    let mut msg = json!({
         "type": "tunnel.playbooks.put",
         "request_id": request_id,
         "name": name,
         "content": content,
     });
+    if let Some(ref client) = sctl_client {
+        msg["_source"] = json!(client);
+    }
 
     let response =
         tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
@@ -1428,6 +1596,11 @@ async fn proxy_playbook_delete(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
+    let sctl_client = request
+        .headers()
+        .get("x-sctl-client")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
 
     {
         let devices = state.devices.read().await;
@@ -1435,11 +1608,14 @@ async fn proxy_playbook_delete(
     }
 
     let request_id = uuid::Uuid::new_v4().to_string();
-    let msg = json!({
+    let mut msg = json!({
         "type": "tunnel.playbooks.delete",
         "request_id": request_id,
         "name": name,
     });
+    if let Some(ref client) = sctl_client {
+        msg["_source"] = json!(client);
+    }
 
     let response =
         tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
@@ -1452,6 +1628,34 @@ async fn proxy_playbook_delete(
 #[derive(Deserialize)]
 struct WsProxyQuery {
     token: String,
+}
+
+/// `GET /d/{serial}/api/gps` — proxied GPS data.
+async fn proxy_gps(
+    State(state): State<RelayState>,
+    AxumPath(serial): AxumPath<String>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "tunnel.gps",
+        "request_id": request_id,
+    });
+
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
 }
 
 /// `GET /d/{serial}/api/ws?token=<api_key>` — WS proxy to device.
@@ -1595,14 +1799,18 @@ async fn handle_client_ws(
         subs.retain(|_, v| !v.is_empty());
     }
 
-    // Tell the device to detach sessions that no longer have any subscribers
+    // Tell the device to detach sessions that no longer have any subscribers.
+    // After `retain` above, sessions with zero subscribers were removed from the
+    // map entirely, so `get()` returns None. `map_or(true, ...)` means:
+    //   None (removed = no subscribers left) → true → detach
+    //   Some(non-empty set) → false → other clients still watching, keep alive
     for session_id in &detach_sessions {
-        let still_subscribed = session_subs
+        let should_detach = session_subs
             .read()
             .await
             .get(session_id)
-            .map_or(true, HashSet::is_empty);
-        if still_subscribed {
+            .is_none_or(HashSet::is_empty);
+        if should_detach {
             let _ = device_tx
                 .send(TunnelMessage::Text(json!({
                     "type": "session.detach",

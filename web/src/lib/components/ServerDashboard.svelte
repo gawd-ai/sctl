@@ -99,6 +99,26 @@
 		return 'text-red-400/80';
 	}
 
+	function signalBars(bars: number): string {
+		const blocks = ['\u2581', '\u2582', '\u2583', '\u2584', '\u2585'];
+		return blocks.slice(0, bars).join('');
+	}
+
+	function signalColor(bars: number): string {
+		if (bars >= 4) return 'text-green-400';
+		if (bars >= 2) return 'text-amber-400';
+		return 'text-red-400';
+	}
+
+	function gpsStatusDot(status: string): string {
+		switch (status) {
+			case 'active': return 'bg-green-500';
+			case 'searching': return 'bg-yellow-500 animate-pulse';
+			case 'error': return 'bg-red-500';
+			default: return 'bg-neutral-600';
+		}
+	}
+
 	function dotColor(status: ConnectionStatus): string {
 		switch (status) {
 			case 'connected': return 'bg-green-500';
@@ -207,7 +227,7 @@
 				</div>
 
 				<!-- Network -->
-				{@const upInterfaces = deviceInfo.interfaces.filter(i => i.state === 'up' || i.state === 'UP' || i.state === 'unknown')}
+				{@const upInterfaces = deviceInfo.interfaces.filter(i => { const s = i.state.toUpperCase(); return s === 'UP' || s === 'UNKNOWN'; })}
 				{#if upInterfaces.length > 0}
 					<div class="border border-neutral-800/60 rounded p-2.5 space-y-1">
 						<span class="text-[10px] text-neutral-600">[ network ]</span>
@@ -221,6 +241,97 @@
 								{/if}
 							</div>
 						{/each}
+					</div>
+				{/if}
+
+				<!-- LTE -->
+				{#if deviceInfo.lte}
+					<div class="border border-neutral-800/60 rounded p-2.5 space-y-1">
+						<div class="flex items-center justify-between">
+							<span class="text-[10px] text-neutral-600">[ lte ]</span>
+							<div class="flex items-center gap-1.5">
+								<span class="text-sm leading-none {signalColor(deviceInfo.lte.signal_bars)}">{signalBars(deviceInfo.lte.signal_bars)}</span>
+								{#if deviceInfo.lte.operator}
+									<span class="text-[10px] text-neutral-400">{deviceInfo.lte.operator}</span>
+								{/if}
+							</div>
+						</div>
+						<div class="text-[10px] text-neutral-300 tabular-nums">
+							{#if deviceInfo.lte.band}
+								<span>{deviceInfo.lte.band}</span>
+							{/if}
+							{#if deviceInfo.lte.technology}
+								<span class="text-neutral-500 ml-1">{deviceInfo.lte.technology}</span>
+							{/if}
+							{#if deviceInfo.lte.rsrp != null}
+								<span class="text-neutral-700 mx-1">|</span>
+								<span>RSRP {deviceInfo.lte.rsrp}</span>
+							{/if}
+							<span class="text-neutral-700 mx-1">|</span>
+							<span class="text-neutral-500">RSSI {deviceInfo.lte.rssi_dbm}</span>
+							{#if deviceInfo.lte.sinr != null}
+								<span class="text-neutral-700 mx-1">|</span>
+								<span class="text-neutral-500">SINR {deviceInfo.lte.sinr}</span>
+							{/if}
+							{#if deviceInfo.lte.rsrq != null}
+								<span class="text-neutral-700 mx-1">|</span>
+								<span class="text-neutral-500">RSRQ {deviceInfo.lte.rsrq}</span>
+							{/if}
+						</div>
+						{#if deviceInfo.lte.modem || deviceInfo.lte.cell_id}
+							<div class="text-[10px] text-neutral-600 tabular-nums">
+								{#if deviceInfo.lte.modem?.model}
+									<span>{deviceInfo.lte.modem.model}</span>
+								{/if}
+								{#if deviceInfo.lte.modem?.imei}
+									<span class="text-neutral-700 mx-1">|</span>
+									<span>{deviceInfo.lte.modem.imei}</span>
+								{/if}
+								{#if deviceInfo.lte.cell_id}
+									<span class="text-neutral-700 mx-1">|</span>
+									<span>cell {deviceInfo.lte.cell_id}</span>
+								{/if}
+							</div>
+						{/if}
+						{#if deviceInfo.lte.modem?.iccid}
+							<div class="text-[10px] text-neutral-700 tabular-nums">
+								ICCID {deviceInfo.lte.modem.iccid}
+							</div>
+						{/if}
+					</div>
+				{/if}
+
+				<!-- GPS -->
+				{#if deviceInfo.gps}
+					<div class="border border-neutral-800/60 rounded p-2.5 space-y-1">
+						<div class="flex items-center justify-between">
+							<span class="text-[10px] text-neutral-600">[ gps ]</span>
+							<div class="flex items-center gap-1.5">
+								<span class="w-1.5 h-1.5 rounded-full shrink-0 {gpsStatusDot(deviceInfo.gps.status)}"></span>
+								<span class="text-[10px] text-neutral-500">{deviceInfo.gps.status}</span>
+							</div>
+						</div>
+						{#if deviceInfo.gps.latitude != null && deviceInfo.gps.longitude != null}
+							<div class="text-[10px] text-neutral-300 tabular-nums">
+								{deviceInfo.gps.latitude.toFixed(4)}, {deviceInfo.gps.longitude.toFixed(4)}
+								{#if deviceInfo.gps.altitude != null}
+									<span class="text-neutral-600 ml-1">alt {deviceInfo.gps.altitude.toFixed(0)}m</span>
+								{/if}
+							</div>
+							<div class="text-[10px] text-neutral-500 tabular-nums">
+								{#if deviceInfo.gps.satellites != null}
+									<span>{deviceInfo.gps.satellites} sats</span>
+								{/if}
+								{#if deviceInfo.gps.hdop != null}
+									<span class="text-neutral-700 mx-1">|</span>
+									<span>hdop {deviceInfo.gps.hdop.toFixed(1)}</span>
+								{/if}
+								{#if deviceInfo.gps.fix_age_secs != null}
+									<span class="text-neutral-700 mx-1">|</span>
+									<span class="text-neutral-600">{deviceInfo.gps.fix_age_secs}s ago</span>
+								{/if}
+							</div>
+						{/if}
 					</div>
 				{/if}
 

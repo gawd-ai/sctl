@@ -256,6 +256,20 @@ fn builtin_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "device_gps",
+            "description": "Get GPS location data from a sctl device. Returns current fix (lat/lon/alt/speed/satellites), status (active/searching/error/disabled), and recent fix history. Returns an error if GPS is not configured on the device.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "device": {
+                        "type": "string",
+                        "description": "Device name. Omit to use the default device."
+                    }
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "session_start",
             "description": "Start a persistent interactive shell session on a device. Returns a session_id for subsequent calls. Sessions are NEVER killed automatically unless you set idle_timeout. Use idle_timeout to control cleanup of sessions you may not return to.\n\nSession lifecycle:\n- idle_timeout=0 (default): session lives forever until explicitly killed via session_kill\n- idle_timeout=N: session is gracefully terminated after N seconds of inactivity while detached (no client connected)\n- For long-running work, use 0 or a high value (3600). For quick one-off commands, use a lower value (300-600).\n- Activity resets whenever you send input or re-attach.\n\nSet pty=true for full terminal emulation (TUI programs like nano, vi, htop).\n\nPTY workflow:\n1. session_exec to run commands — works in both shell prompts and TUI programs (auto-appends Enter)\n2. session_send for raw keystrokes without Enter (arrow keys, Ctrl combos, Escape sequences)\n3. session_read to see output (contains ANSI escape codes in PTY mode)\n\nSee session_send description for full list of control characters and escape sequences (arrow keys, function keys, navigation keys, etc.).\n\nPTY workflow for TUI programs (Claude Code, fzf, dialog, etc.):\n- Use session_send to type text (no Enter appended)\n- Use session_send with \\n to press Enter (auto-translated to \\r)\n- Do NOT use session_exec for TUI input fields — it sends text+Enter as one write, which TUIs may interpret as embedded newline rather than submit",
             "inputSchema": {
@@ -672,6 +686,7 @@ pub async fn handle_tool_call(
         "device_file_write" => handle_device_file_write(args, registry).await,
         "device_file_delete" => handle_device_file_delete(args, registry).await,
         "device_activity" => handle_device_activity(args, registry).await,
+        "device_gps" => handle_device_gps(args, registry).await,
         "session_start" => handle_session_start(args, registry).await,
         "session_exec" => handle_session_exec(args, registry).await,
         "session_send" => handle_session_send(args, registry).await,
@@ -844,6 +859,11 @@ async fn handle_device_file_read(args: &Value, registry: &DeviceRegistry) -> Too
     }
 }
 
+/// Threshold above which base64-encoded content is uploaded via gawdxfer chunked
+/// transfer instead of a single PUT /api/files request. 2MB raw bytes gives
+/// plenty of headroom below the relay's 10MB proxy limit.
+const CHUNKED_UPLOAD_THRESHOLD: usize = 2 * 1024 * 1024;
+
 async fn handle_device_file_write(args: &Value, registry: &DeviceRegistry) -> ToolResult {
     let client = match registry.resolve(get_device_param(args)).await {
         Ok(c) => c,
@@ -863,6 +883,31 @@ async fn handle_device_file_write(args: &Value, registry: &DeviceRegistry) -> To
     let encoding = args.get("encoding").and_then(Value::as_str);
     let mode = args.get("mode").and_then(Value::as_str);
     let create_dirs = args.get("create_dirs").and_then(Value::as_bool);
+
+    // Auto-select chunked upload for large base64-encoded files
+    if encoding == Some("base64") {
+        use base64::Engine;
+        match base64::engine::general_purpose::STANDARD.decode(content) {
+            Ok(raw_bytes) if raw_bytes.len() > CHUNKED_UPLOAD_THRESHOLD => {
+                // Ensure parent dirs exist before chunked upload
+                if create_dirs == Some(true) {
+                    if let Some(parent) = path.rsplit_once('/').map(|(p, _)| p) {
+                        if !parent.is_empty() {
+                            let _ = client
+                                .exec(&format!("mkdir -p '{parent}'"), Some(5000), None, None)
+                                .await;
+                        }
+                    }
+                }
+                return match client.file_write_chunked(path, &raw_bytes, mode).await {
+                    Ok(v) => ToolResult::success(v),
+                    Err(e) => ToolResult::error(e.to_string()),
+                };
+            }
+            Ok(_) => {} // Under threshold, use normal path
+            Err(e) => return ToolResult::error(format!("Invalid base64 content: {e}")),
+        }
+    }
 
     match client
         .file_write(path, content, encoding, mode, create_dirs)
@@ -902,6 +947,23 @@ async fn handle_device_activity(args: &Value, registry: &DeviceRegistry) -> Tool
     match client.activity(since_id, limit).await {
         Ok(v) => ToolResult::success(v),
         Err(e) => ToolResult::error(e.to_string()),
+    }
+}
+
+async fn handle_device_gps(args: &Value, registry: &DeviceRegistry) -> ToolResult {
+    let client = match registry.resolve(get_device_param(args)).await {
+        Ok(c) => c,
+        Err(e) => return ToolResult::error(e),
+    };
+    match client.gps().await {
+        Ok(v) => ToolResult::success(v),
+        Err(e) => {
+            if e.is_not_found() {
+                ToolResult::error("GPS not configured on this device".into())
+            } else {
+                ToolResult::error(e.to_string())
+            }
+        }
     }
 }
 

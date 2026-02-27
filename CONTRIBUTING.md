@@ -15,10 +15,20 @@ Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before contributing.
 
 ```
 sctl/
-├── server/    # sctl — HTTP/WebSocket server (runs on target devices)
-├── mcp/       # mcp-sctl — MCP proxy (runs on client side)
-├── web/       # sctlin — Svelte 5 terminal UI component library
-└── .github/   # CI workflows
+├── server/        # sctl — HTTP/WebSocket server
+│   └── src/
+│       ├── routes/    # REST API handlers (exec, files, info, health, ...)
+│       ├── tunnel/    # Relay and client tunnel (NAT traversal)
+│       ├── sessions/  # Session management (PTY, persistence, AI status)
+│       ├── gps.rs     # GPS tracking via Quectel modem GNSS
+│       ├── lte.rs     # LTE signal monitoring via AT commands
+│       ├── modem.rs   # Shared AT command infrastructure (serial port mutex)
+│       ├── state.rs   # AppState, TunnelStats shared types
+│       └── lib.rs     # Library crate re-exports
+├── mcp/           # mcp-sctl — MCP proxy (runs on client side)
+├── web/           # sctlin — Svelte 5 terminal UI component library
+├── playbooks/     # Built-in playbook library
+└── .github/       # CI workflows
 ```
 
 The Rust crates are independent -- each has its own `Cargo.toml`, dependencies, and deployment target. The server targets embedded ARM devices; the MCP proxy runs on developer machines. The web package is a Svelte component library for terminal UIs.

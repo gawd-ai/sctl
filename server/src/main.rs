@@ -15,115 +15,16 @@
 //!
 //! - `sctl serve` (default) — run the HTTP/WS server
 //! - `sctl supervise` — run as supervisor: starts server and restarts on crash
-//!
-//! ## API surface
-//!
-//! | Method | Path                        | Auth | Description                          |
-//! |--------|-----------------------------|------|--------------------------------------|
-//! | GET    | `/api/health`               | No   | Liveness probe                       |
-//! | GET    | `/api/info`                 | Yes  | System info (IPs, CPU, mem, disk)    |
-//! | POST   | `/api/exec`                 | Yes  | One-shot command execution           |
-//! | POST   | `/api/exec/batch`           | Yes  | Batch command execution              |
-//! | GET    | `/api/files`                | Yes  | Read file or list directory          |
-//! | PUT    | `/api/files`                | Yes  | Write file (atomic)                  |
-//! | DELETE | `/api/files`                | Yes  | Delete a file                        |
-//! | GET    | `/api/activity`             | Yes  | Activity journal (with filters)      |
-//! | GET    | `/api/sessions`             | Yes  | List all sessions                    |
-//! | POST   | `/api/sessions/{id}/signal` | Yes  | Send POSIX signal to session         |
-//! | DELETE | `/api/sessions/{id}`        | Yes  | Kill a session                       |
-//! | PATCH  | `/api/sessions/{id}`        | Yes  | Rename / set AI permission & status  |
-//! | GET    | `/api/shells`               | Yes  | List available shells                |
-//! | GET    | `/api/events`               | Yes  | SSE event stream (real-time)         |
-//! | GET    | `/api/playbooks`            | Yes  | List playbooks                       |
-//! | GET    | `/api/playbooks/{name}`     | Yes  | Get playbook detail                  |
-//! | PUT    | `/api/playbooks/{name}`     | Yes  | Create/update playbook               |
-//! | DELETE | `/api/playbooks/{name}`     | Yes  | Delete playbook                      |
-//! | GET    | `/api/ws`                   | Yes* | WebSocket for interactive sessions   |
-//!
-//! *WebSocket auth is via `?token=<key>` query param (no `Authorization` header
-//! available during the upgrade handshake).
-//!
-//! ### Tunnel endpoints (when `tunnel.relay = true`)
-//!
-//! | Method | Path                                     | Auth         | Description                 |
-//! |--------|------------------------------------------|--------------|-----------------------------|
-//! | GET    | `/api/tunnel/register`                   | `tunnel_key` | Device WS registration      |
-//! | GET    | `/api/tunnel/devices`                    | `tunnel_key` | List connected devices      |
-//! | GET    | `/d/{serial}/api/health`                 | No           | Proxied device health       |
-//! | GET    | `/d/{serial}/api/info`                   | `api_key`    | Proxied device info         |
-//! | POST   | `/d/{serial}/api/exec`                   | `api_key`    | Proxied command execution   |
-//! | POST   | `/d/{serial}/api/exec/batch`             | `api_key`    | Proxied batch execution     |
-//! | GET    | `/d/{serial}/api/files`                  | `api_key`    | Proxied file read/list      |
-//! | PUT    | `/d/{serial}/api/files`                  | `api_key`    | Proxied file write          |
-//! | DELETE | `/d/{serial}/api/files`                  | `api_key`    | Proxied file delete         |
-//! | GET    | `/d/{serial}/api/files/raw`              | `api_key`    | Proxied file download       |
-//! | POST   | `/d/{serial}/api/files/upload`           | `api_key`    | Proxied file upload         |
-//! | GET    | `/d/{serial}/api/activity`               | `api_key`    | Proxied activity journal    |
-//! | GET    | `/d/{serial}/api/sessions`               | `api_key`    | Proxied session list        |
-//! | POST   | `/d/{serial}/api/sessions/{id}/signal`   | `api_key`    | Proxied session signal      |
-//! | DELETE | `/d/{serial}/api/sessions/{id}`          | `api_key`    | Proxied session kill        |
-//! | PATCH  | `/d/{serial}/api/sessions/{id}`          | `api_key`    | Proxied session patch       |
-//! | GET    | `/d/{serial}/api/shells`                 | `api_key`    | Proxied shell list          |
-//! | GET    | `/d/{serial}/api/playbooks`              | `api_key`    | Proxied playbook list       |
-//! | *      | `/d/{serial}/api/playbooks/{name}`       | `api_key`    | Proxied playbook CRUD       |
-//! | GET    | `/d/{serial}/api/ws`                     | `api_key`    | Proxied WS sessions         |
-//!
-//! Note: SSE (`/api/events`) is not proxied through the tunnel (incompatible
-//! with REST-over-WS relay pattern). Tunneled devices use WS proxy for events.
-//!
-//! ## Architecture
-//!
-//! ```text
-//! main.rs          — entry point, clap subcommands, router setup, graceful shutdown
-//! supervisor.rs    — built-in supervisor (fork/restart loop)
-//! activity.rs      — in-memory activity journal (ring buffer + broadcast)
-//! auth.rs          — Bearer token middleware, constant-time comparison
-//! config.rs        — TOML + env-var configuration
-//! routes/
-//!   health.rs      — GET /api/health
-//!   info.rs        — GET /api/info (system introspection)
-//!   exec.rs        — POST /api/exec, POST /api/exec/batch
-//!   files.rs       — GET/PUT/DELETE /api/files (read, write, list, delete)
-//!   activity.rs    — GET /api/activity (operation log, filtered)
-//!   sessions.rs    — GET/POST/DELETE/PATCH /api/sessions (list, signal, kill, patch)
-//!   shells.rs      — GET /api/shells (shell discovery)
-//!   events.rs      — GET /api/events (SSE event stream)
-//!   playbooks.rs   — CRUD /api/playbooks (list, get, put, delete)
-//! shell/
-//!   process.rs     — spawn_shell(), spawn_shell_pgroup(), exec_command()
-//!   pty.rs         — PTY allocation, spawn, resize
-//! sessions/
-//!   buffer.rs      — OutputBuffer ring buffer with Notify wakeup
-//!   session.rs     — ManagedSession (buffer-backed, process groups, PTY, signals)
-//!   journal.rs     — Disk-backed output journal for crash recovery
-//!   mod.rs         — SessionManager (lifecycle, attach/detach, sweep, recovery)
-//! ws/
-//!   mod.rs         — WebSocket upgrade, message dispatch, subscriber pattern
-//! tunnel/
-//!   mod.rs         — Reverse tunnel module root
-//!   client.rs      — Outbound WS to relay, reconnect, handles proxied requests
-//!   relay.rs       — Device registration, client routing, REST/WS proxy
-//! ```
 
-mod activity;
-mod auth;
-mod config;
-mod gawdxfer;
-mod routes;
-mod sessions;
-mod shell;
 mod supervisor;
-mod tunnel;
-mod util;
-mod ws;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Instant;
 
-use gawdxfer::manager::TransferManager;
-use gawdxfer::types::TransferConfig;
+use sctl::gawdxfer::manager::TransferManager;
+use sctl::gawdxfer::types::TransferConfig;
 
 use axum::{
     middleware,
@@ -131,17 +32,21 @@ use axum::{
     Extension, Router,
 };
 use clap::{Parser, Subcommand};
-use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
-use activity::{ActivityLog, ExecResultsCache};
-use auth::ApiKey;
-use config::Config;
-use sessions::SessionManager;
+use sctl::{
+    activity::ActivityLog,
+    auth::ApiKey,
+    config::Config,
+    gps, lte, routes, sessions,
+    sessions::SessionManager,
+    state::{AppState, TunnelStats},
+    tunnel, ws, ExecResultsCache,
+};
 
 /// Remote shell control service for Linux devices.
 #[derive(Parser)]
@@ -165,32 +70,6 @@ enum Commands {
         #[arg(long)]
         config: Option<String>,
     },
-}
-
-/// Shared application state passed to every handler via Axum's `State` extractor.
-#[derive(Clone)]
-pub struct AppState {
-    /// Immutable configuration loaded at startup.
-    pub config: Arc<Config>,
-    /// Monotonic instant when the server started (for uptime calculation).
-    pub start_time: Instant,
-    /// Manages the pool of interactive WebSocket shell sessions.
-    pub session_manager: SessionManager,
-    /// Broadcast channel for session lifecycle events (created/destroyed/renamed).
-    /// All connected WebSocket clients subscribe to receive real-time updates.
-    pub session_events: broadcast::Sender<Value>,
-    /// In-memory activity journal for REST/WS operation tracking.
-    pub activity_log: Arc<ActivityLog>,
-    /// In-memory cache of full exec results, keyed by activity ID.
-    pub exec_results_cache: Arc<ExecResultsCache>,
-    /// Whether the tunnel client is currently connected to the relay.
-    pub tunnel_connected: Arc<AtomicBool>,
-    /// Number of tunnel reconnects since startup.
-    pub tunnel_reconnects: Arc<AtomicU64>,
-    /// Chunked file transfer manager (gawdxfer).
-    pub transfer_manager: Arc<TransferManager>,
-    /// Current number of SSE connections (for connection limiting).
-    pub sse_connections: Arc<AtomicU32>,
 }
 
 #[tokio::main]
@@ -301,6 +180,24 @@ async fn run_server(config_path: Option<&str>) {
         session_events.clone(),
     ));
 
+    // GPS state (only when [gps] config is present)
+    let gps_state = config.gps.as_ref().map(|gc| {
+        info!(
+            "GPS tracking enabled (device: {}, poll: {}s)",
+            gc.device, gc.poll_interval_secs
+        );
+        Arc::new(tokio::sync::Mutex::new(gps::GpsState::new(gc.history_size)))
+    });
+
+    // LTE state (only when [lte] config is present)
+    let lte_state = config.lte.as_ref().map(|lc| {
+        info!(
+            "LTE monitoring enabled (device: {}, poll: {}s)",
+            lc.device, lc.poll_interval_secs
+        );
+        Arc::new(tokio::sync::Mutex::new(lte::LteState::new()))
+    });
+
     let state = AppState {
         session_manager,
         config: Arc::new(config),
@@ -308,10 +205,11 @@ async fn run_server(config_path: Option<&str>) {
         session_events,
         activity_log,
         exec_results_cache,
-        tunnel_connected: Arc::new(AtomicBool::new(false)),
-        tunnel_reconnects: Arc::new(AtomicU64::new(0)),
+        tunnel_stats: Arc::new(TunnelStats::new()),
         transfer_manager,
         sse_connections: Arc::new(AtomicU32::new(0)),
+        gps_state,
+        lte_state,
     };
 
     // Build router
@@ -362,7 +260,8 @@ async fn run_server(config_path: Option<&str>) {
                 .put(routes::playbooks::put_playbook)
                 .delete(routes::playbooks::delete_playbook),
         )
-        .layer(middleware::from_fn(auth::require_api_key));
+        .route("/api/gps", get(routes::gps::gps))
+        .layer(middleware::from_fn(sctl::auth::require_api_key));
 
     let ws_route = Router::new().route("/api/ws", get(ws::ws_upgrade));
 
@@ -410,8 +309,6 @@ async fn run_server(config_path: Option<&str>) {
     }
 
     // GUARD: .layer() only applies to routes merged BEFORE the call.
-    // All routes (including relay) MUST be merged above this point, otherwise
-    // CORS/tracing headers won't be added and browsers will block requests.
     let app = app.layer(cors).layer(TraceLayer::new_for_http()).layer(
         tower::limit::ConcurrencyLimitLayer::new(state.config.server.max_connections),
     );
@@ -422,17 +319,63 @@ async fn run_server(config_path: Option<&str>) {
 
     info!("Server ready");
 
-    // Tunnel: spawn client if configured
+    // Tunnel: spawn client if configured, with panic-recovery supervisor.
+    // If the tunnel task panics it will be restarted after 5s. A normal return
+    // (e.g. permanent auth error) stops the supervisor loop.
     let _tunnel_client_task = if let Some(ref tc) = tunnel_config {
         if tc.url.is_some() && !tc.relay {
             info!(
                 "Tunnel client mode enabled, will connect to {}",
                 tc.url.as_deref().unwrap()
             );
-            Some(tunnel::client::spawn(state.clone(), tc.clone()))
+            let tc = tc.clone();
+            let tunnel_state = state.clone();
+            Some(tokio::spawn(async move {
+                loop {
+                    let handle = tunnel::client::spawn(tunnel_state.clone(), tc.clone());
+                    match handle.await {
+                        Ok(()) => {
+                            // Normal return — tunnel client decided to stop (e.g. permanent auth error)
+                            info!("Tunnel client exited normally, not restarting");
+                            break;
+                        }
+                        Err(e) => {
+                            // JoinError means panic — restart after delay
+                            tracing::error!("Tunnel client panicked: {e}, restarting in 5s");
+                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        }
+                    }
+                }
+            }))
         } else {
             None
         }
+    } else {
+        None
+    };
+
+    // GPS poller (only when [gps] config is present)
+    let gps_config = state.config.gps.clone();
+    let gps_task = if let (Some(gc), Some(ref gs)) = (gps_config, &state.gps_state) {
+        Some(gps::spawn_gps_poller(
+            gc,
+            state.config.shell.default_shell.clone(),
+            gs.clone(),
+            state.session_events.clone(),
+        ))
+    } else {
+        None
+    };
+
+    // LTE poller (only when [lte] config is present)
+    let lte_config = state.config.lte.clone();
+    let lte_task = if let (Some(lc), Some(ref ls)) = (lte_config, &state.lte_state) {
+        Some(lte::spawn_lte_poller(
+            lc,
+            state.config.shell.default_shell.clone(),
+            ls.clone(),
+            state.session_events.clone(),
+        ))
     } else {
         None
     };
@@ -520,6 +463,19 @@ async fn run_server(config_path: Option<&str>) {
         }))
         .await;
         rs.drain_all().await;
+    }
+
+    // GPS: abort poller and disable GNSS
+    if let Some(task) = gps_task {
+        task.abort();
+    }
+    if let Some(ref gc) = state.config.gps {
+        gps::disable_gnss(gc, &state.config.shell.default_shell).await;
+    }
+
+    // LTE: abort poller
+    if let Some(task) = lte_task {
+        task.abort();
     }
 
     state.session_manager.kill_all().await;

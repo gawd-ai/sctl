@@ -35,7 +35,7 @@ impl SctlClient {
         let http = reqwest::Client::builder()
             .default_headers(default_headers)
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(120))
             .build()
             .expect("Failed to build HTTP client");
         // Strip trailing slash for consistent URL construction
@@ -99,14 +99,16 @@ impl SctlClient {
             body["env"] = serde_json::json!(e);
         }
 
-        let resp = self
+        let mut req = self
             .http
             .post(format!("{}/api/exec", self.base_url))
             .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(ClientError::Request)?;
+            .json(&body);
+        // Set per-request HTTP timeout to match command timeout + 10s margin
+        if let Some(t) = timeout_ms {
+            req = req.timeout(Duration::from_millis(t + 10_000));
+        }
+        let resp = req.send().await.map_err(ClientError::Request)?;
         Self::handle_response(resp).await
     }
 
@@ -283,6 +285,108 @@ impl SctlClient {
         Self::handle_response(resp).await
     }
 
+    /// `GET /api/gps` — GPS location data.
+    pub async fn gps(&self) -> Result<serde_json::Value, ClientError> {
+        let resp = self
+            .http
+            .get(format!("{}/api/gps", self.base_url))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .map_err(ClientError::Request)?;
+        Self::handle_response(resp).await
+    }
+
+    /// Upload a file using the gawdxfer chunked transfer protocol.
+    ///
+    /// For large files that exceed the relay's single-request proxy limit (~10MB),
+    /// this method splits the data into 256KB chunks and uploads each individually
+    /// with SHA-256 integrity verification.
+    pub async fn file_write_chunked(
+        &self,
+        path: &str,
+        data: &[u8],
+        mode: Option<&str>,
+    ) -> Result<serde_json::Value, ClientError> {
+        const CHUNK_SIZE: usize = 256 * 1024; // 256KB
+
+        let file_hash = sha256_hex(data);
+        let total_chunks = data.len().div_ceil(CHUNK_SIZE);
+
+        // Extract filename from path
+        let filename = path.rsplit('/').next().unwrap_or(path).to_string();
+
+        // 1. Init transfer
+        let mut init_body = serde_json::json!({
+            "path": path,
+            "filename": filename,
+            "file_size": data.len() as u64,
+            "file_hash": file_hash,
+            "chunk_size": CHUNK_SIZE as u32,
+            "total_chunks": total_chunks as u32,
+        });
+        if let Some(m) = mode {
+            init_body["mode"] = serde_json::json!(m);
+        }
+
+        let resp = self
+            .http
+            .post(format!("{}/api/stp/upload", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&init_body)
+            .send()
+            .await
+            .map_err(ClientError::Request)?;
+        let init_result = Self::handle_response(resp).await?;
+
+        let transfer_id = init_result["transfer_id"]
+            .as_str()
+            .ok_or_else(|| {
+                ClientError::Protocol("Missing transfer_id in upload init response".into())
+            })?
+            .to_string();
+
+        // 2. Upload chunks — use a longer timeout for chunk uploads
+        let chunk_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(120))
+            .build()
+            .map_err(|e| ClientError::Protocol(format!("Failed to build chunk client: {e}")))?;
+
+        for (idx, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
+            let chunk_hash = sha256_hex(chunk);
+
+            let resp = chunk_client
+                .post(format!(
+                    "{}/api/stp/chunk/{}/{}",
+                    self.base_url, transfer_id, idx
+                ))
+                .bearer_auth(&self.api_key)
+                .header("content-type", "application/octet-stream")
+                .header("x-gx-chunk-hash", &chunk_hash)
+                .body(chunk.to_vec())
+                .send()
+                .await
+                .map_err(ClientError::Request)?;
+            let ack = Self::handle_response(resp).await?;
+
+            if ack["ok"].as_bool() != Some(true) {
+                let err_msg = ack["error"].as_str().unwrap_or("chunk rejected");
+                return Err(ClientError::Protocol(format!(
+                    "Chunk {idx}/{total_chunks} rejected: {err_msg}"
+                )));
+            }
+        }
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "transfer_id": transfer_id,
+            "path": path,
+            "size": data.len(),
+            "chunks": total_chunks,
+        }))
+    }
+
     /// Parse an HTTP response — returns the JSON body on success, or a
     /// [`ClientError`] with the error message on failure.
     async fn handle_response(resp: reqwest::Response) -> Result<serde_json::Value, ClientError> {
@@ -304,6 +408,14 @@ impl SctlClient {
             })
         }
     }
+}
+
+/// Compute SHA-256 hash of data, returning lowercase hex string.
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
 }
 
 /// Errors returned by [`SctlClient`] methods.

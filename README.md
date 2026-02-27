@@ -13,7 +13,7 @@
 <p align="center">
   <a href="https://github.com/gawd-ai/sctl/actions/workflows/ci.yml"><img src="https://github.com/gawd-ai/sctl/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-blue.svg" alt="License: GPL-3.0" /></a>
-  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.75%2B-orange.svg" alt="Rust 1.75+" /></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.82%2B-orange.svg" alt="Rust 1.82+" /></a>
 </p>
 
 ---
@@ -49,6 +49,7 @@ Most AI agents can run commands locally. **sctl lets them operate remote devices
 - **Multi-device fleet** — manage many devices from one MCP server
 - **Auto-reconnect** — WebSocket drops are handled transparently with output replay
 - **Playbooks** — device-stored scripts auto-discovered as MCP tools
+- **GPS & LTE monitoring** — location tracking and signal metrics from Quectel modems
 - **Security-first** — constant-time auth, path traversal prevention, process isolation, atomic writes
 
 ## Quick Start
@@ -82,7 +83,7 @@ Verify it's running:
 
 ```bash
 curl http://localhost:1337/api/health
-# {"status":"ok","uptime_secs":5,"version":"0.3.0"}
+# {"status":"ok","uptime_secs":5,"version":"0.4.0","sessions":0,...}
 ```
 
 **2. Start the MCP proxy** on your dev machine:
@@ -136,6 +137,9 @@ When connected via MCP, AI agents get these tools:
 | `device_exec_batch` | Execute multiple commands sequentially |
 | `device_file_read` | Read a file or list a directory |
 | `device_file_write` | Write a file atomically |
+| `device_file_delete` | Delete a file |
+| `device_activity` | Read the activity log (exec, file I/O, sessions) |
+| `device_gps` | GPS location data (fix, history, status) |
 | `session_start` | Start a persistent interactive shell (with optional PTY) |
 | `session_exec` | Run a command in a session |
 | `session_send` | Send raw input (arrow keys, Ctrl sequences) |

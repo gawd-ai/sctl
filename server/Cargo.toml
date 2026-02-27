@@ -10,7 +10,7 @@ homepage = "https://github.com/gawd-ai/sctl"
 readme = "README.md"
 keywords = ["remote-shell", "ai-agent", "pty", "embedded", "iot"]
 categories = ["command-line-utilities", "network-programming"]
-rust-version = "1.75"
+rust-version = "1.82"
 
 [dependencies]
 axum = { version = "0.8", features = ["ws", "multipart"] }

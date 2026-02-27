@@ -14,11 +14,19 @@
 #                        # build + start tunnel dev env (relay + clients + MCP via relay)
 #
 # Device management:
-#   ./rundev.sh device add <name> <host>   # discover + register a device
-#   ./rundev.sh device rm <name>           # remove a device
-#   ./rundev.sh device ls                  # list devices with health status
-#   ./rundev.sh device deploy <name>       # full deploy (binary + config + init)
-#   ./rundev.sh device upgrade <name>      # binary-only upgrade
+#   ./rundev.sh device add <name> <host>        # discover + register a device
+#   ./rundev.sh device rm <name>                # remove a device
+#   ./rundev.sh device ls                       # list devices with health status
+#   ./rundev.sh device deploy <name>            # full deploy (binary + config + init)
+#   ./rundev.sh device upgrade <name>           # binary-only upgrade via SSH
+#   ./rundev.sh device deploy-watchdog <name>   # deploy watchdog + cron (SSH or API)
+#   ./rundev.sh device upgrade-remote <name>    # binary upgrade via relay (no SSH)
+#
+# Relay VPS deployment:
+#   ./rundev.sh relay setup <user@host>   # full VPS provisioning (Caddy + sctl + firewall)
+#   ./rundev.sh relay deploy [user@host]  # deploy binary + service (preserves config)
+#   ./rundev.sh relay upgrade [user@host] # binary-only upgrade
+#   ./rundev.sh relay status [user@host]  # health check + connected devices
 #
 # Playbook library:
 #   ./rundev.sh playbook ls                          # list playbooks in library
@@ -54,6 +62,11 @@ TUNNEL_KEY="dev-tunnel-key"
 DEVICE_SERIAL="DEV-LOCAL-001"
 CLOUDFLARED_PID_FILE="$DATA_DIR/cloudflared.pid"
 
+# Relay VPS deployment
+RELAY_X86_BIN="$SCTL_DIR/target/x86_64-unknown-linux-musl/release/sctl"
+RELAY_REMOTE_BIN="/usr/local/bin/sctl"
+RELAY_REMOTE_CONFIG="/etc/sctl/relay.toml"
+
 # Binaries (release for speed, debug takes too long on PTY-heavy sessions)
 SCTL_BIN="$SCTL_DIR/target/release/sctl"
 MCP_BIN="$MCP_DIR/target/release/mcp-sctl"
@@ -70,6 +83,12 @@ log()  { echo -e "\033[1;34m==>\033[0m $*"; }
 err()  { echo -e "\033[1;31m==>\033[0m $*" >&2; }
 ok()   { echo -e "\033[1;32m==>\033[0m $*"; }
 warn() { echo -e "\033[1;33m==>\033[0m $*" >&2; }
+
+# Check if mcp-sctl supervisor is running (spawned by Claude Code).
+# Returns 0 if alive — callers should skip killing/re-registering MCP.
+is_mcp_alive() {
+    pgrep -f "mcp-sctl.*--supervisor" &>/dev/null
+}
 
 # ─── Config helpers ──────────────────────────────────────────────────
 
@@ -250,8 +269,12 @@ do_kill() {
         rm -f "$CLOUDFLARED_PID_FILE"
     fi
 
-    # Kill any lingering mcp-sctl processes
-    pkill -INT -f "mcp-sctl" 2>/dev/null && ok "Stopped mcp-sctl" || true
+    # Kill mcp-sctl only if not managed by Claude Code
+    if is_mcp_alive; then
+        ok "mcp-sctl supervisor alive (managed by Claude Code) — leaving it running"
+    else
+        pkill -INT -f "mcp-sctl" 2>/dev/null && ok "Stopped mcp-sctl" || true
+    fi
 }
 
 # ─── stop ────────────────────────────────────────────────────────────
@@ -259,8 +282,10 @@ do_kill() {
 do_stop() {
     log "Stopping..."
 
-    # Deregister MCP from Claude Code
-    if claude mcp get "$MCP_NAME" &>/dev/null; then
+    # Deregister MCP only if not managed by a live Claude session
+    if is_mcp_alive; then
+        ok "mcp-sctl managed by Claude Code — skipping deregister"
+    elif claude mcp get "$MCP_NAME" &>/dev/null; then
         claude mcp remove "$MCP_NAME" 2>/dev/null && ok "Removed MCP server '$MCP_NAME' from Claude Code" || true
     fi
 
@@ -331,6 +356,13 @@ generate_sctlin_seed() {
     require_jq
     local seed_file="$WEB_DIR/static/sctlin-seed.json"
 
+    # In tunnel mode the config is rewritten with relay URLs — use the
+    # pre-tunnel backup so we get the real direct URLs for each device.
+    local source_config="$CONFIG_FILE"
+    if [[ -f "$CONFIG_FILE.pre-tunnel" ]]; then
+        source_config="$CONFIG_FILE.pre-tunnel"
+    fi
+
     # Build serial map: device name → serial (from config metadata or known defaults)
     # The relay proxy path is /d/{serial}/api/ws
     local serial_map="{\"local\": \"$DEVICE_SERIAL\"}"
@@ -338,10 +370,16 @@ generate_sctlin_seed() {
     serial_map=$(jq -r --argjson base "$serial_map" '
         [.devices | to_entries[] | select(.value.serial) | {(.key): .value.serial}]
         | reduce .[] as $item ($base; . + $item)
-    ' "$CONFIG_FILE")
+    ' "$source_config")
 
-    # Convert MCP device config → sctlin server entries (direct + relay)
-    jq --argjson serials "$serial_map" '[
+    # Convert MCP device config → sctlin server entries (direct + local-relay)
+    # Skip generating a localhost relay entry when:
+    #   - the device URL already contains /d/ (it IS a relay entry), OR
+    #   - a device named "{name}-relay" already exists in the config
+    local all_device_names
+    all_device_names=$(jq -r '[.devices | keys[]] | @json' "$source_config")
+
+    jq --argjson serials "$serial_map" --argjson names "$all_device_names" '[
         .devices | to_entries[] |
         # Direct entry
         {
@@ -352,8 +390,8 @@ generate_sctlin_seed() {
             shell: "",
             connected: false
         },
-        # Relay entry (only if serial is known)
-        if $serials[.key] then {
+        # Local dev relay entry (skip if URL contains /d/ or {name}-relay already exists)
+        if ($serials[.key] and (.value.url | test("/d/") | not) and ((.key + "-relay") as $rk | ($names | index($rk)) | not)) then {
             id: (.key + "-relay"),
             name: (.key + " (relay)"),
             wsUrl: ("ws://127.0.0.1:8443/d/" + $serials[.key] + "/api/ws"),
@@ -361,7 +399,7 @@ generate_sctlin_seed() {
             shell: "",
             connected: false
         } else empty end
-    ]' "$CONFIG_FILE" > "$seed_file"
+    ]' "$source_config" > "$seed_file"
 
     ok "sctlin seed generated: $seed_file ($(jq length "$seed_file") servers)"
 }
@@ -418,12 +456,16 @@ EOF
     # Start web dev server
     start_web_dev_server
 
-    # Register MCP server with Claude Code
-    log "Registering mcp-sctl with Claude Code..."
-    claude mcp remove "$MCP_NAME" 2>/dev/null || true
-    claude mcp add --transport stdio \
-        "$MCP_NAME" -- "$MCP_BIN" --supervisor --config "$CONFIG_FILE"
-    ok "MCP server '$MCP_NAME' registered (supervisor mode)"
+    # Register MCP server with Claude Code (skip if already managed)
+    if is_mcp_alive; then
+        ok "mcp-sctl already running (managed by Claude Code) — config hot-reload will pick up changes"
+    else
+        log "Registering mcp-sctl with Claude Code..."
+        claude mcp remove "$MCP_NAME" 2>/dev/null || true
+        claude mcp add --transport stdio \
+            "$MCP_NAME" -- "$MCP_BIN" --supervisor --config "$CONFIG_FILE"
+        ok "MCP server '$MCP_NAME' registered (supervisor mode)"
+    fi
 
     echo ""
     echo "============================================"
@@ -434,8 +476,12 @@ EOF
     echo "  MCP server:   $MCP_NAME (stdio, managed by Claude Code)"
     echo "  Config:       $CONFIG_FILE"
     echo ""
-    echo "  Restart Claude Code or start a new conversation"
-    echo "  to pick up the MCP server. Run /mcp to verify."
+    if is_mcp_alive; then
+        echo "  MCP is live — config changes picked up automatically."
+    else
+        echo "  Restart Claude Code or start a new conversation"
+        echo "  to pick up the MCP server. Run /mcp to verify."
+    fi
     echo ""
     echo "  Press Ctrl+C to stop all services."
     echo "============================================"
@@ -524,14 +570,18 @@ EOF
 
     generate_sctlin_seed
 
-    log "Registering mcp-sctl with Claude Code..."
-    claude mcp remove "$MCP_NAME" 2>/dev/null || true
-    claude mcp add --transport stdio \
-        "$MCP_NAME" -- "$MCP_BIN" --supervisor --config "$CONFIG_FILE"
-    ok "MCP server '$MCP_NAME' registered (supervisor mode)"
-    echo ""
-    echo "  Restart Claude Code or start a new conversation"
-    echo "  to pick up the MCP server. Run /mcp to verify."
+    if is_mcp_alive; then
+        ok "mcp-sctl already running (managed by Claude Code) — config hot-reload will pick up changes"
+    else
+        log "Registering mcp-sctl with Claude Code..."
+        claude mcp remove "$MCP_NAME" 2>/dev/null || true
+        claude mcp add --transport stdio \
+            "$MCP_NAME" -- "$MCP_BIN" --supervisor --config "$CONFIG_FILE"
+        ok "MCP server '$MCP_NAME' registered (supervisor mode)"
+        echo ""
+        echo "  Restart Claude Code or start a new conversation"
+        echo "  to pick up the MCP server. Run /mcp to verify."
+    fi
 }
 
 # ─── device add ──────────────────────────────────────────────────────
@@ -931,6 +981,419 @@ do_device_upgrade() {
     fi
 }
 
+# ─── device deploy-watchdog ──────────────────────────────────────────
+
+# Watchdog script content — ash-compatible, deployed to /etc/sctl/watchdog.sh.
+# Runs every 2 minutes via cron. Ensures sctl stays running and handles
+# rollback if a bad binary is deployed.
+WATCHDOG_SCRIPT='#!/bin/sh
+# sctl watchdog — keeps sctl running, handles rollback on failed upgrades.
+# Deployed by: rundev.sh device deploy-watchdog
+# Schedule: */2 * * * * /etc/sctl/watchdog.sh
+
+SCTL_BIN="/usr/bin/sctl"
+ROLLBACK_BIN="/usr/bin/sctl.rollback"
+FAIL_FILE="/tmp/sctl-watchdog-fails"
+HEALTH_URL="http://127.0.0.1:1337/api/health"
+LOG_TAG="sctl-watchdog"
+MAX_FAILS=3
+
+log() { logger -t "$LOG_TAG" "$1"; }
+
+# Count consecutive failures
+get_fails() {
+    if [ -f "$FAIL_FILE" ]; then
+        cat "$FAIL_FILE"
+    else
+        echo 0
+    fi
+}
+set_fails() { echo "$1" > "$FAIL_FILE"; }
+
+# Check if sctl process is running
+is_running() {
+    pgrep -f "sctl.*(serve|supervise)" >/dev/null 2>&1
+}
+
+# Health check via wget (BusyBox)
+is_healthy() {
+    wget -qO /dev/null -T 5 "$HEALTH_URL" 2>/dev/null
+}
+
+# ── Main logic ──
+
+# 1. If sctl not running, start it
+if ! is_running; then
+    log "sctl not running, starting..."
+    /etc/init.d/sctl start
+    sleep 3
+fi
+
+# 2. Health check
+if is_healthy; then
+    # Healthy — reset fail counter
+    if [ "$(get_fails)" -gt 0 ]; then
+        log "sctl healthy again, resetting fail counter"
+        set_fails 0
+    fi
+
+    # If rollback binary exists for >10 min, upgrade is confirmed — clean up
+    if [ -f "$ROLLBACK_BIN" ]; then
+        rollback_age=$(( $(date +%s) - $(date -r "$ROLLBACK_BIN" +%s 2>/dev/null || echo 0) ))
+        if [ "$rollback_age" -gt 600 ]; then
+            log "upgrade confirmed (healthy for >10min), removing rollback binary"
+            rm -f "$ROLLBACK_BIN"
+        fi
+    fi
+else
+    # Unhealthy — increment fail counter
+    fails=$(get_fails)
+    fails=$((fails + 1))
+    set_fails "$fails"
+    log "health check failed ($fails/$MAX_FAILS)"
+
+    if [ "$fails" -ge "$MAX_FAILS" ]; then
+        if [ -f "$ROLLBACK_BIN" ]; then
+            # Rollback to previous binary
+            log "ROLLBACK: swapping to previous binary after $fails failures"
+            cp "$ROLLBACK_BIN" "$SCTL_BIN"
+            rm -f "$ROLLBACK_BIN"
+            /etc/init.d/sctl restart
+            set_fails 0
+        else
+            # No rollback available — just restart
+            log "restarting sctl after $fails failures (no rollback available)"
+            /etc/init.d/sctl restart
+            set_fails 0
+        fi
+    fi
+fi
+'
+
+do_device_deploy_watchdog() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        err "Usage: $0 device deploy-watchdog <name>"
+        exit 1
+    fi
+
+    require_jq
+    ensure_config
+
+    if ! cfg_device_exists "$name"; then
+        err "Device '$name' not found"
+        exit 1
+    fi
+
+    local host url api_key
+    host=$(cfg_device_get "$name" "host")
+    url=$(cfg_device_get "$name" "url")
+    api_key=$(cfg_device_get "$name" "api_key")
+
+    # Determine transport: SSH (if host reachable) or API (via relay)
+    local use_ssh=false
+    if [[ -n "$host" ]]; then
+        if ssh -o ConnectTimeout=3 -o BatchMode=yes "root@$host" true 2>/dev/null; then
+            use_ssh=true
+        fi
+    fi
+
+    if [[ "$use_ssh" == "true" ]]; then
+        log "Deploying watchdog to '$name' via SSH ($host)..."
+
+        local ssh_opts="-o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new"
+
+        # Write watchdog script
+        echo "$WATCHDOG_SCRIPT" | ssh $ssh_opts "root@$host" "cat > /etc/sctl/watchdog.sh && chmod +x /etc/sctl/watchdog.sh"
+        ok "Watchdog script deployed"
+
+        # Add cron entry (idempotent)
+        ssh $ssh_opts "root@$host" '
+            CRON_ENTRY="*/2 * * * * /etc/sctl/watchdog.sh"
+            if ! crontab -l 2>/dev/null | grep -qF "sctl/watchdog.sh"; then
+                (crontab -l 2>/dev/null; echo "$CRON_ENTRY") | crontab -
+            fi
+            /etc/init.d/cron restart 2>/dev/null || true
+        '
+        ok "Cron entry added (every 2 minutes)"
+    elif [[ -n "$url" && -n "$api_key" ]]; then
+        log "Deploying watchdog to '$name' via API ($url)..."
+
+        # Write watchdog script via file API
+        local escaped_script
+        escaped_script=$(printf '%s' "$WATCHDOG_SCRIPT" | jq -Rs .)
+        curl -sf -X PUT "$url/api/files?path=/etc/sctl/watchdog.sh" \
+            -H "Authorization: Bearer $api_key" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\": $escaped_script, \"mode\": \"0755\"}" >/dev/null
+        ok "Watchdog script deployed"
+
+        # Add cron entry via exec
+        curl -sf -X POST "$url/api/exec" \
+            -H "Authorization: Bearer $api_key" \
+            -H "Content-Type: application/json" \
+            -d '{"command": "if ! crontab -l 2>/dev/null | grep -qF \"sctl/watchdog.sh\"; then (crontab -l 2>/dev/null; echo \"*/2 * * * * /etc/sctl/watchdog.sh\") | crontab -; fi; /etc/init.d/cron restart 2>/dev/null || true"}' >/dev/null
+        ok "Cron entry added (every 2 minutes)"
+    else
+        err "No SSH access and no API URL for device '$name'"
+        exit 1
+    fi
+
+    echo ""
+    ok "Watchdog deployed to '$name'"
+    echo "  Script: /etc/sctl/watchdog.sh"
+    echo "  Schedule: every 2 minutes via cron"
+    echo "  Rollback: swaps to /usr/bin/sctl.rollback after 3 failed health checks"
+}
+
+# ─── device upgrade-remote ───────────────────────────────────────────
+
+do_device_upgrade_remote() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        err "Usage: $0 device upgrade-remote <name>"
+        exit 1
+    fi
+
+    require_jq
+    ensure_config
+
+    if ! cfg_device_exists "$name"; then
+        err "Device '$name' not found"
+        exit 1
+    fi
+
+    local arch url api_key serial
+    arch=$(cfg_device_get "$name" "arch")
+    url=$(cfg_device_get "$name" "url")
+    api_key=$(cfg_device_get "$name" "api_key")
+    serial=$(cfg_device_get "$name" "serial")
+
+    if [[ -z "$url" || -z "$api_key" ]]; then
+        err "Device '$name' missing url or api_key in config"
+        exit 1
+    fi
+    if [[ -z "$arch" ]]; then
+        err "Device '$name' has no arch configured"
+        exit 1
+    fi
+
+    # Step 1: Cross-compile
+    local target bin_path
+    target=$(arch_to_target "$arch")
+    bin_path=$(arch_to_bin "$arch")
+
+    if [[ "$target" == "native" ]]; then
+        log "Building sctl for $arch (native)..."
+        (cd "$SCTL_DIR" && cargo build --release 2>&1)
+    else
+        log "Building sctl for $arch (cross: $target)..."
+        (cd "$SCTL_DIR" && cross build --release --target "$target" 2>&1)
+    fi
+    ok "Build complete: $bin_path"
+
+    local file_size chunk_size total_chunks
+    file_size=$(stat -c%s "$bin_path")
+    chunk_size=262144  # 256 KiB
+    total_chunks=$(( (file_size + chunk_size - 1) / chunk_size ))
+
+    log "Binary: $bin_path ($file_size bytes, $total_chunks chunks)"
+
+    # Step 2: Init upload via STP
+    log "Initiating upload to $url..."
+    local init_resp
+    init_resp=$(curl -sf -X POST "$url/api/stp/upload" \
+        -H "Authorization: Bearer $api_key" \
+        -H "Content-Type: application/json" \
+        -d "$(jq -n \
+            --arg path "/tmp" \
+            --arg filename "sctl-upgrade" \
+            --argjson file_size "$file_size" \
+            --argjson chunk_size "$chunk_size" \
+            --argjson total_chunks "$total_chunks" \
+            '{path: $path, filename: $filename, file_size: $file_size, chunk_size: $chunk_size, total_chunks: $total_chunks, file_hash: "", mode: "0755"}'
+        )")
+
+    if [[ -z "$init_resp" ]]; then
+        err "Failed to init upload"
+        exit 1
+    fi
+
+    local xfer_id
+    xfer_id=$(echo "$init_resp" | jq -r '.transfer_id')
+    if [[ -z "$xfer_id" || "$xfer_id" == "null" ]]; then
+        err "Invalid upload init response: $init_resp"
+        exit 1
+    fi
+    ok "Transfer ID: $xfer_id"
+
+    # Step 3: Upload chunks
+    log "Uploading $total_chunks chunks..."
+    local idx=0
+    local failed=false
+    while [[ $idx -lt $total_chunks ]]; do
+        local offset=$((idx * chunk_size))
+        local this_size=$chunk_size
+        if [[ $((offset + this_size)) -gt $file_size ]]; then
+            this_size=$((file_size - offset))
+        fi
+
+        # Extract chunk and compute hash
+        local chunk_hash
+        chunk_hash=$(dd if="$bin_path" bs=1 skip="$offset" count="$this_size" 2>/dev/null | sha256sum | cut -d' ' -f1)
+
+        local chunk_resp
+        chunk_resp=$(dd if="$bin_path" bs=1 skip="$offset" count="$this_size" 2>/dev/null | \
+            curl -sf -X POST "$url/api/stp/chunk/$xfer_id/$idx" \
+                -H "Authorization: Bearer $api_key" \
+                -H "Content-Type: application/octet-stream" \
+                -H "X-Gx-Chunk-Hash: $chunk_hash" \
+                --data-binary @-)
+
+        local ok_val
+        ok_val=$(echo "$chunk_resp" | jq -r '.ok // false')
+        if [[ "$ok_val" != "true" ]]; then
+            err "Chunk $idx failed: $chunk_resp"
+            # Retry once
+            sleep 1
+            chunk_hash=$(dd if="$bin_path" bs=1 skip="$offset" count="$this_size" 2>/dev/null | sha256sum | cut -d' ' -f1)
+            chunk_resp=$(dd if="$bin_path" bs=1 skip="$offset" count="$this_size" 2>/dev/null | \
+                curl -sf -X POST "$url/api/stp/chunk/$xfer_id/$idx" \
+                    -H "Authorization: Bearer $api_key" \
+                    -H "Content-Type: application/octet-stream" \
+                    -H "X-Gx-Chunk-Hash: $chunk_hash" \
+                    --data-binary @-)
+            ok_val=$(echo "$chunk_resp" | jq -r '.ok // false')
+            if [[ "$ok_val" != "true" ]]; then
+                err "Chunk $idx retry failed, aborting"
+                curl -sf -X DELETE "$url/api/stp/$xfer_id" \
+                    -H "Authorization: Bearer $api_key" >/dev/null 2>&1 || true
+                failed=true
+                break
+            fi
+        fi
+
+        # Progress
+        printf "\r  chunks: %d/%d" "$((idx + 1))" "$total_chunks"
+        idx=$((idx + 1))
+    done
+    echo ""
+
+    if [[ "$failed" == "true" ]]; then
+        exit 1
+    fi
+
+    # Step 4: Wait for transfer completion (verification)
+    log "Waiting for transfer verification..."
+    local phase=""
+    for _ in $(seq 1 30); do
+        local status_resp
+        status_resp=$(curl -sf "$url/api/stp/status/$xfer_id" \
+            -H "Authorization: Bearer $api_key" 2>/dev/null) || true
+        phase=$(echo "$status_resp" | jq -r '.phase // empty')
+        case "$phase" in
+            complete)
+                ok "Upload complete and verified"
+                break
+                ;;
+            failed)
+                err "Transfer verification failed: $(echo "$status_resp" | jq -r '.error // "unknown"')"
+                exit 1
+                ;;
+            *)
+                sleep 0.5
+                ;;
+        esac
+    done
+    if [[ "$phase" != "complete" ]]; then
+        err "Transfer did not complete (phase: $phase)"
+        exit 1
+    fi
+
+    # Step 5: Verify binary on device
+    log "Verifying uploaded binary..."
+    local verify_resp
+    verify_resp=$(curl -sf -X POST "$url/api/exec" \
+        -H "Authorization: Bearer $api_key" \
+        -H "Content-Type: application/json" \
+        -d '{"command": "/tmp/sctl-upgrade --version", "timeout": 5000}')
+    local verify_out
+    verify_out=$(echo "$verify_resp" | jq -r '.stdout // empty')
+    if [[ -z "$verify_out" ]]; then
+        err "Binary verification failed — not executable or crashed"
+        err "Response: $verify_resp"
+        # Clean up
+        curl -sf -X POST "$url/api/exec" \
+            -H "Authorization: Bearer $api_key" \
+            -H "Content-Type: application/json" \
+            -d '{"command": "rm -f /tmp/sctl-upgrade"}' >/dev/null 2>&1 || true
+        exit 1
+    fi
+    ok "Binary verified: $verify_out"
+
+    # Step 6: Ensure watchdog is deployed
+    log "Ensuring watchdog is deployed..."
+    local wd_check
+    wd_check=$(curl -sf -X POST "$url/api/exec" \
+        -H "Authorization: Bearer $api_key" \
+        -H "Content-Type: application/json" \
+        -d '{"command": "test -f /etc/sctl/watchdog.sh && echo yes || echo no"}')
+    local has_watchdog
+    has_watchdog=$(echo "$wd_check" | jq -r '.stdout // empty' | tr -d '[:space:]')
+    if [[ "$has_watchdog" != "yes" ]]; then
+        warn "Watchdog not found, deploying..."
+        do_device_deploy_watchdog "$name"
+    else
+        ok "Watchdog already deployed"
+    fi
+
+    # Step 7: Swap binary via nohup (survives sctl restart)
+    log "Swapping binary and restarting sctl..."
+    curl -sf -X POST "$url/api/exec" \
+        -H "Authorization: Bearer $api_key" \
+        -H "Content-Type: application/json" \
+        -d '{"command": "nohup sh -c '\''cp /usr/bin/sctl /usr/bin/sctl.rollback && cp /tmp/sctl-upgrade /usr/bin/sctl && chmod +x /usr/bin/sctl && /etc/init.d/sctl restart'\'' > /tmp/sctl-upgrade.log 2>&1 &"}' >/dev/null 2>&1 || true
+
+    # Step 8: Poll health through relay
+    log "Waiting for device to come back up (60s timeout)..."
+    local healthy=false
+    for i in $(seq 1 60); do
+        sleep 1
+        local health_resp
+        health_resp=$(curl -sf "$url/api/health" 2>/dev/null) || continue
+        local version
+        version=$(echo "$health_resp" | jq -r '.version // empty')
+        if [[ -n "$version" ]]; then
+            healthy=true
+            ok "Device healthy after ${i}s (version: $version)"
+
+            # Update version in config
+            jq --arg name "$name" --arg ver "$version" \
+                '.devices[$name].sctl_version = $ver' \
+                "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+            break
+        fi
+    done
+
+    if [[ "$healthy" == "true" ]]; then
+        # Clean up
+        log "Cleaning up..."
+        curl -sf -X POST "$url/api/exec" \
+            -H "Authorization: Bearer $api_key" \
+            -H "Content-Type: application/json" \
+            -d '{"command": "rm -f /tmp/sctl-upgrade /tmp/sctl-upgrade.log"}' >/dev/null 2>&1 || true
+
+        echo ""
+        ok "Remote upgrade complete for '$name'"
+        echo "  Rollback binary at /usr/bin/sctl.rollback will be auto-removed after 10 min"
+    else
+        echo ""
+        warn "Device did not come back within 60s"
+        warn "The watchdog will attempt rollback within 6 minutes if health checks fail"
+        warn "Check status: curl -sf $url/api/health"
+    fi
+}
+
 # ─── playbook library ────────────────────────────────────────────────
 
 PLAYBOOKS_LIBRARY_DIR="$REPO_DIR/playbooks"
@@ -1279,8 +1742,9 @@ EOF
                 log "  $rname ($rhost) — relay via $our_ip:8443"
             fi
 
-            # Build optional DNS fixup for external tunnel URLs
+            # Build optional DNS fixup and LTE bind for external tunnel URLs
             local dns_fixup=""
+            local bind_address_line=""
             if [[ -n "$remote_relay_url" ]]; then
                 dns_fixup='
 # Ensure DNS can resolve external hostnames (dnsmasq may use a local
@@ -1292,14 +1756,25 @@ if [ -n "$DNSMASQ_CONFDIR" ] && [ ! -f "$DNSMASQ_CONFDIR/tunnel-dns.conf" ]; the
     /etc/init.d/dnsmasq restart 2>/dev/null || killall -HUP dnsmasq 2>/dev/null || true
     sleep 1
 fi'
+                # Detect LTE interface for bind_address (force tunnel over cellular)
+                bind_address_line='
+# Check for wwan0 (LTE/cellular) interface — bind_address accepts interface names
+WWAN_IFACE=""
+if ip link show wwan0 >/dev/null 2>&1; then
+    WWAN_IFACE="wwan0"
+fi
+'
             fi
 
             # SSH in: stop init.d, create temp config, start sctl with tunnel
             local remote_script
             remote_script=$(cat <<REOF
-# Stop normal sctl
+# Stop normal sctl (init.d stop tells procd, killall ensures the process is gone)
 /etc/init.d/sctl stop 2>/dev/null || true
+killall sctl 2>/dev/null || true
+sleep 1
 $dns_fixup
+$bind_address_line
 
 # Copy config as base
 cp /etc/sctl/sctl.toml /tmp/sctl-relay.toml 2>/dev/null || true
@@ -1319,6 +1794,13 @@ cat >> /tmp/sctl-relay.toml <<TEOF
 tunnel_key = "$TUNNEL_KEY"
 url = "$device_tunnel_url"
 TEOF
+
+# Add bind_address if LTE interface was detected (forces tunnel over cellular)
+# Uses interface name so sctl resolves the current IP on each connect attempt,
+# surviving carrier IP reassignment across reboots.
+if [ -n "\$WWAN_IFACE" ]; then
+    echo "bind_address = \"\$WWAN_IFACE\"" >> /tmp/sctl-relay.toml
+fi
 
 # Start sctl with tunnel config (no nohup on OpenWrt/ash)
 /usr/bin/sctl serve --config /tmp/sctl-relay.toml >/tmp/sctl-relay.log 2>&1 &
@@ -1371,46 +1853,60 @@ REOF
         fi
     fi
 
-    # Rewrite MCP config with all devices routed via relay
+    # Rewrite MCP config with direct + relay entries for all devices
     log "Updating MCP config for relay routing..."
     local relay_config='{"config_version":2,"devices":{},"default_device":"local"}'
 
-    # Add local device via relay
+    # Add local device: direct + relay
     relay_config=$(echo "$relay_config" | jq \
-        --arg url "http://127.0.0.1:8443/d/$DEVICE_SERIAL" \
+        --arg direct_url "http://$LISTEN" \
+        --arg relay_url "http://127.0.0.1:8443/d/$DEVICE_SERIAL" \
         --arg key "$API_KEY" \
         --arg pb "$PLAYBOOKS_DIR" \
-        '.devices.local = {url: $url, api_key: $key, playbooks_dir: $pb}')
+        '.devices.local = {url: $direct_url, api_key: $key, playbooks_dir: $pb}
+         | .devices["local-relay"] = {url: $relay_url, api_key: $key, playbooks_dir: $pb}')
 
-    # Add remote devices via relay
+    # Add remote devices: direct + relay (preserving metadata from pre-tunnel config)
     for i in "${!remote_names[@]}"; do
         local rname="${remote_names[$i]}"
+        local rhost="${remote_hosts[$i]}"
         local rserial="${remote_serials[$i]}"
         local rapi_key="${remote_api_keys[$i]}"
 
         if [[ -n "$rserial" && "$rserial" != "unknown" ]]; then
+            # Read metadata from pre-tunnel backup so a mid-tunnel crash doesn't lose it
+            local meta
+            meta=$(jq -c ".devices[\"$rname\"] | {host, serial, arch, sctl_version, added_at} | with_entries(select(.value != null))" "$CONFIG_FILE.pre-tunnel" 2>/dev/null || echo '{}')
+
             relay_config=$(echo "$relay_config" | jq \
                 --arg name "$rname" \
-                --arg url "http://127.0.0.1:8443/d/$rserial" \
+                --arg direct_url "http://$rhost:1337" \
+                --arg relay_url "http://127.0.0.1:8443/d/$rserial" \
                 --arg key "$rapi_key" \
-                '.devices[$name] = {url: $url, api_key: $key}')
+                --argjson meta "$meta" \
+                '.devices[$name] = ({url: $direct_url, api_key: $key} + $meta)
+                 | .devices[$name + "-relay"] = ({url: $relay_url, api_key: $key} + $meta)')
         fi
     done
 
     echo "$relay_config" | jq '.' > "$CONFIG_FILE"
-    ok "MCP config updated for relay routing"
+    ok "MCP config updated (direct + relay entries for all devices)"
 
     generate_sctlin_seed
 
     # Start web dev server
     start_web_dev_server
 
-    # Register MCP server with Claude Code (via relay)
-    log "Registering mcp-sctl with Claude Code (via relay)..."
-    claude mcp remove "$MCP_NAME" 2>/dev/null || true
-    claude mcp add --transport stdio \
-        "$MCP_NAME" -- "$MCP_BIN" --supervisor --config "$CONFIG_FILE"
-    ok "MCP server '$MCP_NAME' registered (supervisor mode)"
+    # Register MCP server with Claude Code (skip if already managed)
+    if is_mcp_alive; then
+        ok "mcp-sctl already running (managed by Claude Code) — config hot-reload will pick up relay routing"
+    else
+        log "Registering mcp-sctl with Claude Code (via relay)..."
+        claude mcp remove "$MCP_NAME" 2>/dev/null || true
+        claude mcp add --transport stdio \
+            "$MCP_NAME" -- "$MCP_BIN" --supervisor --config "$CONFIG_FILE"
+        ok "MCP server '$MCP_NAME' registered (supervisor mode)"
+    fi
 
     echo ""
     echo "============================================"
@@ -1439,8 +1935,12 @@ REOF
     echo ""
     echo "  Traffic flow: client -> relay -> tunnel -> sctl device"
     echo ""
-    echo "  Restart Claude Code or start a new conversation"
-    echo "  to pick up the MCP server. Run /mcp to verify."
+    if is_mcp_alive; then
+        echo "  MCP is live — config changes picked up automatically."
+    else
+        echo "  Restart Claude Code or start a new conversation"
+        echo "  to pick up the MCP server. Run /mcp to verify."
+    fi
     echo ""
     echo "  Press Ctrl+C to stop all services."
     echo "============================================"
@@ -1485,10 +1985,11 @@ REOF
             rm -f "$CLOUDFLARED_PID_FILE"
         fi
 
-        # Restore config from backup
+        # Restore config from backup and regenerate sctlin seed
         if [[ -f "$CONFIG_FILE.pre-tunnel" ]]; then
             mv "$CONFIG_FILE.pre-tunnel" "$CONFIG_FILE"
             ok "Config restored from backup"
+            generate_sctlin_seed
         fi
 
         # Stop local services + deregister MCP
@@ -1506,6 +2007,369 @@ REOF
     tail -f "${tail_files[@]}" &
     TAIL_PID=$!
     wait $TAIL_PID
+}
+
+# ─── relay (production VPS deployment) ────────────────────────────────
+
+do_relay_setup() {
+    local remote="${1:-}"
+    if [[ -z "$remote" ]]; then
+        err "Usage: $0 relay setup <user@host>"
+        exit 1
+    fi
+
+    # Build x86_64-musl binary
+    log "Building sctl for x86_64-musl..."
+    make -C "$SCTL_DIR" build-x86
+
+    # Prompt for relay domain (optional — skip for IP-only staging)
+    local domain=""
+    read -rp "Relay domain (leave empty for IP-only, no TLS): " domain
+
+    # Extract host IP from user@host for IP-only mode
+    local remote_ip="${remote#*@}"
+
+    # Determine listen address, URLs, and WS scheme based on domain vs IP-only
+    local listen_addr relay_url tunnel_ws_url relay_port
+    if [[ -n "$domain" ]]; then
+        # Domain mode: Caddy handles TLS + reverse proxy on :443
+        listen_addr="127.0.0.1:8443"
+        relay_url="https://$domain"
+        tunnel_ws_url="wss://$domain/api/tunnel/register"
+        relay_port="443"
+    else
+        # IP-only mode: sctl binds directly, no Caddy
+        listen_addr="0.0.0.0:8443"
+        relay_url="http://$remote_ip:8443"
+        tunnel_ws_url="ws://$remote_ip:8443/api/tunnel/register"
+        relay_port="8443"
+    fi
+
+    # Generate tunnel key
+    local tunnel_key
+    tunnel_key=$(openssl rand -hex 16)
+    log "Generated tunnel_key: $tunnel_key"
+
+    local ssh_opts="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+
+    # Upload binary
+    log "Uploading sctl binary to $remote..."
+    ssh $ssh_opts "$remote" "systemctl stop sctl-relay 2>/dev/null || true"
+    scp $ssh_opts "$RELAY_X86_BIN" "$remote:$RELAY_REMOTE_BIN"
+    ssh $ssh_opts "$remote" "chmod +x $RELAY_REMOTE_BIN"
+    ok "Binary uploaded"
+
+    # Generate and upload relay.toml
+    log "Generating relay config..."
+    local relay_toml
+    relay_toml=$(cat <<EOF
+[server]
+listen = "$listen_addr"
+max_connections = 100
+journal_enabled = false
+data_dir = "/var/lib/sctl"
+
+[auth]
+api_key = "relay-no-direct-api"
+
+[device]
+serial = "RELAY-001"
+
+[logging]
+level = "info"
+
+[tunnel]
+relay = true
+tunnel_key = "$tunnel_key"
+heartbeat_timeout_secs = 45
+tunnel_proxy_timeout_secs = 60
+EOF
+    )
+    ssh $ssh_opts "$remote" "mkdir -p /etc/sctl /var/lib/sctl"
+    echo "$relay_toml" | ssh $ssh_opts "$remote" "cat > $RELAY_REMOTE_CONFIG"
+    ok "Config uploaded"
+
+    # Upload systemd service
+    log "Installing systemd service..."
+    scp $ssh_opts "$SCTL_DIR/files/sctl-relay.service" "$remote:/etc/systemd/system/sctl-relay.service"
+    ssh $ssh_opts "$remote" "systemctl daemon-reload && systemctl enable sctl-relay"
+    ok "Service installed"
+
+    # Install + configure Caddy (domain mode only)
+    if [[ -n "$domain" ]]; then
+        log "Installing Caddy..."
+        ssh $ssh_opts "$remote" bash <<'CADDY_EOF'
+if ! command -v caddy &>/dev/null; then
+    apt-get update -qq
+    apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
+    apt-get update -qq
+    apt-get install -y -qq caddy
+fi
+echo "Caddy $(caddy version 2>/dev/null || echo 'installed')"
+CADDY_EOF
+        ok "Caddy ready"
+
+        log "Configuring Caddy for $domain..."
+        echo "$domain {
+    reverse_proxy localhost:8443
+}" | ssh $ssh_opts "$remote" "cat > /etc/caddy/Caddyfile"
+        ssh $ssh_opts "$remote" "systemctl restart caddy"
+        ok "Caddy configured for $domain"
+    fi
+
+    # Configure ufw
+    log "Configuring firewall..."
+    if [[ -n "$domain" ]]; then
+        ssh $ssh_opts "$remote" bash <<'UFW_EOF'
+if command -v ufw &>/dev/null; then
+    ufw allow 22/tcp >/dev/null 2>&1
+    ufw allow 80/tcp >/dev/null 2>&1
+    ufw allow 443/tcp >/dev/null 2>&1
+    echo "y" | ufw enable 2>/dev/null || true
+    ufw status | grep -E "^(22|80|443)"
+else
+    echo "ufw not found — skipping firewall config"
+fi
+UFW_EOF
+    else
+        ssh $ssh_opts "$remote" bash <<'UFW_EOF'
+if command -v ufw &>/dev/null; then
+    ufw allow 22/tcp >/dev/null 2>&1
+    ufw allow 8443/tcp >/dev/null 2>&1
+    echo "y" | ufw enable 2>/dev/null || true
+    ufw status | grep -E "^(22|8443)"
+else
+    echo "ufw not found — skipping firewall config"
+fi
+UFW_EOF
+    fi
+    ok "Firewall configured"
+
+    # Start relay service
+    log "Starting sctl-relay service..."
+    ssh $ssh_opts "$remote" "systemctl start sctl-relay"
+    sleep 2
+
+    # Health check
+    log "Checking relay health..."
+    local health
+    health=$(ssh $ssh_opts "$remote" "curl -sf http://127.0.0.1:8443/api/health" 2>/dev/null) || true
+    if [[ -n "$health" ]]; then
+        ok "Relay healthy: $health"
+    else
+        warn "Health check failed — check logs: ssh $remote journalctl -u sctl-relay -n 50"
+    fi
+
+    # Save to .env.local
+    local env_file="$REPO_DIR/.env.local"
+    # Remove old relay vars if present
+    if [[ -f "$env_file" ]]; then
+        grep -v '^RELAY_URL=\|^RELAY_TUNNEL_KEY=\|^RELAY_HOST=\|^RELAY_DOMAIN=' "$env_file" > "$env_file.tmp" || true
+        mv "$env_file.tmp" "$env_file"
+    fi
+    cat >> "$env_file" <<EOF
+
+# Relay VPS (auto-generated by rundev.sh relay setup)
+RELAY_HOST=$remote
+RELAY_DOMAIN=$domain
+RELAY_URL=$relay_url
+RELAY_TUNNEL_KEY=$tunnel_key
+EOF
+    ok "Saved relay config to .env.local"
+
+    echo ""
+    echo "============================================"
+    ok "Relay setup complete!"
+    echo ""
+    if [[ -n "$domain" ]]; then
+        echo "  Domain:       $domain"
+    fi
+    echo "  Relay URL:    $relay_url"
+    echo "  Tunnel key:   $tunnel_key"
+    echo "  Service:      sctl-relay (systemd)"
+    echo "  Host:         $remote"
+    echo ""
+    echo "  BPI config (/etc/sctl/sctl.toml):"
+    echo "    [tunnel]"
+    echo "    tunnel_key = \"$tunnel_key\""
+    echo "    url = \"$tunnel_ws_url\""
+    echo "    bind_address = \"wwan0\""
+    echo ""
+    echo "  MCP config (~/.config/sctl/devices.dev.json):"
+    echo "    \"bpi-relay\": {"
+    echo "      \"url\": \"$relay_url/d/<serial>\","
+    echo "      \"api_key\": \"<bpi api key>\""
+    echo "    }"
+    echo "============================================"
+}
+
+do_relay_deploy() {
+    local remote="${1:-}"
+    if [[ -z "$remote" ]]; then
+        # Try .env.local
+        if [[ -f "$REPO_DIR/.env.local" ]]; then
+            source "$REPO_DIR/.env.local"
+            remote="${RELAY_HOST:-}"
+        fi
+        if [[ -z "$remote" ]]; then
+            err "Usage: $0 relay deploy <user@host>"
+            err "  (or set RELAY_HOST in .env.local via 'relay setup')"
+            exit 1
+        fi
+        log "Using RELAY_HOST=$remote from .env.local"
+    fi
+
+    local ssh_opts="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+
+    # Check config exists remotely
+    if ! ssh $ssh_opts "$remote" "test -f $RELAY_REMOTE_CONFIG" 2>/dev/null; then
+        err "No config found at $remote:$RELAY_REMOTE_CONFIG"
+        err "Run '$0 relay setup $remote' first"
+        exit 1
+    fi
+
+    # Build
+    log "Building sctl for x86_64-musl..."
+    make -C "$SCTL_DIR" build-x86
+
+    # Stop, upload binary + service, start
+    log "Deploying to $remote..."
+    ssh $ssh_opts "$remote" "systemctl stop sctl-relay"
+    scp $ssh_opts "$RELAY_X86_BIN" "$remote:$RELAY_REMOTE_BIN"
+    ssh $ssh_opts "$remote" "chmod +x $RELAY_REMOTE_BIN"
+    scp $ssh_opts "$SCTL_DIR/files/sctl-relay.service" "$remote:/etc/systemd/system/sctl-relay.service"
+    ssh $ssh_opts "$remote" "systemctl daemon-reload && systemctl start sctl-relay"
+    ok "Binary + service deployed"
+
+    sleep 2
+
+    # Health check
+    local health
+    health=$(ssh $ssh_opts "$remote" "curl -sf http://127.0.0.1:8443/api/health" 2>/dev/null) || true
+    if [[ -n "$health" ]]; then
+        ok "Relay healthy: $health"
+    else
+        warn "Health check failed — check logs: ssh $remote journalctl -u sctl-relay -n 50"
+    fi
+}
+
+do_relay_upgrade() {
+    local remote="${1:-}"
+    if [[ -z "$remote" ]]; then
+        if [[ -f "$REPO_DIR/.env.local" ]]; then
+            source "$REPO_DIR/.env.local"
+            remote="${RELAY_HOST:-}"
+        fi
+        if [[ -z "$remote" ]]; then
+            err "Usage: $0 relay upgrade <user@host>"
+            err "  (or set RELAY_HOST in .env.local via 'relay setup')"
+            exit 1
+        fi
+        log "Using RELAY_HOST=$remote from .env.local"
+    fi
+
+    local ssh_opts="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+
+    # Get old version
+    local old_version
+    old_version=$(ssh $ssh_opts "$remote" "$RELAY_REMOTE_BIN --version 2>/dev/null || echo unknown") || old_version="unknown"
+
+    # Build
+    log "Building sctl for x86_64-musl..."
+    make -C "$SCTL_DIR" build-x86
+
+    # Stop, upload, start
+    log "Upgrading binary on $remote..."
+    ssh $ssh_opts "$remote" "systemctl stop sctl-relay"
+    scp $ssh_opts "$RELAY_X86_BIN" "$remote:$RELAY_REMOTE_BIN"
+    ssh $ssh_opts "$remote" "chmod +x $RELAY_REMOTE_BIN && systemctl start sctl-relay"
+
+    sleep 2
+
+    # Get new version
+    local new_version
+    new_version=$(ssh $ssh_opts "$remote" "$RELAY_REMOTE_BIN --version 2>/dev/null || echo unknown") || new_version="unknown"
+
+    # Health check
+    local health
+    health=$(ssh $ssh_opts "$remote" "curl -sf http://127.0.0.1:8443/api/health" 2>/dev/null) || true
+    if [[ -n "$health" ]]; then
+        ok "Upgrade complete: $old_version → $new_version"
+    else
+        warn "Health check failed after upgrade — check logs: ssh $remote journalctl -u sctl-relay -n 50"
+    fi
+}
+
+do_relay_status() {
+    local remote="${1:-}"
+
+    # If no host given, try external health check via RELAY_URL
+    if [[ -z "$remote" ]]; then
+        if [[ -f "$REPO_DIR/.env.local" ]]; then
+            source "$REPO_DIR/.env.local"
+        fi
+
+        if [[ -n "${RELAY_URL:-}" ]]; then
+            log "Checking relay health at $RELAY_URL..."
+            local health
+            health=$(curl -sf "$RELAY_URL/api/health" 2>/dev/null) || true
+            if [[ -n "$health" ]]; then
+                ok "Relay healthy: $health"
+            else
+                err "Relay unreachable at $RELAY_URL"
+            fi
+
+            # Try tunnel devices endpoint
+            if [[ -n "${RELAY_TUNNEL_KEY:-}" ]]; then
+                local devices
+                devices=$(curl -sf "$RELAY_URL/api/tunnel/devices?token=$RELAY_TUNNEL_KEY" 2>/dev/null) || true
+                if [[ -n "$devices" ]]; then
+                    echo ""
+                    echo "Connected devices:"
+                    echo "$devices" | python3 -m json.tool 2>/dev/null || echo "$devices"
+                fi
+            fi
+            return
+        fi
+
+        # Fall back to RELAY_HOST for SSH
+        remote="${RELAY_HOST:-}"
+        if [[ -z "$remote" ]]; then
+            err "Usage: $0 relay status [user@host]"
+            err "  (or set RELAY_URL/RELAY_HOST in .env.local via 'relay setup')"
+            exit 1
+        fi
+    fi
+
+    local ssh_opts="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+
+    log "Relay status on $remote..."
+    echo ""
+
+    # systemctl status
+    echo "--- systemd service ---"
+    ssh $ssh_opts "$remote" "systemctl status sctl-relay --no-pager -l 2>/dev/null || echo 'Service not found'" || true
+    echo ""
+
+    # Health check
+    echo "--- health ---"
+    ssh $ssh_opts "$remote" "curl -sf http://127.0.0.1:8443/api/health 2>/dev/null || echo 'Health check failed'" || true
+    echo ""
+
+    # Connected devices
+    local tunnel_key
+    tunnel_key=$(ssh $ssh_opts "$remote" "grep tunnel_key $RELAY_REMOTE_CONFIG 2>/dev/null | head -1 | sed 's/.*= *\"\\(.*\\)\"/\\1/'" 2>/dev/null) || true
+    if [[ -n "$tunnel_key" ]]; then
+        echo "--- connected devices ---"
+        ssh $ssh_opts "$remote" "curl -sf 'http://127.0.0.1:8443/api/tunnel/devices?token=$tunnel_key' 2>/dev/null || echo 'No devices'" || true
+        echo ""
+    fi
+
+    # Caddy status
+    echo "--- caddy ---"
+    ssh $ssh_opts "$remote" "systemctl is-active caddy 2>/dev/null && caddy version 2>/dev/null || echo 'Caddy not running'" || true
 }
 
 # ─── setup (default: build + start) ─────────────────────────────────
@@ -1532,15 +2396,37 @@ case "${1:-setup}" in
             ls)      do_device_ls ;;
             deploy)  do_device_deploy "${3:-}" ;;
             upgrade) do_device_upgrade "${3:-}" ;;
+            deploy-watchdog) do_device_deploy_watchdog "${3:-}" ;;
+            upgrade-remote)  do_device_upgrade_remote "${3:-}" ;;
             *)
                 echo "Usage: $0 device <command>"
                 echo ""
                 echo "Commands:"
-                echo "  ls                  list devices with health status (default)"
-                echo "  add <name> <host>   discover + register a device via SSH"
-                echo "  rm <name>           remove a device"
-                echo "  deploy <name>       full deploy (binary + config + init script)"
-                echo "  upgrade <name>      binary-only upgrade (stop → upload → start)"
+                echo "  ls                       list devices with health status (default)"
+                echo "  add <name> <host>        discover + register a device via SSH"
+                echo "  rm <name>                remove a device"
+                echo "  deploy <name>            full deploy (binary + config + init script)"
+                echo "  upgrade <name>           binary-only upgrade via SSH (stop → upload → start)"
+                echo "  deploy-watchdog <name>   deploy watchdog script + cron (SSH or API)"
+                echo "  upgrade-remote <name>    binary upgrade via relay (STP upload + swap)"
+                exit 1
+                ;;
+        esac
+        ;;
+    relay)
+        case "${2:-status}" in
+            setup)   do_relay_setup "${3:-}" ;;
+            deploy)  do_relay_deploy "${3:-}" ;;
+            upgrade) do_relay_upgrade "${3:-}" ;;
+            status)  do_relay_status "${3:-}" ;;
+            *)
+                echo "Usage: $0 relay <command> [user@host]"
+                echo ""
+                echo "Commands:"
+                echo "  setup <user@host>     full VPS provisioning (Caddy + sctl + firewall)"
+                echo "  deploy [user@host]    deploy binary + service (preserves config)"
+                echo "  upgrade [user@host]   binary-only upgrade (stop → upload → start)"
+                echo "  status [user@host]    health check + connected devices (default)"
                 exit 1
                 ;;
         esac
@@ -1574,11 +2460,19 @@ case "${1:-setup}" in
         echo "             --relay-url <url>    use an external relay URL"
         echo ""
         echo "Device management:"
-        echo "  device ls                  list devices with health status"
-        echo "  device add <name> <host>   discover + register a device via SSH"
-        echo "  device rm <name>           remove a device"
-        echo "  device deploy <name>       full deploy (binary + config + init script)"
-        echo "  device upgrade <name>      binary-only upgrade"
+        echo "  device ls                       list devices with health status"
+        echo "  device add <name> <host>        discover + register a device via SSH"
+        echo "  device rm <name>                remove a device"
+        echo "  device deploy <name>            full deploy (binary + config + init script)"
+        echo "  device upgrade <name>           binary-only upgrade via SSH"
+        echo "  device deploy-watchdog <name>   deploy watchdog script + cron"
+        echo "  device upgrade-remote <name>    binary upgrade via relay (no SSH needed)"
+        echo ""
+        echo "Relay VPS deployment:"
+        echo "  relay setup <user@host>     full VPS provisioning (Caddy + sctl + firewall)"
+        echo "  relay deploy [user@host]    deploy binary + service (preserves config)"
+        echo "  relay upgrade [user@host]   binary-only upgrade"
+        echo "  relay status [user@host]    health check + connected devices"
         echo ""
         echo "Playbook library:"
         echo "  playbook ls                              list playbooks in library"

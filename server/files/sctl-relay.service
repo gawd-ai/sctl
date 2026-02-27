@@ -5,14 +5,25 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/sctl supervise --config /etc/sctl/relay.toml
+ExecStart=/usr/local/bin/sctl serve --config /etc/sctl/relay.toml
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=15
+WorkingDirectory=/var/lib/sctl
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=sctl-relay
 LimitNOFILE=65536
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sctl
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
 
 [Install]
 WantedBy=multi-user.target

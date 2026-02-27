@@ -17,8 +17,8 @@ exec_timeout_ms = 30000
 # Maximum commands per POST /api/exec/batch request
 max_batch_size = 20
 
-# Maximum file size for GET/PUT /api/files (bytes, 2 MB)
-max_file_size = 2097152
+# Maximum file size for GET/PUT/DELETE /api/files (bytes, default 50 MB)
+max_file_size = 52428800
 
 # Directory for persistent data (journals, etc). Default /var/lib/sctl
 # data_dir = "/var/lib/sctl"
@@ -60,7 +60,25 @@ level = "info"
 # relay = false
 # tunnel_key = "shared-secret-with-relay"
 # url = "wss://relay.example.com/api/tunnel/register"
+# bind_address = "wwan0"           # Bind outbound WS to interface/IP (LTE failover)
+# reconnect_delay_secs = 2         # Initial backoff (client mode)
+# reconnect_max_delay_secs = 30    # Max backoff (client mode)
+# heartbeat_interval_secs = 15     # Ping interval (client mode)
 #
 # To run AS a relay instead of a client:
 # relay = true
 # tunnel_key = "shared-secret-for-devices"
+# heartbeat_timeout_secs = 45      # Seconds before device is considered dead
+# tunnel_proxy_timeout_secs = 60   # Proxy request timeout
+
+# [gps]
+# GPS location tracking via Quectel modem GNSS.
+# device = "/dev/ttyUSB2"
+# poll_interval_secs = 30
+# history_size = 100
+# auto_enable = true
+
+# [lte]
+# LTE signal monitoring via Quectel modem AT commands.
+# device = "/dev/ttyUSB2"
+# poll_interval_secs = 60

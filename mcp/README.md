@@ -178,6 +178,33 @@ Write content to a file atomically (temp file + rename).
 | `mode` | string | no | File permissions (e.g. `"0644"`) |
 | `create_dirs` | boolean | no | Create parent directories (default false) |
 
+#### `device_file_delete`
+
+Delete a file on a device.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | yes | Absolute path to the file to delete |
+| `device` | string | no | Device name |
+
+#### `device_activity`
+
+Read the activity log from a device. Returns recent operations (exec, file I/O, session lifecycle) with timestamps, sources, and details.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `device` | string | no | Device name |
+| `since_id` | integer | no | Only return entries with id > since_id (default 0) |
+| `limit` | integer | no | Maximum entries to return (default 50) |
+
+#### `device_gps`
+
+Get GPS location data from a device. Returns current fix (lat/lon/alt/speed/satellites), status, and recent fix history. Returns an error if GPS is not configured.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `device` | string | no | Device name |
+
 ### Session Tools (WebSocket)
 
 Session tools provide persistent interactive shells. Output is buffered both server-side (in sctl's `OutputBuffer`) and client-side (in mcp-sctl's local `SessionBuffer`), so `session_read` returns instantly from local memory.

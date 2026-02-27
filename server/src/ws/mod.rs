@@ -155,6 +155,18 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
     // Subscribe to session lifecycle broadcasts
     let mut broadcast_rx = state.session_events.subscribe();
 
+    // Log WS connect
+    state
+        .activity_log
+        .log(
+            ActivityType::WsConnect,
+            ActivitySource::Ws,
+            "Client connected".to_string(),
+            None,
+            None,
+        )
+        .await;
+
     // Track sessions created by this connection for cleanup on disconnect
     let mut connection_sessions: Vec<String> = Vec::new();
 
@@ -640,6 +652,26 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
             }
         }
     }
+
+    // Log WS disconnect
+    state
+        .activity_log
+        .log(
+            ActivityType::WsDisconnect,
+            ActivitySource::Ws,
+            format!(
+                "Client disconnected ({} session{})",
+                connection_sessions.len(),
+                if connection_sessions.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+            None,
+            None,
+        )
+        .await;
 
     // Connection closed — handle cleanup based on persistence
     if !connection_sessions.is_empty() {

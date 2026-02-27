@@ -25,6 +25,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Session rename** — `session.rename` message with broadcast to all connected clients.
 - **TLS via rustls** — switched from native-tls to rustls for TLS support.
 - **Tunnel reliability** — drain pending requests on disconnect, heartbeat sweep, backpressure, structured logging.
+- **GPS location tracking** — `[gps]` config section, `GET /api/gps` endpoint, GPS summary in `/api/health`, GPS data in `/api/info`, `gps.fix` WebSocket broadcast.
+- **LTE signal monitoring** — `[lte]` config section, signal quality and modem info in `/api/info`, `lte.signal` WebSocket broadcast.
+- **Shared AT command infrastructure** — `modem.rs` with per-device serial port mutex for GPS and LTE to share the modem safely.
+- **Activity REST endpoints** — `GET /api/activity` with filtering (since_id, limit, activity_type, source, session_id), `GET /api/activity/{id}/result` for cached exec results.
+- **File delete endpoint** — `DELETE /api/files` with path validation and permission checks.
+- **REST session management** — `GET /api/sessions`, `DELETE /api/sessions/{id}`, `PATCH /api/sessions/{id}` (rename, AI toggle), `POST /api/sessions/{id}/signal`, `GET /api/shells`.
+- **Enhanced `/api/health`** — includes `sessions` count, conditional `tunnel` object with full metrics (messages, RTT, events), conditional `gps` summary.
+- **Enhanced `/api/info`** — includes conditional `tunnel` status, `gps` fix data, `lte` signal + modem info.
+- **Tunnel `bind_address`** — bind outbound WS to a specific interface or IP for LTE failover.
+- **Tunnel resilience** — flap detection (3 connections <30s triggers 60s backoff), channel-based WS sink (replaces mutex), TunnelStats with atomics, pong RTT tracking with median/p95, writer exit detection via oneshot, subscriber task reaping, panic boundaries on spawned handlers.
+- **Activity logging for tunnel exec** — `_source` forwarding from proxied requests.
+- **New tunnel proxy endpoints** — file delete, activity, exec results, sessions, shells, playbooks, GPS at `/d/{serial}/api/*`.
+- **Library crate refactoring** — `lib.rs`, `state.rs` for shared types.
 
 ### mcp-sctl v0.2.0
 
@@ -35,6 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **AI status auto-management** — MCP proxy auto-sets `working=true` before session commands (activity=write for exec/send, activity=read for read). Auto-cleared by server after 60s inactivity.
 - **Session auto-routing** — sessions automatically routed to the correct device.
 - **Config version 2** — `config_version` bumped to 2. Extra metadata fields (`host`, `serial`, `arch`, `sctl_version`, `added_at`) are accepted and ignored by mcp-sctl, used by `rundev.sh device` commands.
+- **`device_gps` tool** — GPS location data (fix, history, status) from devices with `[gps]` configured.
+- **`device_file_delete` tool** — delete files on a device.
+- **`device_activity` tool** — read the activity log with since_id/limit filtering.
+- **Chunked file upload** — auto-switches to chunked upload for files >2 MB via gawdxfer STP.
 
 ### sctlin (web) v0.2.0
 
@@ -53,6 +70,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Types** — `HistoryFilter`, `PlaybookParam`, `PlaybookSummary`, `PlaybookDetail`, `DeviceConnectionConfig`.
 - **playbook-parser.ts** — client-side playbook frontmatter parsing, script rendering, name validation.
 - **Vitest** — test infrastructure with `@testing-library/svelte`.
+- **LTE signal panel** — bars indicator, operator, band, RSRP/SINR metrics in ServerDashboard.
+- **GPS status panel** — coordinates, satellites, fix age in ServerDashboard.
+- **Network interface filter** — handles wwan0/UNKNOWN operstate correctly.
 
 #### Fixed
 

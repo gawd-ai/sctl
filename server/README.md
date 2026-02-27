@@ -49,7 +49,7 @@ sctl listens on `0.0.0.0:1337` by default. Test it:
 
 ```bash
 curl http://localhost:1337/api/health
-# {"status":"ok","uptime_secs":5,"version":"0.3.0"}
+# {"status":"ok","uptime_secs":5,"version":"0.4.0","sessions":0,...}
 
 curl -H "Authorization: Bearer your-secret-key" http://localhost:1337/api/exec \
   -H "Content-Type: application/json" \
@@ -74,7 +74,7 @@ max_sessions = 20                   # Concurrent WebSocket shell sessions
 session_buffer_size = 1000          # Max output entries per session ring buffer
 exec_timeout_ms = 30000             # Default exec timeout in ms (30s)
 max_batch_size = 20                 # Max commands per batch request
-max_file_size = 2097152             # Max file read/write size (2 MB)
+max_file_size = 52428800            # Max file read/write/delete size (50 MB)
 data_dir = "/var/lib/sctl"          # Persistent data (journals, etc)
 journal_enabled = true              # Disk-backed output journaling
 journal_fsync_interval_ms = 5000    # Batch fsync interval (0 = every write)
@@ -104,40 +104,81 @@ stable_threshold = 60               # Seconds of uptime before resetting backoff
 relay = false                       # true = relay mode, false = client mode
 tunnel_key = "shared-secret"        # Device<->relay auth
 url = "wss://relay.example.com/api/tunnel/register"  # Client mode only
-reconnect_delay_secs = 5            # Client mode initial backoff
-reconnect_max_delay_secs = 60       # Client mode max backoff
-heartbeat_interval_secs = 30        # Client mode ping interval
+reconnect_delay_secs = 2            # Client mode initial backoff
+reconnect_max_delay_secs = 30       # Client mode max backoff
+heartbeat_interval_secs = 15        # Client mode ping interval
+bind_address = "wwan0"              # Client mode: bind to interface or IP (LTE failover)
+heartbeat_timeout_secs = 45         # Relay mode: seconds before device eviction
+tunnel_proxy_timeout_secs = 60      # Relay mode: proxy request timeout
+
+# Optional — GPS location tracking via Quectel modem GNSS
+[gps]
+device = "/dev/ttyUSB2"             # Serial device for AT commands
+poll_interval_secs = 30             # Seconds between GPS polls
+history_size = 100                  # Maximum fix history entries
+auto_enable = true                  # Auto-enable GNSS engine on startup
+
+# Optional — LTE signal monitoring via Quectel modem AT commands
+[lte]
+device = "/dev/ttyUSB2"             # Serial device for AT commands
+poll_interval_secs = 60             # Seconds between signal polls
 ```
 
 ## API Reference
 
 All endpoints except `/api/health` require `Authorization: Bearer <key>`.
 
-| Method | Path              | Auth | Description                          |
-|--------|-------------------|------|--------------------------------------|
-| GET    | `/api/health`     | No   | Liveness probe                       |
-| GET    | `/api/info`       | Yes  | System info (IPs, CPU, mem, disk)    |
-| POST   | `/api/exec`       | Yes  | One-shot command execution           |
-| POST   | `/api/exec/batch` | Yes  | Batch command execution              |
-| GET    | `/api/files`      | Yes  | Read file or list directory          |
-| PUT    | `/api/files`      | Yes  | Write file (atomic)                  |
-| GET    | `/api/ws`         | Yes* | WebSocket interactive sessions       |
+| Method | Path                      | Auth | Description                          |
+|--------|---------------------------|------|--------------------------------------|
+| GET    | `/api/health`             | No   | Liveness probe                       |
+| GET    | `/api/info`               | Yes  | System info (IPs, CPU, mem, disk)    |
+| POST   | `/api/exec`               | Yes  | One-shot command execution           |
+| POST   | `/api/exec/batch`         | Yes  | Batch command execution              |
+| GET    | `/api/files`              | Yes  | Read file or list directory          |
+| PUT    | `/api/files`              | Yes  | Write file (atomic)                  |
+| DELETE | `/api/files`              | Yes  | Delete a file                        |
+| GET    | `/api/activity`           | Yes  | Activity journal with filtering      |
+| GET    | `/api/activity/{id}/result` | Yes | Cached exec result by activity ID    |
+| GET    | `/api/sessions`           | Yes  | List sessions (REST)                 |
+| DELETE | `/api/sessions/{id}`      | Yes  | Kill a session (REST)                |
+| PATCH  | `/api/sessions/{id}`      | Yes  | Rename / AI toggle (REST)            |
+| POST   | `/api/sessions/{id}/signal` | Yes | Signal a session (REST)              |
+| GET    | `/api/shells`             | Yes  | List available shells                |
+| GET    | `/api/gps`                | Yes  | GPS location data                    |
+| GET    | `/api/playbooks`          | Yes  | List playbooks                       |
+| GET    | `/api/playbooks/{name}`   | Yes  | Get playbook detail                  |
+| PUT    | `/api/playbooks/{name}`   | Yes  | Create or update playbook            |
+| DELETE | `/api/playbooks/{name}`   | Yes  | Delete playbook                      |
+| GET    | `/api/ws`                 | Yes* | WebSocket interactive sessions       |
 
 *WebSocket auth uses `?token=<key>` query parameter.
 
 #### Tunnel endpoints (when `tunnel.relay = true`)
 
-| Method | Path                          | Auth         | Description                 |
-|--------|-------------------------------|--------------|-----------------------------|
-| GET    | `/api/tunnel/register`        | `tunnel_key` | Device WS registration      |
-| GET    | `/api/tunnel/devices`         | `tunnel_key` | List connected devices      |
-| GET    | `/d/{serial}/api/health`      | No           | Proxied device health       |
-| GET    | `/d/{serial}/api/info`        | `api_key`    | Proxied device info         |
-| POST   | `/d/{serial}/api/exec`        | `api_key`    | Proxied command execution   |
-| POST   | `/d/{serial}/api/exec/batch`  | `api_key`    | Proxied batch execution     |
-| GET    | `/d/{serial}/api/files`       | `api_key`    | Proxied file read/list      |
-| PUT    | `/d/{serial}/api/files`       | `api_key`    | Proxied file write          |
-| GET    | `/d/{serial}/api/ws`          | `api_key`    | Proxied WS sessions         |
+| Method | Path                                | Auth         | Description                   |
+|--------|-------------------------------------|--------------|-------------------------------|
+| GET    | `/api/tunnel/register`              | `tunnel_key` | Device WS registration        |
+| GET    | `/api/tunnel/devices`               | `tunnel_key` | List connected devices        |
+| GET    | `/d/{serial}/api/health`            | No           | Proxied device health         |
+| GET    | `/d/{serial}/api/info`              | `api_key`    | Proxied device info           |
+| POST   | `/d/{serial}/api/exec`              | `api_key`    | Proxied command execution     |
+| POST   | `/d/{serial}/api/exec/batch`        | `api_key`    | Proxied batch execution       |
+| GET    | `/d/{serial}/api/files`             | `api_key`    | Proxied file read/list        |
+| PUT    | `/d/{serial}/api/files`             | `api_key`    | Proxied file write            |
+| DELETE | `/d/{serial}/api/files`             | `api_key`    | Proxied file delete           |
+| GET    | `/d/{serial}/api/activity`          | `api_key`    | Proxied activity journal      |
+| GET    | `/d/{serial}/api/activity/{id}/result` | `api_key` | Proxied exec result           |
+| GET    | `/d/{serial}/api/sessions`          | `api_key`    | Proxied session list          |
+| DELETE | `/d/{serial}/api/sessions/{id}`     | `api_key`    | Proxied session kill          |
+| PATCH  | `/d/{serial}/api/sessions/{id}`     | `api_key`    | Proxied session patch         |
+| POST   | `/d/{serial}/api/sessions/{id}/signal` | `api_key` | Proxied session signal        |
+| GET    | `/d/{serial}/api/shells`            | `api_key`    | Proxied shell list            |
+| GET    | `/d/{serial}/api/playbooks`         | `api_key`    | Proxied playbook list         |
+| GET    | `/d/{serial}/api/playbooks/{name}`  | `api_key`    | Proxied playbook get          |
+| PUT    | `/d/{serial}/api/playbooks/{name}`  | `api_key`    | Proxied playbook put          |
+| DELETE | `/d/{serial}/api/playbooks/{name}`  | `api_key`    | Proxied playbook delete       |
+| GET    | `/d/{serial}/api/gps`               | `api_key`    | Proxied GPS data              |
+| GET    | `/d/{serial}/api/ws`                | `api_key`    | Proxied WS sessions           |
 
 Clients connect to the relay using the same API -- just a different base URL (`https://relay.example.com/d/DEVICE-SERIAL` instead of `http://device:1337`).
 
@@ -169,12 +210,40 @@ curl http://localhost:1337/api/health
 ```
 
 ```json
-{"status": "ok", "uptime_secs": 42, "version": "0.3.0"}
+{
+  "status": "ok",
+  "uptime_secs": 42,
+  "version": "0.4.0",
+  "sessions": 3,
+  "tunnel": {
+    "connected": true,
+    "reconnects": 2,
+    "uptime_secs": 3600,
+    "messages_sent": 1234,
+    "messages_received": 1230,
+    "last_pong_age_ms": 5200,
+    "dropped_outbound": 0,
+    "rtt_median_ms": 45,
+    "rtt_p95_ms": 120,
+    "recent_events": [
+      {"time": "5s ago", "event": "pong", "detail": "rtt=42ms"},
+      {"time": "2m ago", "event": "connected", "detail": "attempt 3"}
+    ]
+  },
+  "gps": {
+    "status": "active",
+    "has_fix": true,
+    "fix_age_secs": 12,
+    "satellites": 8
+  }
+}
 ```
+
+The `tunnel` object is included when tunnel client mode is configured. Full metrics (uptime, messages, RTT, events) appear for client mode; relay mode shows only `connected` and `reconnects`. The `gps` object is included when `[gps]` is configured (null otherwise).
 
 ### GET /api/info
 
-Returns system information: hostname, kernel, CPU, memory, disk, and network interfaces.
+Returns system information: hostname, kernel, CPU, memory, disk, and network interfaces. Conditionally includes `tunnel`, `gps`, and `lte` sections when configured.
 
 ```bash
 curl -H "Authorization: Bearer $KEY" http://localhost:1337/api/info
@@ -188,13 +257,47 @@ curl -H "Authorization: Bearer $KEY" http://localhost:1337/api/info
   "system_uptime_secs": 86400,
   "cpu_model": "ARMv7 Processor rev 3 (v7l)",
   "load_average": [0.12, 0.08, 0.05],
-  "memory": {"total_kb": 2048000, "available_kb": 1536000},
+  "memory": {"total_bytes": 2097152000, "available_bytes": 1572864000, "used_bytes": 524288000},
   "disk": {"path": "/", "total_bytes": 8000000000, "used_bytes": 2000000000, "available_bytes": 6000000000},
   "interfaces": [
     {"name": "eth0", "state": "UP", "mac": "02:00:00:00:00:01", "addresses": ["192.168.1.1/24"]}
-  ]
+  ],
+  "tunnel": {
+    "connected": true,
+    "relay_url": "wss://relay.example.com/api/tunnel/register",
+    "reconnects": 2
+  },
+  "gps": {
+    "status": "active",
+    "latitude": 45.5017,
+    "longitude": -73.5673,
+    "altitude": 50.2,
+    "satellites": 8,
+    "speed_kmh": 0.0,
+    "hdop": 1.2,
+    "fix_age_secs": 12
+  },
+  "lte": {
+    "rssi_dbm": -75,
+    "rsrp": -105,
+    "rsrq": -12,
+    "sinr": 8.5,
+    "band": "B4",
+    "operator": "Rogers",
+    "technology": "LTE",
+    "cell_id": "1A2B3C4",
+    "signal_bars": 3,
+    "modem": {
+      "model": "EC25",
+      "firmware": "EC25AFAR06A06M4G",
+      "imei": "860000000000000",
+      "iccid": "89000000000000000000"
+    }
+  }
 }
 ```
+
+The `tunnel`, `gps`, and `lte` sections are only present when the corresponding feature is configured.
 
 ### POST /api/exec
 
@@ -315,6 +418,136 @@ curl -X PUT -H "Authorization: Bearer $KEY" http://localhost:1337/api/files \
 | `mode`        | string | no       | Octal permissions (e.g. `"0644"`)        |
 | `create_dirs` | bool   | no       | Create parent directories if missing     |
 
+### DELETE /api/files
+
+Delete a file.
+
+```bash
+curl -X DELETE -H "Authorization: Bearer $KEY" http://localhost:1337/api/files \
+  -H "Content-Type: application/json" \
+  -d '{"path": "/tmp/test.txt"}'
+```
+
+| Field  | Type   | Required | Description                |
+|--------|--------|----------|----------------------------|
+| `path` | string | yes      | Absolute path to delete    |
+
+Returns `200` with `{"deleted": "/tmp/test.txt"}` on success. Returns `404 FILE_NOT_FOUND` if the file does not exist, `403 PERMISSION_DENIED` on OS permission errors.
+
+### GET /api/activity
+
+Read recent activity entries with optional filtering.
+
+```bash
+curl -H "Authorization: Bearer $KEY" \
+  "http://localhost:1337/api/activity?since_id=0&limit=50&activity_type=exec&source=mcp"
+```
+
+Query parameters:
+
+| Parameter       | Type   | Default | Description                              |
+|-----------------|--------|---------|------------------------------------------|
+| `since_id`      | number | `0`     | Return entries with `id > since_id`      |
+| `limit`         | number | `50`    | Maximum entries to return (max 200)      |
+| `activity_type` | string | --      | Filter by type (e.g. `exec`, `file_read`, `session_start`) |
+| `source`        | string | --      | Filter by source (e.g. `mcp`, `ws`, `rest`) |
+| `session_id`    | string | --      | Filter by session ID                     |
+
+```json
+{
+  "entries": [
+    {
+      "id": 42,
+      "activity_type": "exec",
+      "source": "rest",
+      "summary": "uname -a",
+      "detail": {"exit_code": 0, "duration_ms": 12},
+      "timestamp": "2026-02-26T12:00:00Z"
+    }
+  ]
+}
+```
+
+### GET /api/activity/{id}/result
+
+Retrieve a cached full exec result by activity ID.
+
+```bash
+curl -H "Authorization: Bearer $KEY" http://localhost:1337/api/activity/42/result
+```
+
+Returns the full stdout/stderr/exit-code for the given activity ID. Returns `404 NOT_FOUND` if the result has been evicted from the in-memory cache (max `exec_result_cache_size` entries, default 100).
+
+### GET /api/gps
+
+Returns GPS status, last fix, and fix history. Returns `404` if GPS is not configured.
+
+```bash
+curl -H "Authorization: Bearer $KEY" http://localhost:1337/api/gps
+```
+
+```json
+{
+  "status": "active",
+  "last_fix": {
+    "latitude": 45.5017,
+    "longitude": -73.5673,
+    "altitude": 50.2,
+    "speed_kmh": 0.0,
+    "course": 180.0,
+    "hdop": 1.2,
+    "satellites": 8,
+    "utc": "120000.00",
+    "date": "260226",
+    "fix_type": "3D",
+    "recorded_at": "2026-02-26T12:00:00Z"
+  },
+  "fix_age_secs": 12,
+  "history": [
+    {
+      "latitude": 45.5017,
+      "longitude": -73.5673,
+      "altitude": 50.2,
+      "speed_kmh": 0.0,
+      "satellites": 8,
+      "recorded_at": "2026-02-26T12:00:00Z"
+    }
+  ],
+  "fixes_total": 1234,
+  "errors_total": 5,
+  "last_error": "timeout waiting for AT response"
+}
+```
+
+### GET /api/playbooks
+
+List all playbooks with name, description, and parameters.
+
+```bash
+curl -H "Authorization: Bearer $KEY" http://localhost:1337/api/playbooks
+```
+
+### GET/PUT/DELETE /api/playbooks/{name}
+
+- **GET** — returns playbook detail (metadata, params, script, raw content)
+- **PUT** — create or update a playbook (request body is raw markdown)
+- **DELETE** — delete a playbook
+
+```bash
+# Get a playbook
+curl -H "Authorization: Bearer $KEY" http://localhost:1337/api/playbooks/health-check
+
+# Create/update a playbook
+curl -X PUT -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: text/markdown" \
+  --data-binary @playbook.md \
+  http://localhost:1337/api/playbooks/health-check
+
+# Delete a playbook
+curl -X DELETE -H "Authorization: Bearer $KEY" \
+  http://localhost:1337/api/playbooks/health-check
+```
+
 ## WebSocket Protocol
 
 Connect to `GET /api/ws?token=<api_key>`. All messages are JSON with a `"type"` field. An optional `"request_id"` on any client message is echoed back.
@@ -360,6 +593,9 @@ Connect to `GET /api/ws?token=<api_key>`. All messages are JSON with a `"type"` 
 | `session.ai_permission_changed` | `session_id`, `allowed` (broadcast)                                       |
 | `session.ai_status_changed`     | `session_id`, `working`, `activity`, `message` (broadcast)                |
 | `shell.listed`                  | `shells[]`, `default`                                                     |
+| `gps.fix`                       | `latitude`, `longitude`, `altitude`, `satellites`, `speed_kmh` (broadcast)|
+| `lte.signal`                    | `rssi_dbm`, `signal_bars`, `band`, `operator`, `technology` (broadcast)   |
+| `activity.new`                  | `entry` (broadcast on every new activity log entry)                       |
 | `error`                         | `code`, `message`, `session_id?`                                          |
 
 Output messages (`session.stdout`, `session.stderr`, `session.system`) include a monotonically increasing `seq` number and a `timestamp_ms` field. Clients use `seq` for reliable catch-up via `session.attach`.

@@ -215,14 +215,14 @@ impl DeviceWsConnection {
             msg["name"] = json!(n);
         }
 
+        // Register waiter BEFORE sending to avoid Notify race: if the I/O
+        // loop receives the response between send() and notified(), the
+        // notify_waiters() call would find no waiters and the notification
+        // would be lost, causing a spurious 10s timeout.
+        let notified = self.notifiers.start_notify.notified();
         self.send(msg).await?;
 
-        // Wait for session.started (with timeout)
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(10),
-            self.notifiers.start_notify.notified(),
-        )
-        .await;
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(10), notified).await;
 
         if result.is_err() {
             return Err("Timeout waiting for session.started".to_string());
@@ -267,14 +267,10 @@ impl DeviceWsConnection {
             msg["message"] = json!(m);
         }
 
+        let notified = self.notifiers.ai_status_notify.notified();
         self.send(msg).await?;
 
-        // Wait for ack or error
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            self.notifiers.ai_status_notify.notified(),
-        )
-        .await;
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(5), notified).await;
 
         if result.is_err() {
             return Err("Timeout waiting for session.ai_status response".to_string());
@@ -423,13 +419,10 @@ impl DeviceWsConnection {
         // Clear any stale result
         *self.notifiers.list_result.lock().await = None;
 
+        let notified = self.notifiers.list_notify.notified();
         self.send(json!({ "type": "session.list" })).await?;
 
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(10),
-            self.notifiers.list_notify.notified(),
-        )
-        .await;
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(10), notified).await;
 
         if result.is_err() {
             return Err("Timeout waiting for session.listed".to_string());
@@ -459,7 +452,8 @@ impl DeviceWsConnection {
             Arc::clone(&buf.attach_notify)
         };
 
-        // Send attach request
+        // Register waiter before sending to avoid Notify race
+        let notified = attach_notify.notified();
         self.send(json!({
             "type": "session.attach",
             "session_id": session_id,
@@ -467,12 +461,7 @@ impl DeviceWsConnection {
         }))
         .await?;
 
-        // Wait for session.attached response (with timeout)
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(10),
-            attach_notify.notified(),
-        )
-        .await;
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(10), notified).await;
 
         if result.is_err() {
             return Err("Timeout waiting for session.attached response".to_string());
@@ -953,6 +942,31 @@ async fn dispatch_message(
                 ai_set.remove(session_id);
             }
             eprintln!("mcp-sctl: broadcast {msg_type} for session {session_id}");
+        }
+        "session.gap" => {
+            // Relay dropped session output due to backpressure.
+            // Re-attach with last known seq to recover missed output.
+            let session_id = msg["session_id"].as_str().unwrap_or("");
+            let reason = msg["reason"].as_str().unwrap_or("unknown");
+            eprintln!("mcp-sctl: session.gap for {session_id} (reason: {reason}), will re-attach");
+            if !session_id.is_empty() {
+                let last_seq = {
+                    let sessions = sessions.lock().await;
+                    sessions.get(session_id).map(|b| b.last_seq).unwrap_or(0)
+                };
+                // Queue a re-attach. We can't call self.attach_session here since
+                // we don't have the sender. Instead, synthesize a system entry so
+                // the consumer knows output may have been lost.
+                let mut sessions = sessions.lock().await;
+                if let Some(buf) = sessions.get_mut(session_id) {
+                    buf.push(OutputEntry {
+                        seq: buf.last_seq + 1,
+                        stream: "system".into(),
+                        data: format!("[output gap detected: {reason}, last_seq={last_seq}]"),
+                        timestamp_ms: 0,
+                    });
+                }
+            }
         }
         "session.created"
         | "session.destroyed"

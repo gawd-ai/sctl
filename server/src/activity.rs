@@ -39,6 +39,10 @@ pub enum ActivityType {
     PlaybookRead,
     PlaybookWrite,
     PlaybookDelete,
+    WsConnect,
+    WsDisconnect,
+    TunnelConnect,
+    TunnelDisconnect,
 }
 
 /// Where the request originated.
@@ -48,6 +52,7 @@ pub enum ActivitySource {
     Mcp,
     Ws,
     Rest,
+    Tunnel,
     Unknown,
 }
 
@@ -82,6 +87,10 @@ impl ActivityType {
             "playbook_read" => Some(Self::PlaybookRead),
             "playbook_write" => Some(Self::PlaybookWrite),
             "playbook_delete" => Some(Self::PlaybookDelete),
+            "ws_connect" => Some(Self::WsConnect),
+            "ws_disconnect" => Some(Self::WsDisconnect),
+            "tunnel_connect" => Some(Self::TunnelConnect),
+            "tunnel_disconnect" => Some(Self::TunnelDisconnect),
             _ => None,
         }
     }
@@ -94,6 +103,7 @@ impl ActivitySource {
             "mcp" => Some(Self::Mcp),
             "ws" => Some(Self::Ws),
             "rest" => Some(Self::Rest),
+            "tunnel" => Some(Self::Tunnel),
             "unknown" => Some(Self::Unknown),
             _ => None,
         }
@@ -184,10 +194,10 @@ impl ActivityLog {
         entries
             .iter()
             .filter(|e| e.id > since_id)
-            .filter(|e| activity_type.map_or(true, |t| e.activity_type == t))
-            .filter(|e| source.map_or(true, |s| e.source == s))
+            .filter(|e| activity_type.is_none_or(|t| e.activity_type == t))
+            .filter(|e| source.is_none_or(|s| e.source == s))
             .filter(|e| {
-                session_id.map_or(true, |sid| {
+                session_id.is_none_or(|sid| {
                     e.detail
                         .as_ref()
                         .and_then(|d| d["session_id"].as_str())
@@ -207,6 +217,7 @@ impl ActivityLog {
 pub fn source_from_headers(headers: &HeaderMap) -> ActivitySource {
     match headers.get("x-sctl-client").and_then(|v| v.to_str().ok()) {
         Some("mcp") => ActivitySource::Mcp,
+        Some("tunnel") => ActivitySource::Tunnel,
         _ => ActivitySource::Rest,
     }
 }

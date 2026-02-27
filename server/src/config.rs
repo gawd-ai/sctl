@@ -42,6 +42,7 @@
 //! reconnect_delay_secs = 2                 # client mode, initial backoff
 //! reconnect_max_delay_secs = 30            # client mode, max backoff
 //! heartbeat_interval_secs = 15             # client mode, ping interval
+//! bind_address = "wwan0"                   # client mode, interface name or IP
 //! ```
 
 use serde::Deserialize;
@@ -64,6 +65,10 @@ pub struct Config {
     pub supervisor: SupervisorConfig,
     /// Optional tunnel configuration for relay or client mode.
     pub tunnel: Option<TunnelConfig>,
+    /// Optional GPS configuration for Quectel modem GNSS tracking.
+    pub gps: Option<GpsConfig>,
+    /// Optional LTE signal monitoring for Quectel modem.
+    pub lte: Option<LteConfig>,
 }
 
 /// HTTP server and resource-limit settings.
@@ -208,6 +213,67 @@ pub struct TunnelConfig {
     /// Default proxy request timeout in seconds (relay mode, default 60).
     #[serde(default = "default_tunnel_proxy_timeout")]
     pub tunnel_proxy_timeout_secs: u64,
+    /// Local address or interface name to bind outbound tunnel connections to
+    /// (client mode). Forces traffic over a specific interface.
+    /// Accepts either an IP (`"10.180.41.231"`) or interface name (`"wwan0"`).
+    /// Interface names are resolved to their current IPv4 on each connect
+    /// attempt, surviving DHCP/carrier IP changes across reboots.
+    pub bind_address: Option<String>,
+}
+
+/// GPS configuration for Quectel modem GNSS tracking.
+///
+/// When present, sctl periodically polls the modem for GPS fixes via AT commands
+/// and exposes location data through `/api/gps` and the health endpoint.
+///
+/// ```toml
+/// [gps]
+/// device = "/dev/ttyUSB2"
+/// poll_interval_secs = 30
+/// history_size = 100
+/// auto_enable = true
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct GpsConfig {
+    /// Serial device for AT commands (default `/dev/ttyUSB2`).
+    #[serde(default = "default_gps_device")]
+    pub device: String,
+    /// Seconds between GPS polls (default 30).
+    #[serde(default = "default_gps_poll_interval")]
+    pub poll_interval_secs: u64,
+    /// Maximum GPS fix history entries (default 100).
+    #[serde(default = "default_gps_history_size")]
+    pub history_size: usize,
+    /// Auto-enable GNSS engine on startup (default true).
+    #[serde(default = "default_gps_auto_enable")]
+    pub auto_enable: bool,
+}
+
+/// LTE signal monitoring for Quectel modem.
+///
+/// When present, sctl periodically polls the modem for signal quality via AT
+/// commands and exposes the data through `/api/info`.
+///
+/// ```toml
+/// [lte]
+/// device = "/dev/ttyUSB2"
+/// poll_interval_secs = 60
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct LteConfig {
+    /// Serial device for AT commands (default `/dev/ttyUSB2`).
+    #[serde(default = "default_lte_device")]
+    pub device: String,
+    /// Seconds between LTE signal polls (default 60).
+    #[serde(default = "default_lte_poll_interval")]
+    pub poll_interval_secs: u64,
+}
+
+fn default_lte_device() -> String {
+    "/dev/ttyUSB2".to_string()
+}
+fn default_lte_poll_interval() -> u64 {
+    60
 }
 
 fn default_listen() -> String {
@@ -290,6 +356,18 @@ fn default_transfer_max_file_size() -> u64 {
 }
 fn default_transfer_stale_timeout() -> u64 {
     3600 // 1 hour
+}
+fn default_gps_device() -> String {
+    "/dev/ttyUSB2".to_string()
+}
+fn default_gps_poll_interval() -> u64 {
+    30
+}
+fn default_gps_history_size() -> usize {
+    100
+}
+fn default_gps_auto_enable() -> bool {
+    true
 }
 fn default_reconnect_delay() -> u64 {
     2
@@ -470,6 +548,8 @@ impl Config {
                 logging: LoggingConfig::default(),
                 supervisor: SupervisorConfig::default(),
                 tunnel: None,
+                gps: None,
+                lte: None,
             }
         };
 
