@@ -1347,12 +1347,13 @@ do_device_upgrade_remote() {
         ok "Watchdog already deployed"
     fi
 
-    # Step 7: Swap binary via nohup (survives sctl restart)
+    # Step 7: Swap binary (sync cp) then restart (background, survives sctl death)
     log "Swapping binary and restarting sctl..."
     curl -sf -X POST "$url/api/exec" \
         -H "Authorization: Bearer $api_key" \
         -H "Content-Type: application/json" \
-        -d '{"command": "nohup sh -c '\''cp /usr/bin/sctl /usr/bin/sctl.rollback && cp /tmp/sctl-upgrade /usr/bin/sctl && chmod +x /usr/bin/sctl && /etc/init.d/sctl restart'\'' > /tmp/sctl-upgrade.log 2>&1 &"}' >/dev/null 2>&1 || true
+        -d '{"command": "cp /usr/bin/sctl /usr/bin/sctl.rollback && cp /tmp/sctl-upgrade /usr/bin/sctl && chmod +x /usr/bin/sctl && (nohup /etc/init.d/sctl restart > /tmp/sctl-upgrade.log 2>&1 &)", "timeout": 15000}' >/dev/null 2>&1 || true
+    sleep 3
 
     # Step 8: Poll health through relay
     log "Waiting for device to come back up (60s timeout)..."

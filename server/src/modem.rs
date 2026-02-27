@@ -29,9 +29,10 @@ async fn device_lock(device: &str) -> &'static Mutex<()> {
 
 /// Send an AT command to the modem and read the response.
 ///
-/// Opens the serial device read/write via fd 3, writes the command, then
-/// reads the response using a background `cat` with `kill` timeout.
-/// This approach works on BusyBox ash (no `stty`, `timeout`, or fractional `sleep`).
+/// Opens the serial device read/write via fd 3, drains any stale buffer data,
+/// writes the command, then reads with `awk` that gates on the AT echo before
+/// matching `OK`/`ERROR` terminators. A parallel `sleep+kill` provides a safety
+/// timeout. Works on BusyBox ash (no `stty`, `timeout`, or fractional `sleep`).
 ///
 /// Serialized per device path — concurrent callers targeting the same device
 /// will queue behind the lock to prevent interleaved AT responses.
@@ -41,15 +42,15 @@ pub async fn at_command(shell: &str, device: &str, command: &str) -> Result<Stri
 
     let cmd = format!(
         "exec 3<>{device}; \
+         cat <&3 >/dev/null & _d=$!; sleep 1; kill $_d 2>/dev/null; wait $_d 2>/dev/null; \
          printf '{command}\\r' >&3; \
-         sleep 1; \
-         cat <&3 & pid=$!; \
-         sleep 1; \
-         kill $pid 2>/dev/null; \
+         awk '/^AT/ {{s=1}} s && /^OK/ {{print; exit}} s && /ERROR/ {{print; exit}} s {{print}}' <&3 & pid=$!; \
+         (sleep 3; kill $pid 2>/dev/null) & _t=$!; \
          wait $pid 2>/dev/null; \
+         kill $_t 2>/dev/null; wait $_t 2>/dev/null; \
          exec 3>&-"
     );
-    match crate::shell::process::exec_command(shell, "/", &cmd, 5000, None).await {
+    match crate::shell::process::exec_command(shell, "/", &cmd, 8000, None).await {
         Ok(result) => Ok(result.stdout),
         Err(e) => Err(format!("AT command exec error: {e}")),
     }

@@ -114,19 +114,22 @@ use crate::modem::at_command;
 /// Returns `Ok(GpsFix)` on success, `Err("searching")` for CME ERROR 516 (no fix),
 /// or `Err(description)` for other failures.
 fn parse_qgpsloc(response: &str) -> Result<GpsFix, String> {
-    // Check for CME ERROR 516 = not fixed yet
-    if response.contains("516") && response.contains("ERROR") {
-        return Err("searching".into());
-    }
-    if response.contains("ERROR") {
-        return Err(format!("modem error: {}", response.trim()));
+    // Look for valid GPS data first — stale buffer data may contain ERROR
+    // alongside a valid response, so prioritize +QGPSLOC: over ERROR.
+    let line = response.lines().find(|l| l.contains("+QGPSLOC:"));
+
+    if line.is_none() {
+        // No GPS data — check error codes
+        if response.contains("516") && response.contains("ERROR") {
+            return Err("searching".into());
+        }
+        if response.contains("ERROR") {
+            return Err(format!("modem error: {}", response.trim()));
+        }
+        return Err(format!("no +QGPSLOC in response: {}", response.trim()));
     }
 
-    // Find the +QGPSLOC: line
-    let line = response
-        .lines()
-        .find(|l| l.contains("+QGPSLOC:"))
-        .ok_or_else(|| format!("no +QGPSLOC in response: {}", response.trim()))?;
+    let line = line.unwrap();
 
     let data = line
         .split(':')
@@ -178,31 +181,54 @@ pub fn spawn_gps_poller(
         let device = &config.device;
         let interval = tokio::time::Duration::from_secs(config.poll_interval_secs);
 
-        // Auto-enable GNSS engine
+        // Auto-enable GNSS engine (retry up to 3 times on failure)
         if config.auto_enable {
             info!("GPS: enabling GNSS engine on {device}");
-            match at_command(shell, device, "AT+QGPS=1").await {
-                Ok(resp) => {
-                    if resp.contains("OK") || resp.contains("Session is ongoing") {
-                        info!("GPS: GNSS engine enabled");
-                        gps_state.lock().await.status = GpsStatus::Searching;
-                    } else if resp.contains("ERROR") {
-                        warn!("GPS: failed to enable GNSS: {}", resp.trim());
-                    } else {
-                        debug!("GPS: AT+QGPS=1 response: {}", resp.trim());
-                        gps_state.lock().await.status = GpsStatus::Searching;
+            let mut enabled = false;
+            for attempt in 1..=3 {
+                match at_command(shell, device, "AT+QGPS=1").await {
+                    Ok(resp) => {
+                        if resp.contains("OK") || resp.contains("Session is ongoing") {
+                            info!("GPS: GNSS engine enabled (attempt {attempt})");
+                            gps_state.lock().await.status = GpsStatus::Searching;
+                            enabled = true;
+                            break;
+                        } else if resp.contains("ERROR") {
+                            warn!(
+                                "GPS: failed to enable GNSS (attempt {attempt}): {}",
+                                resp.trim()
+                            );
+                        } else {
+                            debug!(
+                                "GPS: AT+QGPS=1 response (attempt {attempt}): {}",
+                                resp.trim()
+                            );
+                            gps_state.lock().await.status = GpsStatus::Searching;
+                            enabled = true;
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("GPS: failed to send AT+QGPS=1 (attempt {attempt}): {e}");
+                        if attempt == 3 {
+                            gps_state.lock().await.set_error(e);
+                        }
                     }
                 }
-                Err(e) => {
-                    warn!("GPS: failed to send AT+QGPS=1: {e}");
-                    gps_state.lock().await.set_error(e);
+                if attempt < 3 {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                 }
+            }
+            if !enabled {
+                warn!("GPS: failed to enable GNSS after 3 attempts");
             }
         }
 
         let mut ticker = tokio::time::interval(interval);
         // Skip the first immediate tick (we just enabled GNSS, give it a moment)
         ticker.tick().await;
+
+        let mut consecutive_errors: u32 = 0;
 
         loop {
             ticker.tick().await;
@@ -214,6 +240,7 @@ pub fn spawn_gps_poller(
                             "GPS: fix {:.6},{:.6} alt={:.0}m sats={} hdop={:.1}",
                             fix.latitude, fix.longitude, fix.altitude, fix.satellites, fix.hdop
                         );
+                        consecutive_errors = 0;
                         // Broadcast GPS fix event
                         let _ = session_events.send(serde_json::json!({
                             "type": "gps.fix",
@@ -226,16 +253,36 @@ pub fn spawn_gps_poller(
                     }
                     Err(ref e) if e == "searching" => {
                         debug!("GPS: searching for satellites...");
+                        consecutive_errors = 0;
                         gps_state.lock().await.set_searching();
                     }
                     Err(e) => {
-                        warn!("GPS: parse error: {e}");
+                        consecutive_errors += 1;
+                        warn!("GPS: parse error ({consecutive_errors}/3): {e}");
                         gps_state.lock().await.set_error(e);
                     }
                 },
                 Err(e) => {
-                    warn!("GPS: AT command failed: {e}");
+                    consecutive_errors += 1;
+                    warn!("GPS: AT command failed ({consecutive_errors}/3): {e}");
                     gps_state.lock().await.set_error(e);
+                }
+            }
+
+            // Re-enable GNSS after 3 consecutive non-searching errors
+            if consecutive_errors >= 3 {
+                warn!("GPS: {consecutive_errors} consecutive errors, attempting AT+QGPS=1");
+                consecutive_errors = 0;
+                match at_command(shell, device, "AT+QGPS=1").await {
+                    Ok(resp) => {
+                        if resp.contains("OK") || resp.contains("Session is ongoing") {
+                            info!("GPS: GNSS re-enabled successfully");
+                            gps_state.lock().await.status = GpsStatus::Searching;
+                        } else {
+                            warn!("GPS: GNSS re-enable response: {}", resp.trim());
+                        }
+                    }
+                    Err(e) => warn!("GPS: failed to re-enable GNSS: {e}"),
                 }
             }
         }

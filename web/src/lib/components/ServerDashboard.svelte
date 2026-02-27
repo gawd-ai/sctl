@@ -99,11 +99,6 @@
 		return 'text-red-400/80';
 	}
 
-	function signalBars(bars: number): string {
-		const blocks = ['\u2581', '\u2582', '\u2583', '\u2584', '\u2585'];
-		return blocks.slice(0, bars).join('');
-	}
-
 	function signalColor(bars: number): string {
 		if (bars >= 4) return 'text-green-400';
 		if (bars >= 2) return 'text-amber-400';
@@ -246,25 +241,29 @@
 
 				<!-- LTE -->
 				{#if deviceInfo.lte}
+					{@const bars = deviceInfo.lte.signal_bars}
 					<div class="border border-neutral-800/60 rounded p-2.5 space-y-1">
 						<div class="flex items-center justify-between">
-							<span class="text-[10px] text-neutral-600">[ lte ]</span>
 							<div class="flex items-center gap-1.5">
-								<span class="text-sm leading-none {signalColor(deviceInfo.lte.signal_bars)}">{signalBars(deviceInfo.lte.signal_bars)}</span>
+								<span class="text-[10px] text-neutral-600">[ lte ]</span>
 								{#if deviceInfo.lte.operator}
-									<span class="text-[10px] text-neutral-400">{deviceInfo.lte.operator}</span>
+									<span class="text-[10px] text-neutral-300">{deviceInfo.lte.operator}</span>
 								{/if}
+								{#if deviceInfo.lte.technology}
+									<span class="text-[10px] text-neutral-600">{deviceInfo.lte.technology}</span>
+								{/if}
+							</div>
+							<div class="flex items-end gap-px">
+								{#each [0, 1, 2, 3, 4] as i}
+									<div
+										class="w-1 rounded-sm {i < bars ? signalColor(bars).replace('text-', 'bg-') : 'bg-neutral-800'}"
+										style="height: {4 + i * 2}px"
+									></div>
+								{/each}
 							</div>
 						</div>
 						<div class="text-[10px] text-neutral-300 tabular-nums">
-							{#if deviceInfo.lte.band}
-								<span>{deviceInfo.lte.band}</span>
-							{/if}
-							{#if deviceInfo.lte.technology}
-								<span class="text-neutral-500 ml-1">{deviceInfo.lte.technology}</span>
-							{/if}
 							{#if deviceInfo.lte.rsrp != null}
-								<span class="text-neutral-700 mx-1">|</span>
 								<span>RSRP {deviceInfo.lte.rsrp}</span>
 							{/if}
 							<span class="text-neutral-700 mx-1">|</span>
@@ -276,6 +275,10 @@
 							{#if deviceInfo.lte.rsrq != null}
 								<span class="text-neutral-700 mx-1">|</span>
 								<span class="text-neutral-500">RSRQ {deviceInfo.lte.rsrq}</span>
+							{/if}
+							{#if deviceInfo.lte.band}
+								<span class="text-neutral-700 mx-1">|</span>
+								<span class="text-neutral-600">{deviceInfo.lte.band}</span>
 							{/if}
 						</div>
 						{#if deviceInfo.lte.modem || deviceInfo.lte.cell_id}
