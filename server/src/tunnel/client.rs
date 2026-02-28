@@ -778,6 +778,12 @@ async fn connect_and_run(
                                 }
                             }
                             "tunnel.register.ack" | "ping" => {}
+                            // Relay-initiated ping — respond inline to avoid blocking
+                            "tunnel.ping" => {
+                                let _ = ws_sink.send(tokio_tungstenite::tungstenite::Message::Text(
+                                    r#"{"type":"tunnel.pong"}"#.into(),
+                                )).await;
+                            }
                             // Everything else: spawn as task to keep the read loop responsive.
                             // This prevents slow handlers (exec, file I/O) from blocking
                             // pong reads, which would trigger the pong watchdog.
@@ -918,6 +924,9 @@ async fn handle_relay_message(
         }
         "tunnel.gps" => {
             handle_tunnel_gps(state, ws_sink, request_id.as_deref()).await;
+        }
+        "tunnel.lte" => {
+            handle_tunnel_lte(state, ws_sink, request_id.as_deref()).await;
         }
         // gawdxfer transfer protocol messages
         "gx.download.init" => {
@@ -2773,6 +2782,36 @@ async fn handle_tunnel_gps(state: &AppState, ws_sink: &WsSink, request_id: Optio
                 ws_sink,
                 json!({
                     "type": "tunnel.gps.result",
+                    "request_id": request_id,
+                    "status": status.as_u16(),
+                    "body": body,
+                }),
+            )
+            .await;
+        }
+    }
+}
+
+/// Handle `tunnel.lte` — LTE signal and modem data.
+async fn handle_tunnel_lte(state: &AppState, ws_sink: &WsSink, request_id: Option<&str>) {
+    match crate::routes::lte::lte(axum::extract::State(state.clone())).await {
+        Ok(axum::Json(body)) => {
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "tunnel.lte.result",
+                    "request_id": request_id,
+                    "status": 200,
+                    "body": body,
+                }),
+            )
+            .await;
+        }
+        Err((status, axum::Json(body))) => {
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "tunnel.lte.result",
                     "request_id": request_id,
                     "status": status.as_u16(),
                     "body": body,

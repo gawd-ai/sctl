@@ -61,6 +61,10 @@ pub struct ConnectedDevice {
     pub dropped_messages: Arc<AtomicU64>,
     /// Signal old device handler to shut down on duplicate serial reconnect.
     pub shutdown_tx: watch::Sender<bool>,
+    /// Latest GPS fix broadcast from device.
+    pub last_gps_fix: Arc<RwLock<Option<Value>>>,
+    /// Latest LTE signal broadcast from device.
+    pub last_lte_signal: Arc<RwLock<Option<Value>>>,
 }
 
 /// Drain all pending requests for a device, sending error responses on each oneshot.
@@ -241,6 +245,7 @@ pub fn relay_router(relay_state: RelayState) -> Router {
                 .delete(proxy_playbook_delete),
         )
         .route("/d/{serial}/api/gps", get(proxy_gps))
+        .route("/d/{serial}/api/lte", get(proxy_lte))
         .route("/d/{serial}/api/ws", get(proxy_ws));
 
     tunnel_admin.merge(device_proxy).with_state(relay_state)
@@ -323,11 +328,13 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
     // When a device reconnects (LTE flap, etc.), WS clients are still connected
     // to the relay. By sharing the same Arcs, client handlers' references stay
     // valid — cleanup (remove on disconnect) works regardless of tunnel reconnects.
-    let (shared_clients, shared_subs) = {
+    let (shared_clients, shared_subs, shared_gps, shared_lte) = {
         let devices = state.devices.read().await;
         if let Some(old_device) = devices.get(&serial) {
             let clients = old_device.clients.clone();
             let subs = old_device.session_subscriptions.clone();
+            let gps = old_device.last_gps_fix.clone();
+            let lte = old_device.last_lte_signal.clone();
             let n = clients.read().await.len();
             if n > 0 {
                 info!(
@@ -336,11 +343,13 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                     "Preserving {n} WS clients across device reconnect"
                 );
             }
-            (clients, subs)
+            (clients, subs, gps, lte)
         } else {
             (
                 Arc::new(RwLock::new(HashMap::new())),
                 Arc::new(RwLock::new(HashMap::new())),
+                Arc::new(RwLock::new(None)),
+                Arc::new(RwLock::new(None)),
             )
         }
     };
@@ -356,6 +365,8 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
         connected_since: Instant::now(),
         dropped_messages: Arc::new(AtomicU64::new(0)),
         shutdown_tx,
+        last_gps_fix: shared_gps,
+        last_lte_signal: shared_lte,
     };
 
     let pending_requests = device.pending_requests.clone();
@@ -364,6 +375,8 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
     let heartbeat_ms = device.last_heartbeat_ms.clone();
     let relay_epoch = state.epoch;
     let dropped_messages = device.dropped_messages.clone();
+    let last_gps_fix = device.last_gps_fix.clone();
+    let last_lte_signal = device.last_lte_signal.clone();
 
     // Handle duplicate serial: signal old handler to shut down, drain pending
     // REST requests, then replace. Don't notify WS clients — they were migrated above.
@@ -413,6 +426,28 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
             };
             if ws_sink.send(ws_msg).await.is_err() {
                 break;
+            }
+        }
+    });
+
+    // Relay-side active ping: send tunnel.ping every 20s via device_tx.
+    // If device_tx.send() fails (writer exited), this task exits — the main
+    // message loop will also detect the dead connection via ws_stream EOF.
+    let ping_tx = device_tx.clone();
+    let mut ping_shutdown_rx = shutdown_rx.clone();
+    let ping_serial = serial.clone();
+    let relay_ping_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(20));
+        interval.tick().await; // skip immediate first tick
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if ping_tx.send(TunnelMessage::Text(json!({"type": "tunnel.ping"}))).await.is_err() {
+                        info!(serial = %ping_serial, "Relay ping: device_tx closed, exiting");
+                        break;
+                    }
+                }
+                _ = ping_shutdown_rx.changed() => break,
             }
         }
     });
@@ -507,6 +542,12 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                         let _ = device_tx
                             .send(TunnelMessage::Text(json!({"type": "tunnel.pong"})))
                             .await;
+                    }
+                    "tunnel.pong" => {
+                        // Response to relay-initiated ping — update heartbeat timestamp
+                        #[allow(clippy::cast_possible_truncation)]
+                        let now_ms = relay_epoch.elapsed().as_millis() as u64;
+                        heartbeat_ms.store(now_ms, Ordering::Relaxed);
                     }
                     // Response routing: matches .result (REST responses) and .ack (gx.chunk.ack, etc.)
                     // GUARD: New message types with non-.result/.ack suffixes need explicit handling.
@@ -616,6 +657,20 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                             }
                         }
                     }
+                    // Device telemetry broadcasts — store latest and forward to WS clients
+                    "gps.fix" | "lte.signal" => {
+                        if msg_type == "gps.fix" {
+                            *last_gps_fix.write().await = Some(parsed.clone());
+                        } else {
+                            *last_lte_signal.write().await = Some(parsed.clone());
+                        }
+                        let clients_read = clients.read().await;
+                        for (_, client_tx) in clients_read.iter() {
+                            if client_tx.try_send(parsed.clone()).is_err() {
+                                dropped_messages.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
                     _ => {
                         warn!(serial = %serial, msg_type, "Unknown message from device");
                     }
@@ -655,6 +710,7 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
         info!(serial = %serial, "Device disconnected");
     }
     send_task.abort();
+    relay_ping_task.abort();
 }
 
 /// `GET /api/tunnel/devices` — list connected devices (admin, requires `tunnel_key`).
@@ -699,6 +755,8 @@ async fn list_devices(
             "session_subscriptions": subs_map,
             "connected_since_ms": connected_ms,
             "dropped_messages": d.dropped_messages.load(Ordering::Relaxed),
+            "last_gps_fix": *d.last_gps_fix.read().await,
+            "last_lte_signal": *d.last_lte_signal.read().await,
         }));
     }
 
@@ -1650,6 +1708,34 @@ async fn proxy_gps(
     let request_id = uuid::Uuid::new_v4().to_string();
     let msg = json!({
         "type": "tunnel.gps",
+        "request_id": request_id,
+    });
+
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
+}
+
+/// `GET /d/{serial}/api/lte` — proxied LTE signal data.
+async fn proxy_lte(
+    State(state): State<RelayState>,
+    AxumPath(serial): AxumPath<String>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "tunnel.lte",
         "request_id": request_id,
     });
 
