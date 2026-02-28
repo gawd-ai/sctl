@@ -95,14 +95,19 @@ impl GpsState {
         self.status = GpsStatus::Searching;
     }
 
-    fn set_error(&mut self, msg: String) {
-        self.status = GpsStatus::Error;
+    /// Record an error. Only degrades status to `Error` if `escalate` is true
+    /// (i.e. sustained failures). Transient errors just bump the counter without
+    /// changing status — a single serial contention blip shouldn't hide an active fix.
+    fn record_error(&mut self, msg: String, escalate: bool) {
         self.errors_total += 1;
         self.last_error = Some(msg);
+        if escalate {
+            self.status = GpsStatus::Error;
+        }
     }
 }
 
-use crate::modem::at_command;
+use crate::modem::Modem;
 
 /// Parse `AT+QGPSLOC=2` response (decimal degrees format).
 ///
@@ -170,25 +175,25 @@ fn parse_qgpsloc(response: &str) -> Result<GpsFix, String> {
 }
 
 /// Spawn the background GPS poller. Returns a `JoinHandle` for abort on shutdown.
+#[allow(clippy::needless_pass_by_value)] // config is moved into spawned task
 pub fn spawn_gps_poller(
     config: GpsConfig,
-    shell: String,
+    modem: Modem,
     gps_state: Arc<Mutex<GpsState>>,
     session_events: broadcast::Sender<serde_json::Value>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let shell = &shell;
-        let device = &config.device;
         let interval = tokio::time::Duration::from_secs(config.poll_interval_secs);
 
         // Auto-enable GNSS engine (retry up to 3 times on failure)
         if config.auto_enable {
-            info!("GPS: enabling GNSS engine on {device}");
+            info!("GPS: enabling GNSS engine on {}", modem.device());
             let mut enabled = false;
             for attempt in 1..=3 {
-                match at_command(shell, device, "AT+QGPS=1").await {
+                match modem.command("AT+QGPS=1").await {
                     Ok(resp) => {
-                        if resp.contains("OK") || resp.contains("Session is ongoing") {
+                        // CME ERROR 504 = GNSS session already active (success)
+                        if resp.contains("OK") || resp.contains("504") {
                             info!("GPS: GNSS engine enabled (attempt {attempt})");
                             gps_state.lock().await.status = GpsStatus::Searching;
                             enabled = true;
@@ -211,7 +216,7 @@ pub fn spawn_gps_poller(
                     Err(e) => {
                         warn!("GPS: failed to send AT+QGPS=1 (attempt {attempt}): {e}");
                         if attempt == 3 {
-                            gps_state.lock().await.set_error(e);
+                            gps_state.lock().await.record_error(e, true);
                         }
                     }
                 }
@@ -233,7 +238,7 @@ pub fn spawn_gps_poller(
         loop {
             ticker.tick().await;
 
-            match at_command(shell, device, "AT+QGPSLOC=2").await {
+            match modem.command("AT+QGPSLOC=2").await {
                 Ok(resp) => match parse_qgpsloc(&resp) {
                     Ok(fix) => {
                         debug!(
@@ -258,14 +263,24 @@ pub fn spawn_gps_poller(
                     }
                     Err(e) => {
                         consecutive_errors += 1;
-                        warn!("GPS: parse error ({consecutive_errors}/3): {e}");
-                        gps_state.lock().await.set_error(e);
+                        if consecutive_errors < 3 {
+                            debug!("GPS: transient error ({consecutive_errors}): {e}");
+                            gps_state.lock().await.record_error(e, false);
+                        } else {
+                            warn!("GPS: sustained error ({consecutive_errors}): {e}");
+                            gps_state.lock().await.record_error(e, true);
+                        }
                     }
                 },
                 Err(e) => {
                     consecutive_errors += 1;
-                    warn!("GPS: AT command failed ({consecutive_errors}/3): {e}");
-                    gps_state.lock().await.set_error(e);
+                    if consecutive_errors < 3 {
+                        debug!("GPS: transient AT failure ({consecutive_errors}): {e}");
+                        gps_state.lock().await.record_error(e, false);
+                    } else {
+                        warn!("GPS: sustained AT failure ({consecutive_errors}): {e}");
+                        gps_state.lock().await.record_error(e, true);
+                    }
                 }
             }
 
@@ -273,9 +288,9 @@ pub fn spawn_gps_poller(
             if consecutive_errors >= 3 {
                 warn!("GPS: {consecutive_errors} consecutive errors, attempting AT+QGPS=1");
                 consecutive_errors = 0;
-                match at_command(shell, device, "AT+QGPS=1").await {
+                match modem.command("AT+QGPS=1").await {
                     Ok(resp) => {
-                        if resp.contains("OK") || resp.contains("Session is ongoing") {
+                        if resp.contains("OK") || resp.contains("504") {
                             info!("GPS: GNSS re-enabled successfully");
                             gps_state.lock().await.status = GpsStatus::Searching;
                         } else {
@@ -290,9 +305,9 @@ pub fn spawn_gps_poller(
 }
 
 /// Disable the GNSS engine (called on shutdown).
-pub async fn disable_gnss(config: &GpsConfig, shell: &str) {
-    info!("GPS: disabling GNSS engine on {}", config.device);
-    match at_command(shell, &config.device, "AT+QGPSEND").await {
+pub async fn disable_gnss(modem: &Modem) {
+    info!("GPS: disabling GNSS engine on {}", modem.device());
+    match modem.command("AT+QGPSEND").await {
         Ok(resp) => {
             if resp.contains("OK") {
                 info!("GPS: GNSS engine disabled");

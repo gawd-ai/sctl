@@ -261,6 +261,7 @@ async fn run_server(config_path: Option<&str>) {
                 .delete(routes::playbooks::delete_playbook),
         )
         .route("/api/gps", get(routes::gps::gps))
+        .route("/api/lte", get(routes::lte::lte))
         .layer(middleware::from_fn(sctl::auth::require_api_key));
 
     let ws_route = Router::new().route("/api/ws", get(ws::ws_upgrade));
@@ -354,31 +355,61 @@ async fn run_server(config_path: Option<&str>) {
         None
     };
 
+    // Open modem instances (deduplicated by device path) for GPS/LTE pollers
+    let mut modems: std::collections::HashMap<String, sctl::modem::Modem> =
+        std::collections::HashMap::new();
+
+    // Helper: get or create modem for a device path
+    let get_modem = |modems: &mut std::collections::HashMap<String, sctl::modem::Modem>,
+                     device: &str| {
+        if let Some(m) = modems.get(device) {
+            return Some(m.clone());
+        }
+        match sctl::modem::Modem::open(device) {
+            Ok(m) => {
+                modems.insert(device.to_string(), m.clone());
+                Some(m)
+            }
+            Err(e) => {
+                warn!("Failed to open modem {device}: {e}");
+                None
+            }
+        }
+    };
+
     // GPS poller (only when [gps] config is present)
     let gps_config = state.config.gps.clone();
-    let gps_task = if let (Some(gc), Some(ref gs)) = (gps_config, &state.gps_state) {
-        Some(gps::spawn_gps_poller(
-            gc,
-            state.config.shell.default_shell.clone(),
-            gs.clone(),
-            state.session_events.clone(),
-        ))
-    } else {
-        None
-    };
+    let gps_modem = gps_config
+        .as_ref()
+        .and_then(|gc| get_modem(&mut modems, &gc.device));
+    let gps_task =
+        if let (Some(gc), Some(ref gs), Some(modem)) = (gps_config, &state.gps_state, &gps_modem) {
+            Some(gps::spawn_gps_poller(
+                gc,
+                modem.clone(),
+                gs.clone(),
+                state.session_events.clone(),
+            ))
+        } else {
+            None
+        };
 
     // LTE poller (only when [lte] config is present)
     let lte_config = state.config.lte.clone();
-    let lte_task = if let (Some(lc), Some(ref ls)) = (lte_config, &state.lte_state) {
-        Some(lte::spawn_lte_poller(
-            lc,
-            state.config.shell.default_shell.clone(),
-            ls.clone(),
-            state.session_events.clone(),
-        ))
-    } else {
-        None
-    };
+    let lte_modem = lte_config
+        .as_ref()
+        .and_then(|lc| get_modem(&mut modems, &lc.device));
+    let lte_task =
+        if let (Some(lc), Some(ref ls), Some(modem)) = (lte_config, &state.lte_state, &lte_modem) {
+            Some(lte::spawn_lte_poller(
+                lc,
+                modem.clone(),
+                ls.clone(),
+                state.session_events.clone(),
+            ))
+        } else {
+            None
+        };
 
     // Periodic sweep: clean up sessions whose process has exited + stale transfers
     let mgr = state.session_manager.clone();
@@ -469,8 +500,8 @@ async fn run_server(config_path: Option<&str>) {
     if let Some(task) = gps_task {
         task.abort();
     }
-    if let Some(ref gc) = state.config.gps {
-        gps::disable_gnss(gc, &state.config.shell.default_shell).await;
+    if let Some(ref modem) = gps_modem {
+        gps::disable_gnss(modem).await;
     }
 
     // LTE: abort poller

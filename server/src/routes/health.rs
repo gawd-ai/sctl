@@ -94,6 +94,25 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
         json!(null)
     };
 
+    // LTE summary
+    let lte = if let Some(ref ls) = state.lte_state {
+        let ls = ls.lock().await;
+        if let Some(ref sig) = ls.signal {
+            json!({
+                "rssi_dbm": sig.rssi_dbm,
+                "rsrp": sig.rsrp,
+                "sinr": sig.sinr,
+                "signal_bars": sig.signal_bars,
+                "band": sig.band,
+                "operator": sig.operator,
+            })
+        } else {
+            json!({"status": "no_signal"})
+        }
+    } else {
+        json!(null)
+    };
+
     Json(json!({
         "status": "ok",
         "uptime_secs": uptime,
@@ -101,5 +120,6 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
         "sessions": sessions,
         "tunnel": tunnel,
         "gps": gps,
+        "lte": lte,
     }))
 }

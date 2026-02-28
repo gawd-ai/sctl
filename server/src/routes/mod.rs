@@ -11,6 +11,7 @@ pub mod files;
 pub mod gps;
 pub mod health;
 pub mod info;
+pub mod lte;
 pub mod playbooks;
 pub mod sessions;
 pub mod shells;

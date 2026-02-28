@@ -13,7 +13,7 @@ use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, info};
 
 use crate::config::LteConfig;
-use crate::modem::at_command;
+use crate::modem::Modem;
 
 /// Static modem identity — read once at startup.
 #[derive(Debug, Clone, Serialize)]
@@ -273,20 +273,21 @@ fn parse_qccid(response: &str) -> Option<String> {
 }
 
 /// Read static modem identity (IMEI, model, firmware, ICCID).
-async fn read_modem_info(shell: &str, device: &str) -> ModemInfo {
-    let model = match at_command(shell, device, "AT+CGMM").await {
+#[allow(clippy::similar_names)]
+async fn read_modem_info(modem: &Modem) -> ModemInfo {
+    let model = match modem.command("AT+CGMM").await {
         Ok(resp) => parse_simple_line(&resp),
         Err(_) => None,
     };
-    let firmware = match at_command(shell, device, "AT+CGMR").await {
+    let firmware = match modem.command("AT+CGMR").await {
         Ok(resp) => parse_simple_line(&resp),
         Err(_) => None,
     };
-    let imei = match at_command(shell, device, "AT+GSN").await {
+    let imei = match modem.command("AT+GSN").await {
         Ok(resp) => parse_simple_line(&resp),
         Err(_) => None,
     };
-    let iccid = match at_command(shell, device, "AT+QCCID").await {
+    let iccid = match modem.command("AT+QCCID").await {
         Ok(resp) => parse_qccid(&resp),
         Err(_) => None,
     };
@@ -300,19 +301,18 @@ async fn read_modem_info(shell: &str, device: &str) -> ModemInfo {
 }
 
 /// Spawn the background LTE signal poller. Returns a `JoinHandle` for abort on shutdown.
+#[allow(clippy::needless_pass_by_value)] // config is moved into spawned task
 pub fn spawn_lte_poller(
     config: LteConfig,
-    shell: String,
+    modem: Modem,
     lte_state: Arc<Mutex<LteState>>,
     session_events: broadcast::Sender<serde_json::Value>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let shell = &shell;
-        let device = &config.device;
         let interval = tokio::time::Duration::from_secs(config.poll_interval_secs);
 
         // Read static modem info once at startup
-        let modem_info = read_modem_info(shell, device).await;
+        let modem_info = read_modem_info(&modem).await;
         info!(
             "LTE modem: {} {} IMEI={}",
             modem_info.model.as_deref().unwrap_or("?"),
@@ -327,7 +327,7 @@ pub fn spawn_lte_poller(
 
         loop {
             // 1. AT+CSQ for RSSI
-            let rssi_result = match at_command(shell, device, "AT+CSQ").await {
+            let rssi_result = match modem.command("AT+CSQ").await {
                 Ok(resp) => parse_csq(&resp),
                 Err(e) => Err(e),
             };
@@ -345,7 +345,7 @@ pub fn spawn_lte_poller(
             };
 
             // 2. AT+QENG for RSRP/RSRQ/SINR/cell_id
-            let qeng = match at_command(shell, device, "AT+QENG=\"servingcell\"").await {
+            let qeng = match modem.command("AT+QENG=\"servingcell\"").await {
                 Ok(resp) => parse_qeng(&resp),
                 Err(e) => {
                     debug!("LTE: QENG failed: {e}");
@@ -359,7 +359,7 @@ pub fn spawn_lte_poller(
             };
 
             // 3. AT+QNWINFO for band/technology
-            let (technology, band) = match at_command(shell, device, "AT+QNWINFO").await {
+            let (technology, band) = match modem.command("AT+QNWINFO").await {
                 Ok(resp) => parse_qnwinfo(&resp),
                 Err(e) => {
                     debug!("LTE: QNWINFO failed: {e}");
@@ -368,7 +368,7 @@ pub fn spawn_lte_poller(
             };
 
             // 4. AT+COPS? for operator name
-            let operator = match at_command(shell, device, "AT+COPS?").await {
+            let operator = match modem.command("AT+COPS?").await {
                 Ok(resp) => parse_cops(&resp),
                 Err(e) => {
                     debug!("LTE: COPS failed: {e}");
