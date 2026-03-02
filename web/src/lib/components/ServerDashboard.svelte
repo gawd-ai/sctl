@@ -213,10 +213,12 @@
 		// Parse as Date to display in local timezone (consistent with connection history)
 		const d = new Date(ts);
 		if (!isNaN(d.getTime())) {
+			const mon = d.getMonth() + 1;
+			const day = d.getDate();
 			const hh = String(d.getHours()).padStart(2, '0');
 			const mm = String(d.getMinutes()).padStart(2, '0');
 			const ss = String(d.getSeconds()).padStart(2, '0');
-			return `${hh}:${mm}:${ss}`;
+			return `${mon}/${day} ${hh}:${mm}:${ss}`;
 		}
 		// Logread format — just return first time-like pattern
 		const timeMatch = ts.match(/(\d{2}:\d{2}:\d{2})/);
@@ -435,8 +437,8 @@
 	// ── Connection history (from relay /api/health structured data) ──
 
 	type TimelineEntry =
-		| { kind: 'connected'; timeHHMM: string; durationLabel: string; reason: string | null; reasonColor: string; active: boolean }
-		| { kind: 'offline'; timeHHMM: string; durationLabel: string };
+		| { kind: 'connected'; time: string; durationLabel: string; reason: string | null; reasonColor: string; active: boolean }
+		| { kind: 'offline'; time: string; durationLabel: string };
 
 	function fmtDuration(secs: number): string {
 		const h = Math.floor(secs / 3600);
@@ -446,9 +448,13 @@
 		return `${m}m ${String(s).padStart(2, '0')}s`;
 	}
 
-	function epochToHHMM(epoch: number): string {
+	function epochToTimeStr(epoch: number): string {
 		const d = new Date(epoch * 1000);
-		return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+		const hh = String(d.getHours()).padStart(2, '0');
+		const mm = String(d.getMinutes()).padStart(2, '0');
+		const mon = d.getMonth() + 1;
+		const day = d.getDate();
+		return `${mon}/${day} ${hh}:${mm}`;
 	}
 
 	function reasonColor(reason: string | null): string {
@@ -493,7 +499,7 @@
 				if (gapSecs > 0) {
 					entries.push({
 						kind: 'offline',
-						timeHHMM: epochToHHMM(prevEnd),
+						time: epochToTimeStr(prevEnd),
 						durationLabel: fmtDuration(gapSecs),
 					});
 				}
@@ -504,7 +510,7 @@
 
 			entries.push({
 				kind: 'connected',
-				timeHHMM: epochToHHMM(s.connected_at),
+				time: epochToTimeStr(s.connected_at),
 				durationLabel: fmtDuration(duration),
 				reason: s.reason,
 				reasonColor: reasonColor(s.reason),
@@ -520,7 +526,7 @@
 				if (offlineSecs > 0) {
 					entries.push({
 						kind: 'offline',
-						timeHHMM: epochToHHMM(last.disconnected_at),
+						time: epochToTimeStr(last.disconnected_at),
 						durationLabel: fmtDuration(offlineSecs),
 					});
 				}
@@ -732,7 +738,7 @@
 			<div class="max-h-48 overflow-y-auto space-y-0 scrollbar-thin scrollbar-thumb-neutral-800 scrollbar-track-transparent">
 				{#each [...d.logs].reverse() as log}
 					<div class="flex items-start gap-1.5 py-0.5 text-[10px] tabular-nums">
-						<span class="shrink-0 text-neutral-700 w-14 text-right">{formatLogTime(log.timestamp)}</span>
+						<span class="shrink-0 text-neutral-700 w-20 text-right">{formatLogTime(log.timestamp)}</span>
 						<span class="shrink-0 w-8 text-right {logLevelColor(log.level)}">{log.level}</span>
 						<span class="text-neutral-400 break-all min-w-0">{log.message}</span>
 					</div>
@@ -1019,7 +1025,7 @@
 								{#each connectionTimeline as entry}
 									{#if entry.kind === 'connected'}
 										<div class="flex items-center gap-1.5 py-0.5 text-[9px] tabular-nums">
-											<span class="text-neutral-700 w-10 shrink-0 text-right">{entry.timeHHMM}</span>
+											<span class="text-neutral-700 w-14 shrink-0 text-right">{entry.time}</span>
 											<span class="{entry.active ? 'text-green-400' : 'text-neutral-500'} w-16 shrink-0 text-right">{entry.durationLabel}</span>
 											<span class="{entry.active ? 'text-green-400' : 'text-neutral-400'}">connected</span>
 											{#if entry.reason}
@@ -1028,7 +1034,7 @@
 										</div>
 									{:else}
 										<div class="flex items-center gap-1.5 py-0.5 text-[9px] tabular-nums opacity-50">
-											<span class="text-neutral-700 w-10 shrink-0 text-right">{entry.timeHHMM}</span>
+											<span class="text-neutral-700 w-14 shrink-0 text-right">{entry.time}</span>
 											<span class="text-red-400/60 w-16 shrink-0 text-right">{entry.durationLabel}</span>
 											<span class="text-red-400/60">offline</span>
 										</div>
