@@ -113,7 +113,36 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
         json!(null)
     };
 
-    Json(json!({
+    // Connection history (relay mode only)
+    let connection_history = if let Some(ref history) = state.relay_history {
+        let sessions_snap = history.snapshot().await;
+        #[allow(clippy::cast_possible_truncation)]
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let entries: Vec<serde_json::Value> = sessions_snap
+            .iter()
+            .map(|s| {
+                let duration_secs = s
+                    .disconnected_at
+                    .unwrap_or(now)
+                    .saturating_sub(s.connected_at);
+                json!({
+                    "serial": s.serial,
+                    "connected_at": s.connected_at,
+                    "disconnected_at": s.disconnected_at,
+                    "duration_secs": duration_secs,
+                    "reason": s.reason,
+                })
+            })
+            .collect();
+        Some(entries)
+    } else {
+        None
+    };
+
+    let mut resp = json!({
         "status": "ok",
         "uptime_secs": uptime,
         "version": env!("CARGO_PKG_VERSION"),
@@ -121,5 +150,9 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
         "tunnel": tunnel,
         "gps": gps,
         "lte": lte,
-    }))
+    });
+    if let Some(ch) = connection_history {
+        resp["connection_history"] = json!(ch);
+    }
+    Json(resp)
 }

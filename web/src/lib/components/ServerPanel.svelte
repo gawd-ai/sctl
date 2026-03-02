@@ -98,6 +98,7 @@
 	let addWsUrl = $state('ws://localhost:1337/api/ws');
 	let addApiKey = $state('');
 	let addShell = $state('');
+	let addRelayApiKey = $state('');
 
 	// Edit server
 	let editingServerId: string | null = $state(null);
@@ -105,6 +106,7 @@
 	let editWsUrl = $state('');
 	let editApiKey = $state('');
 	let editShell = $state('');
+	let editRelayApiKey = $state('');
 
 	// Shell picker
 	let shellPickerServerId: string | null = $state(null);
@@ -503,11 +505,12 @@
 		addWsUrl = 'ws://localhost:1337/api/ws';
 		addApiKey = '';
 		addShell = '';
+		addRelayApiKey = '';
 	}
 
 	function submitAddForm() {
 		if (!addName.trim() || !addWsUrl.trim()) return;
-		onaddserver?.({ name: addName.trim(), wsUrl: addWsUrl.trim(), apiKey: addApiKey, shell: addShell });
+		onaddserver?.({ name: addName.trim(), wsUrl: addWsUrl.trim(), apiKey: addApiKey, shell: addShell, relayApiKey: addRelayApiKey || undefined });
 		showAddForm = false;
 	}
 
@@ -538,6 +541,7 @@
 		editWsUrl = server.wsUrl;
 		editApiKey = server.apiKey;
 		editShell = server.shell;
+		editRelayApiKey = server.relayApiKey ?? '';
 	}
 
 	function submitEdit() {
@@ -546,7 +550,8 @@
 			name: editName.trim(),
 			wsUrl: editWsUrl.trim(),
 			apiKey: editApiKey,
-			shell: editShell
+			shell: editShell,
+			relayApiKey: editRelayApiKey || undefined
 		});
 		editingServerId = null;
 	}
@@ -561,6 +566,8 @@
 		switch (status) {
 			case 'connected':
 				return 'bg-green-500';
+			case 'device_offline':
+				return 'bg-orange-500 animate-pulse';
 			case 'connecting':
 			case 'reconnecting':
 				return 'bg-yellow-500 animate-pulse';
@@ -573,6 +580,8 @@
 		switch (status) {
 			case 'connected':
 				return 'Connected (click to disconnect)';
+			case 'device_offline':
+				return 'Relay reachable, device offline (click to disconnect)';
 			case 'connecting':
 				return 'Connecting... (click to abort)';
 			case 'reconnecting':
@@ -583,7 +592,28 @@
 	}
 
 	function statusLabel(status: ConnectionStatus): string | null {
-		return null;
+		switch (status) {
+			case 'device_offline':
+				return 'device offline';
+			case 'connecting':
+				return 'connecting...';
+			case 'reconnecting':
+				return 'reconnecting...';
+			default:
+				return null;
+		}
+	}
+
+	function statusLabelColor(status: ConnectionStatus): string {
+		switch (status) {
+			case 'device_offline':
+				return 'text-orange-500/80';
+			case 'connecting':
+			case 'reconnecting':
+				return 'text-yellow-500/60';
+			default:
+				return 'text-neutral-500';
+		}
 	}
 </script>
 
@@ -660,6 +690,10 @@
 					class="w-full px-1.5 py-1 bg-neutral-800 border border-neutral-700 rounded text-[10px] text-neutral-200 font-mono focus:outline-none focus:border-neutral-500" />
 				<input type="text" bind:value={addShell} placeholder="shell (optional)"
 					class="w-full px-1.5 py-1 bg-neutral-800 border border-neutral-700 rounded text-[10px] text-neutral-200 font-mono focus:outline-none focus:border-neutral-500" />
+				{#if addWsUrl.includes('/d/')}
+					<input type="password" bind:value={addRelayApiKey} placeholder="relay api key (optional)"
+						class="w-full px-1.5 py-1 bg-neutral-800 border border-neutral-700 rounded text-[10px] text-neutral-200 font-mono focus:outline-none focus:border-neutral-500" />
+				{/if}
 				<div class="flex items-center gap-1 pt-0.5">
 					<button
 						class="h-5 px-1.5 rounded text-[10px] bg-neutral-700 hover:bg-neutral-600 text-neutral-300 transition-colors inline-flex items-center gap-1"
@@ -746,7 +780,12 @@
 					{/if}
 				</div>
 			{:else}
-				<span class="font-mono text-[10px] text-neutral-500 truncate flex-1">{server.host}</span>
+				{@const label = statusLabel(server.status)}
+				{#if label}
+					<span class="font-mono text-[10px] {statusLabelColor(server.status)} truncate flex-1">{label}</span>
+				{:else}
+					<span class="font-mono text-[10px] text-neutral-500 truncate flex-1">{server.host}</span>
+				{/if}
 			{/if}
 		</div>
 		{#if !inFlyout}
@@ -784,6 +823,10 @@
 					class="w-full px-1.5 py-0.5 bg-neutral-800 border border-neutral-700 rounded text-[10px] text-neutral-200 font-mono focus:outline-none focus:border-neutral-500" />
 				<input type="text" bind:value={editShell} placeholder="shell (optional)"
 					class="w-full px-1.5 py-0.5 bg-neutral-800 border border-neutral-700 rounded text-[10px] text-neutral-200 font-mono focus:outline-none focus:border-neutral-500" />
+				{#if editWsUrl.includes('/d/')}
+					<input type="password" bind:value={editRelayApiKey} placeholder="relay api key (optional)"
+						class="w-full px-1.5 py-0.5 bg-neutral-800 border border-neutral-700 rounded text-[10px] text-neutral-200 font-mono focus:outline-none focus:border-neutral-500" />
+				{/if}
 				<div class="flex items-center gap-1 pt-0.5">
 					<!-- Save -->
 					<button

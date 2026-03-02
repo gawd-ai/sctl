@@ -17,6 +17,7 @@ import type {
 	WsShellListedMsg
 } from '../types/terminal.types';
 import { ConnectionError, ServerError, TimeoutError } from './errors';
+import { getRelayBaseUrl } from './relay';
 
 type ServerMsgType = WsServerMsg['type'];
 type MsgOfType<T extends ServerMsgType> = Extract<WsServerMsg, { type: T }>;
@@ -72,9 +73,9 @@ export class SctlWsClient {
 		this.reconnectConfig = { ...DEFAULT_RECONNECT, ...reconnect };
 		this.ackTimeoutMs = config?.ackTimeout ?? DEFAULT_ACK_TIMEOUT_MS;
 		this.pingIntervalMs = config?.pingInterval ?? DEFAULT_PING_INTERVAL_MS;
-		// Immediately retry when tab becomes visible during reconnect
+		// Immediately retry when tab becomes visible during reconnect or device_offline
 		this.visibilityHandler = () => {
-			if (document.visibilityState === 'visible' && this._status === 'reconnecting') {
+			if (document.visibilityState === 'visible' && (this._status === 'reconnecting' || this._status === 'device_offline')) {
 				if (this.reconnectTimer) {
 					clearTimeout(this.reconnectTimer);
 					this.reconnectTimer = null;
@@ -89,7 +90,7 @@ export class SctlWsClient {
 
 	// ── Connection ──────────────────────────────────────────────────
 
-	/** Current connection status (`'disconnected'`, `'connecting'`, `'connected'`, `'reconnecting'`). */
+	/** Current connection status. */
 	get status(): ConnectionStatus {
 		return this._status;
 	}
@@ -105,8 +106,51 @@ export class SctlWsClient {
 			return;
 		}
 		this.intentionalClose = false;
-		this.setStatus('connecting');
 
+		// For relay URLs, pre-flight the health endpoint to instantly detect device offline.
+		// This avoids waiting for the browser's WS upgrade timeout on a 404 rejection.
+		const relayBase = this.getRelayBaseUrl();
+		if (relayBase) {
+			this.connectViaRelay(relayBase);
+			return;
+		}
+
+		// Preserve device_offline during reconnect attempts — don't flash to 'connecting'
+		if (this._status !== 'device_offline') {
+			this.setStatus('connecting');
+		}
+		this.openWs();
+	}
+
+	/** Pre-flight relay health check, then open WS only if device is on the tunnel. */
+	private async connectViaRelay(relayBase: string): Promise<void> {
+		if (this._status !== 'device_offline') {
+			this.setStatus('connecting');
+		}
+		try {
+			const resp = await fetch(`${relayBase}/api/health`, {
+				signal: AbortSignal.timeout(3000)
+			});
+			if (this.intentionalClose) return;
+			if (resp.ok) {
+				const health = await resp.json();
+				if (!health.tunnel?.connected) {
+					// Relay is up but device is not on the tunnel — skip WS attempt entirely
+					this.setStatus('device_offline');
+					this.scheduleReconnect();
+					return;
+				}
+			}
+		} catch {
+			// Relay unreachable — fall through to WS attempt
+			if (this.intentionalClose) return;
+		}
+		// Device appears connected (or relay unreachable) — try WS
+		this.openWs();
+	}
+
+	/** Actually open the WebSocket (shared by direct and relay paths). */
+	private openWs(): void {
 		const sep = this.wsUrl.includes('?') ? '&' : '?';
 		const url = `${this.wsUrl}${sep}token=${encodeURIComponent(this.apiKey)}`;
 		const ws = new WebSocket(url);
@@ -130,17 +174,20 @@ export class SctlWsClient {
 		};
 
 		ws.onclose = () => {
+			const wasNeverOpen = this._status === 'connecting' || this._status === 'device_offline';
 			this.ws = null;
 			this.stopPing();
 			if (this.intentionalClose) {
 				this.setStatus('disconnected');
 			} else {
+				if (wasNeverOpen && this.getRelayBaseUrl() && this._status !== 'device_offline') {
+					this.setStatus('device_offline');
+				}
 				this.scheduleReconnect();
 			}
 		};
 
-		ws.onerror = (event) => {
-			console.error('[SctlWsClient] WebSocket error:', event);
+		ws.onerror = () => {
 			// onclose will fire after onerror — reconnect handled there
 		};
 
@@ -175,7 +222,10 @@ export class SctlWsClient {
 			this.setStatus('disconnected');
 			return;
 		}
-		this.setStatus('reconnecting');
+		// Preserve device_offline status — don't overwrite with reconnecting
+		if (this._status !== 'device_offline') {
+			this.setStatus('reconnecting');
+		}
 		// First attempt is immediate, then exponential backoff
 		const delay = this.reconnectAttempt === 0
 			? 0
@@ -205,6 +255,11 @@ export class SctlWsClient {
 	// ── Event dispatch ──────────────────────────────────────────────
 
 	private dispatch(msg: WsServerMsg): void {
+		// Handle tunnel.device_disconnected — relay telling us the device dropped
+		if ((msg as { type: string }).type === 'tunnel.device_disconnected') {
+			this.setStatus('device_offline');
+		}
+
 		// Resolve pending ack if request_id matches
 		if ('request_id' in msg && msg.request_id) {
 			const pending = this.pendingAcks.get(msg.request_id);
@@ -410,6 +465,13 @@ export class SctlWsClient {
 			this.on('session.exited', (m) => { if (m.session_id === sessionId) cb(m); })
 		];
 		return () => unsubs.forEach((u) => u());
+	}
+
+	// ── Relay detection ─────────────────────────────────────────────
+
+	/** If wsUrl is a relay URL like ws://host/d/{serial}/api/ws, return the relay HTTP base. */
+	private getRelayBaseUrl(): string | null {
+		return getRelayBaseUrl(this.wsUrl);
 	}
 
 	// ── Ping keepalive ──────────────────────────────────────────────

@@ -379,9 +379,11 @@ generate_sctlin_seed() {
     local all_device_names
     all_device_names=$(jq -r '[.devices | keys[]] | @json' "$source_config")
 
-    jq --argjson serials "$serial_map" --argjson names "$all_device_names" '[
+    local relay_api_key="${RELAY_API_KEY:-}"
+
+    jq --argjson serials "$serial_map" --argjson names "$all_device_names" --arg relay_key "$relay_api_key" '[
         .devices | to_entries[] |
-        # Direct entry
+        # Direct entry (add relayApiKey if URL contains /d/ — it IS a relay entry)
         {
             id: .key,
             name: .key,
@@ -389,7 +391,7 @@ generate_sctlin_seed() {
             apiKey: .value.api_key,
             shell: "",
             connected: false
-        },
+        } + (if (.value.url | test("/d/")) and ($relay_key | length > 0) then {relayApiKey: $relay_key} else {} end),
         # Local dev relay entry (skip if URL contains /d/ or {name}-relay already exists)
         if ($serials[.key] and (.value.url | test("/d/") | not) and ((.key + "-relay") as $rk | ($names | index($rk)) | not)) then {
             id: (.key + "-relay"),
@@ -398,7 +400,8 @@ generate_sctlin_seed() {
             apiKey: .value.api_key,
             shell: "",
             connected: false
-        } else empty end
+        } + (if $relay_key | length > 0 then {relayApiKey: $relay_key} else {} end)
+        else empty end
     ]' "$source_config" > "$seed_file"
 
     ok "sctlin seed generated: $seed_file ($(jq length "$seed_file") servers)"
@@ -1603,7 +1606,7 @@ do_tunnel() {
     cat > "$DATA_DIR/relay.toml" <<EOF
 [server]
 listen = "$RELAY_LISTEN"
-journal_enabled = false
+journal_enabled = true
 
 [auth]
 api_key = "unused"
@@ -2067,7 +2070,7 @@ do_relay_setup() {
 [server]
 listen = "$listen_addr"
 max_connections = 100
-journal_enabled = false
+journal_enabled = true
 data_dir = "/var/lib/sctl"
 
 [auth]

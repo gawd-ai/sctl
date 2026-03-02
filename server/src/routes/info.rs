@@ -133,12 +133,12 @@ pub async fn info(State(state): State<AppState>) -> Result<Json<Value>, StatusCo
     Ok(Json(response))
 }
 
-fn read_proc_file(path: &str) -> String {
+pub(crate) fn read_proc_file(path: &str) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
 /// Parse `MemTotal` and `MemAvailable` from `/proc/meminfo` content.
-fn parse_meminfo(meminfo: &str) -> (u64, u64) {
+pub(crate) fn parse_meminfo(meminfo: &str) -> (u64, u64) {
     let mut total = 0u64;
     let mut available = 0u64;
     for line in meminfo.lines() {
@@ -159,7 +159,7 @@ fn parse_kb_value(s: &str) -> u64 {
 }
 
 /// Parse the 1/5/15-minute load averages from `/proc/loadavg`.
-fn parse_loadavg(loadavg: &str) -> Vec<f64> {
+pub(crate) fn parse_loadavg(loadavg: &str) -> Vec<f64> {
     loadavg
         .split_whitespace()
         .take(3)
@@ -288,7 +288,7 @@ fn read_sys_file(path: &str) -> String {
 /// Get disk usage for a filesystem via the POSIX `statvfs` syscall.
 ///
 /// Returns `null` on failure (e.g. path doesn't exist, or `statvfs` errors).
-fn get_disk_usage(path: &str) -> Value {
+pub(crate) fn get_disk_usage(path: &str) -> Value {
     use std::ffi::CString;
     use std::mem::MaybeUninit;
 

@@ -5,6 +5,7 @@
 //! middleware.
 
 pub mod activity;
+pub mod diagnostics;
 pub mod events;
 pub mod exec;
 pub mod files;

@@ -1,4 +1,4 @@
-import type { DeviceInfo, DirEntry, FileContent, ExecResult, ActivityEntry, PlaybookSummary, PlaybookDetail, StpInitDownloadResult, StpInitUploadResult, StpChunkAck, StpResumeResult, StpStatusResult, StpListResult, CachedExecResult } from '../types/terminal.types';
+import type { DeviceInfo, DirEntry, FileContent, ExecResult, ActivityEntry, PlaybookSummary, PlaybookDetail, StpInitDownloadResult, StpInitUploadResult, StpChunkAck, StpResumeResult, StpStatusResult, StpListResult, CachedExecResult, ServerDiagnostics } from '../types/terminal.types';
 import { HttpError, TimeoutError } from './errors';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -66,6 +66,13 @@ export class SctlRestClient {
 	/** Fetch device system information (hostname, CPU, memory, disk, interfaces). */
 	async getInfo(): Promise<DeviceInfo> {
 		const res = await this.fetch('/api/info');
+		return res.json();
+	}
+
+	/** Fetch server-side diagnostics (process, system, network, logs). */
+	async getDiagnostics(logLines = 500, logSince = '24h'): Promise<ServerDiagnostics> {
+		const params = new URLSearchParams({ log_lines: String(logLines), log_since: logSince });
+		const res = await this.fetch(`/api/diagnostics?${params}`);
 		return res.json();
 	}
 

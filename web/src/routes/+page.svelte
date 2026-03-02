@@ -18,7 +18,8 @@
 		ActivityEntry,
 		SplitGroupInfo,
 		ViewerTab,
-		ExecViewerData
+		ExecViewerData,
+		RelayHealthInfo
 	} from '$lib';
 
 	// ── Persistence ──────────────────────────────────────────────────
@@ -113,7 +114,8 @@
 					if (idx !== -1) {
 						const old = servers[idx];
 						if (old.name !== entry.name || old.wsUrl !== entry.wsUrl ||
-							old.apiKey !== entry.apiKey || old.shell !== entry.shell) {
+							old.apiKey !== entry.apiKey || old.shell !== entry.shell ||
+							('relayApiKey' in entry && old.relayApiKey !== entry.relayApiKey)) {
 							servers[idx] = { ...old, ...entry, id: old.id };
 							changed = true;
 						}
@@ -165,6 +167,23 @@
 	// Activity feed
 	let serverActivity: Record<string, ActivityEntry[]> = $state({});
 
+	// Relay health (per-server)
+	let serverRelayHealth: Record<string, RelayHealthInfo | null> = $state({});
+
+	// Relay system info (per-server)
+	let serverRelayInfo: Record<string, DeviceInfo | null> = $state({});
+
+	// Relay diagnostics (per-server)
+	let serverDisconnectReasons: Record<string, string | null> = $state({});
+	let serverDeviceProbes: Record<string, import('$lib').DeviceProbeResult | null> = $state({});
+
+	// Connection event log (per-server)
+	let serverConnectionLog: Record<string, import('$lib').ConnectionEvent[]> = $state({});
+
+	// Server diagnostics (per-server)
+	let serverDiagnostics: Record<string, import('$lib').ServerDiagnostics | null> = $state({});
+	let relayDiagnostics: Record<string, import('$lib').ServerDiagnostics | null> = $state({});
+
 	// Server dashboard
 	let serverDashboardActive: Record<string, boolean> = $state({});
 	let dashboardActive = $derived(activeServerId ? serverDashboardActive[activeServerId] ?? false : false);
@@ -192,12 +211,15 @@
 			onConnectionChange: (id, status) => {
 				const prevStatus = connectionStatuses[id];
 				connectionStatuses = { ...connectionStatuses, [id]: status };
+				const name = servers.find(s => s.id === id)?.name ?? id;
 				if (status === 'connected' && prevStatus !== 'connected') {
-					toastRef?.push(`Connected to ${servers.find(s => s.id === id)?.name ?? id}`, 'success');
+					toastRef?.push(`Connected to ${name}`, 'success');
+				} else if (status === 'device_offline' && prevStatus !== 'device_offline') {
+					toastRef?.push(`${name}: relay reachable, device offline`, 'warning');
 				} else if (status === 'reconnecting' && prevStatus === 'connected') {
-					toastRef?.push(`Reconnecting to ${servers.find(s => s.id === id)?.name ?? id}...`, 'warning');
+					toastRef?.push(`Reconnecting to ${name}...`, 'warning');
 				} else if (status === 'disconnected' && prevStatus === 'connected') {
-					toastRef?.push(`Disconnected from ${servers.find(s => s.id === id)?.name ?? id}`, 'info');
+					toastRef?.push(`Disconnected from ${name}`, 'info');
 				}
 			},
 			onDeviceInfo: (id, info) => {
@@ -205,6 +227,21 @@
 			},
 			onActivity: (id, entries) => {
 				serverActivity = { ...serverActivity, [id]: entries };
+			},
+			onRelayHealth: (id, health) => {
+				serverRelayHealth = { ...serverRelayHealth, [id]: health };
+			},
+			onRelayInfo: (id, info) => {
+				serverRelayInfo = { ...serverRelayInfo, [id]: info };
+			},
+			onDisconnectReason: (id, reason) => {
+				serverDisconnectReasons = { ...serverDisconnectReasons, [id]: reason };
+			},
+			onDeviceProbe: (id, result) => {
+				serverDeviceProbes = { ...serverDeviceProbes, [id]: result };
+			},
+			onConnectionLog: (id, events) => {
+				serverConnectionLog = { ...serverConnectionLog, [id]: events };
 			},
 			onTransferChange: (id, transfers) => {
 				serverTransferLists = { ...serverTransferLists, [id]: transfers };
@@ -397,9 +434,12 @@
 		return serverSessions[activeServerId]?.find((s) => s.key === key)?.sessionId ?? null;
 	}
 
-	// Connected servers in display order
+	// Connected servers in display order (includes device_offline — relay is reachable)
 	let connectedServers = $derived(
-		servers.filter((s) => connectionStatuses[s.id] === 'connected')
+		servers.filter((s) => {
+			const st = connectionStatuses[s.id];
+			return st === 'connected' || st === 'device_offline';
+		})
 	);
 
 	// Unified flat session list across all servers (for tab navigation)
@@ -476,6 +516,20 @@
 		serverTransferLists = restTl;
 		const { [id]: _di, ...restDi } = serverDeviceInfo;
 		serverDeviceInfo = restDi;
+		const { [id]: _rh, ...restRh } = serverRelayHealth;
+		serverRelayHealth = restRh;
+		const { [id]: _ri, ...restRi } = serverRelayInfo;
+		serverRelayInfo = restRi;
+		const { [id]: _dr, ...restDr } = serverDisconnectReasons;
+		serverDisconnectReasons = restDr;
+		const { [id]: _dp, ...restDp } = serverDeviceProbes;
+		serverDeviceProbes = restDp;
+		const { [id]: _cl, ...restCl } = serverConnectionLog;
+		serverConnectionLog = restCl;
+		const { [id]: _sd, ...restSd } = serverDiagnostics;
+		serverDiagnostics = restSd;
+		const { [id]: _rd, ...restRd } = relayDiagnostics;
+		relayDiagnostics = restRd;
 		const { [id]: _act, ...restAct } = serverActivity;
 		serverActivity = restAct;
 		const { [id]: _sg, ...restSg } = serverSplitGroups;
@@ -1124,7 +1178,29 @@
 								deviceInfo={serverDeviceInfo[server.id] ?? null}
 								activity={serverActivity[server.id] ?? []}
 								restClient={manager.get(server.id)?.restClient ?? null}
+								relayHealth={serverRelayHealth[server.id] ?? null}
+								isRelay={!!(manager.get(server.id)?.isRelay)}
+								relaySerial={manager.get(server.id)?.relaySerial ?? null}
+								disconnectReason={serverDisconnectReasons[server.id] ?? null}
+								lastConnectedAt={manager.get(server.id)?.lastConnectedAt ?? null}
+								deviceProbe={serverDeviceProbes[server.id] ?? null}
+								connectionLog={serverConnectionLog[server.id] ?? []}
+								onrefreshrelayhealth={() => manager.fetchRelayHealth(server.id)}
+								onrefreshrelayinfo={() => manager.fetchRelayInfo(server.id)}
+								onprobedevice={() => manager.probeRelayDevice(server.id)}
 								onrefreshinfo={() => manager.fetchDeviceInfo(server.id)}
+								serverDiagnostics={serverDiagnostics[server.id] ?? null}
+								onfetchdiagnostics={async () => {
+									const diag = await manager.fetchDiagnostics(server.id);
+									serverDiagnostics = { ...serverDiagnostics, [server.id]: diag };
+								}}
+								relayDiagnostics={relayDiagnostics[server.id] ?? null}
+								onfetchrelaydiagnostics={async () => {
+									const diag = await manager.fetchRelayDiagnostics(server.id);
+									relayDiagnostics = { ...relayDiagnostics, [server.id]: diag };
+								}}
+								relayInfo={serverRelayInfo[server.id] ?? null}
+								hasRelayApiKey={!!(server.relayApiKey)}
 								onToggleFiles={() => { toggleSidePanel('files', dpk); }}
 								onTogglePlaybooks={() => { toggleSidePanel('playbooks', dpk); }}
 								onToggleAi={() => { toggleMasterAi(server.id); }}

@@ -14,6 +14,7 @@ use crate::gawdxfer::manager::TransferManager;
 use crate::gps::GpsState;
 use crate::lte::LteState;
 use crate::sessions::SessionManager;
+use crate::tunnel::relay::RelayConnectionHistory;
 
 /// Shared application state for the sctl server.
 #[derive(Clone)]
@@ -41,6 +42,8 @@ pub struct AppState {
     pub gps_state: Option<Arc<Mutex<GpsState>>>,
     /// LTE signal state (None when `[lte]` not configured).
     pub lte_state: Option<Arc<Mutex<LteState>>>,
+    /// Relay connection history (None when not in relay mode).
+    pub relay_history: Option<Arc<RelayConnectionHistory>>,
 }
 
 /// Tunnel connection event types.

@@ -880,6 +880,9 @@ async fn handle_relay_message(
         "tunnel.health" => {
             handle_tunnel_health(state, ws_sink, request_id.as_deref()).await;
         }
+        "tunnel.diagnostics" => {
+            handle_tunnel_diagnostics(state, ws_sink, &msg, request_id.as_deref()).await;
+        }
         "tunnel.file.read" => {
             handle_tunnel_file_read(state, ws_sink, &msg, request_id.as_deref()).await;
         }
@@ -1336,6 +1339,49 @@ async fn handle_tunnel_health(state: &AppState, ws_sink: &WsSink, request_id: Op
         }),
     )
     .await;
+}
+
+/// Handle tunnel.diagnostics — server diagnostics snapshot
+async fn handle_tunnel_diagnostics(
+    state: &AppState,
+    ws_sink: &WsSink,
+    msg: &Value,
+    request_id: Option<&str>,
+) {
+    let log_lines = msg["log_lines"].as_u64().map(|n| n as u32);
+    let log_since = msg["log_since"].as_str().map(String::from);
+    let query = crate::routes::diagnostics::DiagnosticsQuery { log_lines, log_since };
+    match crate::routes::diagnostics::diagnostics(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(query),
+    )
+    .await
+    {
+        Ok(axum::Json(body)) => {
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "tunnel.diagnostics.result",
+                    "request_id": request_id,
+                    "status": 200,
+                    "body": body,
+                }),
+            )
+            .await;
+        }
+        Err(status) => {
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "tunnel.diagnostics.result",
+                    "request_id": request_id,
+                    "status": status.as_u16(),
+                    "body": {"error": "Failed to get diagnostics"},
+                }),
+            )
+            .await;
+        }
+    }
 }
 
 /// Handle tunnel.file.read — file read or directory list

@@ -8,7 +8,7 @@ export interface SidePanelTabDef {
 // ── Control & status enums ──────────────────────────────────────────
 
 /** WebSocket connection lifecycle state. */
-export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
+export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'reconnecting' | 'device_offline';
 
 // ── Activity feed ───────────────────────────────────────────────────
 
@@ -421,7 +421,7 @@ export interface DeviceInfo {
 	/** RAM usage in bytes. */
 	memory: { total_bytes: number; used_bytes: number; available_bytes: number };
 	/** Root filesystem usage in bytes. */
-	disk: { total_bytes: number; used_bytes: number; available_bytes: number; mount_point: string };
+	disk: { total_bytes: number; used_bytes: number; available_bytes: number; path: string };
 	/** Network interfaces with addresses and link state. */
 	interfaces: NetworkInterface[];
 	/** Tunnel relay connection info, if configured. */
@@ -488,6 +488,91 @@ export interface ExecResult {
 	duration_ms: number;
 }
 
+/** A recorded device connection session from the relay's connection history. */
+export interface RelayConnectionSession {
+	serial: string;
+	connected_at: number;
+	disconnected_at: number | null;
+	duration_secs: number;
+	reason: string | null;
+}
+
+/** Health response from a relay's /api/health endpoint. */
+export interface RelayHealthInfo {
+	status: string;
+	uptime_secs: number;
+	version: string;
+	sessions: number;
+	tunnel: {
+		connected: boolean;
+		reconnects: number;
+		/** Enhanced fields (present when device runs tunnel client mode). */
+		uptime_secs?: number;
+		messages_sent?: number;
+		messages_received?: number;
+		last_pong_age_ms?: number;
+		dropped_outbound?: number;
+		rtt_median_ms?: number;
+		rtt_p95_ms?: number;
+		recent_events?: { time: string; event: string; detail?: string }[];
+	};
+	gps: { status: string; has_fix: boolean; fix_age_secs?: number; satellites?: number } | null;
+	lte: { rssi_dbm?: number; rsrp?: number; sinr?: number; signal_bars?: number; band?: string; operator?: string; status?: string } | null;
+	connection_history?: RelayConnectionSession[];
+}
+
+/** A client-side event in the connection lifecycle log. */
+export type ConnectionEventLevel = 'info' | 'warn' | 'error' | 'success';
+export interface ConnectionEvent {
+	/** Monotonic ID for keyed iteration. */
+	id: number;
+	/** Unix epoch ms. */
+	timestamp: number;
+	/** Severity level for color coding. */
+	level: ConnectionEventLevel;
+	/** Short summary line. */
+	message: string;
+	/** Optional detail (e.g. error code, duration). */
+	detail?: string;
+}
+
+/** Result of probing a device through the relay's proxy endpoint. */
+export interface DeviceProbeResult {
+	/** Whether the device was reachable through the relay. */
+	reachable: boolean;
+	/** HTTP status code from the relay proxy, or null on network error. */
+	status: number | null;
+	/** Error code from the relay (e.g. 'DEVICE_NOT_FOUND', 'TIMEOUT'), or null if reachable. */
+	errorCode: string | null;
+	/** Human-readable error message, or null if reachable. */
+	errorMessage: string | null;
+	/** Timestamp of the probe. */
+	probedAt: number;
+}
+
+/** Server-side diagnostics from `/api/diagnostics`. */
+export interface ServerDiagnostics {
+	process: {
+		pid: number;
+		rss_bytes: number;
+		open_fds: number;
+		threads: number;
+		uptime_secs: number;
+	};
+	system: {
+		hostname: string;
+		os_uptime_secs: number;
+		load_avg: number[];
+		memory: { total_bytes: number; available_bytes: number; used_pct: number };
+		disk: { path: string; total_bytes: number; available_bytes: number; used_bytes: number } | null;
+	};
+	network: {
+		tcp: { established: number; listen: number; time_wait: number; close_wait: number };
+	};
+	logs: { timestamp: string; level: string; message: string }[];
+	log_stats: { errors: number; warnings: number; total: number };
+}
+
 /** Configuration for a server connection (persisted in localStorage). */
 export interface ServerConfig {
 	/** Unique identifier for this server entry. */
@@ -500,6 +585,8 @@ export interface ServerConfig {
 	apiKey: string;
 	/** Preferred shell binary (empty string = device default). */
 	shell: string;
+	/** Optional API key for the relay server itself (for relay diagnostics). */
+	relayApiKey?: string;
 }
 
 export interface WsSessionListedMsg {

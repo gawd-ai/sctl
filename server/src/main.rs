@@ -198,7 +198,7 @@ async fn run_server(config_path: Option<&str>) {
         Arc::new(tokio::sync::Mutex::new(lte::LteState::new()))
     });
 
-    let state = AppState {
+    let mut state = AppState {
         session_manager,
         config: Arc::new(config),
         start_time: Instant::now(),
@@ -210,6 +210,7 @@ async fn run_server(config_path: Option<&str>) {
         sse_connections: Arc::new(AtomicU32::new(0)),
         gps_state,
         lte_state,
+        relay_history: None,
     };
 
     // Build router
@@ -217,6 +218,7 @@ async fn run_server(config_path: Option<&str>) {
 
     let authed_routes = Router::new()
         .route("/api/info", get(routes::info::info))
+        .route("/api/diagnostics", get(routes::diagnostics::diagnostics))
         .route("/api/exec", post(routes::exec::exec))
         .route("/api/exec/batch", post(routes::exec::batch_exec))
         .route(
@@ -285,14 +287,7 @@ async fn run_server(config_path: Option<&str>) {
             axum::http::HeaderName::from_static("x-gx-transfer-id"),
         ]);
 
-    let mut app = Router::new()
-        .merge(public_routes)
-        .merge(authed_routes)
-        .merge(ws_route)
-        .layer(Extension(ApiKey(state.config.auth.api_key.clone())))
-        .with_state(state.clone());
-
-    // Tunnel: add relay routes if configured (before global layers so CORS/tracing apply)
+    // Tunnel: create relay state early so relay_history is set before .with_state() clones
     let tunnel_config = state.config.tunnel.clone();
     let mut relay_state_opt: Option<tunnel::relay::RelayState> = None;
     if let Some(ref tc) = tunnel_config {
@@ -303,10 +298,24 @@ async fn run_server(config_path: Option<&str>) {
                 tc.heartbeat_timeout_secs,
                 tc.tunnel_proxy_timeout_secs,
             );
-            let relay_routes = tunnel::relay::relay_router(relay_state.clone());
-            app = app.merge(relay_routes);
+            // Seed connection history from journald (survives restarts)
+            relay_state.history.seed_from_journal().await;
+            state.relay_history = Some(relay_state.history.clone());
             relay_state_opt = Some(relay_state);
         }
+    }
+
+    let mut app = Router::new()
+        .merge(public_routes)
+        .merge(authed_routes)
+        .merge(ws_route)
+        .layer(Extension(ApiKey(state.config.auth.api_key.clone())))
+        .with_state(state.clone());
+
+    // Tunnel: add relay routes if configured (before global layers so CORS/tracing apply)
+    if let Some(ref relay_state) = relay_state_opt {
+        let relay_routes = tunnel::relay::relay_router(relay_state.clone());
+        app = app.merge(relay_routes);
     }
 
     // GUARD: .layer() only applies to routes merged BEFORE the call.

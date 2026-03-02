@@ -96,7 +96,12 @@ export type {
 	StpTransferSummary,
 	GxProgressMsg,
 	GxCompleteMsg,
-	GxErrorMsg
+	GxErrorMsg,
+	RelayHealthInfo,
+	DeviceProbeResult,
+	ConnectionEvent,
+	ConnectionEventLevel,
+	ServerDiagnostics
 } from './types/terminal.types';
 
 export type { DeviceConnectionConfig } from './types/widget.types';
@@ -111,4 +116,5 @@ export { KeyboardManager, type Shortcut } from './utils/keyboard';
 export { parsePlaybookFrontmatter, renderPlaybookScript, validatePlaybookName } from './utils/playbook-parser';
 export { TransferTracker, type ClientTransfer, type TransferProgress, type TransferState, type OnProgress, type OnComplete, type OnError } from './utils/transfer';
 export { ConnectionManager, type ConnectionManagerConfig, type ConnectionManagerEvents, type ServerConnection } from './utils/connection-manager';
+export { getRelayBaseUrl, getRelaySerial } from './utils/relay';
 export { SctlError, ConnectionError, ServerError, TimeoutError, HttpError, TransferError } from './utils/errors';

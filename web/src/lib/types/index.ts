@@ -71,7 +71,12 @@ export type {
 	StpTransferSummary,
 	GxProgressMsg,
 	GxCompleteMsg,
-	GxErrorMsg
+	GxErrorMsg,
+	RelayHealthInfo,
+	RelayConnectionSession,
+	DeviceProbeResult,
+	ConnectionEvent,
+	ConnectionEventLevel
 } from './terminal.types';
 
 export type { DeviceConnectionConfig } from './widget.types';
