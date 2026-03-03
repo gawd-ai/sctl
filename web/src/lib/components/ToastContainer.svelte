@@ -35,7 +35,7 @@
 </script>
 
 {#if toasts.length > 0}
-	<div class="fixed bottom-4 right-4 z-50 flex flex-col gap-1 pointer-events-none" role="log" aria-live="polite">
+	<div class="fixed bottom-[46px] right-4 z-50 flex flex-col gap-1 pointer-events-none" role="log" aria-live="polite">
 		{#each toasts as toast (toast.id)}
 			<button
 				class="pointer-events-auto max-w-80 px-3 py-1.5 rounded border-l-2 shadow-lg text-[11px] font-mono text-neutral-300 text-left transition-all animate-slide-up {typeColors[toast.type]}"

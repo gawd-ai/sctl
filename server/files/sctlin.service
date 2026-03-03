@@ -1,0 +1,20 @@
+[Unit]
+Description=sctlin Web UI
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/sctl/sctlin
+ExecStart=/usr/bin/node build
+Environment=PORT=3000
+Environment=ORIGIN=http://127.0.0.1:3000
+Restart=always
+RestartSec=3
+
+# Security hardening
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

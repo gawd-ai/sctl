@@ -931,6 +931,12 @@ async fn handle_relay_message(
         "tunnel.lte" => {
             handle_tunnel_lte(state, ws_sink, request_id.as_deref()).await;
         }
+        "tunnel.lte.bands" => {
+            handle_tunnel_lte_bands(state, ws_sink, &msg, request_id.as_deref()).await;
+        }
+        "tunnel.lte.scan" => {
+            handle_tunnel_lte_scan(state, ws_sink, &msg, request_id.as_deref()).await;
+        }
         // gawdxfer transfer protocol messages
         "gx.download.init" => {
             handle_gx_download_init(state, ws_sink, &msg, request_id.as_deref()).await;
@@ -1350,7 +1356,10 @@ async fn handle_tunnel_diagnostics(
 ) {
     let log_lines = msg["log_lines"].as_u64().map(|n| n as u32);
     let log_since = msg["log_since"].as_str().map(String::from);
-    let query = crate::routes::diagnostics::DiagnosticsQuery { log_lines, log_since };
+    let query = crate::routes::diagnostics::DiagnosticsQuery {
+        log_lines,
+        log_since,
+    };
     match crate::routes::diagnostics::diagnostics(
         axum::extract::State(state.clone()),
         axum::extract::Query(query),
@@ -2858,6 +2867,114 @@ async fn handle_tunnel_lte(state: &AppState, ws_sink: &WsSink, request_id: Optio
                 ws_sink,
                 json!({
                     "type": "tunnel.lte.result",
+                    "request_id": request_id,
+                    "status": status.as_u16(),
+                    "body": body,
+                }),
+            )
+            .await;
+        }
+    }
+}
+
+/// Handle `tunnel.lte.bands` — set LTE band configuration.
+async fn handle_tunnel_lte_bands(
+    state: &AppState,
+    ws_sink: &WsSink,
+    msg: &Value,
+    request_id: Option<&str>,
+) {
+    let body: Value = msg.clone();
+    let req: crate::routes::lte::SetBandsRequest = match serde_json::from_value(body) {
+        Ok(r) => r,
+        Err(e) => {
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "tunnel.lte.bands.result",
+                    "request_id": request_id,
+                    "status": 400,
+                    "body": {"error": format!("invalid request: {e}")},
+                }),
+            )
+            .await;
+            return;
+        }
+    };
+
+    match crate::routes::lte::set_bands(axum::extract::State(state.clone()), axum::Json(req)).await
+    {
+        Ok(axum::Json(body)) => {
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "tunnel.lte.bands.result",
+                    "request_id": request_id,
+                    "status": 200,
+                    "body": body,
+                }),
+            )
+            .await;
+        }
+        Err((status, axum::Json(body))) => {
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "tunnel.lte.bands.result",
+                    "request_id": request_id,
+                    "status": status.as_u16(),
+                    "body": body,
+                }),
+            )
+            .await;
+        }
+    }
+}
+
+/// Handle `tunnel.lte.scan` — start a background band scan.
+async fn handle_tunnel_lte_scan(
+    state: &AppState,
+    ws_sink: &WsSink,
+    msg: &Value,
+    request_id: Option<&str>,
+) {
+    let body: Value = msg.clone();
+    let req: crate::routes::lte::StartScanRequest = match serde_json::from_value(body) {
+        Ok(r) => r,
+        Err(e) => {
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "tunnel.lte.scan.result",
+                    "request_id": request_id,
+                    "status": 400,
+                    "body": {"error": format!("invalid request: {e}")},
+                }),
+            )
+            .await;
+            return;
+        }
+    };
+
+    match crate::routes::lte::start_scan(axum::extract::State(state.clone()), axum::Json(req)).await
+    {
+        Ok(axum::Json(body)) => {
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "tunnel.lte.scan.result",
+                    "request_id": request_id,
+                    "status": 200,
+                    "body": body,
+                }),
+            )
+            .await;
+        }
+        Err((status, axum::Json(body))) => {
+            send_response(
+                ws_sink,
+                json!({
+                    "type": "tunnel.lte.scan.result",
                     "request_id": request_id,
                     "status": status.as_u16(),
                     "body": body,

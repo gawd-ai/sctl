@@ -6,7 +6,8 @@
 //! 3. Translates client requests to tunnel messages over the device WS
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -19,7 +20,7 @@ use axum::{
     Json, Router,
 };
 use futures::{SinkExt, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock};
 use tracing::{info, info_span, warn, Instrument};
@@ -256,6 +257,19 @@ impl Default for RelayConnectionHistory {
     }
 }
 
+/// Snapshot of last-known device state, persisted across disconnects and relay restarts.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeviceSnapshot {
+    pub serial: String,
+    pub last_lte_signal: Option<Value>,
+    pub last_gps_fix: Option<Value>,
+    pub last_watchdog: Option<Value>,
+    pub last_seen: u64,
+}
+
+/// Maximum age of a snapshot before it gets pruned (7 days).
+const SNAPSHOT_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+
 /// State shared across all relay handlers.
 #[derive(Clone)]
 pub struct RelayState {
@@ -271,6 +285,12 @@ pub struct RelayState {
     pub epoch: Instant,
     /// Connection history ring buffer for relay dashboard.
     pub history: Arc<RelayConnectionHistory>,
+    /// Last-known device state, survives disconnects and relay restarts.
+    pub device_snapshots: Arc<RwLock<HashMap<String, DeviceSnapshot>>>,
+    /// Dirty flag for debounced snapshot persistence.
+    pub snapshots_dirty: Arc<AtomicBool>,
+    /// Path to snapshot persistence file (None if no data_dir configured).
+    pub snapshots_path: Option<PathBuf>,
 }
 
 /// A device connected to the relay via its outbound WS tunnel.
@@ -339,7 +359,15 @@ impl RelayState {
         tunnel_key: String,
         heartbeat_timeout_secs: u64,
         tunnel_proxy_timeout_secs: u64,
+        data_dir: Option<&str>,
     ) -> Self {
+        let snapshots_path = data_dir.map(|d| Path::new(d).join("relay_snapshots.json"));
+        let snapshots = snapshots_path
+            .as_ref()
+            .map_or_else(HashMap::new, |p| load_snapshots(p));
+        if !snapshots.is_empty() {
+            info!("Loaded {} device snapshot(s) from disk", snapshots.len());
+        }
         Self {
             devices: Arc::new(RwLock::new(HashMap::new())),
             tunnel_key,
@@ -347,6 +375,9 @@ impl RelayState {
             tunnel_proxy_timeout_secs,
             epoch: Instant::now(),
             history: Arc::new(RelayConnectionHistory::new()),
+            device_snapshots: Arc::new(RwLock::new(snapshots)),
+            snapshots_dirty: Arc::new(AtomicBool::new(false)),
+            snapshots_path,
         }
     }
 
@@ -371,7 +402,9 @@ impl RelayState {
                 if now_ms.saturating_sub(last_hb) > timeout_ms {
                     drain_device(device, "heartbeat timeout").await;
                     devices.remove(&serial);
-                    self.history.record_disconnect(&serial, "heartbeat_timeout").await;
+                    self.history
+                        .record_disconnect(&serial, "heartbeat_timeout")
+                        .await;
                     warn!(serial = %serial, "Evicted device (heartbeat timeout)");
                     dead_serials.push(serial);
                 }
@@ -418,10 +451,87 @@ impl RelayState {
         let mut devices = self.devices.write().await;
         for (serial, device) in devices.iter() {
             drain_device(device, "relay shutting down").await;
-            self.history.record_disconnect(serial, "relay_shutdown").await;
+            self.history
+                .record_disconnect(serial, "relay_shutdown")
+                .await;
             info!(serial = %serial, "Drained device for relay shutdown");
         }
         devices.clear();
+    }
+
+    /// Update a device's snapshot with telemetry data.
+    pub async fn update_snapshot(&self, serial: &str, field: &str, value: &Value) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut snapshots = self.device_snapshots.write().await;
+        let snap = snapshots
+            .entry(serial.to_string())
+            .or_insert_with(|| DeviceSnapshot {
+                serial: serial.to_string(),
+                last_lte_signal: None,
+                last_gps_fix: None,
+                last_watchdog: None,
+                last_seen: now,
+            });
+        match field {
+            "lte.signal" => snap.last_lte_signal = Some(value.clone()),
+            "gps.fix" => snap.last_gps_fix = Some(value.clone()),
+            "lte.watchdog" => snap.last_watchdog = Some(value.clone()),
+            _ => {}
+        }
+        snap.last_seen = now;
+        self.snapshots_dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Save snapshots to disk if dirty. Returns true if a write occurred.
+    pub async fn save_snapshots(&self) -> bool {
+        if !self.snapshots_dirty.swap(false, Ordering::Relaxed) {
+            return false;
+        }
+        let Some(ref path) = self.snapshots_path else {
+            return false;
+        };
+        let snapshots = self.device_snapshots.read().await;
+        save_snapshots(path, &snapshots);
+        true
+    }
+}
+
+/// Load snapshots from disk, pruning entries older than 7 days.
+fn load_snapshots(path: &Path) -> HashMap<String, DeviceSnapshot> {
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    let mut map: HashMap<String, DeviceSnapshot> = match serde_json::from_str(&data) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("Failed to parse relay_snapshots.json: {e}");
+            return HashMap::new();
+        }
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    map.retain(|_, snap| now.saturating_sub(snap.last_seen) < SNAPSHOT_MAX_AGE_SECS);
+    map
+}
+
+/// Atomically write snapshots to disk (write to .tmp, then rename).
+fn save_snapshots(path: &Path, snapshots: &HashMap<String, DeviceSnapshot>) {
+    let tmp = path.with_extension("json.tmp");
+    let Ok(data) = serde_json::to_string_pretty(snapshots) else {
+        warn!("Failed to serialize snapshots");
+        return;
+    };
+    if let Err(e) = std::fs::write(&tmp, &data) {
+        warn!("Failed to write snapshot tmp file: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        warn!("Failed to rename snapshot file: {e}");
     }
 }
 
@@ -483,6 +593,8 @@ pub fn relay_router(relay_state: RelayState) -> Router {
         )
         .route("/d/{serial}/api/gps", get(proxy_gps))
         .route("/d/{serial}/api/lte", get(proxy_lte))
+        .route("/d/{serial}/api/lte/bands", post(proxy_lte_bands))
+        .route("/d/{serial}/api/lte/scan", post(proxy_lte_scan))
         .route("/d/{serial}/api/ws", get(proxy_ws));
 
     tunnel_admin.merge(device_proxy).with_state(relay_state)
@@ -896,12 +1008,14 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                         }
                     }
                     // Device telemetry broadcasts — store latest and forward to WS clients
-                    "gps.fix" | "lte.signal" => {
-                        if msg_type == "gps.fix" {
-                            *last_gps_fix.write().await = Some(parsed.clone());
-                        } else {
-                            *last_lte_signal.write().await = Some(parsed.clone());
+                    "gps.fix" | "lte.signal" | "lte.watchdog" => {
+                        match msg_type {
+                            "gps.fix" => *last_gps_fix.write().await = Some(parsed.clone()),
+                            "lte.signal" => *last_lte_signal.write().await = Some(parsed.clone()),
+                            _ => {} // lte.watchdog has no ConnectedDevice field
                         }
+                        // Update persistent snapshot
+                        state.update_snapshot(&serial, msg_type, &parsed).await;
                         let clients_read = clients.read().await;
                         for (_, client_tx) in clients_read.iter() {
                             if client_tx.try_send(parsed.clone()).is_err() {
@@ -946,7 +1060,10 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
         if let Some(device) = removed {
             drain_device(&device, "device disconnected").await;
         }
-        state.history.record_disconnect(&serial, "disconnected").await;
+        state
+            .history
+            .record_disconnect(&serial, "disconnected")
+            .await;
         info!(serial = %serial, "Device disconnected");
     }
     send_task.abort();
@@ -2020,6 +2137,92 @@ async fn proxy_lte(
         "type": "tunnel.lte",
         "request_id": request_id,
     });
+
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
+}
+
+/// `POST /d/{serial}/api/lte/bands` — proxied band mode control.
+async fn proxy_lte_bands(
+    State(state): State<RelayState>,
+    AxumPath(serial): AxumPath<String>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), 10 * 1024)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Failed to read request body"})),
+            )
+        })?;
+
+    let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Invalid JSON"})),
+        )
+    })?;
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let mut msg = payload;
+    msg["type"] = json!("tunnel.lte.bands");
+    msg["request_id"] = json!(request_id);
+
+    // Longer timeout — band changes involve registration wait
+    let response = tunnel_request_json(&state, &serial, msg, 45).await?;
+    proxy_response_to_http(&response)
+}
+
+/// `POST /d/{serial}/api/lte/scan` — proxied band scan start.
+async fn proxy_lte_scan(
+    State(state): State<RelayState>,
+    AxumPath(serial): AxumPath<String>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), 10 * 1024)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Failed to read request body"})),
+            )
+        })?;
+
+    let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Invalid JSON"})),
+        )
+    })?;
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let mut msg = payload;
+    msg["type"] = json!("tunnel.lte.scan");
+    msg["request_id"] = json!(request_id);
 
     let response =
         tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;

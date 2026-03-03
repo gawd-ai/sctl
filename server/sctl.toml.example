@@ -82,3 +82,6 @@ level = "info"
 # LTE signal monitoring via Quectel modem AT commands.
 # device = "/dev/ttyUSB2"
 # poll_interval_secs = 60
+# watchdog = true                       # Auto-recovery when tunnel drops (requires [tunnel])
+# interface = "wwan0"                   # Network interface for watchdog IP checks
+# speed_test_url = "http://speedtest.tele2.net/10MB.zip"  # Download URL for band scan speed test

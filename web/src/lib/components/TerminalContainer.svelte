@@ -14,6 +14,7 @@
 		WsActivityNewMsg
 	} from '../types/terminal.types';
 	import { SctlWsClient } from '../utils/ws-client';
+	import { uuid } from '../utils/index';
 	import Terminal from './Terminal.svelte';
 	import TerminalTabs from './TerminalTabs.svelte';
 	import ControlBar from './ControlBar.svelte';
@@ -201,7 +202,7 @@
 
 			const serverAllowsAi = (result as unknown as Record<string, unknown>).user_allows_ai as boolean | undefined;
 			const serverName = (result as unknown as Record<string, unknown>).name as string | undefined;
-			const key = crypto.randomUUID();
+			const key = uuid();
 			const session: SessionInfo = {
 				key,
 				sessionId: result.session_id,
@@ -243,7 +244,7 @@
 		// If no local tab exists, create one immediately so the user sees feedback
 		if (!existing) {
 			const remote = remoteSessions.find((r) => r.session_id === sessionId);
-			const key = crypto.randomUUID();
+			const key = uuid();
 			const session: SessionInfo = {
 				key,
 				sessionId,
@@ -334,7 +335,7 @@
 		}
 		// Look up the remote session name for the tab label
 		const remote = remoteSessions.find((r) => r.session_id === sessionId);
-		const key = crypto.randomUUID();
+		const key = uuid();
 		const session: SessionInfo = {
 			key,
 			sessionId,

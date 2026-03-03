@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::Serialize;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, watch, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::config::GpsConfig;
@@ -181,9 +181,11 @@ pub fn spawn_gps_poller(
     modem: Modem,
     gps_state: Arc<Mutex<GpsState>>,
     session_events: broadcast::Sender<serde_json::Value>,
+    mut modem_rx: watch::Receiver<Modem>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = tokio::time::Duration::from_secs(config.poll_interval_secs);
+        let mut modem = modem;
 
         // Auto-enable GNSS engine (retry up to 3 times on failure)
         if config.auto_enable {
@@ -237,6 +239,12 @@ pub fn spawn_gps_poller(
 
         loop {
             ticker.tick().await;
+
+            // Pick up refreshed modem handle if watchdog re-opened it
+            if modem_rx.has_changed().unwrap_or(false) {
+                modem = modem_rx.borrow_and_update().clone();
+                info!("GPS poller: modem handle refreshed");
+            }
 
             match modem.command("AT+QGPSLOC=2").await {
                 Ok(resp) => match parse_qgpsloc(&resp) {

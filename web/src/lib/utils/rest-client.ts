@@ -1,4 +1,4 @@
-import type { DeviceInfo, DirEntry, FileContent, ExecResult, ActivityEntry, PlaybookSummary, PlaybookDetail, StpInitDownloadResult, StpInitUploadResult, StpChunkAck, StpResumeResult, StpStatusResult, StpListResult, CachedExecResult, ServerDiagnostics } from '../types/terminal.types';
+import type { DeviceInfo, DirEntry, FileContent, ExecResult, ActivityEntry, PlaybookSummary, PlaybookDetail, StpInitDownloadResult, StpInitUploadResult, StpChunkAck, StpResumeResult, StpStatusResult, StpListResult, CachedExecResult, ServerDiagnostics, LteData, SetBandsRequest, SetBandsResult, StartScanRequest, StartScanResult } from '../types/terminal.types';
 import { HttpError, TimeoutError } from './errors';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -36,7 +36,7 @@ export class SctlRestClient {
 		this.chunkTimeoutMs = config?.chunkTimeout ?? DEFAULT_CHUNK_TIMEOUT_MS;
 	}
 
-	private async fetch(path: string, init?: RequestInit): Promise<Response> {
+	private async fetch(path: string, init?: RequestInit, timeoutOverride?: number): Promise<Response> {
 		const url = `${this.baseUrl}${path}`;
 		const headers: Record<string, string> = {
 			...(init?.headers as Record<string, string>),
@@ -44,8 +44,9 @@ export class SctlRestClient {
 		if (this.apiKey) {
 			headers['Authorization'] = `Bearer ${this.apiKey}`;
 		}
+		const ms = timeoutOverride ?? this.timeoutMs;
 		const controller = new AbortController();
-		const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+		const timeout = setTimeout(() => controller.abort(), ms);
 		try {
 			const res = await fetch(url, { ...init, headers, signal: controller.signal });
 			if (!res.ok) {
@@ -55,7 +56,7 @@ export class SctlRestClient {
 			return res;
 		} catch (e) {
 			if (e instanceof DOMException && e.name === 'AbortError') {
-				throw new TimeoutError(`Request timed out after ${this.timeoutMs}ms: ${path}`);
+				throw new TimeoutError(`Request timed out after ${ms}ms: ${path}`);
 			}
 			throw e;
 		} finally {
@@ -205,6 +206,34 @@ export class SctlRestClient {
 	/** Fetch a cached exec result by activity ID (stdout/stderr/exit code). */
 	async getExecResult(activityId: number): Promise<CachedExecResult> {
 		const res = await this.fetch(`/api/activity/${activityId}/result`);
+		return res.json();
+	}
+
+	// ── LTE band management methods ────────────────────────────────
+
+	/** Fetch full LTE data: signal, modem, band history, and scan status. */
+	async getLte(): Promise<LteData> {
+		const res = await this.fetch('/api/lte');
+		return res.json();
+	}
+
+	/** Switch LTE bands (auto or locked). Uses 45s timeout for modem registration wait. */
+	async setLteBands(req: SetBandsRequest): Promise<SetBandsResult> {
+		const res = await this.fetch('/api/lte/bands', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(req)
+		}, 45_000);
+		return res.json();
+	}
+
+	/** Start a background band scan on the device. */
+	async startLteScan(req: StartScanRequest = {}): Promise<StartScanResult> {
+		const res = await this.fetch('/api/lte/scan', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(req)
+		});
 		return res.json();
 	}
 

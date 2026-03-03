@@ -258,6 +258,8 @@ pub struct GpsConfig {
 /// [lte]
 /// device = "/dev/ttyUSB2"
 /// poll_interval_secs = 60
+/// watchdog = true
+/// interface = "wwan0"
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct LteConfig {
@@ -267,6 +269,14 @@ pub struct LteConfig {
     /// Seconds between LTE signal polls (default 60).
     #[serde(default = "default_lte_poll_interval")]
     pub poll_interval_secs: u64,
+    /// Enable LTE watchdog for automatic modem recovery (default true).
+    #[serde(default = "default_lte_watchdog")]
+    pub watchdog: bool,
+    /// Network interface name for the LTE modem (default `wwan0`).
+    #[serde(default = "default_lte_interface")]
+    pub interface: String,
+    /// URL for download speed test during band scan (optional).
+    pub speed_test_url: Option<String>,
 }
 
 fn default_lte_device() -> String {
@@ -274,6 +284,12 @@ fn default_lte_device() -> String {
 }
 fn default_lte_poll_interval() -> u64 {
     60
+}
+fn default_lte_watchdog() -> bool {
+    true
+}
+fn default_lte_interface() -> String {
+    "wwan0".to_string()
 }
 
 fn default_listen() -> String {

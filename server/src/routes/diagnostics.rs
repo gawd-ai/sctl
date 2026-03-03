@@ -387,29 +387,51 @@ async fn try_logread(max_lines: u32) -> Option<Vec<Value>> {
 }
 
 /// Best-effort parse of a logread line.
-/// Format: "Mon DD HH:MM:SS YYYY daemon.level host prog[pid]: message"
+/// Format: "Mon DD HH:MM:SS YYYY facility.level host prog[pid]: message"
 fn parse_logread_line(line: &str) -> (String, &'static str, String) {
-    // Try to extract level from "daemon.level" field
-    let level = if line.contains(".err")
-        || line.contains(".crit")
-        || line.contains(".alert")
-        || line.contains(".emerg")
-    {
-        "error"
-    } else if line.contains(".warn") {
-        "warn"
-    } else if line.contains(".debug") {
-        "debug"
+    let words: Vec<&str> = line.split_whitespace().collect();
+
+    // Need at least: DOW Month Day Time Year Facility
+    if words.len() < 6 {
+        return (String::new(), "info", line.to_string());
+    }
+
+    // Convert timestamp to ISO 8601 (consistent with journalctl output)
+    let month_num = match words[1] {
+        "Feb" => "02",
+        "Mar" => "03",
+        "Apr" => "04",
+        "May" => "05",
+        "Jun" => "06",
+        "Jul" => "07",
+        "Aug" => "08",
+        "Sep" => "09",
+        "Oct" => "10",
+        "Nov" => "11",
+        "Dec" => "12",
+        _ => "01",
+    };
+    let timestamp = format!("{}-{}-{:0>2}T{}Z", words[4], month_num, words[2], words[3]);
+
+    // Extract level from facility.level field (words[5])
+    // BusyBox crond logs all job executions at cron.err — not a real error
+    let facility_level = words[5];
+    let level = if let Some(dot_pos) = facility_level.rfind('.') {
+        let facility = &facility_level[..dot_pos];
+        match &facility_level[dot_pos + 1..] {
+            "err" | "crit" | "alert" | "emerg" => {
+                if facility == "cron" {
+                    "info"
+                } else {
+                    "error"
+                }
+            }
+            "warn" | "warning" => "warn",
+            "debug" => "debug",
+            _ => "info",
+        }
     } else {
         "info"
-    };
-
-    // Extract timestamp: first ~24 chars are typically the date
-    // "Mon DD HH:MM:SS YYYY" = positions 0..20 approx
-    let timestamp = if line.len() > 15 {
-        line[..20].trim().to_string()
-    } else {
-        String::new()
     };
 
     // Message is everything after the colon following the program name

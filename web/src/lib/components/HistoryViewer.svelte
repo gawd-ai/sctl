@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { ActivityEntry, ActivityType, ActivitySource, ViewerTab } from '../types/terminal.types';
 	import type { SctlRestClient } from '../utils/rest-client';
+	import { uuid } from '../utils/index';
 
 	interface Props {
 		entries: ActivityEntry[];
@@ -131,12 +132,14 @@
 		return t.replace(/_/g, ' ');
 	}
 
-	function relativeTime(timestampMs: number): string {
-		const delta = Date.now() - timestampMs;
-		if (delta < 1000) return 'now';
-		if (delta < 60_000) return `${Math.floor(delta / 1000)}s`;
-		if (delta < 3_600_000) return `${Math.floor(delta / 60_000)}m`;
-		return `${Math.floor(delta / 3_600_000)}h`;
+	function formatTimestamp(epochMs: number): string {
+		const d = new Date(epochMs);
+		const mon = d.getMonth() + 1;
+		const day = d.getDate();
+		const hh = String(d.getHours()).padStart(2, '0');
+		const mm = String(d.getMinutes()).padStart(2, '0');
+		const ss = String(d.getSeconds()).padStart(2, '0');
+		return `${mon}/${day} ${hh}:${mm}:${ss}`;
 	}
 
 	function formatValue(key: string, value: unknown): string {
@@ -164,7 +167,7 @@
 		try {
 			const result = await restClient.getExecResult(entry.id);
 			const tab: ViewerTab = {
-				key: crypto.randomUUID(),
+				key: uuid(),
 				type: 'exec',
 				label: result.command.length > 24
 					? result.command.slice(0, 24) + '...'
@@ -194,11 +197,11 @@
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <!-- svelte-ignore a11y_click_events_have_key_events -->
-<div class="history-viewer flex flex-col h-full bg-neutral-950 font-mono text-[11px]">
+<div class="history-viewer flex flex-col h-full bg-neutral-950 font-mono">
 	<!-- Header -->
-	<div class="flex items-center gap-2 px-3 py-2 border-b border-neutral-800 shrink-0">
-		<span class="text-neutral-300 text-xs font-semibold">Activity History</span>
-		<span class="text-[9px] text-neutral-600 tabular-nums">{filtered.length} / {entries.length}</span>
+	<div class="flex items-center gap-2 px-3 h-8 border-b border-neutral-800/50 shrink-0">
+		<span class="text-neutral-400 text-[10px]">Activity</span>
+		<span class="text-[10px] text-neutral-600 tabular-nums">{filtered.length} / {entries.length}</span>
 		<div class="flex-1"></div>
 		<button
 			class="px-1.5 py-0.5 rounded text-[9px] text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors"
@@ -241,7 +244,7 @@
 	</div>
 
 	<!-- Search bar -->
-	<div class="px-3 py-1.5 border-b border-neutral-800/50 shrink-0">
+	<div class="px-3 py-1 border-b border-neutral-800/50 shrink-0">
 		<input
 			type="text"
 			bind:value={searchQuery}
@@ -254,24 +257,19 @@
 	<div class="flex-1 overflow-y-auto min-h-0">
 		{#each filtered as entry (entry.id)}
 			<div
-				class="flex items-start gap-1 px-3 py-1 hover:bg-neutral-800/40 cursor-pointer transition-colors border-b border-neutral-800/20"
+				class="flex items-start gap-1.5 py-1 px-3 text-[10px] tabular-nums hover:bg-neutral-800/40 cursor-pointer transition-colors border-b border-neutral-800/20"
 				onclick={() => toggleExpand(entry.id)}
 			>
-				<!-- Type icon -->
+				<span class="shrink-0 text-neutral-600 w-20 text-right">{formatTimestamp(entry.timestamp)}</span>
 				<span class="w-3 text-center shrink-0 {typeColor(entry.activity_type)}"
 					>{typeIcon(entry.activity_type)}</span>
-				<!-- Source badge -->
 				<span class="shrink-0 px-1 rounded text-[9px] leading-[14px] {sourceColor(entry.source)}"
 					>{entry.source}</span>
-				<!-- Summary -->
 				<span class="flex-1 truncate text-neutral-400">{entry.summary}</span>
-				<!-- Expand indicator -->
 				{#if entry.detail}
 					<span class="shrink-0 text-neutral-700 text-[8px]"
 						>{expandedIds.has(entry.id) ? '▾' : '▸'}</span>
 				{/if}
-				<!-- Time -->
-				<span class="shrink-0 text-neutral-600 tabular-nums text-[10px]">{relativeTime(entry.timestamp)}</span>
 			</div>
 			<!-- Expanded detail -->
 			{#if expandedIds.has(entry.id) && entry.detail}
@@ -304,7 +302,7 @@
 
 	<!-- Footer: load more -->
 	{#if onloadmore && entries.length > 0}
-		<div class="flex items-center justify-center py-2 border-t border-neutral-800 shrink-0">
+		<div class="flex items-center justify-center py-1.5 border-t border-neutral-800/50 shrink-0">
 			<button
 				class="px-3 py-1 rounded text-[10px] text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors"
 				onclick={onloadmore}

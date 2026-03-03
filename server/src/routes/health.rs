@@ -37,19 +37,22 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
 
         // Format recent events
         let events = ts.events.lock().await;
-        let now = std::time::Instant::now();
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let recent_events: Vec<Value> = events
             .iter()
             .rev()
             .take(10)
             .map(|e| {
-                let ago = now.duration_since(e.timestamp);
-                let ago_str = if ago.as_secs() < 60 {
-                    format!("{}s ago", ago.as_secs())
-                } else if ago.as_secs() < 3600 {
-                    format!("{}m ago", ago.as_secs() / 60)
+                let ago_secs = now_unix.saturating_sub(e.timestamp);
+                let ago_str = if ago_secs < 60 {
+                    format!("{ago_secs}s ago")
+                } else if ago_secs < 3600 {
+                    format!("{}m ago", ago_secs / 60)
                 } else {
-                    format!("{}h ago", ago.as_secs() / 3600)
+                    format!("{}h ago", ago_secs / 3600)
                 };
                 json!({
                     "time": ago_str,
@@ -142,6 +145,28 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
         None
     };
 
+    // Device snapshots (relay mode only) — last-known telemetry for offline devices
+    let device_snapshots = if let Some(ref snaps) = state.device_snapshots {
+        let snaps = snaps.read().await;
+        let map: serde_json::Map<String, Value> = snaps
+            .iter()
+            .map(|(serial, snap)| {
+                (
+                    serial.clone(),
+                    json!({
+                        "last_lte_signal": snap.last_lte_signal,
+                        "last_gps_fix": snap.last_gps_fix,
+                        "last_watchdog": snap.last_watchdog,
+                        "last_seen": snap.last_seen,
+                    }),
+                )
+            })
+            .collect();
+        Some(Value::Object(map))
+    } else {
+        None
+    };
+
     let mut resp = json!({
         "status": "ok",
         "uptime_secs": uptime,
@@ -153,6 +178,9 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
     });
     if let Some(ch) = connection_history {
         resp["connection_history"] = json!(ch);
+    }
+    if let Some(ds) = device_snapshots {
+        resp["device_snapshots"] = ds;
     }
     Json(resp)
 }

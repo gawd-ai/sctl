@@ -2,8 +2,12 @@
 //!
 //! `sctl supervise` forks `sctl serve` and monitors it. On abnormal
 //! exit the server is restarted with exponential backoff. A clean exit (code 0)
-//! causes the supervisor to stop. SIGINT/SIGTERM are forwarded to the child.
+//! causes the supervisor to stop. SIGINT/SIGTERM trigger graceful shutdown:
+//! the signal is forwarded to the child, and once the child exits the supervisor
+//! exits too (no restart).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::process::Command;
@@ -19,6 +23,10 @@ pub async fn run_supervisor(config_path: Option<&str>, sup_config: &SupervisorCo
 
     let exe = std::env::current_exe().expect("resolve own executable path");
 
+    // Shared shutdown flag — set by SIGINT/SIGTERM handler so the main loop
+    // knows not to restart the child.
+    let shutting_down = Arc::new(AtomicBool::new(false));
+
     loop {
         let started = Instant::now();
 
@@ -32,8 +40,9 @@ pub async fn run_supervisor(config_path: Option<&str>, sup_config: &SupervisorCo
         let server_pid = child.id();
         info!("Supervisor: started server (pid {server_pid:?})");
 
-        // Forward SIGINT and SIGTERM to child
+        // Forward SIGINT and SIGTERM to child, and set shutdown flag
         let fwd_pid = server_pid;
+        let sd = Arc::clone(&shutting_down);
         let _signal_task = tokio::spawn(async move {
             let mut sigint =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
@@ -43,14 +52,16 @@ pub async fn run_supervisor(config_path: Option<&str>, sup_config: &SupervisorCo
                     .expect("register SIGTERM");
             tokio::select! {
                 _ = sigint.recv() => {
-                    info!("Supervisor: forwarding SIGINT to child");
+                    info!("Supervisor: received SIGINT, shutting down");
+                    sd.store(true, Ordering::SeqCst);
                     if let Some(pid) = fwd_pid {
                         #[allow(clippy::cast_possible_wrap)]
                         unsafe { libc::kill(pid as i32, libc::SIGINT); }
                     }
                 }
                 _ = sigterm.recv() => {
-                    info!("Supervisor: forwarding SIGTERM to child");
+                    info!("Supervisor: received SIGTERM, shutting down");
+                    sd.store(true, Ordering::SeqCst);
                     if let Some(pid) = fwd_pid {
                         #[allow(clippy::cast_possible_wrap)]
                         unsafe { libc::kill(pid as i32, libc::SIGTERM); }
@@ -61,6 +72,12 @@ pub async fn run_supervisor(config_path: Option<&str>, sup_config: &SupervisorCo
 
         let status = child.wait().await;
         let uptime = started.elapsed();
+
+        // If we received a shutdown signal, always exit regardless of child status
+        if shutting_down.load(Ordering::SeqCst) {
+            info!("Supervisor: child exited after shutdown signal ({status:?}), stopping");
+            std::process::exit(0);
+        }
 
         match status {
             Ok(s) if s.success() => {
@@ -73,6 +90,13 @@ pub async fn run_supervisor(config_path: Option<&str>, sup_config: &SupervisorCo
                     uptime.as_secs_f64()
                 );
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
+
+                // Check again after sleep — a signal may have arrived during backoff
+                if shutting_down.load(Ordering::SeqCst) {
+                    info!("Supervisor: shutdown requested during backoff, stopping");
+                    std::process::exit(0);
+                }
+
                 if uptime >= stable_threshold {
                     backoff = 1;
                 } else {
@@ -85,6 +109,12 @@ pub async fn run_supervisor(config_path: Option<&str>, sup_config: &SupervisorCo
                     uptime.as_secs_f64()
                 );
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
+
+                if shutting_down.load(Ordering::SeqCst) {
+                    info!("Supervisor: shutdown requested during backoff, stopping");
+                    std::process::exit(0);
+                }
+
                 if uptime >= stable_threshold {
                     backoff = 1;
                 } else {

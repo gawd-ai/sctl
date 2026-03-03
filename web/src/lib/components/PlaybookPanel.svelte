@@ -54,17 +54,23 @@
 		}
 	}
 
+	// Pending name shown in header while detail loads
+	let pendingName: string | null = $state(null);
+	let headerName = $derived(selectedPlaybook?.name ?? pendingName);
+
 	async function selectPlaybook(name: string) {
 		if (!restClient) return;
+		pendingName = name;
+		view = 'detail';
 		loading = true;
 		error = null;
 		try {
 			selectedPlaybook = await restClient.getPlaybook(name);
-			view = 'detail';
 		} catch (e) {
 			error = e instanceof Error ? e.message : 'Failed to fetch playbook';
 		} finally {
 			loading = false;
+			pendingName = null;
 		}
 	}
 
@@ -97,7 +103,7 @@
 			{#if view !== 'list'}
 				<div class="flex items-center gap-1 px-1.5 h-8 border-b border-neutral-700 shrink-0">
 					<button
-						class="w-5 h-5 flex items-center justify-center rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors"
+						class="w-5 h-5 shrink-0 flex items-center justify-center rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors"
 						title="Back"
 						onclick={goBack}
 					>
@@ -105,38 +111,49 @@
 							<path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7" />
 						</svg>
 					</button>
+					{#if headerName}
+						<span class="flex-1 min-w-0 text-[11px] text-neutral-200 font-mono font-semibold truncate">{headerName}</span>
+						{#if view === 'detail'}
+							<button
+								class="shrink-0 px-2 py-0.5 rounded text-[10px] transition-colors
+									{loading ? 'bg-green-900/20 text-green-800 cursor-not-allowed' : 'bg-green-900/40 text-green-400 hover:bg-green-900/60'}"
+								disabled={loading}
+								onclick={() => { view = 'execute'; }}
+							>Run</button>
+						{/if}
+					{/if}
 				</div>
 			{/if}
 
-			<!-- Loading / error -->
-			{#if loading}
-				<div class="flex items-center justify-center py-8 text-[10px] text-neutral-500">Loading...</div>
-			{:else if error}
+			<!-- Error -->
+			{#if error}
 				<div class="px-3 py-2 text-[10px] text-red-400">{error}</div>
 			{/if}
 
 			<!-- Views -->
-			<div class="flex-1 min-h-0 overflow-hidden">
-				{#if view === 'list' && !loading}
+			<div class="flex-1 min-h-0 overflow-hidden relative">
+				{#if view === 'list'}
 					<PlaybookList
 						{playbooks}
 						onselect={selectPlaybook}
 						ondelete={deletePlaybook}
 						onrefresh={fetchPlaybooks}
 					/>
-				{:else if view === 'detail' && selectedPlaybook && !loading}
+				{:else if view === 'detail' && selectedPlaybook}
 					<PlaybookViewer
 						playbook={selectedPlaybook}
-						onexecute={(pb) => { view = 'execute'; }}
-						onclose={goBack}
 					/>
-				{:else if view === 'execute' && selectedPlaybook && !loading}
+				{:else if view === 'execute' && selectedPlaybook}
 					<PlaybookExecutor
 						playbook={selectedPlaybook}
 						{restClient}
 						{onRunInTerminal}
-						onclose={goBack}
 					/>
+				{/if}
+				{#if loading}
+					<div class="absolute inset-0 bg-neutral-900/60 flex items-center justify-center">
+						<span class="text-[10px] text-neutral-500">Loading...</span>
+					</div>
 				{/if}
 			</div>
 </div>

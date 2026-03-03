@@ -1,10 +1,11 @@
 <script lang="ts">
-	import '../app.css';
 	import { onMount } from 'svelte';
 	import { TerminalContainer, TerminalTabs, ServerPanel, ToastContainer, QuickExecBar, FileBrowser, CommandPalette, KeyboardShortcuts, TransferIndicator, PlaybookPanel, SidePanel, ServerDashboard } from '$lib';
 	import ExecViewer from '$lib/components/ExecViewer.svelte';
 	import { ConnectionManager } from '$lib/utils/connection-manager';
 	import { KeyboardManager } from '$lib/utils/keyboard';
+	import { uuid } from '$lib/utils/index';
+	import { base } from '$app/paths';
 	import { AppSidebar } from 'gawdux';
 	import type { SidebarConfig } from 'gawdux';
 	import type { ClientTransfer } from '$lib/utils/transfer';
@@ -90,7 +91,7 @@
 
 	async function mergeSeedServers(): Promise<void> {
 		try {
-			const resp = await fetch('/sctlin-seed.json');
+			const resp = await fetch(`${base}/sctlin-seed.json`);
 			if (!resp.ok) return;
 			const seed: ServerEntry[] = await resp.json();
 			if (!Array.isArray(seed) || seed.length === 0) return;
@@ -180,6 +181,9 @@
 	// Connection event log (per-server)
 	let serverConnectionLog: Record<string, import('$lib').ConnectionEvent[]> = $state({});
 
+	// Device telemetry log (per-server, LTE/GPS/tunnel history)
+	let serverTelemetryLog: Record<string, import('$lib').ConnectionEvent[]> = $state({});
+
 	// Server diagnostics (per-server)
 	let serverDiagnostics: Record<string, import('$lib').ServerDiagnostics | null> = $state({});
 	let relayDiagnostics: Record<string, import('$lib').ServerDiagnostics | null> = $state({});
@@ -242,6 +246,9 @@
 			},
 			onConnectionLog: (id, events) => {
 				serverConnectionLog = { ...serverConnectionLog, [id]: events };
+			},
+			onTelemetryLog: (id, events) => {
+				serverTelemetryLog = { ...serverTelemetryLog, [id]: events };
 			},
 			onTransferChange: (id, transfers) => {
 				serverTransferLists = { ...serverTransferLists, [id]: transfers };
@@ -526,6 +533,8 @@
 		serverDeviceProbes = restDp;
 		const { [id]: _cl, ...restCl } = serverConnectionLog;
 		serverConnectionLog = restCl;
+		const { [id]: _tel, ...restTel } = serverTelemetryLog;
+		serverTelemetryLog = restTel;
 		const { [id]: _sd, ...restSd } = serverDiagnostics;
 		serverDiagnostics = restSd;
 		const { [id]: _rd, ...restRd } = relayDiagnostics;
@@ -549,7 +558,7 @@
 
 	function addServer(partial: Omit<ServerConfig, 'id'>): void {
 		const server: ServerConfig = {
-			id: crypto.randomUUID(),
+			id: uuid(),
 			...partial
 		};
 		servers = [...servers, server];
@@ -1138,7 +1147,7 @@
 			<div class="flex-1 relative min-h-0">
 				<!-- Logo in background -->
 				<div class="absolute inset-0 flex items-center justify-center bg-neutral-950 pointer-events-none">
-					<img src="/sctl-logo.png" alt="sctl" class="max-w-full max-h-full w-auto h-auto opacity-90" style="object-fit: contain;" />
+					<img src="{base}/sctl-logo.png" alt="sctl" class="max-w-full max-h-full w-auto h-auto opacity-90" style="object-fit: contain;" />
 				</div>
 
 				<!-- Terminal containers -->
@@ -1185,6 +1194,7 @@
 								lastConnectedAt={manager.get(server.id)?.lastConnectedAt ?? null}
 								deviceProbe={serverDeviceProbes[server.id] ?? null}
 								connectionLog={serverConnectionLog[server.id] ?? []}
+								telemetryLog={serverTelemetryLog[server.id] ?? []}
 								onrefreshrelayhealth={() => manager.fetchRelayHealth(server.id)}
 								onrefreshrelayinfo={() => manager.fetchRelayInfo(server.id)}
 								onprobedevice={() => manager.probeRelayDevice(server.id)}

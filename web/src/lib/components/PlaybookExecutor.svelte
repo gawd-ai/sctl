@@ -6,16 +6,17 @@
 	interface Props {
 		playbook: PlaybookDetail | null;
 		restClient: SctlRestClient | null;
-		onclose?: () => void;
 		onresult?: (result: ExecResult) => void;
 		onRunInTerminal?: (script: string) => void;
 	}
 
-	let { playbook, restClient, onclose, onresult, onRunInTerminal }: Props = $props();
+	let { playbook, restClient, onresult, onRunInTerminal }: Props = $props();
 
 	// Parameter values
 	let paramValues: Record<string, string> = $state({});
 	let executing = $state(false);
+	let scriptPreviewExpanded = $state(false);
+	let confirmingExecute = $state(false);
 	let result: ExecResult | null = $state(null);
 	let error: string | null = $state(null);
 
@@ -70,77 +71,42 @@
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <div class="playbook-executor flex flex-col h-full bg-neutral-900 font-mono">
 	{#if playbook}
-		<!-- Header -->
-		<div class="flex items-center gap-2 px-3 py-2 border-b border-neutral-800 shrink-0">
-			<div class="flex-1 min-w-0">
-				<div class="text-xs text-neutral-200 font-semibold truncate">{playbook.name}</div>
-				<div class="text-[10px] text-neutral-500">Execute playbook</div>
-			</div>
-			{#if onRunInTerminal}
-				<button
-					class="px-2 py-1 rounded text-[10px] transition-colors bg-green-900/40 text-green-400 hover:bg-green-900/60 flex items-center gap-1"
-					onclick={() => onRunInTerminal?.(previewScript)}
-					title="Send script to active terminal session"
-				>
-					<svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-						<polyline points="4 17 10 11 4 5" />
-						<line x1="12" y1="19" x2="20" y2="19" />
-					</svg>
-					Terminal
-				</button>
-			{/if}
-			<button
-				class="px-2 py-1 rounded text-[10px] transition-colors
-					{executing
-						? 'bg-neutral-800 text-neutral-500 cursor-wait'
-						: 'bg-neutral-800 text-neutral-400 hover:text-neutral-200 hover:bg-neutral-700'}"
-				disabled={executing}
-				onclick={execute}
-			>{executing ? 'Running...' : 'Execute'}</button>
-			{#if onclose}
-				<button
-					class="w-5 h-5 flex items-center justify-center rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors"
-					onclick={onclose}
-				>
-					<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-						<path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
-					</svg>
-				</button>
-			{/if}
-		</div>
-
 		<div class="flex-1 overflow-y-auto min-h-0 px-3 py-2 space-y-3">
+			<!-- Description -->
+			<div class="text-[10px] text-neutral-500">{playbook.description}</div>
+
 			<!-- Parameters form -->
 			{#if paramEntries.length > 0}
 				<div>
 					<div class="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Parameters</div>
 					<div class="space-y-1.5">
 						{#each paramEntries as [name, param]}
-							<div>
-								<label class="flex items-center gap-2 text-[10px]">
-									<span class="text-neutral-400 w-24 shrink-0 truncate" title={param.description}>{name}</span>
-									{#if param.enum && param.enum.length > 0}
-										<select
-											class="flex-1 px-1.5 py-1 bg-neutral-800 border border-neutral-700 rounded text-[10px] text-neutral-200 focus:outline-none focus:border-neutral-500"
-											value={paramValues[name] ?? ''}
-											onchange={(e) => { paramValues = { ...paramValues, [name]: (e.target as HTMLSelectElement).value }; }}
-										>
-											{#each param.enum as val}
-												<option value={String(val)}>{String(val)}</option>
-											{/each}
-										</select>
-									{:else}
-										<input
-											type="text"
-											class="flex-1 px-1.5 py-1 bg-neutral-800 border border-neutral-700 rounded text-[10px] text-neutral-200 focus:outline-none focus:border-neutral-500"
-											value={paramValues[name] ?? ''}
-											placeholder={param.default !== undefined ? String(param.default) : `${param.type}`}
-											oninput={(e) => { paramValues = { ...paramValues, [name]: (e.target as HTMLInputElement).value }; }}
-										/>
-									{/if}
-								</label>
+							<div class="px-2 py-1.5 bg-neutral-800/30 rounded border border-neutral-800/50">
+								<div class="flex items-baseline gap-1.5 mb-1">
+									<span class="text-[10px] text-neutral-300 font-semibold">{name}</span>
+									<span class="text-[9px] text-neutral-600">{param.type}</span>
+								</div>
 								{#if param.description}
-									<div class="text-[9px] text-neutral-600 ml-26 pl-[104px]">{param.description}</div>
+									<div class="text-[9px] text-neutral-500 mb-1.5">{param.description}</div>
+								{/if}
+								{#if param.enum && param.enum.length > 0}
+									<select
+										class="w-full px-1.5 py-1 bg-neutral-800 border border-neutral-700 rounded text-[10px] text-neutral-200 focus:outline-none focus:border-neutral-500"
+										value={paramValues[name] ?? ''}
+										onchange={(e) => { paramValues = { ...paramValues, [name]: (e.target as HTMLSelectElement).value }; }}
+									>
+										{#each param.enum as val}
+											<option value={String(val)}>{String(val)}</option>
+										{/each}
+									</select>
+								{:else}
+									<input
+										type="text"
+										class="w-full px-1.5 py-1 bg-neutral-800 border border-neutral-700 rounded text-[10px] text-neutral-200 focus:outline-none focus:border-neutral-500"
+										value={paramValues[name] ?? ''}
+										placeholder={param.default !== undefined ? String(param.default) : param.type}
+										oninput={(e) => { paramValues = { ...paramValues, [name]: (e.target as HTMLInputElement).value }; }}
+									/>
 								{/if}
 							</div>
 						{/each}
@@ -148,10 +114,56 @@
 				</div>
 			{/if}
 
-			<!-- Script preview -->
+			<!-- Actions -->
+			<div class="flex items-center gap-2">
+				{#if onRunInTerminal}
+					<button
+						class="px-2 py-1 rounded text-[10px] transition-colors bg-neutral-800 text-neutral-400 hover:text-neutral-200 hover:bg-neutral-700 flex items-center gap-1"
+						onclick={() => onRunInTerminal?.(previewScript)}
+						title="Send script to active terminal session"
+					>
+						<svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+							<polyline points="4 17 10 11 4 5" />
+							<line x1="12" y1="19" x2="20" y2="19" />
+						</svg>
+						Terminal
+					</button>
+				{/if}
+				<div class="flex-1"></div>
+				<button
+					class="px-2 py-1 rounded text-[10px] transition-colors
+						{executing
+							? 'bg-neutral-800 text-neutral-500 cursor-wait'
+							: confirmingExecute
+								? 'bg-red-900/40 text-red-400 hover:bg-red-900/60'
+								: 'bg-green-900/40 text-green-400 hover:bg-green-900/60'}"
+					disabled={executing}
+					onclick={() => {
+						if (confirmingExecute) {
+							confirmingExecute = false;
+							execute();
+						} else {
+							confirmingExecute = true;
+						}
+					}}
+					onmouseleave={() => { confirmingExecute = false; }}
+				>{executing ? 'Running...' : confirmingExecute ? 'Confirm?' : 'Execute'}</button>
+			</div>
+
+			<!-- Script preview (collapsible) -->
 			<div>
-				<div class="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Script Preview</div>
-				<pre class="p-2 bg-neutral-800/50 border border-neutral-800 rounded text-[10px] text-neutral-300 whitespace-pre-wrap break-all">{previewScript}</pre>
+				<button
+					class="flex items-center gap-1 text-[10px] text-neutral-500 uppercase tracking-wide mb-1 hover:text-neutral-400 transition-colors"
+					onclick={() => { scriptPreviewExpanded = !scriptPreviewExpanded; }}
+				>
+					<svg class="w-3 h-3 transition-transform {scriptPreviewExpanded ? 'rotate-90' : ''}" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+						<path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
+					</svg>
+					Script Preview
+				</button>
+				{#if scriptPreviewExpanded}
+					<pre class="p-2 bg-neutral-800/50 border border-neutral-800 rounded text-[10px] text-neutral-300 whitespace-pre-wrap break-all">{previewScript}</pre>
+				{/if}
 			</div>
 
 			<!-- Result -->

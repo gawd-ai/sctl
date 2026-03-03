@@ -17,7 +17,7 @@ import type {
 	WsShellListedMsg
 } from '../types/terminal.types';
 import { ConnectionError, ServerError, TimeoutError } from './errors';
-import { getRelayBaseUrl } from './relay';
+import { getRelayBaseUrl, getRelaySerial } from './relay';
 
 type ServerMsgType = WsServerMsg['type'];
 type MsgOfType<T extends ServerMsgType> = Extract<WsServerMsg, { type: T }>;
@@ -128,18 +128,17 @@ export class SctlWsClient {
 			this.setStatus('connecting');
 		}
 		try {
-			const resp = await fetch(`${relayBase}/api/health`, {
-				signal: AbortSignal.timeout(3000)
+			const serial = getRelaySerial(this.wsUrl);
+			const resp = await fetch(`${relayBase}/d/${serial}/api/health`, {
+				signal: AbortSignal.timeout(3000),
+				headers: { 'Authorization': `Bearer ${this.apiKey}` }
 			});
 			if (this.intentionalClose) return;
-			if (resp.ok) {
-				const health = await resp.json();
-				if (!health.tunnel?.connected) {
-					// Relay is up but device is not on the tunnel — skip WS attempt entirely
-					this.setStatus('device_offline');
-					this.scheduleReconnect();
-					return;
-				}
+			if (!resp.ok) {
+				// Device not reachable through relay (404 = not registered, 502 = tunnel down)
+				this.setStatus('device_offline');
+				this.scheduleReconnect();
+				return;
 			}
 		} catch {
 			// Relay unreachable — fall through to WS attempt

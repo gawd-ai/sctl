@@ -66,7 +66,7 @@
 			>
 				<div class="flex-1 min-w-0">
 					<div class="text-[11px] font-mono text-neutral-300 truncate">{pb.name}</div>
-					<div class="text-[9px] text-neutral-500 truncate">{pb.description}</div>
+					<div class="text-[9px] text-neutral-500 truncate" title={pb.description}>{pb.description}</div>
 				</div>
 				{#if pb.params.length > 0}
 					<span class="shrink-0 px-1 rounded text-[9px] bg-neutral-800 text-neutral-500 tabular-nums">

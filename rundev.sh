@@ -27,6 +27,7 @@
 #   ./rundev.sh relay deploy [user@host]  # deploy binary + service (preserves config)
 #   ./rundev.sh relay upgrade [user@host] # binary-only upgrade
 #   ./rundev.sh relay status [user@host]  # health check + connected devices
+#   ./rundev.sh relay sctlin [user@host]  # deploy sctlin web UI to relay
 #
 # Playbook library:
 #   ./rundev.sh playbook ls                          # list playbooks in library
@@ -1350,26 +1351,40 @@ do_device_upgrade_remote() {
         ok "Watchdog already deployed"
     fi
 
-    # Step 7: Swap binary (sync cp) then restart (background, survives sctl death)
+    # Step 7: Swap binary, then kill the child `sctl serve` process.
+    # The supervisor stays alive and auto-restarts with the new binary.
+    # (Old approach: `init.d restart` via nohup — but sctl killing itself
+    # also killed the shell running the restart, so `start` never ran.)
     log "Swapping binary and restarting sctl..."
     curl -sf -X POST "$url/api/exec" \
         -H "Authorization: Bearer $api_key" \
         -H "Content-Type: application/json" \
-        -d '{"command": "cp /usr/bin/sctl /usr/bin/sctl.rollback && cp /tmp/sctl-upgrade /usr/bin/sctl && chmod +x /usr/bin/sctl && (nohup /etc/init.d/sctl restart > /tmp/sctl-upgrade.log 2>&1 &)", "timeout": 15000}' >/dev/null 2>&1 || true
-    sleep 3
+        -d '{"command": "cp /usr/bin/sctl /usr/bin/sctl.rollback && cp /tmp/sctl-upgrade /usr/bin/sctl && chmod +x /usr/bin/sctl && kill $(pgrep -f \"sctl serve\")", "timeout": 15000}' >/dev/null 2>&1 || true
 
-    # Step 8: Poll health through relay
-    log "Waiting for device to come back up (60s timeout)..."
+    # Step 8: Wait for device disconnect then reconnect through relay.
+    # First wait for health to FAIL (proves old process is dead),
+    # then wait for it to SUCCEED (proves new process is up).
+    log "Waiting for device to restart (60s timeout)..."
+    local saw_disconnect=false
     local healthy=false
     for i in $(seq 1 60); do
         sleep 1
         local health_resp
-        health_resp=$(curl -sf "$url/api/health" 2>/dev/null) || continue
+        health_resp=$(curl -sf "$url/api/health" 2>/dev/null) || {
+            if [[ "$saw_disconnect" == "false" ]]; then
+                saw_disconnect=true
+            fi
+            continue
+        }
+        # Only accept health after we've seen a disconnect
+        if [[ "$saw_disconnect" == "false" ]]; then
+            continue
+        fi
         local version
         version=$(echo "$health_resp" | jq -r '.version // empty')
         if [[ -n "$version" ]]; then
             healthy=true
-            ok "Device healthy after ${i}s (version: $version)"
+            ok "Device restarted after ${i}s (version: $version)"
 
             # Update version in config
             jq --arg name "$name" --arg ver "$version" \
@@ -2284,25 +2299,68 @@ do_relay_upgrade() {
     log "Building sctl for x86_64-musl..."
     make -C "$SCTL_DIR" build-x86
 
-    # Stop, upload, start
-    log "Upgrading binary on $remote..."
-    ssh $ssh_opts "$remote" "systemctl stop sctl-relay"
-    scp $ssh_opts "$RELAY_X86_BIN" "$remote:$RELAY_REMOTE_BIN"
-    ssh $ssh_opts "$remote" "chmod +x $RELAY_REMOTE_BIN && systemctl start sctl-relay"
+    # Record old PID
+    local old_pid
+    old_pid=$(ssh $ssh_opts "$remote" "systemctl show sctl-relay --property=MainPID --value 2>/dev/null") || old_pid="0"
+    [[ "$old_pid" == "0" ]] && old_pid=""
 
+    # Stop service
+    log "Stopping sctl-relay on $remote... (pid ${old_pid:-unknown})"
+    ssh $ssh_opts "$remote" "systemctl stop sctl-relay" || true
+
+    # Verify the process is actually gone
+    local retries=0
+    while ssh $ssh_opts "$remote" "pgrep -x sctl >/dev/null 2>&1"; do
+        retries=$((retries + 1))
+        if [[ $retries -ge 10 ]]; then
+            warn "sctl process still alive after stop — force killing"
+            ssh $ssh_opts "$remote" "pkill -9 -x sctl || true"
+            sleep 1
+            break
+        fi
+        sleep 1
+    done
+
+    # Upload new binary
+    log "Uploading binary to $remote..."
+    scp $ssh_opts "$RELAY_X86_BIN" "$remote:$RELAY_REMOTE_BIN"
+    ssh $ssh_opts "$remote" "chmod +x $RELAY_REMOTE_BIN"
+
+    # Start service
+    log "Starting sctl-relay..."
+    ssh $ssh_opts "$remote" "systemctl start sctl-relay"
+
+    # Wait for process to be ready
     sleep 2
+
+    # Verify new PID is different
+    local new_pid
+    new_pid=$(ssh $ssh_opts "$remote" "systemctl show sctl-relay --property=MainPID --value 2>/dev/null") || new_pid="0"
+    if [[ "$new_pid" == "0" || "$new_pid" == "$old_pid" ]]; then
+        err "Service failed to start or PID didn't change (old=$old_pid new=$new_pid)"
+        err "Check logs: ssh $remote journalctl -u sctl-relay -n 50"
+        exit 1
+    fi
 
     # Get new version
     local new_version
     new_version=$(ssh $ssh_opts "$remote" "$RELAY_REMOTE_BIN --version 2>/dev/null || echo unknown") || new_version="unknown"
 
-    # Health check
+    # Health check — verify uptime is fresh (< 30s)
     local health
     health=$(ssh $ssh_opts "$remote" "curl -sf http://127.0.0.1:8443/api/health" 2>/dev/null) || true
     if [[ -n "$health" ]]; then
-        ok "Upgrade complete: $old_version → $new_version"
+        local uptime_secs
+        uptime_secs=$(echo "$health" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uptime_secs',999))" 2>/dev/null) || uptime_secs="999"
+        if [[ "$uptime_secs" -lt 30 ]]; then
+            ok "Upgrade complete: $old_version → $new_version (pid $new_pid, uptime ${uptime_secs}s)"
+        else
+            warn "Relay healthy but uptime=${uptime_secs}s — old process may not have been replaced"
+            warn "Check: ssh $remote journalctl -u sctl-relay -n 50"
+        fi
     else
-        warn "Health check failed after upgrade — check logs: ssh $remote journalctl -u sctl-relay -n 50"
+        err "Health check failed after upgrade — check logs: ssh $remote journalctl -u sctl-relay -n 50"
+        exit 1
     fi
 }
 
@@ -2376,6 +2434,91 @@ do_relay_status() {
     ssh $ssh_opts "$remote" "systemctl is-active caddy 2>/dev/null && caddy version 2>/dev/null || echo 'Caddy not running'" || true
 }
 
+# ─── relay sctlin (deploy web UI to relay) ───────────────────────────
+
+do_relay_sctlin() {
+    local remote="${1:-}"
+    if [[ -z "$remote" ]]; then
+        if [[ -f "$REPO_DIR/.env.local" ]]; then
+            source "$REPO_DIR/.env.local"
+            remote="${RELAY_HOST:-}"
+        fi
+        if [[ -z "$remote" ]]; then
+            err "Usage: $0 relay sctlin [user@host]"
+            err "  (or set RELAY_HOST in .env.local via 'relay setup')"
+            exit 1
+        fi
+        log "Using RELAY_HOST=$remote from .env.local"
+    fi
+
+    local ssh_opts="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+
+    # 1. Ensure Node.js is installed on relay
+    log "Checking Node.js on relay..."
+    if ! ssh $ssh_opts "$remote" "command -v node" &>/dev/null; then
+        log "Installing Node.js on relay..."
+        ssh $ssh_opts "$remote" "apt-get update -qq && apt-get install -y -qq nodejs npm"
+    fi
+    local node_ver
+    node_ver=$(ssh $ssh_opts "$remote" "node --version 2>/dev/null") || node_ver="unknown"
+    ok "Node.js $node_ver on relay"
+
+    # 2. Build sctlin web UI
+    log "Building sctlin web UI..."
+    (cd "$WEB_DIR" && npm run build)
+
+    # 3. Ensure build output has package.json with type=module (Node 18 ESM compat)
+    echo '{"type":"module"}' > "$WEB_DIR/build/package.json"
+
+    # 4. Override sctlin-seed.json in build output if a relay-specific one exists
+    #    (web/sctlin-seed.json is gitignored — create it with relay device entries)
+    #    The build already includes web/static/sctlin-seed.json at build/client/sctlin/
+    local seed_file="$WEB_DIR/sctlin-seed.json"
+    if [[ -f "$seed_file" ]]; then
+        log "Overriding sctlin-seed.json with relay-specific version"
+        cp "$seed_file" "$WEB_DIR/build/client/sctlin/sctlin-seed.json"
+    fi
+
+    # 5. Upload build to relay
+    log "Deploying sctlin build to relay..."
+    ssh $ssh_opts "$remote" "mkdir -p /var/lib/sctl/sctlin"
+    # Remove old build to avoid stale assets
+    ssh $ssh_opts "$remote" "rm -rf /var/lib/sctl/sctlin/build"
+    scp -r $ssh_opts "$WEB_DIR/build" "$remote:/var/lib/sctl/sctlin/"
+
+    # 6. Upload + enable systemd service
+    scp $ssh_opts "$SCTL_DIR/files/sctlin.service" "$remote:/etc/systemd/system/sctlin.service"
+    ssh $ssh_opts "$remote" "systemctl daemon-reload && systemctl enable sctlin && systemctl restart sctlin"
+    ok "sctlin service deployed and started"
+
+    sleep 2
+
+    # 7. Health check — sctlin should respond on localhost:3000
+    local sctlin_status
+    sctlin_status=$(ssh $ssh_opts "$remote" "curl -sf -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/sctlin/ 2>/dev/null") || sctlin_status="000"
+    if [[ "$sctlin_status" == "200" ]]; then
+        ok "sctlin responding on relay (HTTP $sctlin_status)"
+        # Check via sctl proxy if relay is running
+        local relay_status
+        relay_status=$(ssh $ssh_opts "$remote" "curl -sf -o /dev/null -w '%{http_code}' http://127.0.0.1:8443/sctlin/ 2>/dev/null") || relay_status="000"
+        if [[ "$relay_status" == "200" ]]; then
+            ok "sctlin proxied through sctl relay (HTTP $relay_status)"
+        else
+            warn "sctl relay proxy returned HTTP $relay_status — is sctl-relay running?"
+        fi
+    else
+        warn "sctlin returned HTTP $sctlin_status — check: ssh $remote journalctl -u sctlin -n 30"
+    fi
+
+    # Show access URL
+    if [[ -f "$REPO_DIR/.env.local" ]]; then
+        source "$REPO_DIR/.env.local"
+        if [[ -n "${RELAY_URL:-}" ]]; then
+            ok "Access sctlin at: ${RELAY_URL}/sctlin/"
+        fi
+    fi
+}
+
 # ─── setup (default: build + start) ─────────────────────────────────
 
 do_setup() {
@@ -2423,6 +2566,7 @@ case "${1:-setup}" in
             deploy)  do_relay_deploy "${3:-}" ;;
             upgrade) do_relay_upgrade "${3:-}" ;;
             status)  do_relay_status "${3:-}" ;;
+            sctlin)  do_relay_sctlin "${3:-}" ;;
             *)
                 echo "Usage: $0 relay <command> [user@host]"
                 echo ""
@@ -2431,6 +2575,7 @@ case "${1:-setup}" in
                 echo "  deploy [user@host]    deploy binary + service (preserves config)"
                 echo "  upgrade [user@host]   binary-only upgrade (stop → upload → start)"
                 echo "  status [user@host]    health check + connected devices (default)"
+                echo "  sctlin [user@host]    deploy sctlin web UI to relay"
                 exit 1
                 ;;
         esac
@@ -2477,6 +2622,7 @@ case "${1:-setup}" in
         echo "  relay deploy [user@host]    deploy binary + service (preserves config)"
         echo "  relay upgrade [user@host]   binary-only upgrade"
         echo "  relay status [user@host]    health check + connected devices"
+        echo "  relay sctlin [user@host]    deploy sctlin web UI to relay"
         echo ""
         echo "Playbook library:"
         echo "  playbook ls                              list playbooks in library"

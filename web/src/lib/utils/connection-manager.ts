@@ -109,6 +109,8 @@ export interface ServerConnection {
 	deviceProbe: DeviceProbeResult | null;
 	/** Client-side connection lifecycle event log. */
 	connectionLog: ConnectionEvent[];
+	/** Client-side device telemetry log (LTE signal, GPS, tunnel status over time). */
+	telemetryLog: ConnectionEvent[];
 }
 
 /** Callbacks for ConnectionManager state changes. */
@@ -135,6 +137,8 @@ export interface ConnectionManagerEvents {
 	onDeviceProbe?: (serverId: string, result: DeviceProbeResult) => void;
 	/** Fired when a connection log event is added. */
 	onConnectionLog?: (serverId: string, events: ConnectionEvent[]) => void;
+	/** Fired when a telemetry log event is added (LTE/GPS/tunnel). */
+	onTelemetryLog?: (serverId: string, events: ConnectionEvent[]) => void;
 	/** Fired on any error (connection, fetch, etc.). */
 	onError?: (serverId: string, error: Error) => void;
 }
@@ -188,6 +192,21 @@ export class ConnectionManager {
 		};
 		conn.connectionLog = [...conn.connectionLog, event].slice(-200);
 		this.events.onConnectionLog?.(serverId, conn.connectionLog);
+	}
+
+	/** Push a telemetry event (LTE/GPS/tunnel) to a connection's telemetry log and notify listeners. */
+	private logTelemetry(serverId: string, level: ConnectionEventLevel, message: string, detail?: string): void {
+		const conn = this.connections.get(serverId);
+		if (!conn) return;
+		const event: ConnectionEvent = {
+			id: ++this.eventIdCounter,
+			timestamp: Date.now(),
+			level,
+			message,
+			detail,
+		};
+		conn.telemetryLog = [...conn.telemetryLog, event].slice(-200);
+		this.events.onTelemetryLog?.(serverId, conn.telemetryLog);
 	}
 
 	/** Build a fingerprint of relay health for dedup (excludes uptime which always changes). */
@@ -248,6 +267,7 @@ export class ConnectionManager {
 			lastConnectedAt: null,
 			deviceProbe: null,
 			connectionLog: [],
+			telemetryLog: [],
 		};
 
 		// Wire transfer tracker events
@@ -460,10 +480,10 @@ export class ConnectionManager {
 			const info = await conn.restClient.getInfo();
 			conn.deviceInfo = info;
 			this.events.onDeviceInfo?.(serverId, info);
-			// Log device info summary
+			// Log device info summary to connection log
 			this.logEvent(serverId, 'info', `device: ${info.hostname}`,
 				`${info.serial}, up ${this.formatDuration(info.system_uptime_secs * 1000)}, ${info.kernel}`);
-			// Log LTE signal if available
+			// Log LTE/GPS/tunnel to telemetry log (historical, shown in device view)
 			if (info.lte) {
 				const parts: string[] = [];
 				if (info.lte.operator) parts.push(info.lte.operator);
@@ -472,31 +492,35 @@ export class ConnectionManager {
 				if (info.lte.rsrp != null) parts.push(`RSRP ${info.lte.rsrp}`);
 				if (info.lte.sinr != null) parts.push(`SINR ${info.lte.sinr}`);
 				if (info.lte.band) parts.push(info.lte.band);
+				if (info.lte.freq_band != null) parts.push(`B${info.lte.freq_band}`);
+				if (info.lte.pci != null) parts.push(`PCI ${info.lte.pci}`);
 				if (info.lte.modem?.model) parts.push(info.lte.modem.model);
-				this.logEvent(serverId, 'info', 'lte signal', parts.join(' | '));
+				this.logTelemetry(serverId, 'info', 'lte signal', parts.join(' | '));
 			}
-			// Log GPS if available
 			if (info.gps) {
 				const parts: string[] = [info.gps.status];
 				if (info.gps.satellites != null) parts.push(`${info.gps.satellites} sats`);
 				if (info.gps.latitude != null && info.gps.longitude != null) {
 					parts.push(`${info.gps.latitude.toFixed(4)}, ${info.gps.longitude.toFixed(4)}`);
 				}
-				this.logEvent(serverId, 'info', 'gps', parts.join(' | '));
+				this.logTelemetry(serverId, 'info', 'gps', parts.join(' | '));
 			}
-			// Log tunnel status if available
 			if (info.tunnel) {
-				this.logEvent(serverId, 'info', 'tunnel',
-					`${info.tunnel.connected ? 'connected' : 'disconnected'} → ${info.tunnel.url}`);
+				const url = info.tunnel.relay_url ?? info.tunnel.url;
+				this.logTelemetry(serverId, 'info', 'tunnel',
+					`${info.tunnel.connected ? 'connected' : 'disconnected'}${url ? ` → ${url}` : ''}`);
 			}
 			return info;
 		} catch (err) {
-			conn.deviceInfo = null;
-			this.events.onDeviceInfo?.(serverId, null);
+			// Only clear deviceInfo if we never had data — don't nuke stale data
+			// on transient refresh errors (causes "loading system info" flash).
+			if (!conn.deviceInfo) {
+				this.events.onDeviceInfo?.(serverId, null);
+			}
 			this.events.onError?.(serverId, err instanceof Error ? err : new Error(String(err)));
 			this.logEvent(serverId, 'error', 'failed to fetch device info',
 				err instanceof Error ? err.message : String(err));
-			return null;
+			return conn.deviceInfo;
 		}
 	}
 
@@ -553,6 +577,7 @@ export class ConnectionManager {
 					: `tunnel: no device, ${health.tunnel.reconnects} reconnect(s)`;
 				this.logEvent(serverId, 'info', `relay health: ${health.status}`,
 					`v${health.version}, up ${this.formatDuration(health.uptime_secs * 1000)}, ${tunnelDetail}`);
+				// Log device telemetry from relay health (LTE/GPS) to telemetry log
 				if (health.lte) {
 					const parts: string[] = [];
 					if (health.lte.operator) parts.push(health.lte.operator);
@@ -561,14 +586,14 @@ export class ConnectionManager {
 					if (health.lte.sinr != null) parts.push(`SINR ${health.lte.sinr}`);
 					if (health.lte.band) parts.push(health.lte.band);
 					if (parts.length > 0) {
-						this.logEvent(serverId, 'info', 'lte signal', parts.join(' | '));
+						this.logTelemetry(serverId, 'info', 'lte signal', parts.join(' | '));
 					}
 				}
 				if (health.gps) {
 					const parts: string[] = [health.gps.status];
 					if (health.gps.satellites != null) parts.push(`${health.gps.satellites} sats`);
 					if (health.gps.has_fix) parts.push('fix');
-					this.logEvent(serverId, 'info', 'gps', parts.join(' | '));
+					this.logTelemetry(serverId, 'info', 'gps', parts.join(' | '));
 				}
 				// Track which IDs belong to this health check
 				const ids: number[] = [];

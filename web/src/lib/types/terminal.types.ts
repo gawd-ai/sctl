@@ -425,7 +425,7 @@ export interface DeviceInfo {
 	/** Network interfaces with addresses and link state. */
 	interfaces: NetworkInterface[];
 	/** Tunnel relay connection info, if configured. */
-	tunnel?: { url: string; connected: boolean };
+	tunnel?: { connected: boolean; relay_url?: string; url?: string; reconnects?: number };
 	/** GPS location data, if GPS is configured on the device. */
 	gps?: {
 		status: 'active' | 'searching' | 'error' | 'disabled';
@@ -448,6 +448,22 @@ export interface DeviceInfo {
 		technology?: string;
 		cell_id?: string;
 		signal_bars: number;
+		pci?: number;
+		earfcn?: number;
+		freq_band?: number;
+		tac?: string;
+		plmn?: string;
+		enodeb_id?: number;
+		sector?: number;
+		ul_bw_mhz?: string;
+		dl_bw_mhz?: string;
+		connection_state?: string;
+		duplex?: string;
+		neighbors?: NeighborCell[];
+		band_config?: {
+			enabled_bands: number[];
+			priority_band?: number;
+		};
 		modem?: {
 			model?: string;
 			firmware?: string;
@@ -455,6 +471,16 @@ export interface DeviceInfo {
 			iccid?: string;
 		};
 	} | null;
+}
+
+export interface NeighborCell {
+	earfcn: number;
+	pci: number;
+	rsrp?: number;
+	rsrq?: number;
+	rssi?: number;
+	sinr?: number;
+	cell_type: string;
 }
 
 export interface NetworkInterface {
@@ -519,6 +545,15 @@ export interface RelayHealthInfo {
 	gps: { status: string; has_fix: boolean; fix_age_secs?: number; satellites?: number } | null;
 	lte: { rssi_dbm?: number; rsrp?: number; sinr?: number; signal_bars?: number; band?: string; operator?: string; status?: string } | null;
 	connection_history?: RelayConnectionSession[];
+	device_snapshots?: Record<string, DeviceSnapshot>;
+}
+
+/** Last-known device state snapshot from relay (survives disconnect + restart). */
+export interface DeviceSnapshot {
+	last_lte_signal: { rssi_dbm?: number; rsrp?: number; sinr?: number; signal_bars?: number; band?: string; operator?: string } | null;
+	last_gps_fix: Record<string, unknown> | null;
+	last_watchdog: { level?: number; action?: string; disconnect_secs?: number; signal_stale?: boolean; registration?: string } | null;
+	last_seen: number;
 }
 
 /** A client-side event in the connection lifecycle log. */
@@ -834,6 +869,119 @@ export interface HistoryFilter {
 	activityTypes?: ActivityType[];
 	sources?: ActivitySource[];
 	search?: string;
+}
+
+// ── LTE band management types ──────────────────────────────────
+
+/** A single signal observation on a specific band. */
+export interface BandObservation {
+	rsrp: number;
+	rsrq?: number | null;
+	sinr?: number | null;
+	pci: number;
+	recorded_at: number;
+	serving: boolean;
+}
+
+/** Accumulated per-band signal history from passive monitoring. */
+export interface BandHistoryEntry {
+	band: number;
+	best_rsrp: number;
+	latest_rsrp: number;
+	observation_count: number;
+	last_seen: number;
+	recent: BandObservation[];
+}
+
+/** Per-band result from a band scan. */
+export interface ScanBandResult {
+	band: number;
+	registered: boolean;
+	registration_time_ms: number;
+	rsrp?: number | null;
+	rsrq?: number | null;
+	sinr?: number | null;
+	download_bps?: number | null;
+	upload_bps?: number | null;
+}
+
+/** Status of a running or completed band scan. */
+export interface ScanStatus {
+	state: 'running' | 'completed';
+	started_at: number;
+	completed_at?: number | null;
+	bands_to_scan: number[];
+	bands_scanned: number[];
+	current_band?: number | null;
+	results: ScanBandResult[];
+	original_bands: number[];
+	original_priority?: number | null;
+}
+
+/** Full `/api/lte` response with signal, modem, band history, and scan status. */
+export interface LteData {
+	signal?: {
+		rssi_dbm: number;
+		rsrp?: number | null;
+		rsrq?: number | null;
+		sinr?: number | null;
+		band?: string | null;
+		operator?: string | null;
+		technology?: string | null;
+		cell_id?: string | null;
+		pci?: number | null;
+		earfcn?: number | null;
+		freq_band?: number | null;
+		tac?: string | null;
+		plmn?: string | null;
+		enodeb_id?: number | null;
+		sector?: number | null;
+		ul_bw_mhz?: string | null;
+		dl_bw_mhz?: string | null;
+		connection_state?: string | null;
+		duplex?: string | null;
+		neighbors?: NeighborCell[];
+		band_config?: { enabled_bands: number[]; priority_band?: number | null };
+		signal_bars?: number;
+		recorded_at?: number;
+	} | null;
+	modem?: {
+		model?: string | null;
+		firmware?: string | null;
+		imei?: string | null;
+		iccid?: string | null;
+	} | null;
+	errors_total: number;
+	last_error?: string | null;
+	band_history: BandHistoryEntry[];
+	scan_status?: ScanStatus | null;
+}
+
+/** Request body for `POST /api/lte/bands`. */
+export interface SetBandsRequest {
+	mode: 'auto' | 'locked';
+	bands?: number[];
+	priority_band?: number;
+}
+
+/** Response from `POST /api/lte/bands`. */
+export interface SetBandsResult {
+	status: string;
+	mode: string;
+	band_config: { enabled_bands: number[]; priority_band?: number | null };
+	error?: string;
+}
+
+/** Request body for `POST /api/lte/scan`. */
+export interface StartScanRequest {
+	bands?: number[];
+	include_speed_test?: boolean;
+}
+
+/** Response from `POST /api/lte/scan`. */
+export interface StartScanResult {
+	status: string;
+	bands_to_scan: number[];
 }
 
 // ── Playbook types ─────────────────────────────────────────────

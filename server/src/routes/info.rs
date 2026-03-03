@@ -100,12 +100,13 @@ pub async fn info(State(state): State<AppState>) -> Result<Json<Value>, StatusCo
         }
     }
 
-    // Include LTE signal + modem data if configured
+    // Include LTE signal + modem data if configured.
+    // Always include the key when LTE is configured so the UI can show the section
+    // even when signal data isn't available yet (e.g. modem not responding).
     if let Some(ref lte_state) = state.lte_state {
         let ls = lte_state.lock().await;
-        let mut lte = json!({});
-        if let Some(ref sig) = ls.signal {
-            lte = json!({
+        let mut lte = if let Some(ref sig) = ls.signal {
+            json!({
                 "rssi_dbm": sig.rssi_dbm,
                 "rsrp": sig.rsrp,
                 "rsrq": sig.rsrq,
@@ -115,8 +116,23 @@ pub async fn info(State(state): State<AppState>) -> Result<Json<Value>, StatusCo
                 "technology": sig.technology,
                 "cell_id": sig.cell_id,
                 "signal_bars": sig.signal_bars,
-            });
-        }
+                "pci": sig.pci,
+                "earfcn": sig.earfcn,
+                "freq_band": sig.freq_band,
+                "tac": sig.tac,
+                "plmn": sig.plmn,
+                "enodeb_id": sig.enodeb_id,
+                "sector": sig.sector,
+                "ul_bw_mhz": sig.ul_bw_mhz,
+                "dl_bw_mhz": sig.dl_bw_mhz,
+                "connection_state": sig.connection_state,
+                "duplex": sig.duplex,
+                "neighbors": sig.neighbors,
+                "band_config": sig.band_config,
+            })
+        } else {
+            json!({"status": "no_signal"})
+        };
         if let Some(ref modem) = ls.modem {
             lte["modem"] = json!({
                 "model": modem.model,
@@ -125,9 +141,7 @@ pub async fn info(State(state): State<AppState>) -> Result<Json<Value>, StatusCo
                 "iccid": modem.iccid,
             });
         }
-        if !lte.as_object().is_none_or(serde_json::Map::is_empty) {
-            response["lte"] = lte;
-        }
+        response["lte"] = lte;
     }
 
     Ok(Json(response))

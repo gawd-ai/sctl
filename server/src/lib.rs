@@ -30,6 +30,7 @@ pub mod config;
 pub mod gawdxfer;
 pub mod gps;
 pub mod lte;
+pub mod lte_watchdog;
 pub mod modem;
 pub mod routes;
 pub mod sessions;
