@@ -137,6 +137,7 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
                     "disconnected_at": s.disconnected_at,
                     "duration_secs": duration_secs,
                     "reason": s.reason,
+                    "last_heartbeat_age_ms": s.last_heartbeat_age_ms,
                 })
             })
             .collect();

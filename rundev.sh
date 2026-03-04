@@ -357,6 +357,11 @@ generate_sctlin_seed() {
     require_jq
     local seed_file="$WEB_DIR/static/sctlin-seed.json"
 
+    # Source .env.local for RELAY_API_KEY if not already set
+    if [[ -z "${RELAY_API_KEY:-}" && -f "$REPO_DIR/.env.local" ]]; then
+        source "$REPO_DIR/.env.local"
+    fi
+
     # In tunnel mode the config is rewritten with relay URLs — use the
     # pre-tunnel backup so we get the real direct URLs for each device.
     local source_config="$CONFIG_FILE"
@@ -440,6 +445,7 @@ EOF
     fi
 
     generate_sctlin_seed
+    sync_local_playbooks
 
     # Stop any running instances (clean slate)
     do_kill
@@ -975,6 +981,9 @@ do_device_upgrade() {
                 "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
         fi
 
+        # Deploy playbooks
+        deploy_playbooks_to_device "$name"
+
         ok "Upgrade complete for '$name' ($host)"
         if [[ -n "$new_version" ]]; then
             echo "  Version: $new_version"
@@ -1395,6 +1404,10 @@ do_device_upgrade_remote() {
     done
 
     if [[ "$healthy" == "true" ]]; then
+        # Deploy playbooks
+        log "Deploying playbooks..."
+        deploy_playbooks_to_device "$name"
+
         # Clean up
         log "Cleaning up..."
         curl -sf -X POST "$url/api/exec" \
@@ -1416,6 +1429,63 @@ do_device_upgrade_remote() {
 # ─── playbook library ────────────────────────────────────────────────
 
 PLAYBOOKS_LIBRARY_DIR="$REPO_DIR/playbooks"
+
+# Copy library playbooks into a local playbooks_dir (for dev server / tunnel).
+# Uses frontmatter `name:` as filename so names match API deploy convention.
+sync_local_playbooks() {
+    local dest="${1:-$PLAYBOOKS_DIR}"
+    mkdir -p "$dest"
+    local count=0
+    for cat_dir in "$PLAYBOOKS_LIBRARY_DIR"/*/; do
+        [[ -d "$cat_dir" ]] || continue
+        for f in "$cat_dir"*.md; do
+            [[ -f "$f" ]] || continue
+            local fm_name
+            fm_name=$(sed -n '/^name:/{ s/^name: *//; s/\r$//; p; q }' "$f")
+            [[ -z "$fm_name" ]] && fm_name=$(basename "$f" .md)
+            cp "$f" "$dest/${fm_name}.md"
+            count=$((count + 1))
+        done
+    done
+    if [[ $count -gt 0 ]]; then
+        ok "Synced $count playbook(s) to $dest"
+    fi
+}
+
+# Deploy library playbooks to a device via API (by name, using config)
+deploy_playbooks_to_device() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && return
+
+    local url api_key
+    url=$(cfg_device_get "$name" "url")
+    api_key=$(cfg_device_get "$name" "api_key")
+    [[ -z "$url" || -z "$api_key" ]] && return
+
+    local count=0 ok_count=0
+    for cat_dir in "$PLAYBOOKS_LIBRARY_DIR"/*/; do
+        [[ -d "$cat_dir" ]] || continue
+        for f in "$cat_dir"*.md; do
+            [[ -f "$f" ]] || continue
+            count=$((count + 1))
+            local fm_name
+            fm_name=$(sed -n '/^name:/{ s/^name: *//; s/\r$//; p; q }' "$f")
+            [[ -z "$fm_name" ]] && fm_name=$(basename "$f" .md)
+
+            local sc
+            sc=$(curl -sf -o /dev/null -w "%{http_code}" \
+                -X PUT \
+                -H "Authorization: Bearer $api_key" \
+                -H "Content-Type: text/plain" \
+                --data-binary "@$f" \
+                "$url/api/playbooks/$fm_name" 2>/dev/null) || sc="000"
+            [[ "$sc" =~ ^2 ]] && ok_count=$((ok_count + 1))
+        done
+    done
+    if [[ $count -gt 0 ]]; then
+        ok "Deployed $ok_count/$count playbook(s) to $name"
+    fi
+}
 
 do_playbook_ls() {
     log "Playbook library ($PLAYBOOKS_LIBRARY_DIR):"
@@ -1592,6 +1662,7 @@ do_tunnel() {
     do_build
 
     mkdir -p "$DATA_DIR" "$PLAYBOOKS_DIR"
+    sync_local_playbooks
 
     require_jq
     ensure_config
@@ -1621,6 +1692,7 @@ do_tunnel() {
     cat > "$DATA_DIR/relay.toml" <<EOF
 [server]
 listen = "$RELAY_LISTEN"
+data_dir = "$DATA_DIR/relay-data"
 journal_enabled = true
 
 [auth]
@@ -1633,6 +1705,8 @@ serial = "RELAY"
 relay = true
 tunnel_key = "$TUNNEL_KEY"
 EOF
+
+    mkdir -p "$DATA_DIR/relay-data"
 
     # Generate tunnel client TOML config
     cat > "$DATA_DIR/client.toml" <<EOF
@@ -1911,7 +1985,7 @@ REOF
     echo "$relay_config" | jq '.' > "$CONFIG_FILE"
     ok "MCP config updated (direct + relay entries for all devices)"
 
-    generate_sctlin_seed
+    RELAY_API_KEY="unused" generate_sctlin_seed
 
     # Start web dev server
     start_web_dev_server

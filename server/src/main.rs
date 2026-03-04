@@ -64,6 +64,9 @@ enum Commands {
         /// Path to TOML config file.
         #[arg(long)]
         config: Option<String>,
+        /// Skip the process singleton lock (used internally by supervisor).
+        #[arg(long, hide = true)]
+        skip_lock: bool,
     },
     /// Run as supervisor: starts server and restarts on crash.
     Supervise {
@@ -81,8 +84,8 @@ async fn main() {
         Some(Commands::Supervise { config }) => {
             run_supervisor_mode(config.as_deref()).await;
         }
-        Some(Commands::Serve { config }) => {
-            run_server(config.as_deref()).await;
+        Some(Commands::Serve { config, skip_lock }) => {
+            run_server(config.as_deref(), skip_lock).await;
         }
         None => {
             // Backward compat: no subcommand but --config may be passed
@@ -91,9 +94,27 @@ async fn main() {
                 .windows(2)
                 .find(|w| w[0] == "--config")
                 .map(|w| w[1].clone());
-            run_server(config_path.as_deref()).await;
+            run_server(config_path.as_deref(), false).await;
         }
     }
+}
+
+/// Acquire exclusive process lock. Returns the held file (must not be dropped).
+/// Exits with code 99 if another instance holds the lock.
+#[cfg(unix)]
+fn acquire_process_lock(data_dir: &str) -> std::fs::File {
+    let lock_path = format!("{data_dir}/sctl.lock");
+    let f = std::fs::File::create(&lock_path).unwrap_or_else(|e| {
+        eprintln!("Failed to create lock file {lock_path}: {e}");
+        std::process::exit(1);
+    });
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        eprintln!("Another sctl instance is already running (lock: {lock_path})");
+        std::process::exit(99);
+    }
+    f
 }
 
 async fn run_supervisor_mode(config_path: Option<&str>) -> ! {
@@ -103,12 +124,16 @@ async fn run_supervisor_mode(config_path: Option<&str>) -> ! {
     let log_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| config.logging.level.clone());
     tracing_subscriber::fmt().with_env_filter(log_filter).init();
 
+    // Acquire lock at supervisor level — prevents two supervisors from running
+    #[cfg(unix)]
+    let _lock = acquire_process_lock(&config.server.data_dir);
+
     info!("sctl supervisor starting");
     supervisor::run_supervisor(config_path, &config.supervisor).await
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run_server(config_path: Option<&str>) {
+async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     let config = Config::load(config_path);
 
     // Initialize tracing
@@ -123,6 +148,15 @@ async fn run_server(config_path: Option<&str>) {
         }
         std::process::exit(1);
     }
+
+    // Acquire exclusive lock — prevents dual instances (e.g. upgrade race, cron watchdog).
+    // Skipped when launched by supervisor (which holds its own lock).
+    #[cfg(unix)]
+    let _lock = if !skip_lock {
+        Some(acquire_process_lock(&config.server.data_dir))
+    } else {
+        None
+    };
 
     info!("sctl v{} starting", env!("CARGO_PKG_VERSION"));
     info!("Device serial: {}", config.device.serial);
@@ -221,6 +255,7 @@ async fn run_server(config_path: Option<&str>) {
         gps_state,
         lte_state,
         modem: None,
+        lte_poll_notify: None,
         relay_history: None,
         device_snapshots: None,
     };
@@ -336,24 +371,33 @@ async fn run_server(config_path: Option<&str>) {
         if let Some((m, _)) = modems.get(device) {
             return Some(m.clone());
         }
+        // Auto-detect the actual ttyUSB port — USB re-enumeration after power
+        // cycles can shift device numbering (e.g. ttyUSB2 → ttyUSB3).
+        let actual_device = sctl::modem::detect_quectel_at_port(device);
+        // Also check if we already opened this path under a different name
+        if actual_device != device {
+            if let Some((m, _)) = modems.get(&actual_device) {
+                return Some(m.clone());
+            }
+        }
         // Retry up to 5 times with 2s delay — after USB power cycle, device nodes
         // take a few seconds to appear.
         for attempt in 0..5 {
-            match sctl::modem::Modem::open(device) {
+            match sctl::modem::Modem::open(&actual_device) {
                 Ok(m) => {
                     if attempt > 0 {
-                        info!("Modem {device}: opened on attempt {}", attempt + 1);
+                        info!("Modem {actual_device}: opened on attempt {}", attempt + 1);
                     }
                     let (tx, _rx) = watch::channel(m.clone());
-                    modems.insert(device.to_string(), (m.clone(), tx));
+                    modems.insert(actual_device.clone(), (m.clone(), tx));
                     return Some(m);
                 }
                 Err(e) => {
                     if attempt < 4 {
-                        info!("Modem {device}: not ready ({e}), retrying in 2s...");
+                        info!("Modem {actual_device}: not ready ({e}), retrying in 2s...");
                         std::thread::sleep(std::time::Duration::from_secs(2));
                     } else {
-                        warn!("Failed to open modem {device} after 5 attempts: {e}");
+                        warn!("Failed to open modem {actual_device} after 5 attempts: {e}");
                     }
                 }
             }
@@ -472,7 +516,12 @@ async fn run_server(config_path: Option<&str>) {
         None
     };
 
+    let is_tunnel_client = tunnel_config
+        .as_ref()
+        .is_some_and(|tc| tc.url.is_some() && !tc.relay);
+
     // GPS poller (only when [gps] config is present)
+    // Like the LTE poller, AT commands are suppressed while the tunnel is connected.
     let gps_task =
         if let (Some(gc), Some(ref gs), Some(modem)) = (gps_config, &state.gps_state, &gps_modem) {
             let modem_rx = modems
@@ -480,18 +529,28 @@ async fn run_server(config_path: Option<&str>) {
                 .expect("modem must exist in map")
                 .1
                 .subscribe();
+            // Only pass tunnel_stats if this is a tunnel client (device behind CGNAT)
+            let ts = if is_tunnel_client {
+                Some(state.tunnel_stats.clone())
+            } else {
+                None
+            };
             Some(gps::spawn_gps_poller(
                 gc,
                 modem.clone(),
                 gs.clone(),
                 state.session_events.clone(),
                 modem_rx,
+                ts,
             ))
         } else {
             None
         };
 
     // LTE poller (only when [lte] config is present)
+    // The poller skips AT commands while the tunnel is connected to avoid
+    // disrupting the QMI data path. On-demand polls can be triggered via
+    // lte_poll_notify (e.g. from the /api/lte endpoint).
     let lte_task =
         if let (Some(lc), Some(ref ls), Some(modem)) = (lte_config, &state.lte_state, &lte_modem) {
             let modem_rx = modems
@@ -499,6 +558,8 @@ async fn run_server(config_path: Option<&str>) {
                 .expect("modem must exist in map")
                 .1
                 .subscribe();
+            let poll_notify = Arc::new(tokio::sync::Notify::new());
+            state.lte_poll_notify = Some(poll_notify.clone());
             Some(lte::spawn_lte_poller(
                 lc,
                 modem.clone(),
@@ -506,6 +567,8 @@ async fn run_server(config_path: Option<&str>) {
                 state.session_events.clone(),
                 modem_rx,
                 data_dir.clone(),
+                state.tunnel_stats.clone(),
+                poll_notify,
             ))
         } else {
             None
@@ -514,9 +577,6 @@ async fn run_server(config_path: Option<&str>) {
     // LTE watchdog (only when [lte] watchdog=true AND tunnel client mode active)
     // Takes ownership of the watch::Sender so it can broadcast new modem handles
     // after USB power cycle. Receivers in GPS/LTE pollers were already created above.
-    let is_tunnel_client = tunnel_config
-        .as_ref()
-        .is_some_and(|tc| tc.url.is_some() && !tc.relay);
     let watchdog_task = if let (Some(lc), Some(ref ls), Some(modem)) =
         (state.config.lte.clone(), &state.lte_state, &lte_modem)
     {
@@ -526,6 +586,7 @@ async fn run_server(config_path: Option<&str>) {
                 .expect("modem must exist in map")
                 .1;
             info!("LTE watchdog enabled (interface: {})", lc.interface);
+            let tunnel_url = tunnel_config.as_ref().and_then(|tc| tc.url.clone());
             Some(sctl::lte_watchdog::spawn_lte_watchdog(
                 modem.clone(),
                 modem_tx,
@@ -534,6 +595,7 @@ async fn run_server(config_path: Option<&str>) {
                 state.session_events.clone(),
                 lc,
                 data_dir.clone(),
+                tunnel_url,
             ))
         } else {
             None

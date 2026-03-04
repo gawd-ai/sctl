@@ -11,14 +11,28 @@ use crate::AppState;
 
 /// `GET /api/lte` — returns current LTE signal quality, modem identity, band history, and scan status.
 ///
+/// Returns cached data by default. Pass `?refresh=true` to trigger an on-demand
+/// signal poll (runs AT commands — avoid while tunnel is connected over LTE).
 /// Returns 404 if LTE monitoring is not configured on this device.
-pub async fn lte(State(state): State<AppState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn lte(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(lte_state) = &state.lte_state else {
         return Err((
             StatusCode::NOT_FOUND,
             Json(json!({"error": "LTE not configured on this device"})),
         ));
     };
+
+    // Only trigger on-demand poll when explicitly requested
+    if params.get("refresh").is_some_and(|v| v == "true") {
+        if let Some(ref notify) = state.lte_poll_notify {
+            notify.notify_one();
+            // Brief wait for the poller to complete one cycle
+            tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+        }
+    }
 
     let ls = lte_state.lock().await;
 
@@ -99,6 +113,20 @@ pub async fn set_bands(
             Json(json!({"error": "modem not available"})),
         ));
     };
+
+    // AT commands disrupt the QMI data path — block while tunnel is active
+    if state
+        .tunnel_stats
+        .connected
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(
+                json!({"error": "band changes blocked while tunnel is connected (AT commands disrupt LTE data path)"}),
+            ),
+        ));
+    }
 
     // Validate request before touching the modem
     let (new_bands, new_priority): (Vec<u16>, Option<u16>) = match req.mode.as_str() {
@@ -201,6 +229,20 @@ pub async fn start_scan(
         ));
     };
 
+    // AT commands disrupt the QMI data path — block while tunnel is active
+    if state
+        .tunnel_stats
+        .connected
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(
+                json!({"error": "band scan blocked while tunnel is connected (AT commands disrupt LTE data path)"}),
+            ),
+        ));
+    }
+
     // Check if scan already running
     {
         let ls = lte_state.lock().await;
@@ -228,6 +270,12 @@ pub async fn start_scan(
         .as_ref()
         .and_then(|lc| lc.speed_test_url.clone());
 
+    let interface = state
+        .config
+        .lte
+        .as_ref()
+        .map_or_else(|| "wwan0".to_string(), |lc| lc.interface.clone());
+
     lte::spawn_band_scan(
         modem.clone(),
         lte_state.clone(),
@@ -235,6 +283,8 @@ pub async fn start_scan(
         include_speed_test,
         speed_test_url,
         state.config.server.data_dir.clone(),
+        interface,
+        state.tunnel_stats.clone(),
     );
 
     Ok(Json(json!({

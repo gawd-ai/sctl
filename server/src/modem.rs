@@ -128,6 +128,12 @@ impl Modem {
     pub fn device(&self) -> &str {
         &self.device
     }
+
+    /// Check if the modem I/O thread is still alive (channel not closed).
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        !self.tx.is_closed()
+    }
 }
 
 /// Configure termios: raw mode, 115200 baud, 8N1, no flow control.
@@ -403,4 +409,69 @@ mod tests {
         assert!(!cleaned.contains('\u{FFFD}'));
         assert!(cleaned.starts_with("AT"));
     }
+}
+
+/// Auto-detect the Quectel AT command port by scanning sysfs.
+///
+/// Walks `/sys/bus/usb/devices/*/` looking for vendor `2c7c` (Quectel).
+/// The AT command interface is USB interface 2 (third interface).
+/// Returns the ttyUSB device path (e.g. `/dev/ttyUSB3`), or the
+/// configured `fallback` path if detection fails.
+pub fn detect_quectel_at_port(fallback: &str) -> String {
+    let Ok(entries) = std::fs::read_dir("/sys/bus/usb/devices") else {
+        return fallback.to_string();
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let vendor_path = path.join("idVendor");
+        if let Ok(vendor) = std::fs::read_to_string(&vendor_path) {
+            if vendor.trim() != "2c7c" {
+                continue;
+            }
+            // Found Quectel device. The AT port is interface 2.
+            // USB interfaces are named like: 1-1.2:1.2 (bus-port:config.interface)
+            let dev_name = entry.file_name();
+            let dev_str = dev_name.to_string_lossy();
+            let at_iface = format!("{dev_str}:1.2");
+            let iface_path = path.join(&at_iface);
+
+            // Look for ttyUSB* under the interface
+            if let Ok(iface_entries) = std::fs::read_dir(&iface_path) {
+                for ie in iface_entries.flatten() {
+                    let ie_name = ie.file_name();
+                    let ie_str = ie_name.to_string_lossy();
+                    if ie_str.starts_with("ttyUSB") {
+                        // Found it — check for the tty subdir to get the real device
+                        let tty_dir = iface_path.join(&*ie_str).join("tty");
+                        if let Ok(tty_entries) = std::fs::read_dir(&tty_dir) {
+                            for te in tty_entries.flatten() {
+                                let tty_name = te.file_name().to_string_lossy().to_string();
+                                if tty_name.starts_with("ttyUSB") {
+                                    let detected = format!("/dev/{tty_name}");
+                                    if detected != fallback {
+                                        info!(
+                                            "Auto-detected Quectel AT port: {detected} \
+                                             (configured: {fallback})"
+                                        );
+                                    }
+                                    return detected;
+                                }
+                            }
+                        }
+                        // Fallback: the ttyUSB dir itself is the device
+                        let detected = format!("/dev/{ie_str}");
+                        if detected != fallback {
+                            info!(
+                                "Auto-detected Quectel AT port: {detected} (configured: {fallback})"
+                            );
+                        }
+                        return detected;
+                    }
+                }
+            }
+        }
+    }
+
+    fallback.to_string()
 }

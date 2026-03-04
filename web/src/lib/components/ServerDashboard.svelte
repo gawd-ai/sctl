@@ -94,20 +94,30 @@
 	let relayRightTab: RelayRightTab = $state('connection');
 	let prevStatus: ConnectionStatus | null = $state(null);
 
+	// Wrapper that calls the fetch callback and clears loading on completion
+	async function doFetchDiagnostics() {
+		diagLoading = true;
+		await onfetchdiagnostics?.();
+		if (!serverDiagnostics) diagLoading = false;
+	}
+	async function doFetchRelayDiagnostics() {
+		relayDiagLoading = true;
+		await onfetchrelaydiagnostics?.();
+		if (!relayDiagnostics) relayDiagLoading = false;
+	}
+
 	// Auto-fetch diagnostics when dashboard first becomes visible (device view)
 	$effect(() => {
 		if (visible && activeView === 'device' &&
 			connectionStatus === 'connected' && !serverDiagnostics && !diagLoading) {
-			diagLoading = true;
-			onfetchdiagnostics?.();
+			doFetchDiagnostics();
 		}
 	});
 	// Auto-fetch diagnostics when logs tab selected or dashboard visible (relay view)
 	$effect(() => {
 		if (visible && activeView === 'relay' &&
 			hasRelayApiKey && !relayDiagnostics && !relayDiagLoading) {
-			relayDiagLoading = true;
-			onfetchrelaydiagnostics?.();
+			doFetchRelayDiagnostics();
 		}
 	});
 
@@ -1497,7 +1507,7 @@ function dotColor(status: ConnectionStatus): string {
 
 					<!-- Server process info -->
 					{@render serverInfo('server', serverDiagnostics, diagLoading,
-						connectionStatus === 'connected' ? () => { diagLoading = true; onfetchdiagnostics?.(); } : undefined)}
+						connectionStatus === 'connected' ? () => { doFetchDiagnostics(); } : undefined)}
 
 				{:else if connectionStatus === 'connected'}
 					<div class="flex items-center justify-center h-32 text-[10px] text-neutral-600">
@@ -1670,7 +1680,7 @@ function dotColor(status: ConnectionStatus): string {
 
 					<!-- Relay server process info -->
 					{@render serverInfo('relay server', relayDiagnostics, relayDiagLoading,
-						hasRelayApiKey ? () => { relayDiagLoading = true; onfetchrelaydiagnostics?.(); } : undefined)}
+						hasRelayApiKey ? () => { doFetchRelayDiagnostics(); } : undefined)}
 
 				{:else}
 					<div class="flex items-center justify-center h-32 text-[10px] text-neutral-600">
@@ -1714,7 +1724,7 @@ function dotColor(status: ConnectionStatus): string {
 								logStats.errors > 0 ? `${logStats.errors} err` : '',
 								logStats.warnings > 0 ? `${logStats.warnings} warn` : '',
 							].filter(Boolean).join(' / ') : undefined,
-							connectionStatus === 'connected' ? () => { diagLoading = true; onfetchdiagnostics?.(); } : undefined,
+							connectionStatus === 'connected' ? () => { doFetchDiagnostics(); } : undefined,
 							diagLoading)}
 						<div class="flex-1 overflow-y-auto min-h-0">
 							{#if serverDiagnostics && serverDiagnostics.logs.length > 0}
@@ -1835,7 +1845,7 @@ function dotColor(status: ConnectionStatus): string {
 								logStats.errors > 0 ? `${logStats.errors} err` : '',
 								logStats.warnings > 0 ? `${logStats.warnings} warn` : '',
 							].filter(Boolean).join(' / ') : undefined,
-							hasRelayApiKey ? () => { relayDiagLoading = true; onfetchrelaydiagnostics?.(); } : undefined,
+							hasRelayApiKey ? () => { doFetchRelayDiagnostics(); } : undefined,
 							relayDiagLoading)}
 						<div class="flex-1 overflow-y-auto min-h-0">
 							{#if relayDiagnostics && relayDiagnostics.logs.length > 0}

@@ -31,7 +31,7 @@ pub async fn run_supervisor(config_path: Option<&str>, sup_config: &SupervisorCo
         let started = Instant::now();
 
         let mut cmd = Command::new(&exe);
-        cmd.arg("serve");
+        cmd.args(["serve", "--skip-lock"]);
         if let Some(p) = config_path {
             cmd.args(["--config", p]);
         }
@@ -80,6 +80,10 @@ pub async fn run_supervisor(config_path: Option<&str>, sup_config: &SupervisorCo
         }
 
         match status {
+            Ok(s) if s.code() == Some(99) => {
+                warn!("Supervisor: child reports another instance is running, stopping");
+                std::process::exit(0);
+            }
             Ok(s) if s.success() => {
                 info!("Server exited cleanly, supervisor stopping");
                 std::process::exit(0);

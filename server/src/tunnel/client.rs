@@ -120,7 +120,16 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
             .await;
         let mut escalate_backoff = false;
         let connect_start = Instant::now();
-        match connect_and_run(&state, &config, relay_url).await {
+        state
+            .tunnel_stats
+            .reconnecting
+            .store(true, Ordering::Relaxed);
+        let result = connect_and_run(&state, &config, relay_url).await;
+        state
+            .tunnel_stats
+            .reconnecting
+            .store(false, Ordering::Relaxed);
+        match result {
             Ok(DisconnectReason::RelayShutdown) => {
                 info!("Tunnel: relay shutting down, reconnecting immediately...");
                 state
@@ -129,11 +138,16 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
                     .await;
                 delay = Duration::ZERO;
             }
-            Ok(DisconnectReason::Clean) => {
-                info!("Tunnel: connection closed cleanly, reconnecting...");
+            Ok(
+                reason @ (DisconnectReason::WsClose
+                | DisconnectReason::PongTimeout
+                | DisconnectReason::WriterExit
+                | DisconnectReason::ReadError),
+            ) => {
+                info!("Tunnel: disconnected (reason: {reason}), reconnecting...");
                 state
                     .tunnel_stats
-                    .push_event(TunnelEventType::Disconnected, "clean close".into())
+                    .push_event(TunnelEventType::Disconnected, reason.to_string())
                     .await;
                 delay = Duration::ZERO;
             }
@@ -224,7 +238,31 @@ enum DisconnectReason {
     /// Relay sent `tunnel.relay_shutdown` — intentional, skip backoff.
     RelayShutdown,
     /// Normal close frame or EOF.
-    Clean,
+    WsClose,
+    /// Heartbeat pong timeout — no response from relay.
+    PongTimeout,
+    /// Writer task exited (WS send failure or timeout).
+    WriterExit,
+    /// WS read error.
+    ReadError,
+}
+
+impl DisconnectReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::RelayShutdown => "relay_shutdown",
+            Self::WsClose => "ws_close",
+            Self::PongTimeout => "pong_timeout",
+            Self::WriterExit => "writer_exit",
+            Self::ReadError => "read_error",
+        }
+    }
+}
+
+impl std::fmt::Display for DisconnectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Classification of connection errors for backoff strategy.
@@ -288,6 +326,21 @@ fn set_tcp_keepalive(stream: &TcpStream, idle: u32, interval: u32, count: u32) {
             libc::IPPROTO_TCP,
             libc::TCP_KEEPCNT,
             ptr::addr_of!(count).cast(),
+            sz,
+        );
+        // TCP_USER_TIMEOUT: abort connection if sent data goes unacknowledged
+        // for 15s. On LTE with CGNAT, NAT mappings can silently expire, causing
+        // TCP retransmissions to loop for minutes. Without this, send() succeeds
+        // into the local buffer but data never reaches the relay, and neither
+        // keepalive (requires idle connection) nor application-level timeouts
+        // (writer only sees local buffer) can detect it. Worst case detection
+        // is heartbeat_interval + 15s.
+        let user_timeout: libc::c_int = 15_000; // milliseconds
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_USER_TIMEOUT,
+            ptr::addr_of!(user_timeout).cast(),
             sz,
         );
     }
@@ -590,12 +643,25 @@ async fn connect_and_run(
     let writer_stats = state.tunnel_stats.clone();
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = ws_out_rx.recv().await {
-            if raw_ws_sink.send(msg).await.is_err() {
-                warn!("Tunnel: writer task WS send failed, exiting");
-                writer_stats
-                    .push_event(TunnelEventType::WriterFailed, "WS send error".into())
-                    .await;
-                break;
+            match tokio::time::timeout(Duration::from_secs(15), raw_ws_sink.send(msg)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!("Tunnel: writer task WS send failed: {e}");
+                    writer_stats
+                        .push_event(TunnelEventType::WriterFailed, format!("WS send error: {e}"))
+                        .await;
+                    break;
+                }
+                Err(_) => {
+                    warn!("Tunnel: writer task WS send timed out (15s)");
+                    writer_stats
+                        .push_event(
+                            TunnelEventType::WriterFailed,
+                            "WS send timeout (15s)".into(),
+                        )
+                        .await;
+                    break;
+                }
             }
             writer_stats.messages_sent.fetch_add(1, Ordering::Relaxed);
         }
@@ -675,16 +741,22 @@ async fn connect_and_run(
                 warn!("Tunnel: writer channel backpressure ({capacity}/512 slots free)");
             }
 
-            if heartbeat_sink
-                .send(tokio_tungstenite::tungstenite::Message::Text(
-                    PING_TEXT.into(),
-                ))
-                .await
-                .is_err()
-            {
-                warn!("Tunnel: heartbeat send failed, triggering reconnect");
-                let _ = heartbeat_cancel_tx.send(true);
-                break;
+            match heartbeat_sink.try_send(tokio_tungstenite::tungstenite::Message::Text(
+                PING_TEXT.into(),
+            )) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        "Tunnel: heartbeat channel full, writer likely stuck — forcing reconnect"
+                    );
+                    let _ = heartbeat_cancel_tx.send(true);
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    warn!("Tunnel: heartbeat channel closed, triggering reconnect");
+                    let _ = heartbeat_cancel_tx.send(true);
+                    break;
+                }
             }
             // Record ping timestamp for RTT calculation on pong
             #[allow(clippy::cast_possible_truncation)]
@@ -703,7 +775,7 @@ async fn connect_and_run(
     let mut reap_interval = tokio::time::interval(Duration::from_secs(30));
     reap_interval.tick().await; // consume the immediate first tick
 
-    let mut disconnect_reason = DisconnectReason::Clean;
+    let mut disconnect_reason = DisconnectReason::WsClose;
 
     // Re-subscribe to all running sessions after reconnect
     {
@@ -741,6 +813,7 @@ async fn connect_and_run(
                     Ok(m) => m,
                     Err(e) => {
                         warn!("Tunnel: WS read error: {e}");
+                        disconnect_reason = DisconnectReason::ReadError;
                         break;
                     }
                 };
@@ -754,6 +827,11 @@ async fn connect_and_run(
                             }
                         };
                         state.tunnel_stats.messages_received.fetch_add(1, Ordering::Relaxed);
+                        // Any message from the relay proves the connection is alive.
+                        // Update pong timestamp so the pong watchdog doesn't fire
+                        // when relay pongs are queued behind sctlin request bursts.
+                        #[allow(clippy::cast_possible_truncation)]
+                        last_pong_ms.store(connection_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
                         let msg_type = parsed["type"].as_str().unwrap_or("");
                         match msg_type {
                             "tunnel.relay_shutdown" => {
@@ -778,11 +856,15 @@ async fn connect_and_run(
                                 }
                             }
                             "tunnel.register.ack" | "ping" => {}
-                            // Relay-initiated ping — respond inline to avoid blocking
+                            // Relay-initiated ping — respond with try_send to never
+                            // block the read loop (if channel full, write path is stuck anyway)
                             "tunnel.ping" => {
-                                let _ = ws_sink.send(tokio_tungstenite::tungstenite::Message::Text(
+                                let pong = tokio_tungstenite::tungstenite::Message::Text(
                                     r#"{"type":"tunnel.pong"}"#.into(),
-                                )).await;
+                                );
+                                if let Err(e) = ws_sink.try_send(pong) {
+                                    warn!("Tunnel: pong dropped (channel: {e}), write path likely stuck");
+                                }
                             }
                             // Everything else: spawn as task to keep the read loop responsive.
                             // This prevents slow handlers (exec, file I/O) from blocking
@@ -824,9 +906,11 @@ async fn connect_and_run(
                     // Forward session lifecycle events to relay
                     let text = serde_json::to_string(&event)
                         .unwrap_or_else(|_| r#"{"type":"error","message":"serialize failed"}"#.to_string());
-                    let _ = ws_sink.send(tokio_tungstenite::tungstenite::Message::Text(
+                    if let Err(e) = ws_sink.try_send(tokio_tungstenite::tungstenite::Message::Text(
                         text.into(),
-                    )).await;
+                    )) {
+                        warn!("Tunnel: session event dropped (channel: {e})");
+                    }
                 }
             }
             _ = reap_interval.tick() => {
@@ -834,10 +918,12 @@ async fn connect_and_run(
             }
             _ = heartbeat_cancel_rx.changed() => {
                 warn!("Tunnel: heartbeat failure detected, disconnecting");
+                disconnect_reason = DisconnectReason::PongTimeout;
                 break;
             }
             _ = &mut writer_exit_rx => {
                 warn!("Tunnel: writer task exited, disconnecting");
+                disconnect_reason = DisconnectReason::WriterExit;
                 break;
             }
         }
@@ -853,6 +939,30 @@ async fn connect_and_run(
 
     // Pause all active transfers on tunnel disconnect
     state.transfer_manager.pause_all().await;
+
+    // Summary log: single parseable line with everything needed for diagnosis
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        let duration_secs = connection_epoch.elapsed().as_secs();
+        let pong_age_ms = {
+            let last = last_pong_ms.load(Ordering::Relaxed);
+            if last > 0 {
+                (connection_epoch.elapsed().as_millis() as u64).saturating_sub(last)
+            } else {
+                0
+            }
+        };
+        let msgs_sent = state.tunnel_stats.messages_sent.load(Ordering::Relaxed);
+        let msgs_recv = state.tunnel_stats.messages_received.load(Ordering::Relaxed);
+        info!(
+            duration_secs,
+            reason = disconnect_reason.as_str(),
+            last_pong_age_ms = pong_age_ms,
+            messages_sent = msgs_sent,
+            messages_received = msgs_recv,
+            "Tunnel: disconnected"
+        );
+    }
 
     Ok(disconnect_reason)
 }
@@ -987,13 +1097,13 @@ fn tunnel_headers(msg: &Value) -> axum::http::HeaderMap {
     headers
 }
 
-/// Send a JSON response back through the tunnel WS channel.
-async fn send_response(ws_sink: &WsSink, msg: Value) {
+/// Send a JSON response back through the tunnel WS channel (non-blocking).
+fn send_response(ws_sink: &WsSink, msg: Value) {
     let text = serde_json::to_string(&msg)
         .unwrap_or_else(|_| r#"{"type":"error","message":"serialize failed"}"#.to_string());
-    let _ = ws_sink
-        .send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
-        .await;
+    if let Err(e) = ws_sink.try_send(tokio_tungstenite::tungstenite::Message::Text(text.into())) {
+        warn!("Tunnel: response dropped (channel: {e})");
+    }
 }
 
 /// Log a successful exec from a tunnel request (mirrors `routes::exec::log_exec_ok`).
@@ -1154,7 +1264,7 @@ async fn handle_tunnel_exec(
         }
     };
 
-    send_response(ws_sink, result).await;
+    send_response(ws_sink, result);
 }
 
 /// Handle `tunnel.exec_batch` — batch command execution
@@ -1173,22 +1283,23 @@ async fn handle_tunnel_exec_batch(
                 "status": 400,
                 "body": {"error": "commands array is required", "code": "INVALID_REQUEST"}
             }),
-        )
-        .await;
+        );
         return;
     };
 
     if commands.len() > state.config.server.max_batch_size {
-        send_response(ws_sink, json!({
-            "type": "tunnel.exec_batch.result",
-            "request_id": request_id,
-            "status": 400,
-            "body": {
-                "error": format!("Too many commands (max {})", state.config.server.max_batch_size),
-                "code": "BATCH_TOO_LARGE"
-            }
-        }))
-        .await;
+        send_response(
+            ws_sink,
+            json!({
+                "type": "tunnel.exec_batch.result",
+                "request_id": request_id,
+                "status": 400,
+                "body": {
+                    "error": format!("Too many commands (max {})", state.config.server.max_batch_size),
+                    "code": "BATCH_TOO_LARGE"
+                }
+            }),
+        );
         return;
     }
 
@@ -1297,8 +1408,7 @@ async fn handle_tunnel_exec_batch(
             "status": 200,
             "body": {"results": results}
         }),
-    )
-    .await;
+    );
 }
 
 /// Handle tunnel.info — system information
@@ -1314,8 +1424,7 @@ async fn handle_tunnel_info(state: &AppState, ws_sink: &WsSink, request_id: Opti
                     "status": 200,
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
         Err(status) => {
             send_response(
@@ -1326,8 +1435,7 @@ async fn handle_tunnel_info(state: &AppState, ws_sink: &WsSink, request_id: Opti
                     "status": status.as_u16(),
                     "body": {"error": "Failed to get info"},
                 }),
-            )
-            .await;
+            );
         }
     }
 }
@@ -1343,8 +1451,7 @@ async fn handle_tunnel_health(state: &AppState, ws_sink: &WsSink, request_id: Op
             "status": 200,
             "body": body,
         }),
-    )
-    .await;
+    );
 }
 
 /// Handle tunnel.diagnostics — server diagnostics snapshot
@@ -1375,8 +1482,7 @@ async fn handle_tunnel_diagnostics(
                     "status": 200,
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
         Err(status) => {
             send_response(
@@ -1387,8 +1493,7 @@ async fn handle_tunnel_diagnostics(
                     "status": status.as_u16(),
                     "body": {"error": "Failed to get diagnostics"},
                 }),
-            )
-            .await;
+            );
         }
     }
 }
@@ -1430,8 +1535,7 @@ async fn handle_tunnel_file_read(
                     "status": 200,
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
         Err((status, axum::Json(body))) => {
             send_response(
@@ -1442,8 +1546,7 @@ async fn handle_tunnel_file_read(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
     }
 }
@@ -1485,8 +1588,7 @@ async fn handle_tunnel_file_write(
                     "status": 200,
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
         Err((status, axum::Json(body))) => {
             send_response(
@@ -1497,8 +1599,7 @@ async fn handle_tunnel_file_write(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
     }
 }
@@ -1525,8 +1626,7 @@ async fn handle_tunnel_activity(
             "status": 200,
             "body": { "entries": entries },
         }),
-    )
-    .await;
+    );
 }
 
 /// Handle tunnel.exec_result — cached exec result lookup
@@ -1548,8 +1648,7 @@ async fn handle_tunnel_exec_result(
                     "status": 200,
                     "body": result,
                 }),
-            )
-            .await;
+            );
         }
         None => {
             send_response(
@@ -1560,8 +1659,7 @@ async fn handle_tunnel_exec_result(
                     "status": 404,
                     "body": {"error": "Exec result not found or evicted", "code": "NOT_FOUND"},
                 }),
-            )
-            .await;
+            );
         }
     }
 }
@@ -1578,8 +1676,7 @@ async fn handle_tunnel_sessions(state: &AppState, ws_sink: &WsSink, request_id: 
             "status": 200,
             "body": body,
         }),
-    )
-    .await;
+    );
 }
 
 /// Handle tunnel.shells — shell list
@@ -1594,8 +1691,7 @@ async fn handle_tunnel_shells(state: &AppState, ws_sink: &WsSink, request_id: Op
             "status": 200,
             "body": body,
         }),
-    )
-    .await;
+    );
 }
 
 /// Handle tunnel.session.signal — signal a session
@@ -1627,8 +1723,7 @@ async fn handle_tunnel_session_signal(
                     "status": 200,
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
         Err((status, axum::Json(body))) => {
             send_response(
@@ -1639,8 +1734,7 @@ async fn handle_tunnel_session_signal(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
     }
 }
@@ -1669,8 +1763,7 @@ async fn handle_tunnel_session_kill(
                     "status": 200,
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
         Err((status, axum::Json(body))) => {
             send_response(
@@ -1681,8 +1774,7 @@ async fn handle_tunnel_session_kill(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
     }
 }
@@ -1719,8 +1811,7 @@ async fn handle_tunnel_session_patch(
                     "status": 200,
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
         Err((status, axum::Json(body))) => {
             send_response(
@@ -1731,8 +1822,7 @@ async fn handle_tunnel_session_patch(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
     }
 }
@@ -1762,8 +1852,7 @@ async fn handle_tunnel_file_delete(
                     "status": 200,
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
         Err((status, axum::Json(body))) => {
             send_response(
@@ -1774,8 +1863,7 @@ async fn handle_tunnel_file_delete(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
     }
 }
@@ -1817,15 +1905,13 @@ async fn handle_gx_download_init(
                     "status": 200,
                     "body": serde_json::to_value(&result).unwrap_or_default(),
                 }),
-            )
-            .await;
+            );
         }
         Err(e) => {
             send_response(
                 ws_sink,
                 gx_error_response("gx.download.init.result", request_id, &e),
-            )
-            .await;
+            );
         }
     }
 }
@@ -1859,15 +1945,13 @@ async fn handle_gx_upload_init(
                     "status": 200,
                     "body": serde_json::to_value(&result).unwrap_or_default(),
                 }),
-            )
-            .await;
+            );
         }
         Err(e) => {
             send_response(
                 ws_sink,
                 gx_error_response("gx.upload.init.result", request_id, &e),
-            )
-            .await;
+            );
         }
     }
 }
@@ -1898,14 +1982,14 @@ async fn handle_gx_chunk_request(
                 "chunk_hash": chunk_header.chunk_hash,
             });
             let frame = encode_binary_frame(&header, &data);
-            let _ = ws_sink
-                .send(tokio_tungstenite::tungstenite::Message::Binary(
-                    frame.into(),
-                ))
-                .await;
+            if let Err(e) = ws_sink.try_send(tokio_tungstenite::tungstenite::Message::Binary(
+                frame.into(),
+            )) {
+                warn!("Tunnel: binary chunk dropped (channel: {e})");
+            }
         }
         Err(e) => {
-            send_response(ws_sink, gx_error_response("gx.chunk.ack", request_id, &e)).await;
+            send_response(ws_sink, gx_error_response("gx.chunk.ack", request_id, &e));
         }
     }
 }
@@ -1936,11 +2020,10 @@ async fn handle_gx_chunk_receive(
                     "request_id": request_id,
                     "body": serde_json::to_value(&ack).unwrap_or_default(),
                 }),
-            )
-            .await;
+            );
         }
         Err(e) => {
-            send_response(ws_sink, gx_error_response("gx.chunk.ack", request_id, &e)).await;
+            send_response(ws_sink, gx_error_response("gx.chunk.ack", request_id, &e));
         }
     }
 }
@@ -1963,15 +2046,13 @@ async fn handle_gx_resume(
                     "status": 200,
                     "body": serde_json::to_value(&result).unwrap_or_default(),
                 }),
-            )
-            .await;
+            );
         }
         Err(e) => {
             send_response(
                 ws_sink,
                 gx_error_response("gx.resume.result", request_id, &e),
-            )
-            .await;
+            );
         }
     }
 }
@@ -1995,15 +2076,13 @@ async fn handle_gx_abort(
                     "status": 200,
                     "body": {"ok": true, "transfer_id": transfer_id},
                 }),
-            )
-            .await;
+            );
         }
         Err(e) => {
             send_response(
                 ws_sink,
                 gx_error_response("gx.abort.result", request_id, &e),
-            )
-            .await;
+            );
         }
     }
 }
@@ -2026,15 +2105,13 @@ async fn handle_gx_status(
                     "status": 200,
                     "body": serde_json::to_value(&result).unwrap_or_default(),
                 }),
-            )
-            .await;
+            );
         }
         Err(e) => {
             send_response(
                 ws_sink,
                 gx_error_response("gx.status.result", request_id, &e),
-            )
-            .await;
+            );
         }
     }
 }
@@ -2050,8 +2127,7 @@ async fn handle_gx_list(state: &AppState, ws_sink: &WsSink, request_id: Option<&
             "status": 200,
             "body": serde_json::to_value(&result).unwrap_or_default(),
         }),
-    )
-    .await;
+    );
 }
 
 /// Build a JSON error response for gx.* messages.
@@ -2167,7 +2243,7 @@ async fn handle_forwarded_session_message(
                     if let Some(ref rid) = request_id {
                         resp["request_id"] = json!(rid);
                     }
-                    send_response(ws_sink, resp).await;
+                    send_response(ws_sink, resp);
 
                     // Now start subscriber for output forwarding
                     if let Some(buffer) = state.session_manager.get_buffer(&session_id).await {
@@ -2205,7 +2281,7 @@ async fn handle_forwarded_session_message(
                     if let Some(ref rid) = request_id {
                         resp["request_id"] = json!(rid);
                     }
-                    send_response(ws_sink, resp).await;
+                    send_response(ws_sink, resp);
                 }
             }
         }
@@ -2227,7 +2303,7 @@ async fn handle_forwarded_session_message(
                 if let Some(ref rid) = request_id {
                     resp["request_id"] = json!(rid);
                 }
-                send_response(ws_sink, resp).await;
+                send_response(ws_sink, resp);
             } else {
                 let mut resp = json!({
                     "type": "session.exec.ack",
@@ -2236,7 +2312,7 @@ async fn handle_forwarded_session_message(
                 if let Some(ref rid) = request_id {
                     resp["request_id"] = json!(rid);
                 }
-                send_response(ws_sink, resp).await;
+                send_response(ws_sink, resp);
             }
         }
         "session.stdin" => {
@@ -2257,8 +2333,7 @@ async fn handle_forwarded_session_message(
                             "session_id": session_id,
                             "message": e,
                         }),
-                    )
-                    .await;
+                    );
                 }
             }
         }
@@ -2275,7 +2350,7 @@ async fn handle_forwarded_session_message(
                     if let Some(ref rid) = request_id {
                         resp["request_id"] = json!(rid);
                     }
-                    send_response(ws_sink, resp).await;
+                    send_response(ws_sink, resp);
                     let _ = state.session_events.send(json!({
                         "type": "session.destroyed",
                         "session_id": session_id,
@@ -2295,7 +2370,7 @@ async fn handle_forwarded_session_message(
                     if let Some(ref rid) = request_id {
                         resp["request_id"] = json!(rid);
                     }
-                    send_response(ws_sink, resp).await;
+                    send_response(ws_sink, resp);
                 }
             }
         }
@@ -2319,7 +2394,7 @@ async fn handle_forwarded_session_message(
                         if let Some(ref rid) = request_id {
                             resp["request_id"] = json!(rid);
                         }
-                        send_response(ws_sink, resp).await;
+                        send_response(ws_sink, resp);
                     }
                     Err(e) => {
                         let mut resp = json!({
@@ -2331,7 +2406,7 @@ async fn handle_forwarded_session_message(
                         if let Some(ref rid) = request_id {
                             resp["request_id"] = json!(rid);
                         }
-                        send_response(ws_sink, resp).await;
+                        send_response(ws_sink, resp);
                     }
                 }
             }
@@ -2365,7 +2440,7 @@ async fn handle_forwarded_session_message(
                     if let Some(ref rid) = request_id {
                         resp["request_id"] = json!(rid);
                     }
-                    send_response(ws_sink, resp).await;
+                    send_response(ws_sink, resp);
 
                     // Start subscriber
                     let sink_clone = ws_sink.clone();
@@ -2387,7 +2462,7 @@ async fn handle_forwarded_session_message(
                     if let Some(ref rid) = request_id {
                         resp["request_id"] = json!(rid);
                     }
-                    send_response(ws_sink, resp).await;
+                    send_response(ws_sink, resp);
                 }
             }
         }
@@ -2437,7 +2512,7 @@ async fn handle_forwarded_session_message(
             if let Some(ref rid) = request_id {
                 resp["request_id"] = json!(rid);
             }
-            send_response(ws_sink, resp).await;
+            send_response(ws_sink, resp);
         }
         "session.resize" => {
             let session_id = msg["session_id"].as_str().unwrap_or("");
@@ -2461,7 +2536,7 @@ async fn handle_forwarded_session_message(
                         if let Some(ref rid) = request_id {
                             resp["request_id"] = json!(rid);
                         }
-                        send_response(ws_sink, resp).await;
+                        send_response(ws_sink, resp);
                     }
                     Err(e) => {
                         let mut resp = json!({
@@ -2473,7 +2548,7 @@ async fn handle_forwarded_session_message(
                         if let Some(ref rid) = request_id {
                             resp["request_id"] = json!(rid);
                         }
-                        send_response(ws_sink, resp).await;
+                        send_response(ws_sink, resp);
                     }
                 }
             }
@@ -2497,7 +2572,7 @@ async fn handle_forwarded_session_message(
                             if let Some(ref rid) = request_id {
                                 resp["request_id"] = json!(rid);
                             }
-                            send_response(ws_sink, resp).await;
+                            send_response(ws_sink, resp);
                             let _ = state.session_events.send(json!({
                                 "type": "session.ai_permission_changed",
                                 "session_id": session_id,
@@ -2521,7 +2596,7 @@ async fn handle_forwarded_session_message(
                             if let Some(ref rid) = request_id {
                                 resp["request_id"] = json!(rid);
                             }
-                            send_response(ws_sink, resp).await;
+                            send_response(ws_sink, resp);
                         }
                     }
                 }
@@ -2554,7 +2629,7 @@ async fn handle_forwarded_session_message(
                             if let Some(ref rid) = request_id {
                                 resp["request_id"] = json!(rid);
                             }
-                            send_response(ws_sink, resp).await;
+                            send_response(ws_sink, resp);
                             let mut broadcast = json!({
                                 "type": "session.ai_status_changed",
                                 "session_id": session_id,
@@ -2578,7 +2653,7 @@ async fn handle_forwarded_session_message(
                             if let Some(ref rid) = request_id {
                                 resp["request_id"] = json!(rid);
                             }
-                            send_response(ws_sink, resp).await;
+                            send_response(ws_sink, resp);
                         }
                     }
                 }
@@ -2598,7 +2673,7 @@ async fn handle_forwarded_session_message(
                         if let Some(ref rid) = request_id {
                             resp["request_id"] = json!(rid);
                         }
-                        send_response(ws_sink, resp).await;
+                        send_response(ws_sink, resp);
                         let _ = state.session_events.send(json!({
                             "type": "session.renamed",
                             "session_id": session_id,
@@ -2615,7 +2690,7 @@ async fn handle_forwarded_session_message(
                         if let Some(ref rid) = request_id {
                             resp["request_id"] = json!(rid);
                         }
-                        send_response(ws_sink, resp).await;
+                        send_response(ws_sink, resp);
                     }
                 }
             }
@@ -2630,7 +2705,7 @@ async fn handle_forwarded_session_message(
             if let Some(ref rid) = request_id {
                 resp["request_id"] = json!(rid);
             }
-            send_response(ws_sink, resp).await;
+            send_response(ws_sink, resp);
         }
         _ => {
             warn!(msg_type, "Unknown forwarded session message type");
@@ -2671,8 +2746,7 @@ async fn handle_tunnel_playbooks_list(
                     "status": 200,
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
         Err((status, axum::Json(body))) => {
             send_response(
@@ -2683,8 +2757,7 @@ async fn handle_tunnel_playbooks_list(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
     }
 }
@@ -2713,8 +2786,7 @@ async fn handle_tunnel_playbooks_get(
                     "status": 200,
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
         Err((status, axum::Json(body))) => {
             send_response(
@@ -2725,8 +2797,7 @@ async fn handle_tunnel_playbooks_get(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
     }
 }
@@ -2757,8 +2828,7 @@ async fn handle_tunnel_playbooks_put(
                     "status": 200,
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
         Err((status, axum::Json(body))) => {
             send_response(
@@ -2769,8 +2839,7 @@ async fn handle_tunnel_playbooks_put(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
     }
 }
@@ -2799,8 +2868,7 @@ async fn handle_tunnel_playbooks_delete(
                     "status": 200,
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
         Err((status, axum::Json(body))) => {
             send_response(
@@ -2811,8 +2879,7 @@ async fn handle_tunnel_playbooks_delete(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
     }
 }
@@ -2829,8 +2896,7 @@ async fn handle_tunnel_gps(state: &AppState, ws_sink: &WsSink, request_id: Optio
                     "status": 200,
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
         Err((status, axum::Json(body))) => {
             send_response(
@@ -2841,15 +2907,19 @@ async fn handle_tunnel_gps(state: &AppState, ws_sink: &WsSink, request_id: Optio
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
     }
 }
 
 /// Handle `tunnel.lte` — LTE signal and modem data.
 async fn handle_tunnel_lte(state: &AppState, ws_sink: &WsSink, request_id: Option<&str>) {
-    match crate::routes::lte::lte(axum::extract::State(state.clone())).await {
+    match crate::routes::lte::lte(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(std::collections::HashMap::new()),
+    )
+    .await
+    {
         Ok(axum::Json(body)) => {
             send_response(
                 ws_sink,
@@ -2859,8 +2929,7 @@ async fn handle_tunnel_lte(state: &AppState, ws_sink: &WsSink, request_id: Optio
                     "status": 200,
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
         Err((status, axum::Json(body))) => {
             send_response(
@@ -2871,8 +2940,7 @@ async fn handle_tunnel_lte(state: &AppState, ws_sink: &WsSink, request_id: Optio
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
     }
 }
@@ -2896,8 +2964,7 @@ async fn handle_tunnel_lte_bands(
                     "status": 400,
                     "body": {"error": format!("invalid request: {e}")},
                 }),
-            )
-            .await;
+            );
             return;
         }
     };
@@ -2913,8 +2980,7 @@ async fn handle_tunnel_lte_bands(
                     "status": 200,
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
         Err((status, axum::Json(body))) => {
             send_response(
@@ -2925,8 +2991,7 @@ async fn handle_tunnel_lte_bands(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
     }
 }
@@ -2950,8 +3015,7 @@ async fn handle_tunnel_lte_scan(
                     "status": 400,
                     "body": {"error": format!("invalid request: {e}")},
                 }),
-            )
-            .await;
+            );
             return;
         }
     };
@@ -2967,8 +3031,7 @@ async fn handle_tunnel_lte_scan(
                     "status": 200,
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
         Err((status, axum::Json(body))) => {
             send_response(
@@ -2979,8 +3042,7 @@ async fn handle_tunnel_lte_scan(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            )
-            .await;
+            );
         }
     }
 }
@@ -3014,14 +3076,22 @@ async fn tunnel_subscriber_task(
                 let text = serde_json::to_string(&msg).unwrap_or_else(|_| {
                     r#"{"type":"error","message":"serialize failed"}"#.to_string()
                 });
-                if ws_sink
-                    .send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
-                    .await
-                    .is_err()
-                {
-                    return;
+                match ws_sink.try_send(tokio_tungstenite::tungstenite::Message::Text(text.into())) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            "Tunnel: session output dropped (writer channel full)"
+                        );
+                        return;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        return;
+                    }
                 }
             }
+            // Always advance cursor — dropped entries are gone (the relay
+            // will send session.gap notifications for client-side recovery).
             if let Some(last) = entries.last() {
                 cursor = last.seq;
             }

@@ -41,7 +41,7 @@
 //! url = "wss://relay.example.com/api/tunnel/register"  # client mode only
 //! reconnect_delay_secs = 2                 # client mode, initial backoff
 //! reconnect_max_delay_secs = 30            # client mode, max backoff
-//! heartbeat_interval_secs = 15             # client mode, ping interval
+//! heartbeat_interval_secs = 5              # client mode, ping interval
 //! bind_address = "wwan0"                   # client mode, interface name or IP
 //! ```
 
@@ -204,10 +204,10 @@ pub struct TunnelConfig {
     /// Max seconds between reconnect attempts (client mode, default 30).
     #[serde(default = "default_reconnect_max_delay")]
     pub reconnect_max_delay_secs: u64,
-    /// Seconds between heartbeat pings (client mode, default 15).
+    /// Seconds between heartbeat pings (client mode, default 5).
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval_secs: u64,
-    /// Seconds before a device is considered dead if no heartbeat (relay mode, default 45).
+    /// Seconds before a device is considered dead if no heartbeat (relay mode, default 20).
     #[serde(default = "default_heartbeat_timeout")]
     pub heartbeat_timeout_secs: u64,
     /// Default proxy request timeout in seconds (relay mode, default 60).
@@ -277,6 +277,12 @@ pub struct LteConfig {
     pub interface: String,
     /// URL for download speed test during band scan (optional).
     pub speed_test_url: Option<String>,
+    /// Host to ping for internet reachability check before modem escalation.
+    /// Default: relay host extracted from tunnel URL, or `8.8.8.8`.
+    pub reachability_host: Option<String>,
+    /// Custom command to restart the LTE interface (overrides auto-detection).
+    /// E.g. `"ifdown wwan && sleep 2 && ifup wwan"`.
+    pub interface_restart_cmd: Option<String>,
 }
 
 fn default_lte_device() -> String {
@@ -392,10 +398,10 @@ fn default_reconnect_max_delay() -> u64 {
     30
 }
 fn default_heartbeat_interval() -> u64 {
-    15
+    5
 }
 fn default_heartbeat_timeout() -> u64 {
-    45
+    20
 }
 fn default_tunnel_proxy_timeout() -> u64 {
     60

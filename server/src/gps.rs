@@ -6,14 +6,16 @@
 //! (`AT+QGPS=1`) and disabled on shutdown (`AT+QGPSEND`).
 
 use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio::sync::{broadcast, watch, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::config::GpsConfig;
+use crate::state::TunnelStats;
 
 /// A single GPS fix from `AT+QGPSLOC=2`.
 #[derive(Debug, Clone, Serialize)]
@@ -176,12 +178,19 @@ fn parse_qgpsloc(response: &str) -> Result<GpsFix, String> {
 
 /// Spawn the background GPS poller. Returns a `JoinHandle` for abort on shutdown.
 #[allow(clippy::needless_pass_by_value)] // config is moved into spawned task
+/// Spawn the background GPS poller.
+///
+/// Like the LTE poller, GPS AT commands are skipped while the tunnel is
+/// connected — even a single AT command on the shared serial port can disrupt
+/// the QMI data path. GPS fixes use the cached last-known position during
+/// connected periods.
 pub fn spawn_gps_poller(
     config: GpsConfig,
     modem: Modem,
     gps_state: Arc<Mutex<GpsState>>,
     session_events: broadcast::Sender<serde_json::Value>,
     mut modem_rx: watch::Receiver<Modem>,
+    tunnel_stats: Option<Arc<TunnelStats>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = tokio::time::Duration::from_secs(config.poll_interval_secs);
@@ -236,6 +245,7 @@ pub fn spawn_gps_poller(
         ticker.tick().await;
 
         let mut consecutive_errors: u32 = 0;
+        let mut consecutive_channel_errors: u32 = 0;
 
         loop {
             ticker.tick().await;
@@ -243,44 +253,96 @@ pub fn spawn_gps_poller(
             // Pick up refreshed modem handle if watchdog re-opened it
             if modem_rx.has_changed().unwrap_or(false) {
                 modem = modem_rx.borrow_and_update().clone();
+                consecutive_channel_errors = 0;
                 info!("GPS poller: modem handle refreshed");
             }
 
+            // Wait for watchdog to refresh dead modem handle (avoid racing USB cycle)
+            if !modem.is_alive() || consecutive_channel_errors >= 3 {
+                warn!(
+                    "GPS poller: modem handle dead (alive={}, channel_errors={}), waiting for refresh",
+                    modem.is_alive(),
+                    consecutive_channel_errors
+                );
+                loop {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    if modem_rx.has_changed().unwrap_or(false) {
+                        modem = modem_rx.borrow_and_update().clone();
+                        consecutive_channel_errors = 0;
+                        info!("GPS poller: modem handle refreshed by watchdog");
+                        break;
+                    }
+                    // Watchdog sender dropped — no one will broadcast, self-recover
+                    if modem_rx.has_changed().is_err() {
+                        let actual_path = crate::modem::detect_quectel_at_port(&config.device);
+                        match crate::modem::Modem::open(&actual_path) {
+                            Ok(new_modem) => {
+                                info!("GPS poller: modem re-opened (no watchdog) at {actual_path}");
+                                modem = new_modem;
+                                consecutive_channel_errors = 0;
+                            }
+                            Err(e) => {
+                                warn!("GPS poller: modem re-open failed: {e}");
+                            }
+                        }
+                        break;
+                    }
+                    // Check if handle recovered on its own
+                    if modem.is_alive() {
+                        consecutive_channel_errors = 0;
+                        break;
+                    }
+                }
+            }
+
+            // Skip polling while tunnel is connected — AT commands on the shared
+            // serial port can disrupt the QMI data path and kill the LTE connection.
+            if let Some(ref ts) = tunnel_stats {
+                if ts.connected.load(Ordering::Relaxed) {
+                    continue;
+                }
+            }
+
             match modem.command("AT+QGPSLOC=2").await {
-                Ok(resp) => match parse_qgpsloc(&resp) {
-                    Ok(fix) => {
-                        debug!(
-                            "GPS: fix {:.6},{:.6} alt={:.0}m sats={} hdop={:.1}",
-                            fix.latitude, fix.longitude, fix.altitude, fix.satellites, fix.hdop
-                        );
-                        consecutive_errors = 0;
-                        // Broadcast GPS fix event
-                        let _ = session_events.send(serde_json::json!({
-                            "type": "gps.fix",
-                            "latitude": fix.latitude,
-                            "longitude": fix.longitude,
-                            "altitude": fix.altitude,
-                            "satellites": fix.satellites,
-                        }));
-                        gps_state.lock().await.push_fix(fix);
-                    }
-                    Err(ref e) if e == "searching" => {
-                        debug!("GPS: searching for satellites...");
-                        consecutive_errors = 0;
-                        gps_state.lock().await.set_searching();
-                    }
-                    Err(e) => {
-                        consecutive_errors += 1;
-                        if consecutive_errors < 3 {
-                            debug!("GPS: transient error ({consecutive_errors}): {e}");
-                            gps_state.lock().await.record_error(e, false);
-                        } else {
-                            warn!("GPS: sustained error ({consecutive_errors}): {e}");
-                            gps_state.lock().await.record_error(e, true);
+                Ok(resp) => {
+                    consecutive_channel_errors = 0;
+                    match parse_qgpsloc(&resp) {
+                        Ok(fix) => {
+                            debug!(
+                                "GPS: fix {:.6},{:.6} alt={:.0}m sats={} hdop={:.1}",
+                                fix.latitude, fix.longitude, fix.altitude, fix.satellites, fix.hdop
+                            );
+                            consecutive_errors = 0;
+                            let _ = session_events.send(serde_json::json!({
+                                "type": "gps.fix",
+                                "latitude": fix.latitude,
+                                "longitude": fix.longitude,
+                                "altitude": fix.altitude,
+                                "satellites": fix.satellites,
+                            }));
+                            gps_state.lock().await.push_fix(fix);
+                        }
+                        Err(ref e) if e == "searching" => {
+                            debug!("GPS: searching for satellites...");
+                            consecutive_errors = 0;
+                            gps_state.lock().await.set_searching();
+                        }
+                        Err(e) => {
+                            consecutive_errors += 1;
+                            if consecutive_errors < 3 {
+                                debug!("GPS: transient error ({consecutive_errors}): {e}");
+                                gps_state.lock().await.record_error(e, false);
+                            } else {
+                                warn!("GPS: sustained error ({consecutive_errors}): {e}");
+                                gps_state.lock().await.record_error(e, true);
+                            }
                         }
                     }
-                },
+                }
                 Err(e) => {
+                    if e.contains("I/O thread gone") || e.contains("reply channel dropped") {
+                        consecutive_channel_errors += 1;
+                    }
                     consecutive_errors += 1;
                     if consecutive_errors < 3 {
                         debug!("GPS: transient AT failure ({consecutive_errors}): {e}");

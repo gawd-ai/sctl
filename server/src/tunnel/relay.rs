@@ -37,6 +37,8 @@ pub struct ConnectionSession {
     pub connected_at: u64,
     pub disconnected_at: Option<u64>,
     pub reason: Option<String>,
+    /// Age of last heartbeat at disconnect time (ms). Low = sudden death, high = gradual.
+    pub last_heartbeat_age_ms: Option<u64>,
 }
 
 /// Ring buffer of device connection sessions for the relay dashboard.
@@ -68,11 +70,17 @@ impl RelayConnectionHistory {
             connected_at: now,
             disconnected_at: None,
             reason: None,
+            last_heartbeat_age_ms: None,
         });
     }
 
     /// Record a device disconnection. Updates the most recent open session for the serial.
-    pub async fn record_disconnect(&self, serial: &str, reason: &str) {
+    pub async fn record_disconnect(
+        &self,
+        serial: &str,
+        reason: &str,
+        last_heartbeat_age_ms: Option<u64>,
+    ) {
         let mut sessions = self.sessions.lock().await;
         #[allow(clippy::cast_possible_truncation)]
         let now = SystemTime::now()
@@ -84,6 +92,7 @@ impl RelayConnectionHistory {
             if session.serial == serial && session.disconnected_at.is_none() {
                 session.disconnected_at = Some(now);
                 session.reason = Some(reason.to_string());
+                session.last_heartbeat_age_ms = last_heartbeat_age_ms;
                 return;
             }
         }
@@ -160,6 +169,7 @@ impl RelayConnectionHistory {
                         connected_at: ts_secs,
                         disconnected_at: None,
                         reason: None,
+                        last_heartbeat_age_ms: None,
                     });
                     open.insert(serial, idx);
                 }
@@ -277,7 +287,7 @@ pub struct RelayState {
     pub devices: Arc<RwLock<HashMap<String, ConnectedDevice>>>,
     /// The shared tunnel key for device registration auth.
     pub tunnel_key: String,
-    /// Seconds before a device is evicted for missed heartbeat (default 90).
+    /// Seconds before a device is evicted for missed heartbeat (default 20).
     pub heartbeat_timeout_secs: u64,
     /// Default proxy request timeout in seconds (default 60).
     pub tunnel_proxy_timeout_secs: u64,
@@ -400,10 +410,11 @@ impl RelayState {
             if let Some(device) = devices.get(&serial) {
                 let last_hb = device.last_heartbeat_ms.load(Ordering::Relaxed);
                 if now_ms.saturating_sub(last_hb) > timeout_ms {
+                    let hb_age = Some(now_ms.saturating_sub(last_hb));
                     drain_device(device, "heartbeat timeout").await;
                     devices.remove(&serial);
                     self.history
-                        .record_disconnect(&serial, "heartbeat_timeout")
+                        .record_disconnect(&serial, "heartbeat_timeout", hb_age)
                         .await;
                     warn!(serial = %serial, "Evicted device (heartbeat timeout)");
                     dead_serials.push(serial);
@@ -440,7 +451,9 @@ impl RelayState {
                     drain_device(device, "broadcast send failed").await;
                 }
                 devices.remove(serial);
-                self.history.record_disconnect(serial, "send_failed").await;
+                self.history
+                    .record_disconnect(serial, "send_failed", None)
+                    .await;
                 warn!(serial = %serial, "Evicted device (broadcast send failed)");
             }
         }
@@ -452,7 +465,7 @@ impl RelayState {
         for (serial, device) in devices.iter() {
             drain_device(device, "relay shutting down").await;
             self.history
-                .record_disconnect(serial, "relay_shutdown")
+                .record_disconnect(serial, "relay_shutdown", None)
                 .await;
             info!(serial = %serial, "Drained device for relay shutdown");
         }
@@ -648,6 +661,9 @@ async fn device_register_ws(
 async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayState, serial: String) {
     let (mut ws_sink, mut ws_stream) = socket.split();
     let (device_tx, mut device_rx) = mpsc::channel::<TunnelMessage>(256);
+    // Priority channel for ping/pong — bypasses the main device_tx queue so
+    // control messages aren't delayed behind request bursts from sctlin/MCP.
+    let (priority_tx, mut priority_rx) = mpsc::channel::<TunnelMessage>(8);
 
     // Wait for the registration message which contains the api_key
     let Some(Ok(axum::extract::ws::Message::Text(text))) = ws_stream.next().await else {
@@ -703,6 +719,7 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
         }
     };
 
+    let pong_count = Arc::new(AtomicU64::new(0));
     let device = ConnectedDevice {
         serial: serial.clone(),
         api_key,
@@ -764,34 +781,88 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
         ))
         .await;
 
-    // Forward device_tx messages to the WS sink
+    // Forward device_tx messages to the WS sink.
+    // Writer exit notification: if ws_sink.send() fails, notify main loop immediately
+    // so it can break instead of reading forever with a dead write path.
+    let (writer_exit_tx, writer_exit_rx) = tokio::sync::oneshot::channel::<()>();
+    let writer_serial = serial.clone();
     let send_task = tokio::spawn(async move {
-        while let Some(msg) = device_rx.recv().await {
+        loop {
+            // Priority-first: always drain priority_rx before device_rx.
+            // This ensures pong messages bypass request queue depth, so the
+            // device's pong watchdog doesn't fire during sctlin request bursts.
+            let msg = tokio::select! {
+                biased;
+                msg = priority_rx.recv() => msg,
+                msg = device_rx.recv() => msg,
+            };
+            let Some(msg) = msg else { break };
             let ws_msg = match msg {
                 TunnelMessage::Text(val) => {
-                    let text = serde_json::to_string(&val).expect("Value serializes");
+                    let text = match serde_json::to_string(&val) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::error!(serial = %writer_serial, "JSON serialize failed in writer: {e}");
+                            continue;
+                        }
+                    };
                     axum::extract::ws::Message::Text(text.into())
                 }
                 TunnelMessage::Binary(data) => axum::extract::ws::Message::Binary(data.into()),
             };
-            if ws_sink.send(ws_msg).await.is_err() {
-                break;
+            // 10s timeout on WS send: if the TCP send buffer is full and the
+            // kernel can't drain it (dead write path), we detect it here instead
+            // of blocking the writer indefinitely.
+            match tokio::time::timeout(Duration::from_secs(10), ws_sink.send(ws_msg)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(serial = %writer_serial, error = %e, "Relay writer: WS send failed, exiting");
+                    break;
+                }
+                Err(_) => {
+                    warn!(serial = %writer_serial, "Relay writer: WS send timed out (10s), exiting — write path stuck");
+                    break;
+                }
             }
         }
+        let _ = writer_exit_tx.send(());
     });
+    let mut writer_exit_rx = writer_exit_rx;
 
-    // Relay-side active ping: send tunnel.ping every 20s via device_tx.
-    // If device_tx.send() fails (writer exited), this task exits — the main
-    // message loop will also detect the dead connection via ws_stream EOF.
-    let ping_tx = device_tx.clone();
+    // Relay-side active ping: send tunnel.ping via priority channel so pings
+    // bypass the request queue and reach the device promptly.
+    let ping_tx = priority_tx.clone();
     let mut ping_shutdown_rx = shutdown_rx.clone();
     let ping_serial = serial.clone();
+    let ping_pong_count = pong_count.clone();
+    // Relay-side bidirectional liveness: track whether the device responds to
+    // OUR pings. If we send 3 pings (30s) with no pong back, the write path is dead
+    // (data goes into TCP buffer but never reaches the device). Close the
+    // connection so the device can reconnect with a fresh TCP session.
+    let (relay_pong_timeout_tx, relay_pong_timeout_rx) = tokio::sync::oneshot::channel::<()>();
     let relay_ping_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(20));
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
         interval.tick().await; // skip immediate first tick
+        let mut pings_sent_since_pong: u32 = 0;
+        let mut last_pong_count: u64 = 0;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    // Check if device responded to our pings (bidirectional liveness)
+                    let current_pong_count = ping_pong_count.load(Ordering::Relaxed);
+                    if current_pong_count > last_pong_count {
+                        pings_sent_since_pong = 0;
+                        last_pong_count = current_pong_count;
+                    } else {
+                        pings_sent_since_pong += 1;
+                        if pings_sent_since_pong >= 3 {
+                            // 3 pings (30s) with no pong — write path is dead
+                            warn!(serial = %ping_serial, pings = pings_sent_since_pong, "Relay: write path dead (no pong from device), closing connection");
+                            let _ = relay_pong_timeout_tx.send(());
+                            break;
+                        }
+                    }
+
                     if ping_tx.send(TunnelMessage::Text(json!({"type": "tunnel.ping"}))).await.is_err() {
                         info!(serial = %ping_serial, "Relay ping: device_tx closed, exiting");
                         break;
@@ -803,7 +874,8 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
     });
 
     // Process messages from the device
-    let mut replaced = false;
+    let mut disconnect_reason = "ws_close"; // default: stream ended or close frame
+    let mut relay_pong_timeout_rx = relay_pong_timeout_rx;
     loop {
         let msg = tokio::select! {
             msg = ws_stream.next() => {
@@ -812,7 +884,17 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
             }
             _ = shutdown_rx.changed() => {
                 info!(serial = %serial, "Device handler shutting down (replaced by new connection)");
-                replaced = true;
+                disconnect_reason = "replaced";
+                break;
+            }
+            _ = &mut writer_exit_rx => {
+                warn!(serial = %serial, "Relay writer task exited — write path dead, closing device connection");
+                disconnect_reason = "writer_failed";
+                break;
+            }
+            _ = &mut relay_pong_timeout_rx => {
+                warn!(serial = %serial, "Relay: closing connection — device not responding to relay pings (write path dead)");
+                disconnect_reason = "write_path_dead";
                 break;
             }
         };
@@ -889,15 +971,35 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                         #[allow(clippy::cast_possible_truncation)]
                         let now_ms = relay_epoch.elapsed().as_millis() as u64;
                         heartbeat_ms.store(now_ms, Ordering::Relaxed);
-                        let _ = device_tx
-                            .send(TunnelMessage::Text(json!({"type": "tunnel.pong"})))
-                            .await;
+                        // Device heartbeat arriving proves the connection is alive.
+                        // Count it as a "pong" for the relay's bidirectional liveness
+                        // check. This prevents false positives when relay→device pings
+                        // are queued behind sctlin request bursts in device_tx.
+                        // The device's OWN pong watchdog handles relay→device failures.
+                        pong_count.fetch_add(1, Ordering::Relaxed);
+                        // Send pong via priority channel — bypasses request queue
+                        // so device receives it promptly.
+                        match priority_tx
+                            .try_send(TunnelMessage::Text(json!({"type": "tunnel.pong"})))
+                        {
+                            Ok(()) => {
+                                tracing::debug!(serial = %serial, "Relay: pong queued");
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                warn!(serial = %serial, "Relay: pong dropped (channel full, writer stuck?)");
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                warn!(serial = %serial, "Relay: pong send failed (writer dead), closing connection");
+                                break;
+                            }
+                        }
                     }
                     "tunnel.pong" => {
                         // Response to relay-initiated ping — update heartbeat timestamp
                         #[allow(clippy::cast_possible_truncation)]
                         let now_ms = relay_epoch.elapsed().as_millis() as u64;
                         heartbeat_ms.store(now_ms, Ordering::Relaxed);
+                        pong_count.fetch_add(1, Ordering::Relaxed);
                     }
                     // Response routing: matches .result (REST responses) and .ack (gx.chunk.ack, etc.)
                     // GUARD: New message types with non-.result/.ack suffixes need explicit handling.
@@ -925,7 +1027,7 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                                     warn!(
                                         serial = %serial,
                                         request_id,
-                                        msg_type,
+                                        msg_type = t,
                                         "Response arrived for timed-out or unknown request (dropped)"
                                     );
                                 }
@@ -1047,13 +1149,29 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
         }
     }
 
-    // Only drain and remove if this handler wasn't replaced by a new connection.
-    // When replaced, the new handler already owns the device entry in the map —
-    // draining/removing here would destroy the new connection's state.
+    // Check if this handler was replaced by a new connection, regardless of
+    // which select! branch fired. The new handler sends `true` on shutdown_tx
+    // before inserting itself, so has_changed() is definitive. Without this,
+    // the old handler could exit via pong timeout (setting disconnect_reason
+    // to something else) and remove the NEW device from the map.
+    let replaced = shutdown_rx.has_changed().unwrap_or(false) || disconnect_reason == "replaced";
     if replaced {
-        state.history.record_disconnect(&serial, "replaced").await;
+        state
+            .history
+            .record_disconnect(&serial, "replaced", None)
+            .await;
         info!(serial = %serial, "Device handler exiting (replaced, skipping cleanup)");
     } else {
+        // Compute heartbeat age before removing device from map
+        #[allow(clippy::cast_possible_truncation)]
+        let hb_age = {
+            let devices = state.devices.read().await;
+            devices.get(&serial).map(|d| {
+                let now_ms = state.epoch.elapsed().as_millis() as u64;
+                let last_hb = d.last_heartbeat_ms.load(Ordering::Relaxed);
+                now_ms.saturating_sub(last_hb)
+            })
+        };
         // Single write lock: remove then drain. Avoids TOCTOU between read→write
         // and prevents holding a read lock across the async drain_device call.
         let removed = state.devices.write().await.remove(&serial);
@@ -1062,9 +1180,9 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
         }
         state
             .history
-            .record_disconnect(&serial, "disconnected")
+            .record_disconnect(&serial, disconnect_reason, hb_age)
             .await;
-        info!(serial = %serial, "Device disconnected");
+        info!(serial = %serial, reason = disconnect_reason, "Device disconnected");
     }
     send_task.abort();
     relay_ping_task.abort();
@@ -1139,12 +1257,21 @@ pub async fn tunnel_request(
 
     let request_id = msg["request_id"].as_str().unwrap_or("").to_string();
 
+    // Cap pending requests to prevent unbounded growth from slow devices
+    let pending = device.pending_requests.clone();
     let (tx, rx) = oneshot::channel();
-    device
-        .pending_requests
-        .lock()
-        .await
-        .insert(request_id.clone(), tx);
+    {
+        let mut guard = pending.lock().await;
+        if guard.len() >= 256 {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(
+                    json!({"error": "Device has too many pending requests", "code": "OVERLOADED"}),
+                ),
+            ));
+        }
+        guard.insert(request_id.clone(), tx);
+    }
 
     if device
         .device_tx
@@ -1152,7 +1279,7 @@ pub async fn tunnel_request(
         .await
         .is_err()
     {
-        device.pending_requests.lock().await.remove(&request_id);
+        pending.lock().await.remove(&request_id);
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": "Failed to send to device", "code": "DEVICE_SEND_FAILED"})),
@@ -1169,10 +1296,8 @@ pub async fn tunnel_request(
             Json(json!({"error": "Device connection lost", "code": "DEVICE_DISCONNECTED"})),
         )),
         Err(_) => {
-            // Timeout — remove pending request
-            if let Some(device) = state.devices.read().await.get(serial) {
-                device.pending_requests.lock().await.remove(&request_id);
-            }
+            // Timeout — clean up unconditionally via stored Arc
+            pending.lock().await.remove(&request_id);
             Err((
                 StatusCode::GATEWAY_TIMEOUT,
                 Json(json!({"error": "Device did not respond in time", "code": "TIMEOUT"})),
@@ -2287,7 +2412,13 @@ async fn handle_client_ws(
     // Forward client_rx messages to WS sink
     let send_task = tokio::spawn(async move {
         while let Some(msg) = client_rx.recv().await {
-            let text = serde_json::to_string(&msg).expect("Value serializes");
+            let text = match serde_json::to_string(&msg) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!("Client WS serialize failed: {e}");
+                    continue;
+                }
+            };
             if ws_sink
                 .send(axum::extract::ws::Message::Text(text.into()))
                 .await
@@ -2307,6 +2438,7 @@ async fn handle_client_ws(
                 };
 
                 let msg_type = parsed["type"].as_str().unwrap_or("").to_string();
+
                 let original_rid = parsed["request_id"].as_str().unwrap_or("").to_string();
 
                 // Tag request_id with client_id for routing responses back

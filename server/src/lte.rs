@@ -7,16 +7,18 @@
 //! Static modem identity (IMEI, model, firmware, ICCID) is read once at startup.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, watch, Mutex};
+use tokio::sync::{broadcast, watch, Mutex, Notify};
 use tracing::{debug, info, warn};
 
 use crate::config::LteConfig;
 use crate::lte_watchdog::parse_cereg;
 use crate::modem::Modem;
+use crate::state::TunnelStats;
 
 /// Static modem identity — read once at startup.
 #[derive(Debug, Clone, Serialize)]
@@ -155,6 +157,10 @@ pub struct LteSignal {
     pub recorded_at: u64,
 }
 
+/// Minimum RSRP (dBm) required for safe-bands promotion.
+/// Configs with signal below this are "marginal" and won't overwrite a better safe config.
+const SAFE_BANDS_MIN_RSRP: i32 = -110;
+
 /// Band config that last sustained tunnel connectivity — persisted to `{data_dir}/safe_bands.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SafeBandConfig {
@@ -162,6 +168,9 @@ pub struct SafeBandConfig {
     pub priority_band: Option<u16>,
     /// Epoch seconds when tunnel was confirmed stable on this config.
     pub confirmed_at: u64,
+    /// RSRP at promotion time (dBm), for comparing signal quality between configs.
+    #[serde(default)]
+    pub signal_rsrp: Option<i32>,
 }
 
 /// Distinguishes user-initiated band changes from watchdog reverts.
@@ -310,7 +319,37 @@ impl LteState {
     }
 
     /// Promote current band config to safe bands. Called when tunnel has been stable for 5+ min.
-    pub fn promote_safe_bands(&mut self, data_dir: &str, bands: &[u16], priority: Option<u16>) {
+    ///
+    /// Signal quality gate: configs with RSRP below -110 dBm are "marginal" and
+    /// won't overwrite an existing safe config that has better signal quality.
+    pub fn promote_safe_bands(
+        &mut self,
+        data_dir: &str,
+        bands: &[u16],
+        priority: Option<u16>,
+        rsrp: Option<i32>,
+    ) {
+        // Quality gate: if below threshold, only promote if no existing safe config
+        // or existing config has worse signal
+        if let Some(current_rsrp) = rsrp {
+            if current_rsrp < SAFE_BANDS_MIN_RSRP {
+                if let Some(ref existing) = self.safe_bands {
+                    let existing_rsrp = existing.signal_rsrp.unwrap_or(i32::MIN);
+                    if existing_rsrp >= current_rsrp {
+                        info!(
+                            "LTE: skipping safe-bands promotion (RSRP {current_rsrp} dBm < \
+                             threshold {SAFE_BANDS_MIN_RSRP}, existing has {existing_rsrp} dBm)"
+                        );
+                        return;
+                    }
+                }
+                info!(
+                    "LTE: promoting marginal safe bands (RSRP {current_rsrp} dBm < threshold, \
+                     but no better config exists)"
+                );
+            }
+        }
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -320,6 +359,7 @@ impl LteState {
             bands: bands.to_vec(),
             priority_band: priority,
             confirmed_at: now,
+            signal_rsrp: rsrp,
         });
         self.save_safe_bands(data_dir);
     }
@@ -426,7 +466,7 @@ pub fn earfcn_to_band(earfcn: u32) -> Option<u16> {
 pub fn bands_to_hex(bands: &[u16]) -> String {
     let mut mask: u128 = 0;
     for &b in bands {
-        if b >= 1 && b <= 128 {
+        if (1..=128).contains(&b) {
             mask |= 1u128 << (b - 1);
         }
     }
@@ -522,10 +562,29 @@ pub async fn safe_set_bands(
 ) -> Result<BandConfig, String> {
     // Set band_action_until to suppress watchdog during band change
     if let Some(state) = lte_state {
-        let mut ls = state.lock().await;
-        ls.band_action_until = Some(Instant::now() + timeout + Duration::from_secs(5));
+        state.lock().await.band_action_until =
+            Some(Instant::now() + timeout + Duration::from_secs(5));
     }
 
+    let result = do_safe_set_bands(modem, lte_bands, priority_band, timeout, lte_state).await;
+
+    // Clear suppression on failure (success path clears it inside do_safe_set_bands)
+    if result.is_err() {
+        if let Some(state) = lte_state {
+            state.lock().await.band_action_until = None;
+        }
+    }
+
+    result
+}
+
+async fn do_safe_set_bands(
+    modem: &Modem,
+    lte_bands: &[u16],
+    priority_band: Option<u16>,
+    timeout: Duration,
+    lte_state: Option<&Arc<Mutex<LteState>>>,
+) -> Result<BandConfig, String> {
     // 1. Read current config for rollback
     let old_bands_resp = modem
         .command("AT+QCFG=\"band\"")
@@ -573,8 +632,7 @@ pub async fn safe_set_bands(
                     if status.is_registered() {
                         // Clear band action suppression
                         if let Some(state) = lte_state {
-                            let mut ls = state.lock().await;
-                            ls.band_action_until = None;
+                            state.lock().await.band_action_until = None;
                         }
                         // Success — read back the config we set
                         let new_bands = lte_bands.to_vec();
@@ -602,8 +660,7 @@ pub async fn safe_set_bands(
 
     // Clear band action suppression
     if let Some(state) = lte_state {
-        let mut ls = state.lock().await;
-        ls.band_action_until = None;
+        state.lock().await.band_action_until = None;
     }
 
     Err("modem did not register on new bands within timeout, rolled back".into())
@@ -611,6 +668,7 @@ pub async fn safe_set_bands(
 
 /// Spawn a background band scan task. Locks to each band, measures signal,
 /// optionally runs speed test, then restores original config.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_band_scan(
     modem: Modem,
     lte_state: Arc<Mutex<LteState>>,
@@ -618,6 +676,8 @@ pub fn spawn_band_scan(
     include_speed_test: bool,
     speed_test_url: Option<String>,
     data_dir: String,
+    interface: String,
+    tunnel_stats: Arc<TunnelStats>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let now = std::time::SystemTime::now()
@@ -654,6 +714,22 @@ pub fn spawn_band_scan(
         let mut results = Vec::new();
 
         for &band in &bands_to_scan {
+            // Abort if tunnel reconnected mid-scan (AT commands would kill it)
+            if tunnel_stats.connected.load(Ordering::Relaxed) {
+                warn!("Band scan: aborting — tunnel reconnected");
+                let mut state = lte_state.lock().await;
+                if let Some(ref mut scan) = state.scan_status {
+                    scan.state = "aborted".into();
+                    scan.completed_at = Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    );
+                }
+                break; // Falls through to restoration code below
+            }
+
             // Update current band
             {
                 let mut state = lte_state.lock().await;
@@ -677,6 +753,22 @@ pub fn spawn_band_scan(
                     upload_bps: None,
                 });
                 continue;
+            }
+
+            // Re-check tunnel before destructive COPS (could reconnect between band lock and here)
+            if tunnel_stats.connected.load(Ordering::Relaxed) {
+                warn!("Band scan: tunnel reconnected mid-band, aborting");
+                let mut state = lte_state.lock().await;
+                if let Some(ref mut scan) = state.scan_status {
+                    scan.state = "aborted".into();
+                    scan.completed_at = Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    );
+                }
+                break;
             }
 
             // Force network re-registration so the modem actually tries the new band.
@@ -744,34 +836,78 @@ pub fn spawn_band_scan(
             }
         }
 
-        // Always restore original config and force re-registration.
+        // Always restore original config and force clean re-registration.
         // The scan leaves the modem deregistered (AT+COPS=2) after the last band,
         // so we must explicitly re-register or the modem stays offline.
         let restore_hex = bands_to_hex(&original_bands);
         let restore_cmd = format!("AT+QCFG=\"band\",0x260,{restore_hex},0");
-        let _ = modem.command(&restore_cmd).await;
-        if let Some(pri) = original_priority {
-            let _ = modem.command(&format!("AT+QCFG=\"bandpri\",{pri}")).await;
+        if let Err(e) = modem.command(&restore_cmd).await {
+            tracing::error!("Scan: failed to restore bands: {e}");
         }
-        let _ = modem.command("AT+COPS=0").await; // re-register on restored bands
+        if let Some(pri) = original_priority {
+            if let Err(e) = modem.command(&format!("AT+QCFG=\"bandpri\",{pri}")).await {
+                tracing::error!("Scan: failed to restore priority: {e}");
+            }
+        }
 
-        // Mark completed
-        let completed_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        // Force clean re-registration — but skip if tunnel reconnected (COPS kills QMI)
+        if tunnel_stats.connected.load(Ordering::Relaxed) {
+            info!("Scan: tunnel connected, skipping re-registration (bands restored)");
+        } else {
+            let _ = modem.command("AT+COPS=2").await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = modem.command("AT+COPS=0").await;
+
+            // Verify data path recovery (registration + IPv4)
+            let start = Instant::now();
+            let mut recovered = false;
+            while start.elapsed() < Duration::from_secs(45) {
+                if let Ok(resp) = modem.command("AT+CEREG?").await {
+                    if let Ok(status) = crate::lte_watchdog::parse_cereg(&resp) {
+                        if status.is_registered()
+                            && crate::lte_watchdog::interface_has_ipv4(&interface)
+                        {
+                            recovered = true;
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            if !recovered {
+                // Last resort: interface restart
+                warn!("Scan: no IPv4 after restore, restarting interface");
+                crate::lte_watchdog::action_restart_interface(&interface, false, None).await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if crate::lte_watchdog::interface_has_ipv4(&interface) {
+                    recovered = true;
+                }
+            }
+            if !recovered {
+                warn!("Scan: data path did not recover after restore, watchdog will handle");
+            }
+        }
+
+        // Mark completed (don't overwrite "aborted" state)
         {
             let mut state = lte_state.lock().await;
             if let Some(ref mut scan) = state.scan_status {
-                scan.state = "completed".into();
-                scan.completed_at = Some(completed_at);
+                if scan.state != "aborted" {
+                    scan.state = "completed".into();
+                    scan.completed_at = Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    );
+                }
                 scan.current_band = None;
                 scan.results = results;
             }
             state.save_lte_data(&data_dir);
         }
 
-        info!("Band scan completed");
+        info!("Band scan finished");
     })
 }
 
@@ -1190,7 +1326,13 @@ async fn read_modem_info(modem: &Modem) -> ModemInfo {
 }
 
 /// Spawn the background LTE signal poller. Returns a `JoinHandle` for abort on shutdown.
-#[allow(clippy::needless_pass_by_value)] // config is moved into spawned task
+///
+/// The poller skips AT command polling while the tunnel is connected — AT commands
+/// on the shared serial port can disrupt the QMI data path and kill the LTE
+/// connection. Signal data is only polled when:
+/// - The tunnel is disconnected (AT commands can't make things worse)
+/// - An explicit poll is requested via `poll_notify` (e.g. from API request)
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 pub fn spawn_lte_poller(
     config: LteConfig,
     modem: Modem,
@@ -1198,6 +1340,8 @@ pub fn spawn_lte_poller(
     session_events: broadcast::Sender<serde_json::Value>,
     mut modem_rx: watch::Receiver<Modem>,
     data_dir: String,
+    tunnel_stats: Arc<TunnelStats>,
+    poll_notify: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = tokio::time::Duration::from_secs(config.poll_interval_secs);
@@ -1218,17 +1362,91 @@ pub fn spawn_lte_poller(
         // First tick is immediate — get an initial signal reading
         ticker.tick().await;
 
+        let mut consecutive_channel_errors: u32 = 0;
+
         loop {
             // Pick up refreshed modem handle if watchdog re-opened it
             if modem_rx.has_changed().unwrap_or(false) {
                 modem = modem_rx.borrow_and_update().clone();
+                consecutive_channel_errors = 0;
                 info!("LTE poller: modem handle refreshed");
+            }
+
+            // Wait for watchdog to refresh dead modem handle (avoid racing USB cycle)
+            if !modem.is_alive() || consecutive_channel_errors >= 3 {
+                warn!(
+                    "LTE poller: modem handle dead (alive={}, channel_errors={}), waiting for refresh",
+                    modem.is_alive(),
+                    consecutive_channel_errors
+                );
+                loop {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    if modem_rx.has_changed().unwrap_or(false) {
+                        modem = modem_rx.borrow_and_update().clone();
+                        consecutive_channel_errors = 0;
+                        info!("LTE poller: modem handle refreshed by watchdog");
+                        break;
+                    }
+                    // Watchdog sender dropped — no one will broadcast, self-recover
+                    if modem_rx.has_changed().is_err() {
+                        let actual_path = crate::modem::detect_quectel_at_port(&config.device);
+                        match crate::modem::Modem::open(&actual_path) {
+                            Ok(new_modem) => {
+                                info!("LTE poller: modem re-opened (no watchdog) at {actual_path}");
+                                modem = new_modem;
+                                consecutive_channel_errors = 0;
+                            }
+                            Err(e) => {
+                                warn!("LTE poller: modem re-open failed: {e}");
+                            }
+                        }
+                        break;
+                    }
+                    // Check if handle recovered on its own
+                    if modem.is_alive() {
+                        consecutive_channel_errors = 0;
+                        break;
+                    }
+                }
+            }
+
+            // Skip polling while tunnel is connected — AT commands disrupt the
+            // QMI data path and can kill the LTE connection. Wait for either:
+            // - The ticker (in case tunnel drops and we need signal data)
+            // - An explicit trigger (API request for fresh data)
+            if tunnel_stats.connected.load(Ordering::Relaxed) {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        // Tunnel still up? Skip this tick.
+                        if tunnel_stats.connected.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        // Tunnel dropped between select wake and check — fall through to poll
+                    }
+                    _ = poll_notify.notified() => {
+                        // Explicit request — but still skip if tunnel is connected
+                        // AT commands disrupt the QMI data path and can kill the tunnel
+                        if tunnel_stats.connected.load(Ordering::Relaxed) {
+                            debug!("LTE poller: on-demand poll skipped (tunnel connected)");
+                            continue;
+                        }
+                        debug!("LTE poller: on-demand poll triggered");
+                    }
+                }
             }
 
             // 1. AT+CSQ for RSSI
             let rssi_result = match modem.command("AT+CSQ").await {
-                Ok(resp) => parse_csq(&resp),
-                Err(e) => Err(e),
+                Ok(resp) => {
+                    consecutive_channel_errors = 0;
+                    parse_csq(&resp)
+                }
+                Err(e) => {
+                    if e.contains("I/O thread gone") || e.contains("reply channel dropped") {
+                        consecutive_channel_errors += 1;
+                    }
+                    Err(e)
+                }
             };
 
             let rssi_dbm = match rssi_result {

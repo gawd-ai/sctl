@@ -301,7 +301,7 @@ export class ConnectionManager {
 						conn.isRelay ? `via relay (${conn.relaySerial})` : undefined);
 				}
 				if (this.config.autoFetchInfo) {
-					this.fetchDeviceInfo(server.id).catch(() => {});
+					this.fetchDeviceInfoWithRetry(server.id);
 				}
 				if (this.config.autoFetchActivity) {
 					this.fetchActivity(server.id).catch(() => {});
@@ -521,6 +521,27 @@ export class ConnectionManager {
 			this.logEvent(serverId, 'error', 'failed to fetch device info',
 				err instanceof Error ? err.message : String(err));
 			return conn.deviceInfo;
+		}
+	}
+
+	/**
+	 * Fetch device info with retry. On LTE/relay connections, the first
+	 * request often hits the grace period or a dead TCP window. Retry up
+	 * to 3 times with 3s delay so the UI doesn't stay on "loading system info".
+	 */
+	private async fetchDeviceInfoWithRetry(serverId: string): Promise<void> {
+		const result = await this.fetchDeviceInfo(serverId);
+		if (result) return; // Success on first try
+
+		const conn = this.connections.get(serverId);
+		if (!conn) return;
+
+		for (let i = 0; i < 3; i++) {
+			await new Promise(r => setTimeout(r, 3000));
+			// Abort if disconnected while waiting
+			if (conn.status !== 'connected') return;
+			const info = await this.fetchDeviceInfo(serverId);
+			if (info) return;
 		}
 	}
 

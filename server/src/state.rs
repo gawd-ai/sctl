@@ -8,7 +8,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Notify};
 use tracing::warn;
 
 use crate::activity::{ActivityLog, ExecResultsCache};
@@ -48,6 +48,8 @@ pub struct AppState {
     pub lte_state: Option<Arc<Mutex<LteState>>>,
     /// LTE modem handle (None when `[lte]` not configured).
     pub modem: Option<Modem>,
+    /// Notify to trigger an on-demand LTE signal poll (None when `[lte]` not configured).
+    pub lte_poll_notify: Option<Arc<Notify>>,
     /// Relay connection history (None when not in relay mode).
     pub relay_history: Option<Arc<RelayConnectionHistory>>,
     /// Device snapshots (relay mode only) — last-known telemetry for offline devices.
@@ -101,6 +103,9 @@ const MAX_RTT_SAMPLES: usize = 20;
 /// Mutex only for event log and RTT samples (cold path).
 pub struct TunnelStats {
     pub connected: AtomicBool,
+    /// True while the tunnel client is actively attempting a connection (DNS/TCP/TLS/handshake).
+    /// Used by watchdog to avoid disrupting in-progress reconnection attempts.
+    pub reconnecting: AtomicBool,
     pub reconnects: AtomicU64,
     pub messages_sent: AtomicU64,
     pub messages_received: AtomicU64,
@@ -123,6 +128,7 @@ impl TunnelStats {
     pub fn new() -> Self {
         Self {
             connected: AtomicBool::new(false),
+            reconnecting: AtomicBool::new(false),
             reconnects: AtomicU64::new(0),
             messages_sent: AtomicU64::new(0),
             messages_received: AtomicU64::new(0),
