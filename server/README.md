@@ -683,8 +683,8 @@ url = "wss://relay.example.com/api/tunnel/register"
 
 Clients just use a different base URL. No changes to mcp-sctl or sctlin:
 
-- Direct: `http://10.42.0.192:1337`
-- Via relay: `https://relay.example.com/d/BPI-RV2-V11-001`
+- Direct: `http://192.168.1.100:1337`
+- Via relay: `https://relay.example.com/d/MY-DEVICE-001`
 
 Devices register dynamically with their serial and API key. The relay learns devices on connect and routes client requests through the tunnel. Sessions, exec, files, and info all work transparently.
 

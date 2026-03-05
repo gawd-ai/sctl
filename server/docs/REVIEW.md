@@ -39,3 +39,23 @@ These are tracked for future work and are low-risk in current deployments.
 2. **Session timeout is wall-clock, not idle-based** — sessions are killed after a fixed duration from creation, regardless of activity. An idle-based timeout would be better for long-running interactive sessions.
 
 3. **No explicit request body size limit** — relies on Axum's default 2 MB body limit. Should be explicitly configured to match `max_file_size`.
+
+## v0.4.0 Additions
+
+### Tunnel security
+
+The reverse tunnel uses a shared `tunnel_key` for device-to-relay authentication. When a device registers, the relay learns its `api_key`, which is then required for client-to-relay requests routed to that device. REST requests are translated to JSON messages over the device's outbound WebSocket connection and routed back by `request_id`.
+
+**Limitations**: The `tunnel_key` is a single shared secret — all devices that connect to a relay share the same key. A compromised key allows any device to register. There is no per-device tunnel authentication or certificate pinning. The relay trusts the device's self-reported serial number.
+
+### Playbook security
+
+Playbooks are Markdown files with YAML frontmatter (params) and a fenced shell script. Template parameters (`{{param}}`) are substituted server-side before execution. There is no sandboxing or allow-listing of commands — playbooks run as the sctl process user with full shell access. Parameter values are injected directly into the script via string substitution; the server does not validate or sanitize parameter values at execution time.
+
+### Modem/GPS security
+
+GPS and LTE monitoring use AT commands sent over a serial port (`/dev/ttyUSB2`). There is no filtering or allow-listing of AT commands — the modem interface is accessed by the polling tasks, not exposed directly via API. The GPS and LTE API endpoints return parsed data, not raw AT responses.
+
+### AI status trust model
+
+The `session.ai_status` and `session.allow_ai` messages are informational coordination signals for UI display. They are not a security boundary — any authenticated WebSocket client can set AI status or toggle AI permission on any session. These are designed for collaborative human/AI workflows, not access control.

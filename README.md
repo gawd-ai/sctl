@@ -197,7 +197,7 @@ The metadata fields (`host`, `serial`, `arch`, `sctl_version`, `added_at`) are u
 
 ```bash
 # Discover and register a device (probes via SSH for arch, serial, api_key)
-./rundev.sh device add bpi 10.42.0.192
+./rundev.sh device add bpi 192.168.1.100
 
 # List all devices with live health checks
 ./rundev.sh device ls

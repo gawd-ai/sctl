@@ -31,3 +31,8 @@ node_modules/
 # Environment files
 .env
 .env.*
+!.env.example
+
+# Device-specific config (contains secrets)
+sctl.toml.bpi
+*.toml.bpi

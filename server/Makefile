@@ -50,7 +50,7 @@ deploy: build-arm
 	@echo "Deployed. Start with: ssh root@$(HOST) /etc/init.d/sctl start"
 
 ## Deploy to RISC-V device (full: binary + config + init script)
-## Usage: make deploy-riscv HOST=10.42.0.192
+## Usage: make deploy-riscv HOST=192.168.1.100
 deploy-riscv: build-riscv
 	@test -n "$(HOST)" || (echo "Usage: make deploy-riscv HOST=<ip>" && exit 1)
 	scp $(RISCV_RELEASE_DIR)/$(BINARY) root@$(HOST):/usr/bin/$(BINARY)
@@ -69,7 +69,7 @@ upgrade: build-arm
 	@echo "Upgraded $(BINARY) on $(HOST)"
 
 ## Upgrade RISC-V device (binary-only, no config changes)
-## Usage: make upgrade-riscv HOST=10.42.0.192
+## Usage: make upgrade-riscv HOST=192.168.1.100
 upgrade-riscv: build-riscv
 	@test -n "$(HOST)" || (echo "Usage: make upgrade-riscv HOST=<ip>" && exit 1)
 	ssh root@$(HOST) "/etc/init.d/sctl stop; rm -f /usr/bin/$(BINARY)" || true

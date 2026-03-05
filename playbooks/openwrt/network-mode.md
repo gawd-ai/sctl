@@ -2,6 +2,9 @@
 name: network-mode
 description: Configure BPI ethernet port roles — router (stock), switch (L2 bridge), or hybrid (passthrough + routed) with LTE backup
 params:
+  apn:
+    type: string
+    description: Carrier APN (e.g. ltemobile.apn, fast.t-mobile.com)
   action:
     type: string
     description: Action to perform
@@ -364,7 +367,7 @@ config interface 'wwan'
 	option proto 'qmi'
 	option device '/dev/cdc-wdm0'
 	option pdptype 'ipv4v6'
-	option apn 'ltemobile.apn'
+	option apn '{{apn}}'
 	option auth 'none'
 	option metric '20'
 WWAN

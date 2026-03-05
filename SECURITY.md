@@ -18,10 +18,11 @@ We will acknowledge receipt within 48 hours and aim to release a fix within 7 da
 
 ## Supported Versions
 
-| Version | Supported |
-|---------|-----------|
-| 0.3.x   | Yes       |
-| < 0.3   | No        |
+| Version | Supported          |
+|---------|--------------------|
+| 0.4.x   | Yes                |
+| 0.3.x   | Security fixes only|
+| < 0.3   | No                 |
 
 ## Security Design
 
@@ -32,5 +33,8 @@ sctl is designed to run on network-accessible devices and takes security serious
 - **Process isolation**: Sessions in own process groups with `kill_on_drop`
 - **Atomic writes**: Temp-file-then-rename prevents partial reads
 - **Resource limits**: Configurable caps on sessions, file sizes, timeouts
+- **Tunnel auth**: Device-to-relay authentication via shared `tunnel_key`; client-to-relay via device `api_key` learned at registration
+- **Playbook execution**: Server-side template parameter substitution before shell execution; playbooks stored on-device
+- **Modem access**: AT command interface to Quectel modems for GPS/LTE; access gated behind API key authentication
 
 For a detailed security analysis, see [server/docs/REVIEW.md](server/docs/REVIEW.md).
