@@ -1,17 +1,19 @@
 <script lang="ts">
-	import type { PlaybookDetail, ExecResult } from '../types/terminal.types';
+	import type { PlaybookDetail, ExecResult, ViewerTab } from '../types/terminal.types';
 	import type { SctlRestClient } from '../utils/rest-client';
 	import { renderPlaybookScript } from '../utils/playbook-parser';
+	import { uuid } from '../utils/index';
 
 	interface Props {
 		playbook: PlaybookDetail | null;
 		restClient: SctlRestClient | null;
 		onresult?: (result: ExecResult) => void;
 		onRunInTerminal?: (script: string) => void;
+		onOpenViewer?: (tab: ViewerTab) => void;
 		onclose?: () => void;
 	}
 
-	let { playbook, restClient, onresult, onRunInTerminal, onclose }: Props = $props();
+	let { playbook, restClient, onresult, onRunInTerminal, onOpenViewer, onclose }: Props = $props();
 
 	// Parameter values
 	let paramValues: Record<string, string> = $state({});
@@ -19,6 +21,7 @@
 	let scriptPreviewExpanded = $state(false);
 	let confirmingExecute = $state(false);
 	let result: ExecResult | null = $state(null);
+	let resultExpanded = $state(false);
 	let error: string | null = $state(null);
 
 	// Initialize param values from defaults when playbook changes
@@ -30,6 +33,7 @@
 			}
 			paramValues = values;
 			result = null;
+			resultExpanded = false;
 			error = null;
 		}
 	});
@@ -177,23 +181,61 @@
 
 			{#if result}
 				<div>
-					<div class="flex items-center gap-2 mb-1">
-						<span class="text-[10px] text-neutral-500 uppercase tracking-wide">Result</span>
+					<div class="flex items-center gap-2">
+						<button
+							class="flex items-center gap-1 text-[10px] text-neutral-500 uppercase tracking-wide hover:text-neutral-400 transition-colors"
+							onclick={() => { resultExpanded = !resultExpanded; }}
+						>
+							<svg class="w-3 h-3 transition-transform {resultExpanded ? 'rotate-90' : ''}" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+								<path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
+							</svg>
+							Result
+						</button>
 						<span class="text-[9px] tabular-nums {result.exit_code === 0 ? 'text-green-400' : 'text-red-400'}">
 							exit {result.exit_code}
 						</span>
 						<span class="text-[9px] text-neutral-600 tabular-nums">{result.duration_ms}ms</span>
+						{#if onOpenViewer}
+							<div class="flex-1"></div>
+							<button
+								class="px-2 py-0.5 rounded text-[9px] bg-blue-500/15 text-blue-400 hover:bg-blue-500/25 transition-colors"
+								onclick={() => {
+									if (!result || !playbook) return;
+									const cmd = playbook.name;
+									const tab: ViewerTab = {
+										key: uuid(),
+										type: 'exec',
+										label: cmd.length > 24 ? cmd.slice(0, 24) + '...' : cmd,
+										icon: '$',
+										data: {
+											activityId: 0,
+											command: cmd,
+											exitCode: result.exit_code,
+											stdout: result.stdout,
+											stderr: result.stderr,
+											durationMs: result.duration_ms,
+											status: result.exit_code === 0 ? 'success' : 'failed',
+										}
+									};
+									onOpenViewer(tab);
+								}}
+							>view full output</button>
+						{/if}
 					</div>
-					{#if result.stdout}
-						<div class="mb-1">
-							<div class="text-[9px] text-neutral-600 mb-0.5">stdout</div>
-							<pre class="p-2 bg-neutral-800/50 border border-neutral-800 rounded text-[10px] text-neutral-300 whitespace-pre-wrap break-all max-h-48 overflow-y-auto">{result.stdout}</pre>
-						</div>
-					{/if}
-					{#if result.stderr}
-						<div>
-							<div class="text-[9px] text-neutral-600 mb-0.5">stderr</div>
-							<pre class="p-2 bg-red-900/10 border border-red-900/30 rounded text-[10px] text-red-300/80 whitespace-pre-wrap break-all max-h-48 overflow-y-auto">{result.stderr}</pre>
+					{#if resultExpanded}
+						<div class="mt-1">
+							{#if result.stdout}
+								<div class="mb-1">
+									<div class="text-[9px] text-neutral-600 mb-0.5">stdout</div>
+									<pre class="p-2 bg-neutral-800/50 border border-neutral-800 rounded text-[10px] text-neutral-300 whitespace-pre-wrap break-all max-h-48 overflow-y-auto">{result.stdout}</pre>
+								</div>
+							{/if}
+							{#if result.stderr}
+								<div>
+									<div class="text-[9px] text-neutral-600 mb-0.5">stderr</div>
+									<pre class="p-2 bg-red-900/10 border border-red-900/30 rounded text-[10px] text-red-300/80 whitespace-pre-wrap break-all max-h-48 overflow-y-auto">{result.stderr}</pre>
+								</div>
+							{/if}
 						</div>
 					{/if}
 				</div>

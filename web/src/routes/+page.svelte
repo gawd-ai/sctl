@@ -289,7 +289,7 @@
 
 	// Keyboard shortcuts panel (shown in sidebar)
 	let shortcutsVisible = $state(false);
-	let sidebarToggleFn: (() => void) | null = $state(null);
+	let sidebarToggleFn: (() => void) | null = null;
 	let shortcutsAutoExpanded = false; // true if Alt+/ auto-expanded the sidebar
 
 	// Reset button two-click confirmation
@@ -1279,6 +1279,7 @@
 											onRunInTerminal={(script: string) => {
 												containerRefs[server.id]?.execInActiveSession(script);
 											}}
+											onOpenViewer={(tab) => openViewerTab(server.id, tab)}
 										/>
 									</div>
 								{/snippet}
@@ -1318,6 +1319,7 @@
 									<PlaybookPanel
 										visible={isDashFocused && (serverPanelOpen[server.id] ?? false) && dashTab === 'playbooks'}
 										restClient={manager.get(server.id)?.restClient ?? null}
+										onOpenViewer={(tab) => openViewerTab(server.id, tab)}
 									/>
 								</div>
 							{/snippet}
