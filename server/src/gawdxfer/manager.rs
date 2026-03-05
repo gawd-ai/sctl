@@ -998,7 +998,8 @@ fn validate_transfer_path(path: &str) -> Result<PathBuf, TransferError> {
 fn check_disk_space(path: &Path, required_bytes: u64) -> Result<(), TransferError> {
     match nix::sys::statvfs::statvfs(path) {
         Ok(stat) => {
-            let available = stat.blocks_available() * stat.fragment_size();
+            #[allow(clippy::useless_conversion)]
+            let available = u64::from(stat.blocks_available()) * u64::from(stat.fragment_size());
             // Require file_size + 10% headroom
             let needed = required_bytes + required_bytes / 10;
             if available < needed {
