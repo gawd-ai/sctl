@@ -1098,6 +1098,7 @@ fn tunnel_headers(msg: &Value) -> axum::http::HeaderMap {
 }
 
 /// Send a JSON response back through the tunnel WS channel (non-blocking).
+#[allow(clippy::needless_pass_by_value)]
 fn send_response(ws_sink: &WsSink, msg: Value) {
     let text = serde_json::to_string(&msg)
         .unwrap_or_else(|_| r#"{"type":"error","message":"serialize failed"}"#.to_string());

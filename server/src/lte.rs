@@ -831,7 +831,7 @@ pub fn spawn_band_scan(
                 let mut state = lte_state.lock().await;
                 if let Some(ref mut scan) = state.scan_status {
                     scan.bands_scanned.push(band);
-                    scan.results = results.clone();
+                    scan.results.clone_from(&results);
                 }
             }
         }
@@ -934,7 +934,8 @@ async fn run_speed_test(url: &str) -> Option<u64> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Parse speed even on non-zero exit (e.g. timeout after partial download)
-    let speed = stdout.trim().parse::<f64>().ok().map(|v| v as u64);
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let speed = stdout.trim().parse::<f64>().ok().map(|v| v.max(0.0) as u64);
 
     // Return None only if we got zero or no measurement at all
     match speed {
@@ -1245,9 +1246,9 @@ pub fn parse_band_config(response: &str) -> Vec<u16> {
     };
 
     let mut bands = Vec::new();
-    for bit in 0..128 {
+    for bit in 0u16..128 {
         if val & (1u128 << bit) != 0 {
-            bands.push((bit + 1) as u16);
+            bands.push(bit + 1);
         }
     }
     bands
@@ -1423,7 +1424,7 @@ pub fn spawn_lte_poller(
                         }
                         // Tunnel dropped between select wake and check — fall through to poll
                     }
-                    _ = poll_notify.notified() => {
+                    () = poll_notify.notified() => {
                         // Explicit request — but still skip if tunnel is connected
                         // AT commands disrupt the QMI data path and can kill the tunnel
                         if tunnel_stats.connected.load(Ordering::Relaxed) {

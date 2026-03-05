@@ -69,7 +69,7 @@
 	style:transition={!resizing && animate ? 'width 300ms ease-in-out' : 'none'}
 >
 	<div class="flex h-full shrink-0" style="width: {width}px;">
-		<!-- Resize handle -->
+		<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 		<div
 			class="w-1 shrink-0 cursor-col-resize transition-colors
 				{resizing ? 'bg-neutral-500' : 'bg-neutral-700 hover:bg-neutral-500'}"

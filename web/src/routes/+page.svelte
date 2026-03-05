@@ -289,7 +289,7 @@
 
 	// Keyboard shortcuts panel (shown in sidebar)
 	let shortcutsVisible = $state(false);
-	let sidebarToggleFn: (() => void) | null = null;
+	let sidebarToggleFn: (() => void) | null = $state(null);
 	let shortcutsAutoExpanded = false; // true if Alt+/ auto-expanded the sidebar
 
 	// Reset button two-click confirmation

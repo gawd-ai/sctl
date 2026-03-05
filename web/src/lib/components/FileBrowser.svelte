@@ -40,12 +40,16 @@
 	}: Props = $props();
 
 	// ── Directory state ────────────────────────────────────────────
-	let currentPath = $state(initialPath);
+	let currentPath = $state('/');
 	let entries: DirEntry[] = $state([]);
 	let dirLoading = $state(false);
 	let dirError: string | null = $state(null);
 	let filterText = $state('');
-	let showHidden = $state(showHiddenProp);
+	let showHidden = $state(false);
+
+	// Sync props → local state when they change
+	$effect(() => { currentPath = initialPath; });
+	$effect(() => { showHidden = showHiddenProp; });
 
 	// ── File preview/edit state ────────────────────────────────────
 	let previewPath: string | null = $state(null);

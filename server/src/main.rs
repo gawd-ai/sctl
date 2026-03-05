@@ -103,12 +103,13 @@ async fn main() {
 /// Exits with code 99 if another instance holds the lock.
 #[cfg(unix)]
 fn acquire_process_lock(data_dir: &str) -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+
     let lock_path = format!("{data_dir}/sctl.lock");
     let f = std::fs::File::create(&lock_path).unwrap_or_else(|e| {
         eprintln!("Failed to create lock file {lock_path}: {e}");
         std::process::exit(1);
     });
-    use std::os::unix::io::AsRawFd;
     let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
         eprintln!("Another sctl instance is already running (lock: {lock_path})");
@@ -152,10 +153,10 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     // Acquire exclusive lock — prevents dual instances (e.g. upgrade race, cron watchdog).
     // Skipped when launched by supervisor (which holds its own lock).
     #[cfg(unix)]
-    let _lock = if !skip_lock {
-        Some(acquire_process_lock(&config.server.data_dir))
-    } else {
+    let _lock = if skip_lock {
         None
+    } else {
+        Some(acquire_process_lock(&config.server.data_dir))
     };
 
     info!("sctl v{} starting", env!("CARGO_PKG_VERSION"));

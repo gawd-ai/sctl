@@ -23,7 +23,6 @@
 					name="username"
 					type="text"
 					value={form?.username ?? ''}
-					autofocus
 					autocomplete="username"
 					class="w-full bg-neutral-900 border border-neutral-700 text-neutral-100 px-3 py-2 rounded text-sm focus:outline-none focus:border-green-600"
 				/>

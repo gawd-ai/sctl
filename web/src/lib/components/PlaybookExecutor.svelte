@@ -8,9 +8,10 @@
 		restClient: SctlRestClient | null;
 		onresult?: (result: ExecResult) => void;
 		onRunInTerminal?: (script: string) => void;
+		onclose?: () => void;
 	}
 
-	let { playbook, restClient, onresult, onRunInTerminal }: Props = $props();
+	let { playbook, restClient, onresult, onRunInTerminal, onclose }: Props = $props();
 
 	// Parameter values
 	let paramValues: Record<string, string> = $state({});

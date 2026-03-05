@@ -583,15 +583,28 @@ impl SessionManager {
     }
 
     /// Load archived sessions from disk journals. Called once at startup.
+    ///
+    /// Only sessions that were still running when the server died (no exit code)
+    /// are loaded into memory. Sessions that already exited are left on disk for
+    /// the age-based journal cleanup to handle — loading them just to have the
+    /// sweep immediately remove them is pointless noise.
     pub async fn recover_from_journal(&self, data_dir: &Path) {
         let archived = journal::recover_sessions(data_dir).await;
         if archived.is_empty() {
             return;
         }
 
-        let recovered_count = archived.len();
+        let total_on_disk = archived.len();
+        let mut skipped = 0usize;
         let mut sessions = self.sessions.write().await;
         for arch in archived {
+            // Skip already-exited sessions — they can't be reattached and their
+            // output is still available on disk in the journal file.
+            if arch.exit_code.is_some() {
+                skipped += 1;
+                continue;
+            }
+
             let mut buf = OutputBuffer::new(self.buffer_size);
             for entry in arch.entries {
                 buf.push(entry.stream, entry.data);
@@ -640,10 +653,13 @@ impl SessionManager {
             );
         }
 
-        info!(
-            "Recovered {recovered_count} archived session(s), total: {}",
-            sessions.len()
-        );
+        let recovered = total_on_disk - skipped;
+        if recovered > 0 || skipped > 0 {
+            info!(
+                "Journal recovery: {recovered} session(s) loaded, {skipped} already-exited skipped, total in memory: {}",
+                sessions.len()
+            );
+        }
     }
 
     /// Periodic sweep that handles three cases:

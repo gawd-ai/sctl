@@ -4,9 +4,11 @@
 	interface Props {
 		playbook: PlaybookDetail | null;
 		onedit?: (playbook: PlaybookDetail) => void;
+		onexecute?: (playbook: PlaybookDetail) => void;
+		onclose?: () => void;
 	}
 
-	let { playbook, onedit }: Props = $props();
+	let { playbook, onedit, onexecute, onclose }: Props = $props();
 
 	let paramEntries = $derived(
 		playbook ? Object.entries(playbook.params).sort(([a], [b]) => a.localeCompare(b)) : []

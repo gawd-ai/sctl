@@ -21,7 +21,7 @@
 	type View = 'list' | 'detail' | 'execute';
 	let view: View = $state('list');
 	let playbooks: PlaybookSummary[] = $state([]);
-	let selectedPlaybook: PlaybookDetail | null = $state(null);
+	let selectedPlaybook = $state<PlaybookDetail | null>(null);
 	let loading = $state(false);
 	let error: string | null = $state(null);
 
