@@ -115,6 +115,10 @@ CI runs these checks on every push and pull request.
 - **Error handling** -- `?` propagation, descriptive messages at API boundaries
 - **Comments** -- only where the logic isn't self-evident
 
+### AI-friendly documentation
+
+The web package includes a [`web/CLAUDE.md`](web/CLAUDE.md) file that serves as a self-contained integration guide for AI agents -- component API, type shapes, common patterns, and gotchas, all in one file. Consider this pattern when adding new packages or significant feature surfaces.
+
 ## Pull Requests
 
 1. Fork the repo and create a branch from `main`

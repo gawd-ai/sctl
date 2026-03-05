@@ -1,6 +1,8 @@
 # sctlin
 
-Svelte 5 component library for [sctl](../README.md) — embeddable terminal, device management, playbook execution, and activity monitoring.
+Svelte 5 component library for [sctl](../README.md) -- embeddable terminal, device management, playbook execution, and activity monitoring.
+
+> **See also:** [Guide](../docs/guide.md) for standalone deployment, relay setup, and AI collaboration features.
 
 ## Installation
 

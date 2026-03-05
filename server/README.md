@@ -6,31 +6,13 @@
 
 Remote device control server for AI agents.
 
+> **See also:** [Guide](../docs/guide.md) for deployment, tunnel setup, playbooks, GPS/LTE, and troubleshooting.
+
 ## Overview
 
 sctl exposes HTTP and WebSocket APIs that let an AI agent (or any authenticated client) execute commands, manage interactive shell sessions with full PTY support, read/write files, and query device status on Linux devices -- all protected by a pre-shared API key.
 
 Works on any Linux system -- x86_64 servers, ARM single-board computers, RISC-V routers, and more.
-
-```
-┌──────────────┐         HTTPS / WSS          ┌──────────────────────┐
-│              │ ◄──────────────────────────► │  sctl                │
-│  AI Agent /  │   Bearer token auth          │  ┌────────────────┐  │
-│  Dashboard   │                              │  │ HTTP routes    │  │
-│              │   POST /api/exec             │  │  exec, files,  │  │
-│              │   GET  /api/info             │  │  info, health  │  │
-│              │   GET  /api/ws               │  ├────────────────┤  │
-│              │                              │  │ WebSocket      │  │
-│              │ ◄─ session.stdout ────────── │  │  sessions mgr  │  │
-│              │ ── session.exec ───────────► │  │  stdin/out/err │  │
-└──────────────┘                              │  └────────────────┘  │
-                                              │       ▼              │
-                                              │  ┌────────────────┐  │
-                                              │  │ /bin/sh -c ... │  │
-                                              │  └────────────────┘  │
-                                              └──────────────────────┘
-                                                   Linux device
-```
 
 ## Quick Start
 
@@ -712,114 +694,6 @@ After a disconnect, persistent sessions can be re-attached:
 ```
 
 The `since` field is the last `seq` the client received. The server replays all buffered entries after that point. If entries were evicted from the ring buffer, `dropped` indicates how many were lost.
-
-## Deployment
-
-### Cross-compilation
-
-sctl uses [`cross`](https://github.com/cross-rs/cross) for static musl builds targeting embedded devices:
-
-```bash
-# Install cross (Docker-based cross-compiler)
-cargo install cross --git https://github.com/cross-rs/cross
-
-# ARM (e.g. Raspberry Pi, OpenWrt ARM routers)
-cross build --release --target armv7-unknown-linux-musleabihf
-
-# RISC-V (e.g. BPI-RV2, OpenWrt RISC-V routers)
-cross build --release --target riscv64gc-unknown-linux-musl
-```
-
-Or use the Makefile:
-
-```bash
-make build-arm     # ARM build
-make build-riscv   # RISC-V build
-```
-
-### Deploy to device
-
-The easiest way to deploy is with `rundev.sh`, which auto-detects architecture and handles cross-compilation:
-
-```bash
-# One-time: discover device (probes arch, serial, api_key via SSH)
-./rundev.sh device add mydevice 192.168.1.1
-
-# Full deploy: cross-compile + binary + config + init script
-./rundev.sh device deploy mydevice
-
-# Later upgrades: binary-only (stop → upload → start)
-./rundev.sh device upgrade mydevice
-```
-
-Alternatively, use the Makefile directly:
-
-```bash
-make deploy HOST=192.168.1.1         # ARM
-make deploy-riscv HOST=192.168.1.1   # RISC-V
-```
-
-Both approaches copy the binary, config, and init script, then enable the service.
-
-For OpenWrt devices, a procd init script is included at `files/sctl.init`.
-
-## Security
-
-### Authentication
-
-All endpoints except `/api/health` require authentication:
-
-- **HTTP**: `Authorization: Bearer <key>` header
-- **WebSocket**: `?token=<key>` query parameter (browsers can't set headers during WS upgrade)
-
-The API key is compared using constant-time comparison (`auth.rs`) to prevent timing side-channel attacks.
-
-### Path validation
-
-File operations reject paths containing `..` components, null bytes, or relative paths -- preventing path traversal attacks.
-
-### Process management
-
-- All child processes use `kill_on_drop(true)` -- no orphaned processes if the server crashes or a task is cancelled
-- Sessions are spawned in their own process group (`setpgid(0, 0)`) -- signals reach the entire process tree
-- Session creation holds a write lock across the limit check and insert to prevent TOCTOU races
-- Output capture reads stdout and stderr concurrently to prevent pipe deadlocks
-- Output past the 1 MB cap is drained (not pipe-closed) to avoid SIGPIPE
-- Session output is buffer-backed (not WS-coupled) -- sessions survive connection drops
-
-### Atomic file writes
-
-File writes use a temp-file-then-rename pattern, so readers never see partial content.
-
-## Development
-
-### Prerequisites
-
-- Rust 1.82+
-- Docker (for `cross` ARM/RISC-V builds)
-
-### Makefile targets
-
-```bash
-make dev          # Run locally with debug logging
-make build        # Build release binary
-make build-arm    # Cross-compile for ARM
-make build-riscv  # Cross-compile for RISC-V
-make deploy HOST= # Deploy to device (ARM)
-make deploy-riscv HOST= # Deploy to device (RISC-V)
-make fmt          # Check formatting
-make lint         # Run clippy lints
-make test         # Run tests
-make doc          # Generate docs
-make doc-open     # Generate and open docs in browser
-make check        # Run all quality checks (fmt + lint + test + build)
-```
-
-### Running locally
-
-```bash
-SCTL_API_KEY=dev-key RUST_LOG=debug cargo run
-```
 
 ## License
 

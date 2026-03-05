@@ -6,6 +6,8 @@
 
 MCP proxy that gives AI agents (Claude, GPT, local models) hands-on access to remote Linux devices via [sctl](../README.md).
 
+> **See also:** [Guide](../docs/guide.md) for deployment, fleet management, playbooks, and troubleshooting.
+
 ## Overview
 
 mcp-sctl runs as a stdio-based MCP server, translating JSON-RPC tool calls into sctl HTTP and WebSocket requests. It supports multiple named devices, interactive streaming sessions with auto-reconnect, and local output buffering for zero-latency reads.
@@ -394,20 +396,13 @@ Create, update, or delete a playbook. Empty content deletes.
 | `content` | string | yes | Full markdown content (empty = delete) |
 | `device` | string | no | Device name |
 
-## Architecture
+### Playbook auto-discovery
 
-```
-src/
-├── main.rs              # Entry point: parse CLI, load config, run MCP loop
-├── mcp.rs               # JSON-RPC 2.0 handler (initialize, tools/list, tools/call)
-├── config.rs            # Configuration loading (CLI, env vars, JSON file)
-├── devices.rs           # Device registry, WsPool for lazy WS connections
-├── client.rs            # HTTP client for sctl REST endpoints
-├── tools.rs             # Tool definitions (JSON schemas) and handlers
-├── websocket.rs         # WS client, auto-reconnect, local session buffers
-├── playbooks.rs         # Playbook model, YAML frontmatter parsing
-└── playbook_registry.rs # Per-device playbook cache with lazy fetch
-```
+mcp-sctl fetches the playbook list from each device on first request and caches it. Each playbook's YAML frontmatter (name, description, params with type/default/enum) is used to generate an MCP tool schema with the `pb_` prefix. For example, a playbook named `linux-health-check` becomes the tool `pb_linux-health-check` with typed parameters for `disk_threshold` and `verbosity`.
+
+The cache refreshes on next request after a device reconnect. See the [Guide](../docs/guide.md#playbooks) for playbook format details and the built-in library.
+
+## Architecture
 
 ### Data flow
 

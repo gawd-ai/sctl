@@ -6,8 +6,8 @@
 
 <p align="center">
   <strong>Shell Control — pronounced "scuttle" (yes, the Rustacean pun is intended).</strong><br/>
-  Give AI agents hands-on access to Linux devices.<br/>
-  Execute commands, manage interactive shell sessions, and read/write files — via <a href="https://modelcontextprotocol.io/">MCP</a> or direct HTTP/WebSocket API.
+  Give AI agents hands-on access to Linux devices — routers, servers, IoT, VMs — across any network.<br/>
+  Execute commands, manage persistent shell sessions, transfer files, run playbooks, track GPS and LTE — via <a href="https://modelcontextprotocol.io/">MCP</a>, HTTP/WebSocket API, or <a href="web/">web terminal UI</a>.
 </p>
 
 <p align="center">
@@ -22,41 +22,119 @@
 
 ---
 
-sctl is a two-component system that lets AI agents (Claude, GPT, local models) or any authenticated client remotely operate Linux devices with full terminal access:
+## What can sctl do?
 
-| Component | What it does |
-|-----------|-------------|
-| **[sctl](server/)** | Lightweight server that runs on the target device (ARM, RISC-V, or x86) |
-| **[mcp-sctl](mcp/)** | MCP proxy that translates AI tool calls into sctl API requests |
-| **[sctlin](web/)** | Svelte 5 terminal UI component library with xterm.js |
+### AI troubleshoots a remote router
+
+You ask Claude to check why a device is slow. The AI calls `device_exec` to check load, reads logs with `device_file_read`, spots a misconfiguration, and runs `pb_openwrt-health-check` to validate the fix — all on a device behind CGNAT, accessed through the tunnel relay.
+
+```
+You:   "The router at site-3 feels sluggish. Can you check it out?"
+
+Claude: I'll check site-3. Let me start with system health.
+        [calls device_exec on site-3: "uptime && free -m"]
+        Load average is 4.2 on a 2-core device, and memory is at 93%.
+
+        [calls device_exec: "ps aux --sort=-%mem | head -5"]
+        dnsmasq is using 180MB — that's abnormal. Let me check its config.
+
+        [calls device_file_read: "/etc/config/dhcp"]
+        The DNS cache size is set to 50000 — way too high for 256MB RAM.
+
+        [calls device_file_write: updates cachesize to 1000]
+        [calls device_exec: "/etc/init.d/dnsmasq restart"]
+        [calls pb_openwrt-health-check]
+
+        Fixed. dnsmasq had a 50K entry DNS cache consuming most of RAM.
+        Cache is now 1000 entries, memory usage dropped to 41%.
+```
+
+### Sessions survive network blips
+
+Start a persistent PTY session on a device. Your WiFi drops. Your laptop sleeps. Hours later, reconnect — the session is still running, and every byte of output is waiting for you.
+
+```
+# Session starts, runs a long build
+-> session.start  {persistent: true, pty: true, name: "build"}
+<- session.started {session_id: "abc-123"}
+-> session.exec   {command: "make -j4"}
+<- session.stdout  {data: "Compiling...", seq: 0}
+
+   ... network drops, laptop sleeps for 2 hours ...
+
+# Reconnect — replay from where you left off
+-> session.attach  {session_id: "abc-123", since: 0}
+<- session.attached {entries: [seq 0..4847], dropped: 0}
+   # All 4847 output entries replayed. Build finished at seq 4201.
+```
+
+### Fleet management across CGNAT
+
+Manage devices on LAN and behind CGNAT from the same MCP config. The AI doesn't need to know which path each device uses — direct or tunneled, the API is identical.
+
+```json
+{
+  "devices": {
+    "office-router":  {"url": "http://192.168.1.1:1337",  "api_key": "..."},
+    "cell-tower-42":  {"url": "https://relay.example.com/d/SCTL-0042", "api_key": "..."},
+    "remote-sensor":  {"url": "https://relay.example.com/d/SCTL-0099", "api_key": "..."}
+  },
+  "default_device": "office-router"
+}
+```
+
+```
+You:   "Run a health check on all devices"
+
+Claude: [calls device_health on office-router]    — ok, uptime 45d
+        [calls device_health on cell-tower-42]     — ok, uptime 12d, via tunnel
+        [calls device_health on remote-sensor]     — ok, uptime 3d, via tunnel
+        [calls pb_linux-health-check on each]
+
+        All 3 devices healthy. cell-tower-42 has disk at 87% — I'll clean
+        old logs if you want.
+```
+
+## Architecture
 
 ```
                                                          ┌────────────────┐
-┌────────────────┐  stdio (MCP)  ┌────────────────┐      │                │
-│                │ ◄───────────► │                │ HTTP │  sctl          │
-│    AI Agent    │  JSON-RPC 2.0 │   mcp-sctl     │ ◄──► │  (device)      │
-│                │               │  Multi-device  │ +WS+ │                │
-└────────────────┘               └────────────────┘      │  Linux / ARM   │
-                                                         └────────────────┘
+┌────────────────┐  stdio (MCP)  ┌────────────────┐      │  sctl          │
+│                │ <───────────> │                │ HTTP │  (device)      │
+│    AI Agent    │  JSON-RPC 2.0 │   mcp-sctl     │ <──> │                │
+│                │               │  Multi-device  │ +WS  │  Linux / ARM / │
+└────────────────┘               │  Local buffers │      │  RISC-V / x86  │
+                                 └────────────────┘      └────────────────┘
+                                         │
+┌────────────────┐  HTTP + WS            │           ┌────────────────┐
+│   sctlin       │ <─────────────────────┘           │  sctl          │
+│   (web UI)     │                            WS     │  (relay mode)  │
+│   Terminal,    │ <──────────────────────────────>   │  NAT traversal │
+│   files, etc.  │                                   │  for CGNAT     │
+└────────────────┘                                   └────────────────┘
 ```
 
-## Why sctl?
+| Component | What it does |
+|-----------|-------------|
+| **[sctl](server/)** | Lightweight server on the target device — exec, sessions, files, GPS, LTE |
+| **[mcp-sctl](mcp/)** | MCP proxy on your machine — translates AI tool calls into API requests |
+| **[sctlin](web/)** | Svelte 5 web terminal — embeddable component library or standalone app |
+| **sctl relay** | Same binary in relay mode — reverse tunnel for CGNAT/LTE devices |
 
-Most AI agents can run commands locally. **sctl lets them operate remote devices** — routers, servers, IoT devices, VMs — with persistent sessions that survive network blips, full PTY terminal emulation, and security-first design.
+## Key Capabilities
 
-- **Persistent sessions** — shells survive disconnects, output keeps buffering, re-attach and catch up
-- **Full PTY support** — run vim, htop, docker, anything that needs a real terminal
-- **Multi-device fleet** — manage many devices from one MCP server
-- **Auto-reconnect** — WebSocket drops are handled transparently with output replay
-- **Playbooks** — device-stored scripts auto-discovered as MCP tools
-- **GPS & LTE monitoring** — location tracking and signal metrics from Quectel modems
+- **Persistent sessions** — shells survive disconnects, output buffers in a ring buffer, re-attach and catch up with zero loss
+- **Full PTY support** — run vim, htop, docker — anything that needs a real terminal
+- **Multi-device fleet** — manage many devices from one MCP server with hot-reloadable config
+- **Reverse tunnel** — built-in NAT traversal for LTE/5G/CGNAT devices, with heartbeat, flap detection, and auto-reconnect
+- **Playbooks** — markdown scripts with typed parameters, auto-discovered as MCP tools
+- **GPS & LTE monitoring** — location tracking and signal metrics from Quectel modems, with autonomous watchdog recovery
+- **AI collaboration** — session-level AI/human handoff, real-time working status in web UI
 - **Security-first** — constant-time auth, path traversal prevention, process isolation, atomic writes
 
 ## Quick Start
 
 ### Option 1: Claude Code (recommended)
-
-The fastest path from zero to AI-controlled devices:
 
 ```bash
 git clone https://github.com/gawd-ai/sctl.git && cd sctl
@@ -66,7 +144,7 @@ chmod +x rundev.sh
 ./rundev.sh
 ```
 
-This builds the server + MCP proxy, starts sctl locally, and registers it with Claude Code. Open a new Claude Code conversation and your AI can now execute commands, start shell sessions, and manage files on your machine.
+This builds the server + MCP proxy, starts sctl locally, and registers it with Claude Code. Open a new Claude Code conversation and your AI can now execute commands, manage sessions, and operate your machine.
 
 ### Option 2: Manual Setup
 
@@ -74,55 +152,20 @@ This builds the server + MCP proxy, starts sctl locally, and registers it with C
 
 ```bash
 cd server && cargo build --release
-
 SCTL_API_KEY=your-secret-key ./target/release/sctl
 # Listening on 0.0.0.0:1337
-```
-
-Verify it's running:
-
-```bash
-curl http://localhost:1337/api/health
-# {"status":"ok","uptime_secs":5,"version":"0.4.0","sessions":0,...}
 ```
 
 **2. Start the MCP proxy** on your dev machine:
 
 ```bash
 cd mcp && cargo build --release
-
-# Single device via env vars
 export SCTL_URL=http://your-device:1337
 export SCTL_API_KEY=your-secret-key
-
-# Register with Claude Code
 claude mcp add sctl -- ./target/release/mcp-sctl
 ```
 
-**3. Use it.** Open Claude Code and ask it to run commands on your device:
-
-> "Check the disk usage and running processes on my device"
-
-The AI will use `device_exec`, `session_start`, and other MCP tools automatically.
-
-### Option 3: Direct HTTP API
-
-No MCP needed — use sctl's REST API directly:
-
-```bash
-# Execute a command
-curl -H "Authorization: Bearer your-secret-key" \
-     -H "Content-Type: application/json" \
-     -d '{"command": "uname -a"}' \
-     http://localhost:1337/api/exec
-
-# Read a file
-curl -H "Authorization: Bearer your-secret-key" \
-     "http://localhost:1337/api/files?path=/etc/hostname"
-
-# Start an interactive WebSocket session
-websocat "ws://localhost:1337/api/ws?token=your-secret-key"
-```
+**3. Use it.** Ask Claude to run commands on your device — it will use `device_exec`, `session_start`, and other tools automatically.
 
 ## MCP Tool Reference
 
@@ -156,151 +199,16 @@ When connected via MCP, AI agents get these tools:
 | `playbook_list` | List device-stored playbooks |
 | `playbook_get` | Read a playbook |
 | `playbook_put` | Create/update/delete playbooks |
-
-## Multi-Device Configuration
-
-Manage a fleet of devices from a single MCP server:
-
-```json
-{
-  "config_version": 2,
-  "devices": {
-    "router-1": {
-      "url": "http://192.168.1.1:1337",
-      "api_key": "key-for-router-1",
-      "playbooks_dir": "/etc/sctl/playbooks",
-      "host": "192.168.1.1",
-      "serial": "SCTL-0001",
-      "arch": "armv7l"
-    },
-    "router-2": {
-      "url": "http://192.168.1.2:1337",
-      "api_key": "key-for-router-2",
-      "host": "192.168.1.2",
-      "serial": "SCTL-0002",
-      "arch": "riscv64"
-    }
-  },
-  "default_device": "router-1"
-}
-```
-
-```bash
-mcp-sctl --config devices.json
-```
-
-The metadata fields (`host`, `serial`, `arch`, `sctl_version`, `added_at`) are used by `rundev.sh device` commands for deployment and status. mcp-sctl ignores unknown fields, so they're safe to include.
-
-## Device Management
-
-`rundev.sh` includes device management commands that handle discovery, cross-compilation, deployment, and upgrades:
-
-```bash
-# Discover and register a device (probes via SSH for arch, serial, api_key)
-./rundev.sh device add bpi 192.168.1.100
-
-# List all devices with live health checks
-./rundev.sh device ls
-
-# Full deploy: cross-compile + upload binary + config + init script
-./rundev.sh device deploy bpi
-
-# Binary-only upgrade: cross-compile + stop + upload + start
-./rundev.sh device upgrade bpi
-
-# Remove a device
-./rundev.sh device rm bpi
-```
-
-Supported architectures: `riscv64`, `armv7l`, `aarch64`, `x86_64`. Cross-compilation uses [cross](https://github.com/cross-rs/cross) with static musl builds.
-
-## Deployment
-
-### Any Linux
-
-```bash
-SCTL_API_KEY=change-me ./sctl serve --config sctl.toml
-```
-
-### OpenWrt / Embedded (via rundev.sh)
-
-The easiest way to deploy to a device:
-
-```bash
-# One-time: discover the device
-./rundev.sh device add mydevice 192.168.1.1
-
-# Deploy (cross-compiles, uploads binary + config + init script)
-./rundev.sh device deploy mydevice
-```
-
-### OpenWrt / Embedded (via Makefile)
-
-Alternatively, use the server Makefile directly:
-
-```bash
-cd server
-
-# Cross-compile for ARMv7 or RISC-V
-make build-arm
-make build-riscv
-
-# Deploy to device (copies binary, config, init script)
-make deploy HOST=192.168.1.1         # ARM
-make deploy-riscv HOST=192.168.1.1   # RISC-V
-```
-
-A [procd init script](server/files/sctl.init) is included for OpenWrt service management with auto-restart.
-
-### Supervisor Mode
-
-sctl includes a built-in supervisor with exponential backoff restart:
-
-```bash
-./sctl supervise --config sctl.toml
-```
-
-## Reverse Tunnel
-
-sctl includes a built-in reverse tunnel for devices behind CGNAT (LTE/5G) that can't accept inbound connections. Any sctl instance can act as a relay -- devices connect outbound and clients reach them through it.
-
-```
-Device (behind CGNAT)                 Relay (public VPS)               Clients
- +--------+                           +-------------+                  +---------+
- | sctl   |--- outbound WS ---------> | sctl        | <--- HTTP/WS -- | mcp-sctl|
- | server |   (registers serial)      | (relay mode)|   (same API)    | sctlin  |
- +--------+                           +-------------+                  +---------+
-```
-
-Clients use the same API -- just a different base URL (`https://relay.example.com/d/DEVICE-SERIAL` instead of `http://device:1337`). See the [server README](server/README.md#reverse-tunnel) for full configuration details.
-
-### Dev testing with tunnel
-
-```bash
-# Starts tunnel relay + local client + connects all configured physical devices
-./rundev.sh tunnel
-```
-
-This builds everything, starts a local tunnel relay, connects your registered devices via SSH, and rewrites the MCP config so all traffic flows through the relay. Ctrl+C restores all devices to normal operation.
-
-## Security
-
-sctl is designed for deployment on real devices in real networks:
-
-- **Authentication** -- pre-shared API key with constant-time comparison (timing side-channel resistant)
-- **Path validation** -- rejects traversal attacks (`..`, null bytes, relative paths)
-- **Process isolation** -- sessions in own process groups, `kill_on_drop` on all children
-- **Atomic writes** -- temp-file-then-rename prevents partial reads
-- **Resource limits** -- configurable caps on sessions, file sizes, timeouts, batch sizes
-
-See the [security review](server/docs/REVIEW.md) for a detailed analysis.
+| `pb_*` | Auto-generated tools from playbooks (e.g. `pb_linux-health-check`) |
 
 ## Documentation
 
 | Document | Description |
 |----------|-------------|
-| [Server README](server/README.md) | API reference, WebSocket protocol, deployment |
-| [MCP README](mcp/README.md) | MCP tool catalog, configuration, architecture |
+| **[Guide](docs/guide.md)** | **Start here** — deployment, tunnel setup, playbooks, GPS/LTE, AI collaboration, troubleshooting |
+| [Server README](server/README.md) | Full API reference, WebSocket protocol, TOML config |
+| [MCP README](mcp/README.md) | MCP tool catalog, multi-device config, architecture |
+| [Web README](web/README.md) | Component library API, widgets, integration examples |
 | [Server config](server/sctl.toml.example) | Full TOML configuration reference |
 | [MCP config](mcp/devices.example.json) | Multi-device JSON configuration example |
 | [Security review](server/docs/REVIEW.md) | Security audit and known limitations |
@@ -310,19 +218,9 @@ See the [security review](server/docs/REVIEW.md) for a detailed analysis.
 ## Requirements
 
 - **Rust 1.82+** ([rustup.rs](https://rustup.rs/))
-- **Docker** (for ARM/RISC-V cross-compilation via [cross](https://github.com/cross-rs/cross), optional)
-- **jq** (for `rundev.sh device` commands, optional)
-- **Target device**: any Linux system with `/bin/sh` (tested on OpenWrt ARM, RISC-V, and x86_64)
-
-## Contributing
-
-Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup.
-
-```bash
-# Run all quality checks
-cd server && make check
-cd mcp && make check
-```
+- **Docker** (for cross-compilation via [cross](https://github.com/cross-rs/cross), optional)
+- **Node.js 20+** (for sctlin web UI, optional)
+- **Target device**: any Linux system with `/bin/sh`
 
 ## License
 
