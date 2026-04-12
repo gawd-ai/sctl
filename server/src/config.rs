@@ -14,6 +14,7 @@
 //! listen = "0.0.0.0:1337"
 //! max_sessions = 20
 //! exec_timeout_ms = 30000
+//! include_interface_addresses_in_info = true
 //! max_batch_size = 20
 //! max_file_size = 52428800  # 50 MB
 //! max_concurrent_transfers = 4
@@ -86,6 +87,11 @@ pub struct ServerConfig {
     /// Default timeout for `POST /api/exec` in milliseconds (default 30 000).
     #[serde(default = "default_exec_timeout_ms")]
     pub exec_timeout_ms: u64,
+    /// Whether `/api/info` should enumerate interface IP addresses on demand.
+    /// Default `true`. Set `false` to keep interface names/state/MAC but skip
+    /// request-path address discovery on fragile network stacks.
+    #[serde(default = "default_include_interface_addresses_in_info")]
+    pub include_interface_addresses_in_info: bool,
     /// Maximum commands per `POST /api/exec/batch` request (default 20).
     #[serde(default = "default_max_batch_size")]
     pub max_batch_size: usize,
@@ -277,12 +283,34 @@ pub struct LteConfig {
     pub interface: String,
     /// URL for download speed test during band scan (optional).
     pub speed_test_url: Option<String>,
+    /// URL for upload speed test during band scan (optional).
+    /// E.g. `"http://speedtest.tele2.net/upload.php"` — server must accept POST data.
+    pub speed_test_upload_url: Option<String>,
     /// Host to ping for internet reachability check before modem escalation.
     /// Default: relay host extracted from tunnel URL, or `8.8.8.8`.
     pub reachability_host: Option<String>,
     /// Custom command to restart the LTE interface (overrides auto-detection).
     /// E.g. `"ifdown wwan && sleep 2 && ifup wwan"`.
     pub interface_restart_cmd: Option<String>,
+    /// Enable AT/QMI coexistence testing (diagnostic mode). When true and data
+    /// path is active, the poller runs graduated AT command tests to determine
+    /// what's safe. Default false.
+    #[serde(default)]
+    pub at_test_mode: bool,
+    /// Seconds between signal polls when the LTE data path is active (default 120).
+    /// In gentle mode only 2 essential commands are sent with spacing.
+    #[serde(default = "default_active_poll_interval")]
+    pub active_poll_interval_secs: u64,
+    /// Milliseconds to sleep between AT commands when data path is active (default 1000).
+    #[serde(default = "default_inter_command_delay")]
+    pub inter_command_delay_ms: u64,
+    /// APN override. When set, this APN is used on SIM change instead of auto-detection.
+    /// Auto-detection tries: modem PDP context (`AT+CGDCONT?`) → built-in IMSI database.
+    pub apn: Option<String>,
+    /// Seconds the tunnel must be down before the watchdog takes any action (default 120).
+    /// Higher values prevent interference during natural roaming handovers.
+    #[serde(default = "default_watchdog_grace")]
+    pub watchdog_grace_secs: u64,
 }
 
 fn default_lte_device() -> String {
@@ -297,6 +325,15 @@ fn default_lte_watchdog() -> bool {
 fn default_lte_interface() -> String {
     "wwan0".to_string()
 }
+fn default_active_poll_interval() -> u64 {
+    120
+}
+fn default_inter_command_delay() -> u64 {
+    1000
+}
+fn default_watchdog_grace() -> u64 {
+    120
+}
 
 fn default_listen() -> String {
     "0.0.0.0:1337".to_string()
@@ -309,6 +346,9 @@ fn default_max_sessions() -> usize {
 }
 fn default_exec_timeout_ms() -> u64 {
     30000
+}
+fn default_include_interface_addresses_in_info() -> bool {
+    true
 }
 fn default_max_batch_size() -> usize {
     20
@@ -401,7 +441,7 @@ fn default_heartbeat_interval() -> u64 {
     5
 }
 fn default_heartbeat_timeout() -> u64 {
-    20
+    45
 }
 fn default_tunnel_proxy_timeout() -> u64 {
     60
@@ -414,6 +454,7 @@ impl Default for ServerConfig {
             max_connections: default_max_connections(),
             max_sessions: default_max_sessions(),
             exec_timeout_ms: default_exec_timeout_ms(),
+            include_interface_addresses_in_info: default_include_interface_addresses_in_info(),
             max_batch_size: default_max_batch_size(),
             max_file_size: default_max_file_size(),
             session_buffer_size: default_session_buffer_size(),
@@ -593,5 +634,20 @@ impl Config {
         }
 
         config
+    }
+
+    /// Effective client heartbeat interval after applying safety clamps.
+    ///
+    /// On LTE/CGNAT paths, outbound idle periods much above ~15s are prone to
+    /// being culled by the network path long before the logical tunnel timeout.
+    /// Clamp only in client mode so a stale device config cannot silently
+    /// disable keepalives and fall into a ws_close/reconnect loop.
+    pub fn effective_client_heartbeat_interval_secs(&self) -> u64 {
+        self.tunnel
+            .as_ref()
+            .filter(|tc| !tc.relay)
+            .map_or(default_heartbeat_interval(), |tc| {
+                tc.heartbeat_interval_secs.clamp(1, 15)
+            })
     }
 }
