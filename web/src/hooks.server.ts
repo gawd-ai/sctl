@@ -11,7 +11,8 @@ export const handle: Handle = async ({ event, resolve }) => {
 	if (
 		pathname.startsWith(`${base}/_app/`) ||
 		pathname === `${base}/login` ||
-		pathname === '/favicon.png'
+		pathname === '/favicon.png' ||
+		pathname === `${base}/favicon.png`
 	) {
 		return resolve(event);
 	}

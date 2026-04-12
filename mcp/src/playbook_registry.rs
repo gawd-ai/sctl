@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use futures_util::future;
 use tokio::sync::RwLock;
 
 use crate::client::SctlClient;
@@ -59,29 +60,61 @@ impl PlaybookRegistry {
             .unwrap_or(&self.default_dir)
     }
 
-    /// Lazy load: only fetches devices not yet loaded. Called from `tools/list`.
+    /// Check if any devices still need their playbooks fetched.
+    pub async fn has_unloaded_devices(&self, clients: &HashMap<String, SctlClient>) -> bool {
+        let cache = self.cache.read().await;
+        clients
+            .keys()
+            .any(|name| !cache.get(name).is_some_and(|dp| dp.loaded))
+    }
+
+    /// Lazy load: fetches devices not yet loaded, **concurrently**.
     pub async fn ensure_loaded(&self, clients: &HashMap<String, SctlClient>) {
         // Quick check under read lock
-        {
+        let missing: Vec<(String, &SctlClient)> = {
             let cache = self.cache.read().await;
-            let all_loaded = clients
-                .keys()
-                .all(|name| cache.get(name).is_some_and(|dp| dp.loaded));
-            if all_loaded {
-                return;
-            }
+            clients
+                .iter()
+                .filter(|(name, _)| !cache.get(name.as_str()).is_some_and(|dp| dp.loaded))
+                .map(|(name, client)| (name.clone(), client))
+                .collect()
+        };
+
+        if missing.is_empty() {
+            return;
         }
 
-        // Fetch missing devices under write lock
+        // Fetch all missing devices concurrently, with a per-device timeout
+        // so one offline device doesn't block the rest.
+        let fetches: Vec<_> = missing
+            .iter()
+            .map(|(name, client)| {
+                let dir = self.dir_for(name).to_string();
+                let name = name.clone();
+                let client = *client;
+                async move {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        fetch_device_playbooks(client, &dir, &name),
+                    )
+                    .await
+                    {
+                        Ok(playbooks) => (name, playbooks),
+                        Err(_) => {
+                            eprintln!("mcp-sctl: playbooks: {name}: timed out fetching (5s)");
+                            (name, Vec::new())
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        let results = future::join_all(fetches).await;
+
         let mut cache = self.cache.write().await;
-        for (name, client) in clients {
-            let entry = cache.get(name);
-            if entry.is_some_and(|dp| dp.loaded) {
-                continue;
-            }
-            let playbooks = fetch_device_playbooks(client, self.dir_for(name), name).await;
+        for (name, playbooks) in results {
             cache.insert(
-                name.clone(),
+                name,
                 DevicePlaybooks {
                     loaded: true,
                     playbooks,

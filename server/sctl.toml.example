@@ -63,7 +63,7 @@ level = "info"
 # bind_address = "wwan0"           # Bind outbound WS to interface/IP (LTE failover)
 # reconnect_delay_secs = 2         # Initial backoff (client mode)
 # reconnect_max_delay_secs = 30    # Max backoff (client mode)
-# heartbeat_interval_secs = 15     # Ping interval (client mode)
+# heartbeat_interval_secs = 15     # Ping interval (client mode); >15s is clamped for LTE/CGNAT safety
 #
 # To run AS a relay instead of a client:
 # relay = true
@@ -85,3 +85,4 @@ level = "info"
 # watchdog = true                       # Auto-recovery when tunnel drops (requires [tunnel])
 # interface = "wwan0"                   # Network interface for watchdog IP checks
 # speed_test_url = "http://speedtest.tele2.net/10MB.zip"  # Download URL for band scan speed test
+# speed_test_upload_url = "http://speedtest.tele2.net/upload.php"  # Upload URL for band scan speed test

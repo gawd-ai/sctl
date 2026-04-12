@@ -16,8 +16,11 @@
 //! Notifications (`notifications/initialized`, `notifications/cancelled`) are
 //! acknowledged silently.
 
+use std::sync::Arc;
+
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc;
 
 use crate::devices::DeviceRegistry;
 use crate::playbook_registry::PlaybookRegistry;
@@ -30,9 +33,22 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 /// Run the MCP server on stdio, processing JSON-RPC requests until EOF.
 pub async fn run_stdio(registry: DeviceRegistry, pb_registry: PlaybookRegistry) {
     let stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
     let mut line = String::new();
+
+    // Channel for stdout writes — lets background tasks send notifications.
+    let (tx, mut rx) = mpsc::channel::<Value>(64);
+
+    // Stdout writer task — single owner of stdout.
+    let writer_handle = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(msg) = rx.recv().await {
+            write_response(&mut stdout, &msg).await;
+        }
+    });
+
+    let registry = Arc::new(registry);
+    let pb_registry = Arc::new(pb_registry);
 
     loop {
         line.clear();
@@ -61,7 +77,7 @@ pub async fn run_stdio(registry: DeviceRegistry, pb_registry: PlaybookRegistry) 
                         "message": format!("Parse error: {}", e)
                     }
                 });
-                write_response(&mut stdout, &response).await;
+                let _ = tx.send(response).await;
                 continue;
             }
         };
@@ -82,7 +98,7 @@ pub async fn run_stdio(registry: DeviceRegistry, pb_registry: PlaybookRegistry) 
 
         let (response, notify_tools_changed) = match method {
             "initialize" => (handle_initialize(&request), false),
-            "tools/list" => (handle_tools_list(&registry, &pb_registry).await, false),
+            "tools/list" => handle_tools_list(&registry, &pb_registry, tx.clone()).await,
             "tools/call" => handle_tools_call(&request, &registry, &pb_registry).await,
             "ping" => (json!({ "jsonrpc": "2.0", "id": id, "result": {} }), false),
             _ => (
@@ -100,7 +116,7 @@ pub async fn run_stdio(registry: DeviceRegistry, pb_registry: PlaybookRegistry) 
 
         // Inject the request id into the response
         let response = inject_id(response, id);
-        write_response(&mut stdout, &response).await;
+        let _ = tx.send(response).await;
 
         // Send tools/list_changed notification after the response
         if notify_tools_changed {
@@ -108,9 +124,13 @@ pub async fn run_stdio(registry: DeviceRegistry, pb_registry: PlaybookRegistry) 
                 "jsonrpc": "2.0",
                 "method": "notifications/tools/list_changed"
             });
-            write_response(&mut stdout, &notification).await;
+            let _ = tx.send(notification).await;
         }
     }
+
+    // Drop sender to close the writer task.
+    drop(tx);
+    let _ = writer_handle.await;
 }
 
 /// Handle `initialize` — return protocol version, capabilities, and server info.
@@ -131,16 +151,43 @@ fn handle_initialize(request: &Value) -> Value {
     })
 }
 
-/// Handle `tools/list` — return all tool definitions (triggers lazy playbook load).
-async fn handle_tools_list(registry: &DeviceRegistry, pb_reg: &PlaybookRegistry) -> Value {
+/// Handle `tools/list` — return tool definitions immediately, load playbooks in background.
+///
+/// Returns builtins + any already-cached playbooks right away. If there are
+/// devices whose playbooks haven't been fetched yet, a background task loads
+/// them and sends a `notifications/tools/list_changed` once done.
+async fn handle_tools_list(
+    registry: &Arc<DeviceRegistry>,
+    pb_reg: &Arc<PlaybookRegistry>,
+    tx: mpsc::Sender<Value>,
+) -> (Value, bool) {
     let clients = registry.clients().await;
-    pb_reg.ensure_loaded(&clients).await;
-    json!({
-        "jsonrpc": "2.0",
-        "result": {
-            "tools": tools::all_tool_definitions(pb_reg).await
-        }
-    })
+    let needs_bg_load = pb_reg.has_unloaded_devices(&clients).await;
+
+    if needs_bg_load {
+        let reg = Arc::clone(registry);
+        let pb = Arc::clone(pb_reg);
+        tokio::spawn(async move {
+            let clients = reg.clients().await;
+            pb.ensure_loaded(&clients).await;
+            let _ = tx
+                .send(json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/tools/list_changed"
+                }))
+                .await;
+        });
+    }
+
+    (
+        json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "tools": tools::all_tool_definitions(pb_reg).await
+            }
+        }),
+        false,
+    )
 }
 
 /// Handle `tools/call` — dispatch to the appropriate tool handler.

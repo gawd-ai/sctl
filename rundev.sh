@@ -10,6 +10,7 @@
 #   ./rundev.sh stop     # stop all services and deregister MCP
 #   ./rundev.sh status   # show what's running
 #   ./rundev.sh claude   # only register MCP in Claude Code (no build/start)
+#   ./rundev.sh codex    # only register MCP in Codex CLI (no build/start)
 #   ./rundev.sh tunnel [--cloudflared | --relay-url <url>]
 #                        # build + start tunnel dev env (relay + clients + MCP via relay)
 #
@@ -21,6 +22,13 @@
 #   ./rundev.sh device upgrade <name>           # binary-only upgrade via SSH
 #   ./rundev.sh device deploy-watchdog <name>   # deploy watchdog + cron (SSH or API)
 #   ./rundev.sh device upgrade-remote <name>    # binary upgrade via relay (no SSH)
+#
+# Environment profiles:
+#   ./rundev.sh env show              # show current active profile
+#   ./rundev.sh env ls                # list available profiles
+#   ./rundev.sh env use <name>        # switch to a named profile
+#   ./rundev.sh env save [name]       # save current config as a named profile
+#   ./rundev.sh env edit [name]       # open profile in $EDITOR
 #
 # Relay VPS deployment:
 #   ./rundev.sh relay setup <user@host>   # full VPS provisioning (Caddy + sctl + firewall)
@@ -53,8 +61,10 @@ WEB_PORT=5173
 
 # Persistent MCP devices config — survives reboots.
 # Uses a dev-specific filename so rundev never pollutes a prod/stage config.
-PERSISTENT_CONFIG="$HOME/.config/sctl/devices.dev.json"
+SCTL_CONFIG_DIR="$HOME/.config/sctl"
+PERSISTENT_CONFIG="$SCTL_CONFIG_DIR/devices.dev.json"
 CONFIG_FILE="$PERSISTENT_CONFIG"
+ACTIVE_ENV_FILE="$SCTL_CONFIG_DIR/.active-env"
 
 # Tunnel relay config
 RELAY_LISTEN="0.0.0.0:8443"
@@ -64,7 +74,7 @@ DEVICE_SERIAL="DEV-LOCAL-001"
 CLOUDFLARED_PID_FILE="$DATA_DIR/cloudflared.pid"
 
 # Relay VPS deployment
-RELAY_X86_BIN="$SCTL_DIR/target/x86_64-unknown-linux-musl/release/sctl"
+RELAY_X86_BIN="$SCTL_DIR/target/release/sctl"
 RELAY_REMOTE_BIN="/usr/local/bin/sctl"
 RELAY_REMOTE_CONFIG="/etc/sctl/relay.toml"
 
@@ -129,6 +139,29 @@ cfg_device_exists() {
 
 cfg_device_names() {
     jq -r '.devices | keys[]' "$CONFIG_FILE"
+}
+
+# ─── Environment profile helpers ─────────────────────────────────────
+
+active_env_name() {
+    if [[ -f "$ACTIVE_ENV_FILE" ]]; then
+        cat "$ACTIVE_ENV_FILE"
+    else
+        echo ""
+    fi
+}
+
+profile_file() {
+    echo "$SCTL_CONFIG_DIR/devices.${1}.json"
+}
+
+# Sync current devices.dev.json back to the active profile (if any)
+sync_to_active_profile() {
+    local active
+    active=$(active_env_name)
+    if [[ -n "$active" ]]; then
+        cp "$CONFIG_FILE" "$(profile_file "$active")"
+    fi
 }
 
 # ─── Architecture helpers ────────────────────────────────────────────
@@ -347,6 +380,18 @@ do_status() {
     else
         echo "  Not registered"
     fi
+
+    echo ""
+    echo "--- env profile ---"
+    local _env
+    _env=$(active_env_name)
+    if [[ -n "$_env" ]]; then
+        local _devcount
+        _devcount=$(jq '.devices | length' "$CONFIG_FILE" 2>/dev/null || echo "?")
+        echo "  Active: $_env ($_devcount devices)"
+    else
+        echo "  No active profile (using devices.dev.json directly)"
+    fi
 }
 
 # ─── sctlin seed ─────────────────────────────────────────────────
@@ -364,9 +409,16 @@ generate_sctlin_seed() {
 
     # In tunnel mode the config is rewritten with relay URLs — use the
     # pre-tunnel backup so we get the real direct URLs for each device.
+    # Merge any devices added after the backup was taken.
     local source_config="$CONFIG_FILE"
     if [[ -f "$CONFIG_FILE.pre-tunnel" ]]; then
-        source_config="$CONFIG_FILE.pre-tunnel"
+        source_config=$(mktemp)
+        # Start with pre-tunnel (has direct URLs), merge in new devices from current config
+        jq -s '(.[0].devices | keys) as $old_keys |
+            .[0] * {devices: (.[0].devices + ([.[1].devices | to_entries[] | select(.key | IN($old_keys[]) | not)] | from_entries))}' \
+            "$CONFIG_FILE.pre-tunnel" "$CONFIG_FILE" > "$source_config" 2>/dev/null \
+            || source_config="$CONFIG_FILE.pre-tunnel"
+        trap "rm -f '$source_config'" RETURN 2>/dev/null || true
     fi
 
     # Build serial map: device name → serial (from config metadata or known defaults)
@@ -594,6 +646,50 @@ EOF
     fi
 }
 
+# ─── codex (register MCP in Codex CLI) ────────────────────────────────
+
+do_codex() {
+    if [[ ! -x "$MCP_BIN" ]]; then
+        err "mcp-sctl binary not found: $MCP_BIN"
+        err "Run '$0 build' first."
+        exit 1
+    fi
+
+    # Merge local dev device into persistent config (preserves manually-added devices)
+    mkdir -p "$DATA_DIR" "$PLAYBOOKS_DIR" "$(dirname "$CONFIG_FILE")"
+    if [[ -f "$CONFIG_FILE" ]] && command -v jq &>/dev/null; then
+        jq --arg url "$DEVICE_URL" --arg key "$API_KEY" --arg pb "$PLAYBOOKS_DIR" \
+            '.devices.local = {url: $url, api_key: $key, playbooks_dir: $pb} | .default_device = "local" | .config_version = 2' \
+            "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+        ok "Config updated (merged dev device): $CONFIG_FILE"
+    else
+        cat > "$CONFIG_FILE" <<EOF
+{
+  "config_version": 2,
+  "devices": {
+    "local": {
+      "url": "$DEVICE_URL",
+      "api_key": "$API_KEY",
+      "playbooks_dir": "$PLAYBOOKS_DIR"
+    }
+  },
+  "default_device": "local"
+}
+EOF
+        ok "Config created: $CONFIG_FILE"
+    fi
+
+    generate_sctlin_seed
+
+    log "Registering mcp-sctl with Codex..."
+    codex mcp remove "$MCP_NAME" 2>/dev/null || true
+    codex mcp add "$MCP_NAME" -- "$MCP_BIN" --supervisor --config "$CONFIG_FILE"
+    ok "MCP server '$MCP_NAME' registered in Codex (supervisor mode)"
+    echo ""
+    echo "  Restart Codex or start a new session"
+    echo "  to pick up the MCP server."
+}
+
 # ─── device add ──────────────────────────────────────────────────────
 
 do_device_add() {
@@ -645,24 +741,92 @@ echo "VERSION=$VERSION"
 '
 
     local probe_output
-    # Try BatchMode first (key auth), fall back to interactive
+    local arch serial api_key installed version
+    local probe_method=""
+
+    # Try SSH first (key auth, then interactive)
     if probe_output=$($ssh_cmd -o BatchMode=yes "root@$host" "$probe_script" 2>/dev/null); then
-        ok "Connected via key auth"
+        ok "Connected via SSH key auth"
+        probe_method="ssh"
     elif probe_output=$($ssh_cmd "root@$host" "$probe_script" 2>/dev/null); then
-        ok "Connected (interactive auth)"
-    else
-        err "Failed to SSH to root@$host"
-        err "Make sure SSH is accessible and you can log in as root"
-        exit 1
+        ok "Connected via SSH (interactive auth)"
+        probe_method="ssh"
     fi
 
-    # Parse probe output
-    local arch serial api_key installed version
-    arch=$(echo "$probe_output" | grep "^ARCH=" | cut -d= -f2)
-    serial=$(echo "$probe_output" | grep "^SERIAL=" | cut -d= -f2)
-    api_key=$(echo "$probe_output" | grep "^API_KEY=" | cut -d= -f2)
-    installed=$(echo "$probe_output" | grep "^INSTALLED=" | cut -d= -f2)
-    version=$(echo "$probe_output" | grep "^VERSION=" | cut -d= -f2)
+    if [[ "$probe_method" == "ssh" ]]; then
+        # Parse SSH probe output
+        arch=$(echo "$probe_output" | grep "^ARCH=" | cut -d= -f2)
+        serial=$(echo "$probe_output" | grep "^SERIAL=" | cut -d= -f2)
+        api_key=$(echo "$probe_output" | grep "^API_KEY=" | cut -d= -f2)
+        installed=$(echo "$probe_output" | grep "^INSTALLED=" | cut -d= -f2)
+        version=$(echo "$probe_output" | grep "^VERSION=" | cut -d= -f2)
+    else
+        # SSH failed — try sctl API discovery
+        warn "SSH failed, trying sctl API on $host:1337..."
+        local device_url="http://$host:1337"
+
+        # Try known API keys: existing config entry, then common defaults
+        local try_keys=()
+        if cfg_device_exists "$name" 2>/dev/null; then
+            try_keys+=("$(cfg_device_get "$name" "api_key" 2>/dev/null)")
+        fi
+        # Check if user provided SCTL_API_KEY env var
+        if [[ -n "${SCTL_API_KEY:-}" ]]; then
+            try_keys+=("$SCTL_API_KEY")
+        fi
+        try_keys+=("change-me")
+
+        local found_key=""
+        local info_json=""
+        for k in "${try_keys[@]}"; do
+            [[ -z "$k" ]] && continue
+            info_json=$(curl -sf --connect-timeout 5 -H "Authorization: Bearer $k" "$device_url/api/info" 2>/dev/null) && {
+                found_key="$k"
+                break
+            }
+        done
+
+        if [[ -z "$found_key" ]]; then
+            # Prompt for API key
+            echo ""
+            echo "  sctl is running on $host but SSH is unavailable."
+            echo "  Enter the API key to discover the device via sctl API."
+            echo ""
+            read -rp "  API key: " found_key
+            info_json=$(curl -sf --connect-timeout 5 -H "Authorization: Bearer $found_key" "$device_url/api/info" 2>/dev/null) || {
+                err "Failed to connect to sctl at $device_url with provided key"
+                exit 1
+            }
+        fi
+
+        ok "Connected via sctl API"
+        probe_method="api"
+
+        # Parse /api/info JSON
+        arch=$(echo "$info_json" | jq -r '.cpu_model // empty' | head -1)
+        # Normalize arch from cpu_model — extract actual arch from kernel string
+        local kernel
+        kernel=$(echo "$info_json" | jq -r '.kernel // empty')
+        if echo "$kernel" | grep -q "x86_64"; then
+            arch="x86_64"
+        elif echo "$kernel" | grep -q "aarch64"; then
+            arch="aarch64"
+        elif echo "$kernel" | grep -q "armv7"; then
+            arch="armv7l"
+        elif echo "$kernel" | grep -q "riscv64"; then
+            arch="riscv64"
+        else
+            arch=$(uname -m)  # fallback
+        fi
+        serial=$(echo "$info_json" | jq -r '.serial // empty')
+        api_key="$found_key"
+        installed="yes"
+
+        # Get version from /api/health
+        local health_json
+        health_json=$(curl -sf --connect-timeout 5 "$device_url/api/health" 2>/dev/null) || true
+        version=$(echo "$health_json" | jq -r '.version // empty' 2>/dev/null)
+    fi
 
     if [[ -z "$arch" ]]; then
         err "Failed to detect architecture"
@@ -724,6 +888,13 @@ JQEOF
         echo "  sctl is not installed on this device."
         echo "  Deploy with: $0 device deploy $name"
     fi
+
+    # Regenerate sctlin seed so the web UI picks up the new device
+    if [[ -d "$WEB_DIR/static" ]]; then
+        generate_sctlin_seed
+    fi
+
+    sync_to_active_profile
 }
 
 # ─── device rm ───────────────────────────────────────────────────────
@@ -752,6 +923,13 @@ do_device_rm() {
     ' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
 
     ok "Device '$name' removed"
+
+    # Regenerate sctlin seed
+    if [[ -d "$WEB_DIR/static" ]]; then
+        generate_sctlin_seed
+    fi
+
+    sync_to_active_profile
 
     # Warn if it was the default
     local new_default
@@ -1040,6 +1218,13 @@ if ! is_running; then
     log "sctl not running, starting..."
     /etc/init.d/sctl start
     sleep 3
+    # If still not running, procd respawn counter may be exhausted — re-enable
+    if ! is_running; then
+        log "start failed, re-enabling service..."
+        /etc/init.d/sctl enable
+        /etc/init.d/sctl start
+        sleep 3
+    fi
 fi
 
 # 2. Health check
@@ -1161,6 +1346,112 @@ do_device_deploy_watchdog() {
 
 # ─── device upgrade-remote ───────────────────────────────────────────
 
+# Wait for device to be reachable via health endpoint.
+# Returns 0 on success, 1 on timeout.
+# Usage: wait_for_device <url> <timeout_secs> [quiet]
+wait_for_device() {
+    local url="$1" timeout_secs="$2" quiet="${3:-}"
+    for i in $(seq 1 "$timeout_secs"); do
+        if curl -sf --connect-timeout 3 --max-time 5 "$url/api/health" >/dev/null 2>&1; then
+            [[ -z "$quiet" ]] && log "Device reachable (waited ${i}s)"
+            return 0
+        fi
+        [[ -z "$quiet" ]] && printf "." || true
+        sleep 1
+    done
+    [[ -z "$quiet" ]] && echo ""
+    return 1
+}
+
+# Init an STP upload, retrying across connection windows.
+# Sets global: xfer_id
+# Usage: resilient_stp_init <url> <api_key> <file_size> <chunk_size> <total_chunks>
+resilient_stp_init() {
+    local url="$1" api_key="$2" file_size="$3" chunk_size="$4" total_chunks="$5"
+    local max_attempts=10
+    for attempt in $(seq 1 "$max_attempts"); do
+        # Wait for device
+        if ! wait_for_device "$url" 360; then
+            err "Device not reachable (attempt $attempt/$max_attempts)"
+            continue
+        fi
+        local init_resp
+        init_resp=$(curl -sf --max-time 8 -X POST "$url/api/stp/upload" \
+            -H "Authorization: Bearer $api_key" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+                --arg path "/tmp" \
+                --arg filename "sctl-upgrade" \
+                --argjson file_size "$file_size" \
+                --argjson chunk_size "$chunk_size" \
+                --argjson total_chunks "$total_chunks" \
+                '{path: $path, filename: $filename, file_size: $file_size, chunk_size: $chunk_size, total_chunks: $total_chunks, file_hash: "", mode: "0755"}'
+            )" 2>/dev/null)
+        xfer_id=$(echo "$init_resp" | jq -r '.transfer_id // empty' 2>/dev/null)
+        if [[ -n "$xfer_id" && "$xfer_id" != "null" ]]; then
+            return 0
+        fi
+        warn "STP init failed (attempt $attempt), retrying on next window..."
+    done
+    return 1
+}
+
+# Execute a remote command through /api/exec and print the raw JSON response.
+# Retries across short tunnel windows; returns success only when curl itself succeeds.
+remote_exec_json() {
+    local url="$1" api_key="$2" command="$3" timeout_ms="$4" attempts="${5:-5}"
+    local max_time="${6:-8}"
+    local resp=""
+    for attempt in $(seq 1 "$attempts"); do
+        if ! wait_for_device "$url" 360 quiet; then
+            return 1
+        fi
+        resp=$(curl -sf --max-time "$max_time" -X POST "$url/api/exec" \
+            -H "Authorization: Bearer $api_key" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg command "$command" --argjson timeout "$timeout_ms" \
+                '{command: $command, timeout: $timeout}')" 2>/dev/null) || {
+            sleep 1
+            continue
+        }
+        printf '%s' "$resp"
+        return 0
+    done
+    return 1
+}
+
+# Execute a remote command and return trimmed stdout once it is non-empty.
+remote_exec_stdout_trimmed() {
+    local url="$1" api_key="$2" command="$3" timeout_ms="$4" attempts="${5:-5}"
+    local max_time="${6:-8}"
+    local resp="" out=""
+    for attempt in $(seq 1 "$attempts"); do
+        resp=$(remote_exec_json "$url" "$api_key" "$command" "$timeout_ms" 1 "$max_time") || {
+            sleep 1
+            continue
+        }
+        out=$(echo "$resp" | jq -r '.stdout // empty' 2>/dev/null | tr -d '[:space:]')
+        if [[ -n "$out" ]]; then
+            printf '%s' "$out"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+stp_status_json() {
+    local url="$1" api_key="$2" xfer_id="$3"
+    curl -sf --max-time 5 "$url/api/stp/status/$xfer_id" \
+        -H "Authorization: Bearer $api_key" 2>/dev/null
+}
+
+stp_resume_transfer() {
+    local url="$1" api_key="$2" xfer_id="$3"
+    curl -sf --max-time 5 -X POST "$url/api/stp/resume/$xfer_id" \
+        -H "Authorization: Bearer $api_key" 2>/dev/null
+}
+
 do_device_upgrade_remote() {
     local name="${1:-}"
     if [[ -z "$name" ]]; then
@@ -1205,45 +1496,43 @@ do_device_upgrade_remote() {
     fi
     ok "Build complete: $bin_path"
 
-    local file_size chunk_size total_chunks
+    local file_size chunk_size total_chunks expected_hash
     file_size=$(stat -c%s "$bin_path")
-    chunk_size=262144  # 256 KiB
+    # TODO(upload-hardening): GX/STP uploads are still much slower than they should be
+    # for mission-critical remote ops. The current path is strictly serialized
+    # (one HTTP chunk request per RTT, single in-flight chunk, 64 KiB payloads),
+    # which is resilient on flaky links but leaves a lot of throughput on the table.
+    # Future protocol work should support a faster mode with larger chunks and/or a
+    # sliding window of concurrent in-flight chunks with resumable selective acking.
+    chunk_size=65536  # 64 KiB — small chunks for flaky connections
     total_chunks=$(( (file_size + chunk_size - 1) / chunk_size ))
+    expected_hash=$(sha256sum "$bin_path" | cut -d' ' -f1)
 
-    log "Binary: $bin_path ($file_size bytes, $total_chunks chunks)"
+    log "Binary: $bin_path ($file_size bytes, $total_chunks chunks @ 64KiB)"
+    log "Expected binary hash: $expected_hash"
 
-    # Step 2: Init upload via STP
-    log "Initiating upload to $url..."
-    local init_resp
-    init_resp=$(curl -sf -X POST "$url/api/stp/upload" \
-        -H "Authorization: Bearer $api_key" \
-        -H "Content-Type: application/json" \
-        -d "$(jq -n \
-            --arg path "/tmp" \
-            --arg filename "sctl-upgrade" \
-            --argjson file_size "$file_size" \
-            --argjson chunk_size "$chunk_size" \
-            --argjson total_chunks "$total_chunks" \
-            '{path: $path, filename: $filename, file_size: $file_size, chunk_size: $chunk_size, total_chunks: $total_chunks, file_hash: "", mode: "0755"}'
-        )")
+    # ── Phase A: Upload (spans multiple connection windows) ──────────
 
-    if [[ -z "$init_resp" ]]; then
-        err "Failed to init upload"
-        exit 1
-    fi
+    log "Phase A: Resilient chunked upload"
 
-    local xfer_id
-    xfer_id=$(echo "$init_resp" | jq -r '.transfer_id')
-    if [[ -z "$xfer_id" || "$xfer_id" == "null" ]]; then
-        err "Invalid upload init response: $init_resp"
+    # Step 2: Init upload via STP (with retry across windows)
+    local xfer_id=""
+    if ! resilient_stp_init "$url" "$api_key" "$file_size" "$chunk_size" "$total_chunks"; then
+        err "Failed to init upload after multiple attempts"
         exit 1
     fi
     ok "Transfer ID: $xfer_id"
 
-    # Step 3: Upload chunks
-    log "Uploading $total_chunks chunks..."
+    # Step 3: Upload chunks across connection windows
     local idx=0
-    local failed=false
+    local chunk_timeout=8   # per-chunk curl timeout (seconds)
+    local max_upload_wait_secs=21600  # 6h wall-clock budget for mission-critical relay-only upgrades
+    local upload_started_at
+    upload_started_at=$(date +%s)
+    local total_retries=0
+    local windows_used=1
+
+    log "Uploading $total_chunks chunks (retries across connection windows)..."
     while [[ $idx -lt $total_chunks ]]; do
         local offset=$((idx * chunk_size))
         local this_size=$chunk_size
@@ -1251,149 +1540,240 @@ do_device_upgrade_remote() {
             this_size=$((file_size - offset))
         fi
 
-        # Extract chunk and compute hash
+        # Compute hash
         local chunk_hash
         chunk_hash=$(dd if="$bin_path" bs=1 skip="$offset" count="$this_size" 2>/dev/null | sha256sum | cut -d' ' -f1)
 
-        local chunk_resp
+        # Send chunk with short timeout
+        local chunk_resp ok_val
         chunk_resp=$(dd if="$bin_path" bs=1 skip="$offset" count="$this_size" 2>/dev/null | \
-            curl -sf -X POST "$url/api/stp/chunk/$xfer_id/$idx" \
+            curl -sf --max-time "$chunk_timeout" -X POST "$url/api/stp/chunk/$xfer_id/$idx" \
                 -H "Authorization: Bearer $api_key" \
                 -H "Content-Type: application/octet-stream" \
                 -H "X-Gx-Chunk-Hash: $chunk_hash" \
-                --data-binary @-)
+                --data-binary @- 2>/dev/null) || true
+        ok_val=$(echo "$chunk_resp" | jq -r '.ok // false' 2>/dev/null)
 
-        local ok_val
-        ok_val=$(echo "$chunk_resp" | jq -r '.ok // false')
-        if [[ "$ok_val" != "true" ]]; then
-            err "Chunk $idx failed: $chunk_resp"
-            # Retry once
-            sleep 1
-            chunk_hash=$(dd if="$bin_path" bs=1 skip="$offset" count="$this_size" 2>/dev/null | sha256sum | cut -d' ' -f1)
-            chunk_resp=$(dd if="$bin_path" bs=1 skip="$offset" count="$this_size" 2>/dev/null | \
-                curl -sf -X POST "$url/api/stp/chunk/$xfer_id/$idx" \
-                    -H "Authorization: Bearer $api_key" \
-                    -H "Content-Type: application/octet-stream" \
-                    -H "X-Gx-Chunk-Hash: $chunk_hash" \
-                    --data-binary @-)
-            ok_val=$(echo "$chunk_resp" | jq -r '.ok // false')
-            if [[ "$ok_val" != "true" ]]; then
-                err "Chunk $idx retry failed, aborting"
-                curl -sf -X DELETE "$url/api/stp/$xfer_id" \
-                    -H "Authorization: Bearer $api_key" >/dev/null 2>&1 || true
-                failed=true
-                break
-            fi
+        if [[ "$ok_val" == "true" ]]; then
+            printf "\r  chunks: %d/%d (windows: %d, retries: %d)  " "$((idx + 1))" "$total_chunks" "$windows_used" "$total_retries"
+            idx=$((idx + 1))
+            continue
         fi
 
-        # Progress
-        printf "\r  chunks: %d/%d" "$((idx + 1))" "$total_chunks"
-        idx=$((idx + 1))
+        # Chunk failed — determine cause
+        total_retries=$((total_retries + 1))
+        local now_ts elapsed_secs
+        now_ts=$(date +%s)
+        elapsed_secs=$((now_ts - upload_started_at))
+        if [[ $elapsed_secs -ge $max_upload_wait_secs ]]; then
+            echo ""
+            err "Exceeded upload wall-clock budget (${max_upload_wait_secs}s), aborting"
+            curl -sf --max-time 5 -X DELETE "$url/api/stp/$xfer_id" \
+                -H "Authorization: Bearer $api_key" >/dev/null 2>&1 || true
+            exit 1
+        fi
+
+        # Check if transfer_id is still valid (process may have restarted)
+        local status_resp status_code phase chunks_done
+        status_resp=$(stp_status_json "$url" "$api_key" "$xfer_id") || true
+        status_code=$(curl -sf --max-time 5 -o /dev/null -w '%{http_code}' \
+            "$url/api/stp/status/$xfer_id" \
+            -H "Authorization: Bearer $api_key" 2>/dev/null) || status_code="000"
+
+        if [[ "$status_code" == "404" ]]; then
+            # Process restarted, transfer_id gone — re-init from scratch
+            echo ""
+            warn "Transfer lost (process restarted?), re-initializing upload..."
+            idx=0
+            if ! resilient_stp_init "$url" "$api_key" "$file_size" "$chunk_size" "$total_chunks"; then
+                err "Failed to re-init upload"
+                exit 1
+            fi
+            ok "New transfer ID: $xfer_id"
+            windows_used=$((windows_used + 1))
+            continue
+        fi
+
+        phase=$(echo "$status_resp" | jq -r '.phase // empty' 2>/dev/null)
+        chunks_done=$(echo "$status_resp" | jq -r '.chunks_done // 0' 2>/dev/null)
+
+        if [[ "$phase" == "paused" ]]; then
+            echo ""
+            warn "Transfer paused at chunk count ${chunks_done:-?}, resuming..."
+            if wait_for_device "$url" 360 quiet; then
+                local resume_resp
+                resume_resp=$(stp_resume_transfer "$url" "$api_key" "$xfer_id") || true
+                if [[ -n "$resume_resp" ]]; then
+                    ok "Transfer resumed"
+                    continue
+                fi
+                warn "Resume request failed, will retry on next window..."
+            else
+                err "Device not reachable while trying to resume transfer"
+                exit 1
+            fi
+        elif [[ "$phase" == "failed" || "$phase" == "aborted" ]]; then
+            echo ""
+            warn "Transfer entered phase '$phase', re-initializing upload..."
+            idx=0
+            if ! resilient_stp_init "$url" "$api_key" "$file_size" "$chunk_size" "$total_chunks"; then
+                err "Failed to re-init upload"
+                exit 1
+            fi
+            ok "New transfer ID: $xfer_id"
+            windows_used=$((windows_used + 1))
+            continue
+        fi
+
+        # Connection dropped — wait for next window and retry same chunk
+        printf "\n  chunk %d failed, waiting for reconnection... " "$idx"
+        windows_used=$((windows_used + 1))
+        if ! wait_for_device "$url" 360 quiet; then
+            echo ""
+            err "Device not reachable after 120s, aborting"
+            exit 1
+        fi
+        printf "reconnected\n"
+        status_resp=$(stp_status_json "$url" "$api_key" "$xfer_id") || true
+        phase=$(echo "$status_resp" | jq -r '.phase // empty' 2>/dev/null)
+        if [[ "$phase" == "paused" ]]; then
+            warn "Transfer is paused after reconnect, resuming before retrying chunk $idx..."
+            stp_resume_transfer "$url" "$api_key" "$xfer_id" >/dev/null 2>&1 || true
+        fi
+        # retry same idx on next loop iteration
     done
     echo ""
+    ok "All $total_chunks chunks uploaded ($windows_used connection windows, $total_retries retries)"
 
-    if [[ "$failed" == "true" ]]; then
-        exit 1
-    fi
-
-    # Step 4: Wait for transfer completion (verification)
+    # Step 4: Wait for transfer completion (verification) — may need a window
     log "Waiting for transfer verification..."
-    local phase=""
-    for _ in $(seq 1 30); do
-        local status_resp
-        status_resp=$(curl -sf "$url/api/stp/status/$xfer_id" \
-            -H "Authorization: Bearer $api_key" 2>/dev/null) || true
-        phase=$(echo "$status_resp" | jq -r '.phase // empty')
-        case "$phase" in
-            complete)
-                ok "Upload complete and verified"
-                break
-                ;;
-            failed)
-                err "Transfer verification failed: $(echo "$status_resp" | jq -r '.error // "unknown"')"
-                exit 1
-                ;;
-            *)
-                sleep 0.5
-                ;;
-        esac
+    local phase="" verify_attempts=0
+    while [[ "$phase" != "complete" && $verify_attempts -lt 10 ]]; do
+        if ! wait_for_device "$url" 360 quiet; then
+            err "Device not reachable for verification"
+            exit 1
+        fi
+        for _ in $(seq 1 15); do
+            local status_resp
+            status_resp=$(curl -sf --max-time 5 "$url/api/stp/status/$xfer_id" \
+                -H "Authorization: Bearer $api_key" 2>/dev/null) || true
+            phase=$(echo "$status_resp" | jq -r '.phase // empty' 2>/dev/null)
+            case "$phase" in
+                complete)
+                    ok "Upload complete and verified"
+                    break 2
+                    ;;
+                failed)
+                    err "Transfer verification failed: $(echo "$status_resp" | jq -r '.error // "unknown"')"
+                    exit 1
+                    ;;
+                *)
+                    sleep 0.5
+                    ;;
+            esac
+        done
+        verify_attempts=$((verify_attempts + 1))
     done
     if [[ "$phase" != "complete" ]]; then
         err "Transfer did not complete (phase: $phase)"
         exit 1
     fi
 
-    # Step 5: Verify binary on device
+    # ── Phase B: Swap (must complete in one window) ──────────────────
+
+    log "Phase B: Binary swap and restart"
+
+    # Step 5: Verify binary on device (wait for window)
     log "Verifying uploaded binary..."
-    local verify_resp
-    verify_resp=$(curl -sf -X POST "$url/api/exec" \
-        -H "Authorization: Bearer $api_key" \
-        -H "Content-Type: application/json" \
-        -d '{"command": "/tmp/sctl-upgrade --version", "timeout": 5000}')
-    local verify_out
-    verify_out=$(echo "$verify_resp" | jq -r '.stdout // empty')
+    local verify_out=""
+    verify_out=$(remote_exec_stdout_trimmed "$url" "$api_key" "/tmp/sctl-upgrade --version" 5000 15 8) || true
     if [[ -z "$verify_out" ]]; then
         err "Binary verification failed — not executable or crashed"
-        err "Response: $verify_resp"
-        # Clean up
-        curl -sf -X POST "$url/api/exec" \
-            -H "Authorization: Bearer $api_key" \
-            -H "Content-Type: application/json" \
-            -d '{"command": "rm -f /tmp/sctl-upgrade"}' >/dev/null 2>&1 || true
+        remote_exec_json "$url" "$api_key" "rm -f /tmp/sctl-upgrade" 5000 2 5 >/dev/null 2>&1 || true
         exit 1
     fi
     ok "Binary verified: $verify_out"
 
-    # Step 6: Ensure watchdog is deployed
-    log "Ensuring watchdog is deployed..."
-    local wd_check
-    wd_check=$(curl -sf -X POST "$url/api/exec" \
-        -H "Authorization: Bearer $api_key" \
-        -H "Content-Type: application/json" \
-        -d '{"command": "test -f /etc/sctl/watchdog.sh && echo yes || echo no"}')
-    local has_watchdog
-    has_watchdog=$(echo "$wd_check" | jq -r '.stdout // empty' | tr -d '[:space:]')
-    if [[ "$has_watchdog" != "yes" ]]; then
-        warn "Watchdog not found, deploying..."
-        do_device_deploy_watchdog "$name"
+    log "Verifying uploaded binary hash..."
+    local uploaded_hash="" staged_size=""
+    uploaded_hash=$(remote_exec_stdout_trimmed "$url" "$api_key" "sha256sum /tmp/sctl-upgrade | cut -d\" \" -f1" 5000 20 8) || true
+    if [[ "$uploaded_hash" != "$expected_hash" ]]; then
+        staged_size=$(remote_exec_stdout_trimmed "$url" "$api_key" "stat -c%s /tmp/sctl-upgrade" 5000 10 8) || true
+        if [[ -n "$uploaded_hash" ]]; then
+            err "Uploaded binary hash mismatch (expected $expected_hash, got $uploaded_hash)"
+            exit 1
+        fi
+        if [[ "$staged_size" != "$file_size" ]]; then
+            err "Uploaded binary hash unavailable and staged size mismatch (expected $file_size, got ${staged_size:-empty})"
+            exit 1
+        fi
+        warn "Uploaded hash unavailable after retries; continuing because staged binary is executable and size matches ($staged_size bytes)"
     else
-        ok "Watchdog already deployed"
+        ok "Uploaded hash verified: $uploaded_hash"
     fi
 
-    # Step 7: Swap binary, then kill the child `sctl serve` process.
-    # The supervisor stays alive and auto-restarts with the new binary.
-    # (Old approach: `init.d restart` via nohup — but sctl killing itself
-    # also killed the shell running the restart, so `start` never ran.)
-    log "Swapping binary and restarting sctl..."
-    curl -sf -X POST "$url/api/exec" \
-        -H "Authorization: Bearer $api_key" \
-        -H "Content-Type: application/json" \
-        -d '{"command": "cp /usr/bin/sctl /usr/bin/sctl.rollback && cp /tmp/sctl-upgrade /usr/bin/sctl && chmod +x /usr/bin/sctl && kill $(pgrep -f \"sctl serve\")", "timeout": 15000}' >/dev/null 2>&1 || true
+    # Step 6: Ensure watchdog is deployed (wait for window)
+    log "Ensuring watchdog is deployed..."
+    for attempt in $(seq 1 3); do
+        if ! wait_for_device "$url" 360 quiet; then
+            err "Device not reachable"
+            exit 1
+        fi
+        local has_watchdog
+        has_watchdog=$(remote_exec_stdout_trimmed "$url" "$api_key" "test -f /etc/sctl/watchdog.sh && echo yes || echo no" 5000 2 8) || true
+        if [[ "$has_watchdog" == "yes" ]]; then
+            ok "Watchdog already deployed"
+            break
+        elif [[ "$has_watchdog" == "no" ]]; then
+            warn "Watchdog not found, deploying..."
+            do_device_deploy_watchdog "$name"
+            break
+        fi
+        # Empty response = connection dropped, retry
+    done
 
-    # Step 8: Wait for device disconnect then reconnect through relay.
-    # First wait for health to FAIL (proves old process is dead),
-    # then wait for it to SUCCEED (proves new process is up).
-    log "Waiting for device to restart (60s timeout)..."
-    local saw_disconnect=false
+    # Step 7: Swap binary and kill child process (wait for window)
+    # All 3 commands are tiny — must complete in one window.
+    log "Swapping binary and restarting sctl..."
+    local swap_ok=false
+    for attempt in $(seq 1 5); do
+        if ! wait_for_device "$url" 360 quiet; then
+            err "Device not reachable for swap"
+            exit 1
+        fi
+        local swap_out
+        swap_out=$(remote_exec_stdout_trimmed "$url" "$api_key" \
+            "sh -c 'set -e; if [ ! -x /usr/bin/sctl.rollback ]; then cp /usr/bin/sctl /usr/bin/sctl.rollback; fi; cp /tmp/sctl-upgrade /usr/bin/sctl; chmod +x /usr/bin/sctl; sync; echo swap_ok; (sleep 1; kill \$(pgrep -f \"[s]ctl serve\") 2>/dev/null || true) >/dev/null 2>&1 &'" \
+            8000 2 10) || true
+        if [[ "$swap_out" == *swap_ok* ]]; then
+            swap_ok=true
+            ok "Swap command acknowledged"
+            break
+        fi
+        warn "Swap attempt $attempt failed, retrying on next window..."
+    done
+    if [[ "$swap_ok" != "true" ]]; then
+        err "Swap command never returned swap_ok"
+        exit 1
+    fi
+
+    # Step 8: Wait for device to restart with the expected binary.
+    # Success requires both a healthy response and an on-device hash match.
+    log "Waiting for device to restart with expected binary (120s timeout)..."
     local healthy=false
-    for i in $(seq 1 60); do
+    local version=""
+    local running_hash=""
+    for i in $(seq 1 120); do
         sleep 1
         local health_resp
-        health_resp=$(curl -sf "$url/api/health" 2>/dev/null) || {
-            if [[ "$saw_disconnect" == "false" ]]; then
-                saw_disconnect=true
-            fi
-            continue
-        }
-        # Only accept health after we've seen a disconnect
-        if [[ "$saw_disconnect" == "false" ]]; then
-            continue
-        fi
-        local version
-        version=$(echo "$health_resp" | jq -r '.version // empty')
-        if [[ -n "$version" ]]; then
+        health_resp=$(curl -sf --connect-timeout 3 --max-time 5 "$url/api/health" 2>/dev/null) || continue
+        version=$(echo "$health_resp" | jq -r '.version // empty' 2>/dev/null)
+        [[ -n "$version" ]] || continue
+
+        running_hash=$(remote_exec_stdout_trimmed "$url" "$api_key" "sha256sum /usr/bin/sctl | cut -d\" \" -f1" 5000 3 8) || true
+        if [[ "$running_hash" == "$expected_hash" ]]; then
             healthy=true
-            ok "Device restarted after ${i}s (version: $version)"
+            ok "Device running expected binary (version: $version, hash: $running_hash, waited ${i}s)"
 
             # Update version in config
             jq --arg name "$name" --arg ver "$version" \
@@ -1404,25 +1784,29 @@ do_device_upgrade_remote() {
     done
 
     if [[ "$healthy" == "true" ]]; then
-        # Deploy playbooks
+        # Deploy playbooks (tolerant of connection drops)
         log "Deploying playbooks..."
         deploy_playbooks_to_device "$name"
 
         # Clean up
         log "Cleaning up..."
-        curl -sf -X POST "$url/api/exec" \
+        curl -sf --max-time 8 -X POST "$url/api/exec" \
             -H "Authorization: Bearer $api_key" \
             -H "Content-Type: application/json" \
             -d '{"command": "rm -f /tmp/sctl-upgrade /tmp/sctl-upgrade.log"}' >/dev/null 2>&1 || true
 
         echo ""
         ok "Remote upgrade complete for '$name'"
+        echo "  Upload: $total_chunks chunks across $windows_used connection windows"
         echo "  Rollback binary at /usr/bin/sctl.rollback will be auto-removed after 10 min"
     else
         echo ""
-        warn "Device did not come back within 60s"
+        warn "Device did not come back with the expected binary within 120s"
+        warn "Expected hash: $expected_hash"
+        warn "Observed hash: ${running_hash:-unavailable}"
         warn "The watchdog will attempt rollback within 6 minutes if health checks fail"
         warn "Check status: curl -sf $url/api/health"
+        exit 1
     fi
 }
 
@@ -2112,8 +2496,8 @@ do_relay_setup() {
     fi
 
     # Build x86_64-musl binary
-    log "Building sctl for x86_64-musl..."
-    make -C "$SCTL_DIR" build-x86
+    log "Building sctl for relay host..."
+    cargo build --manifest-path "$SCTL_DIR/Cargo.toml" --release
 
     # Prompt for relay domain (optional — skip for IP-only staging)
     local domain=""
@@ -2324,8 +2708,8 @@ do_relay_deploy() {
     fi
 
     # Build
-    log "Building sctl for x86_64-musl..."
-    make -C "$SCTL_DIR" build-x86
+    log "Building sctl for relay host..."
+    cargo build --manifest-path "$SCTL_DIR/Cargo.toml" --release
 
     # Stop, upload binary + service, start
     log "Deploying to $remote..."
@@ -2370,8 +2754,8 @@ do_relay_upgrade() {
     old_version=$(ssh $ssh_opts "$remote" "$RELAY_REMOTE_BIN --version 2>/dev/null || echo unknown") || old_version="unknown"
 
     # Build
-    log "Building sctl for x86_64-musl..."
-    make -C "$SCTL_DIR" build-x86
+    log "Building sctl for relay host..."
+    cargo build --manifest-path "$SCTL_DIR/Cargo.toml" --release
 
     # Record old PID
     local old_pid
@@ -2551,6 +2935,9 @@ do_relay_sctlin() {
     if [[ -f "$seed_file" ]]; then
         log "Overriding sctlin-seed.json with relay-specific version"
         cp "$seed_file" "$WEB_DIR/build/client/sctlin/sctlin-seed.json"
+        # Regenerate pre-compressed copies so adapter-node serves the updated file
+        rm -f "$WEB_DIR/build/client/sctlin/sctlin-seed.json.br" "$WEB_DIR/build/client/sctlin/sctlin-seed.json.gz"
+        gzip -k "$WEB_DIR/build/client/sctlin/sctlin-seed.json" 2>/dev/null || true
     fi
 
     # 5. Upload build to relay
@@ -2600,6 +2987,170 @@ do_setup() {
     do_launch
 }
 
+# ─── env management ──────────────────────────────────────────────────
+
+do_env_ls() {
+    require_jq
+    local active
+    active=$(active_env_name)
+    local found=false
+
+    for f in "$SCTL_CONFIG_DIR"/devices.*.json; do
+        [[ -f "$f" ]] || continue
+        local base
+        base=$(basename "$f")
+        # Skip devices.dev.json (the active copy)
+        [[ "$base" == "devices.dev.json" ]] && continue
+        # Extract profile name from devices.NAME.json
+        local name="${base#devices.}"
+        name="${name%.json}"
+        local count
+        count=$(jq '.devices | length' "$f" 2>/dev/null || echo "?")
+        local devices
+        devices=$(jq -r '.devices | keys[:3] | join(", ")' "$f" 2>/dev/null || echo "")
+        local marker="   "
+        [[ "$name" == "$active" ]] && marker=" * "
+        printf "%s%-14s %s devices  (%s)\n" "$marker" "$name" "$count" "$devices"
+        found=true
+    done
+
+    if [[ "$found" == "false" ]]; then
+        echo "  No profiles found. Save one with: $0 env save <name>"
+    fi
+}
+
+do_env_use() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        err "Usage: $0 env use <name>"
+        echo "Available profiles:"
+        do_env_ls
+        exit 1
+    fi
+    if [[ "$name" =~ [^a-zA-Z0-9_-] ]]; then
+        err "Profile name must only contain letters, numbers, hyphens, and underscores"
+        exit 1
+    fi
+    if [[ "$name" == "dev" ]]; then
+        err "Cannot use 'dev' as a profile name (reserved for the active config)"
+        exit 1
+    fi
+
+    local src
+    src=$(profile_file "$name")
+    if [[ ! -f "$src" ]]; then
+        err "Profile '$name' not found: $src"
+        echo "Available profiles:"
+        do_env_ls
+        exit 1
+    fi
+
+    # Warn if tunnel mode is active
+    if [[ -f "$CONFIG_FILE.pre-tunnel" ]]; then
+        warn "Tunnel mode is active. Switching env will discard the tunnel config backup."
+        rm -f "$CONFIG_FILE.pre-tunnel"
+    fi
+
+    cp "$src" "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    echo "$name" > "$ACTIVE_ENV_FILE"
+
+    ok "Switched to profile '$name'"
+    do_env_show_devices
+
+    # Regenerate sctlin seed
+    if [[ -d "$WEB_DIR/static" ]]; then
+        generate_sctlin_seed
+    fi
+}
+
+do_env_show() {
+    local active
+    active=$(active_env_name)
+    if [[ -z "$active" ]]; then
+        echo "No active profile (using devices.dev.json directly)"
+        echo "Save the current config as a profile with: $0 env save <name>"
+    else
+        echo "Active profile: $active"
+        do_env_show_devices
+    fi
+}
+
+do_env_show_devices() {
+    require_jq
+    local count
+    count=$(jq '.devices | length' "$CONFIG_FILE" 2>/dev/null || echo "?")
+    local devices
+    devices=$(jq -r '.devices | keys | join(", ")' "$CONFIG_FILE" 2>/dev/null || echo "")
+    echo "  Devices ($count): $devices"
+}
+
+do_env_save() {
+    local name="${1:-}"
+
+    # If no name given, save to the active profile
+    if [[ -z "$name" ]]; then
+        name=$(active_env_name)
+        if [[ -z "$name" ]]; then
+            err "Usage: $0 env save <name>"
+            err "No active profile to save to. Provide a name."
+            exit 1
+        fi
+    fi
+    if [[ "$name" =~ [^a-zA-Z0-9_-] ]]; then
+        err "Profile name must only contain letters, numbers, hyphens, and underscores"
+        exit 1
+    fi
+    if [[ "$name" == "dev" ]]; then
+        err "Cannot use 'dev' as a profile name (reserved for the active config)"
+        exit 1
+    fi
+
+    require_jq
+    ensure_config
+
+    local dest
+    dest=$(profile_file "$name")
+
+    cp "$CONFIG_FILE" "$dest"
+    echo "$name" > "$ACTIVE_ENV_FILE"
+
+    ok "Saved current config as profile '$name': $dest"
+}
+
+do_env_edit() {
+    local name="${1:-}"
+
+    if [[ -z "$name" ]]; then
+        name=$(active_env_name)
+        if [[ -z "$name" ]]; then
+            err "Usage: $0 env edit <name>"
+            err "No active profile. Provide a name or switch with: $0 env use <name>"
+            exit 1
+        fi
+    fi
+
+    local file
+    file=$(profile_file "$name")
+    if [[ ! -f "$file" ]]; then
+        err "Profile '$name' not found: $file"
+        exit 1
+    fi
+
+    local editor="${EDITOR:-vi}"
+    "$editor" "$file"
+
+    # If editing the active profile, sync to devices.dev.json
+    local active
+    active=$(active_env_name)
+    if [[ "$name" == "$active" ]]; then
+        cp "$file" "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+        ok "Active profile updated — synced to devices.dev.json"
+        if [[ -d "$WEB_DIR/static" ]]; then
+            generate_sctlin_seed
+        fi
+    fi
+}
+
 # ─── main ────────────────────────────────────────────────────────────
 
 case "${1:-setup}" in
@@ -2609,7 +3160,28 @@ case "${1:-setup}" in
     stop)   do_stop ;;
     status) do_status ;;
     claude) do_claude ;;
+    codex)  do_codex ;;
     tunnel) shift; do_tunnel "$@" ;;
+    env)
+        case "${2:-show}" in
+            ls|list)  do_env_ls ;;
+            use)      do_env_use "${3:-}" ;;
+            show)     do_env_show ;;
+            save)     do_env_save "${3:-}" ;;
+            edit)     do_env_edit "${3:-}" ;;
+            *)
+                echo "Usage: $0 env <command>"
+                echo ""
+                echo "Commands:"
+                echo "  show              show current active profile (default)"
+                echo "  ls                list available profiles"
+                echo "  use <name>        switch to a named profile"
+                echo "  save [name]       save current config as a named profile"
+                echo "  edit [name]       open profile in \$EDITOR"
+                exit 1
+                ;;
+        esac
+        ;;
     device)
         case "${2:-ls}" in
             add)     do_device_add "$3" "${4:-}" ;;
@@ -2678,6 +3250,7 @@ case "${1:-setup}" in
         echo "  stop     stop all services + deregister MCP"
         echo "  status   show what's running"
         echo "  claude   only register MCP in Claude Code (no build/start)"
+        echo "  codex    only register MCP in Codex CLI (no build/start)"
         echo "  tunnel   build + start tunnel dev env (relay + clients via tunnel)"
         echo "             --cloudflared        use Cloudflare Quick Tunnel (double CGNAT)"
         echo "             --relay-url <url>    use an external relay URL"
@@ -2690,6 +3263,13 @@ case "${1:-setup}" in
         echo "  device upgrade <name>           binary-only upgrade via SSH"
         echo "  device deploy-watchdog <name>   deploy watchdog script + cron"
         echo "  device upgrade-remote <name>    binary upgrade via relay (no SSH needed)"
+        echo ""
+        echo "Environment profiles:"
+        echo "  env show                        show current active profile"
+        echo "  env ls                          list available profiles"
+        echo "  env use <name>                  switch to a named profile"
+        echo "  env save [name]                 save current config as a profile"
+        echo "  env edit [name]                 open profile in \$EDITOR"
         echo ""
         echo "Relay VPS deployment:"
         echo "  relay setup <user@host>     full VPS provisioning (Caddy + sctl + firewall)"
