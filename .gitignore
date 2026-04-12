@@ -36,3 +36,10 @@ node_modules/
 # Device-specific config (contains secrets)
 sctl.toml.bpi
 *.toml.bpi
+
+# Scratch / temporary files
+.tmp_*
+*.bak
+*.scratch
+*.local
+/scratch/
