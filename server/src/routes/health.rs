@@ -1,9 +1,11 @@
 //! Unauthenticated health-check endpoint.
 
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use axum::{extract::State, Json};
 use serde_json::{json, Value};
+use tracing::{info, warn};
 
 use crate::AppState;
 
@@ -12,6 +14,10 @@ use crate::AppState;
 /// Returns status, uptime, version, session count, and tunnel status. No
 /// authentication required, suitable for load-balancer health checks.
 pub async fn health(State(state): State<AppState>) -> Json<Value> {
+    let start = Instant::now();
+    let has_lte = state.lte_state.is_some();
+    info!(has_lte, "api.health: begin");
+
     let uptime = state.start_time.elapsed().as_secs();
     let sessions = state.session_manager.session_count().await;
     let ts = &state.tunnel_stats;
@@ -31,6 +37,8 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
         let last_pong_age_ms = ts.last_pong_age_ms.load(Ordering::Relaxed);
         let current_uptime_ms = ts.current_uptime_ms.load(Ordering::Relaxed);
         let dropped_outbound = ts.dropped_outbound.load(Ordering::Relaxed);
+        let stream_backpressure_events = ts.stream_backpressure_events.load(Ordering::Relaxed);
+        let stream_replay_events = ts.stream_replay_events.load(Ordering::Relaxed);
 
         let rtt = ts.rtt_stats().await;
         let (rtt_median, rtt_p95) = rtt.unwrap_or((0, 0));
@@ -70,6 +78,8 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
             "messages_received": messages_received,
             "last_pong_age_ms": last_pong_age_ms,
             "dropped_outbound": dropped_outbound,
+            "stream_backpressure_events": stream_backpressure_events,
+            "stream_replay_events": stream_replay_events,
             "rtt_median_ms": rtt_median,
             "rtt_p95_ms": rtt_p95,
             "recent_events": recent_events,
@@ -98,8 +108,14 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
     };
 
     // LTE summary
+    let mut lte_lock_wait_ms = 0u64;
     let lte = if let Some(ref ls) = state.lte_state {
+        let lock_started = Instant::now();
         let ls = ls.lock().await;
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            lte_lock_wait_ms = lock_started.elapsed().as_millis() as u64;
+        }
         if let Some(ref sig) = ls.signal {
             json!({
                 "rssi_dbm": sig.rssi_dbm,
@@ -168,6 +184,12 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
         None
     };
 
+    let live_devices = if let Some(ref relay_state) = state.relay_state {
+        Some(relay_state.live_device_statuses().await)
+    } else {
+        None
+    };
+
     let mut resp = json!({
         "status": "ok",
         "uptime_secs": uptime,
@@ -183,5 +205,17 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
     if let Some(ds) = device_snapshots {
         resp["device_snapshots"] = ds;
     }
+    if let Some(ld) = live_devices {
+        resp["live_devices"] = json!(ld);
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let total_ms = start.elapsed().as_millis() as u64;
+    if lte_lock_wait_ms >= 250 {
+        warn!(
+            total_ms,
+            lte_lock_wait_ms, "api.health: slow LTE state lock acquisition"
+        );
+    }
+    info!(total_ms, lte_lock_wait_ms, "api.health: end");
     Json(resp)
 }

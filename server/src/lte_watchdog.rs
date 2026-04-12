@@ -1,25 +1,32 @@
-//! LTE watchdog — automatic modem recovery when tunnel is down.
+//! LTE watchdog — symptom-based modem recovery when tunnel is down.
 //!
-//! Correlates LTE signal state with tunnel health and takes escalating
-//! recovery actions — from gentle re-registration to full USB power cycle —
-//! without assuming anything about the radio environment.
+//! Core principle: **first, do no harm.** The modem and netifd usually recover
+//! on their own. The watchdog only intervenes when it's certain the modem is
+//! genuinely stuck, and picks the right action for the specific symptom instead
+//! of blindly climbing an escalation ladder.
+//!
+//! ## Symptom-based dispatch
+//!
+//! Instead of L0→L1→L2→L3 escalation, the watchdog diagnoses the problem:
+//! - `Searching` → wait (roaming handover), then airplane cycle if stuck
+//! - `RegisteredNoData` → interface restart (QMI bearer broken)
+//! - `NotRegistered` → re-register, then airplane cycle if repeat
+//! - `Unresponsive` → interface restart, then USB cycle
+//! - `RelayProblem` → do nothing (modem is fine)
+//! - `TunnelReconnecting` → do nothing (client is working on it)
 //!
 //! ## Safe-bands recovery
 //!
 //! The watchdog tracks which band config last sustained a stable tunnel
 //! connection (5+ minutes). When the tunnel drops after a recent band change,
-//! it can quickly revert to the known-working config before escalating to
-//! heavier recovery actions.
-//!
-//! Recovery order when tunnel drops and signal is fresh:
-//! 1. Pre-change revert (if band change within 3min)
-//! 2. Safe-bands revert (if safe config differs from current)
-//! 3. Standard escalation: L0 re-register → L1 airplane → L2 iface → L3 USB
+//! it can quickly revert to the known-working config before symptom dispatch.
 
+use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{broadcast, watch, Mutex};
 use tracing::{info, warn};
@@ -32,22 +39,14 @@ use crate::state::{TunnelEventType, TunnelStats};
 /// Watchdog tick interval.
 const TICK_INTERVAL: Duration = Duration::from_secs(30);
 
-/// How long the tunnel must be disconnected before the watchdog acts.
-const DISCONNECT_GRACE: Duration = Duration::from_secs(60);
-
 /// How long after a band change the pre-change revert is eligible (3 min).
 const PRECHANGE_REVERT_WINDOW: Duration = Duration::from_secs(180);
 
 /// How long the tunnel must be stable before promoting current bands to safe bands.
 const SAFE_PROMOTE_THRESHOLD: Duration = Duration::from_secs(300);
 
-/// Cooldowns per escalation level.
-const COOLDOWNS: [Duration; 4] = [
-    Duration::from_secs(60),  // Level 0: re-register (1 min)
-    Duration::from_secs(120), // Level 1: airplane cycle (2 min)
-    Duration::from_secs(120), // Level 2: iface restart (2 min)
-    Duration::from_secs(300), // Level 3: USB power cycle (5 min)
-];
+/// Light reset threshold — 90s of stable tunnel resets episode counters.
+const LIGHT_RESET_THRESHOLD: Duration = Duration::from_secs(90);
 
 /// Maximum L3 (USB cycle) attempts before entering dormant mode.
 const MAX_L3_ATTEMPTS: u32 = 3;
@@ -58,91 +57,286 @@ const MAX_L3_COOLDOWN: Duration = Duration::from_secs(1800);
 /// Dormant mode tick interval (15 min).
 const DORMANT_TICK_INTERVAL: Duration = Duration::from_secs(900);
 
-/// How long the modem can be stuck in CEREG=Searching before allowing USB cycle (10 min).
-const STUCK_SEARCHING_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long the modem can be Searching before we try an airplane cycle (3 min).
+const SEARCHING_ACTION_THRESHOLD: Duration = Duration::from_secs(180);
+
+/// Extended grace while modem is actively searching (3 min on top of base grace).
+const SEARCHING_GRACE_EXTENSION: Duration = Duration::from_secs(180);
 
 /// Number of consecutive AT failures before skipping to interface/USB reset.
 const AT_FAILURE_SKIP_THRESHOLD: u32 = 3;
 
-/// Internal watchdog state.
-#[allow(clippy::struct_excessive_bools)]
+/// How long after user activity (band change, scan) the watchdog is suppressed.
+const USER_ACTIVITY_SUPPRESSION: Duration = Duration::from_secs(120);
+
+/// Per-episode action caps.
+const MAX_REREGISTERS_PER_EPISODE: u32 = 1;
+const MAX_IFACE_RESTARTS_PER_EPISODE: u32 = 2;
+const MAX_AIRPLANE_CYCLES_PER_EPISODE: u32 = 2;
+
+/// Maximum recent events in the snapshot.
+const MAX_SNAPSHOT_EVENTS: usize = 20;
+
+// ── Symptom diagnosis ──────────────────────────────────────────────────────
+
+/// What the watchdog thinks is wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Symptom {
+    /// CEREG=2, modem scanning for a cell (likely roaming handover).
+    Searching { secs: u64 },
+    /// CEREG=1|5 but connection state is NOCONN (registered, no QMI bearer).
+    RegisteredNoData,
+    /// CEREG=0|3, modem gave up searching.
+    NotRegistered,
+    /// AT commands are failing.
+    Unresponsive,
+    /// Has IP + internet reachable, but tunnel is down (relay/app problem).
+    RelayProblem,
+    /// Tunnel client is mid-reconnect and we have IP.
+    TunnelReconnecting,
+    /// Can't determine the cause.
+    Unknown,
+}
+
+impl Symptom {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Searching { .. } => "searching",
+            Self::RegisteredNoData => "registered_no_data",
+            Self::NotRegistered => "not_registered",
+            Self::Unresponsive => "unresponsive",
+            Self::RelayProblem => "relay_problem",
+            Self::TunnelReconnecting => "tunnel_reconnecting",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Diagnose the current problem by checking modem state, interface, and tunnel.
+async fn diagnose(
+    modem: &Modem,
+    lte_state: &Mutex<LteState>,
+    tunnel_stats: &TunnelStats,
+    interface: &str,
+    reachability_target: &str,
+    state: &WatchdogState,
+) -> (Symptom, Option<RegistrationStatus>) {
+    // Check modem responsiveness
+    let at_ok = modem.command("AT").await.is_ok();
+    if !at_ok {
+        return (Symptom::Unresponsive, None);
+    }
+
+    // Check if tunnel client is mid-reconnect with IP
+    if tunnel_stats.reconnecting.load(Ordering::Relaxed) && interface_has_ipv4(interface) {
+        return (Symptom::TunnelReconnecting, None);
+    }
+
+    // Check registration status
+    let reg_status = match modem.command("AT+CEREG?").await {
+        Ok(resp) => parse_cereg(&resp).ok(),
+        Err(_) => None,
+    };
+
+    if let Some(reg) = reg_status {
+        match reg {
+            RegistrationStatus::Searching => {
+                let searching_secs = state.searching_since.map_or(0, |s| s.elapsed().as_secs());
+                return (
+                    Symptom::Searching {
+                        secs: searching_secs,
+                    },
+                    Some(reg),
+                );
+            }
+            RegistrationStatus::NotRegistered | RegistrationStatus::Denied => {
+                return (Symptom::NotRegistered, Some(reg));
+            }
+            RegistrationStatus::RegisteredHome | RegistrationStatus::RegisteredRoam => {
+                // Registered — check data path
+                let is_noconn = {
+                    let lte = lte_state.lock().await;
+                    lte.signal
+                        .as_ref()
+                        .and_then(|s| s.connection_state.as_deref())
+                        == Some("NOCONN")
+                };
+                if is_noconn || !interface_has_ipv4(interface) {
+                    return (Symptom::RegisteredNoData, Some(reg));
+                }
+                // Has registration + IP — check internet reachability
+                if check_reachability(reachability_target).await {
+                    return (Symptom::RelayProblem, Some(reg));
+                }
+                // Internet not reachable despite registration + IP — unknown
+                return (Symptom::Unknown, Some(reg));
+            }
+            RegistrationStatus::Unknown => {}
+        }
+    }
+
+    (Symptom::Unknown, reg_status)
+}
+
+// ── Watchdog state ─────────────────────────────────────────────────────────
+
+/// Internal watchdog state — tracks the current disconnect episode.
 struct WatchdogState {
-    level: u8,
-    last_action_at: Option<Instant>,
     tunnel_disconnect_since: Option<Instant>,
+    tunnel_connected_since: Option<Instant>,
+    last_action_at: Option<Instant>,
+    last_symptom: Option<Symptom>,
+    last_action: Option<String>,
     consecutive_at_failures: u32,
-    /// Whether we've already tried a fresh-signal re-register this disconnect episode.
-    tried_fresh_reregister: bool,
-    /// Whether we've already tried reverting to pre-change bands this disconnect episode.
-    tried_prechange_revert: bool,
-    /// Whether we've already tried reverting to safe bands this disconnect episode.
-    tried_safe_revert: bool,
-    /// Whether we've already tried an interface restart for NOCONN this disconnect episode.
-    tried_noconn_fix: bool,
-    /// Number of L3 (USB cycle) attempts this disconnect episode.
+    /// Per-episode action counters (reset on recovery).
+    reregisters: u32,
+    iface_restarts: u32,
+    airplane_cycles: u32,
     l3_attempts: u32,
-    /// Whether watchdog has entered dormant mode (all escalation exhausted).
     dormant: bool,
-    /// Whether internet was reachable on last check (relay-wait mode).
-    internet_reachable: bool,
-    /// When internet reachability was last confirmed.
-    internet_reachable_since: Option<Instant>,
     /// When the modem first entered CEREG=Searching (for stuck-searching detection).
     searching_since: Option<Instant>,
+    /// Whether we've already tried reverting to pre-change bands this episode.
+    tried_prechange_revert: bool,
+    /// Whether we've already tried reverting to safe bands this episode.
+    tried_safe_revert: bool,
+    /// Actions taken this episode, for the snapshot.
+    episode_actions: Vec<String>,
 }
 
 impl WatchdogState {
     fn new() -> Self {
         Self {
-            level: 0,
-            last_action_at: None,
             tunnel_disconnect_since: None,
+            tunnel_connected_since: None,
+            last_action_at: None,
+            last_symptom: None,
+            last_action: None,
             consecutive_at_failures: 0,
-            tried_fresh_reregister: false,
-            tried_prechange_revert: false,
-            tried_safe_revert: false,
-            tried_noconn_fix: false,
+            reregisters: 0,
+            iface_restarts: 0,
+            airplane_cycles: 0,
             l3_attempts: 0,
             dormant: false,
-            internet_reachable: false,
-            internet_reachable_since: None,
             searching_since: None,
+            tried_prechange_revert: false,
+            tried_safe_revert: false,
+            episode_actions: Vec::new(),
         }
     }
 
-    fn reset(&mut self) {
-        self.level = 0;
-        self.last_action_at = None;
+    /// Light reset: clear episode counters but preserve L3 attempts and dormant state.
+    fn light_reset(&mut self) {
         self.tunnel_disconnect_since = None;
+        self.last_action_at = None;
         self.consecutive_at_failures = 0;
-        self.tried_fresh_reregister = false;
+        self.reregisters = 0;
+        self.iface_restarts = 0;
+        self.airplane_cycles = 0;
         self.tried_prechange_revert = false;
         self.tried_safe_revert = false;
-        self.tried_noconn_fix = false;
-        self.l3_attempts = 0;
-        self.dormant = false;
-        self.internet_reachable = false;
-        self.internet_reachable_since = None;
         self.searching_since = None;
+        self.episode_actions.clear();
     }
 
-    fn cooldown_elapsed(&self) -> bool {
+    /// Heavy reset: clear everything including L3 attempts and dormant state.
+    fn heavy_reset(&mut self) {
+        self.light_reset();
+        self.l3_attempts = 0;
+        self.dormant = false;
+    }
+
+    fn cooldown_elapsed(&self, level: u8) -> bool {
         let Some(last) = self.last_action_at else {
             return true;
         };
         if self.dormant {
             return last.elapsed() >= DORMANT_TICK_INTERVAL;
         }
-        // L3 uses exponential backoff: 300s, 600s, 1200s, capped at 1800s
-        if self.level >= 3 && self.l3_attempts > 0 {
+        if level >= 3 && self.l3_attempts > 0 {
             let backoff =
                 Duration::from_secs(300 * 2u64.pow(self.l3_attempts.min(3))).min(MAX_L3_COOLDOWN);
             return last.elapsed() >= backoff;
         }
-        let idx = (self.level as usize).min(COOLDOWNS.len() - 1);
-        last.elapsed() >= COOLDOWNS[idx]
+        // Default cooldown: 60s for most actions, 120s for airplane/iface
+        let cooldown = match level {
+            0 => Duration::from_secs(60),
+            1 | 2 => Duration::from_secs(120),
+            _ => Duration::from_secs(300),
+        };
+        last.elapsed() >= cooldown
+    }
+
+    fn record_action(&mut self, action: &str) {
+        self.last_action_at = Some(Instant::now());
+        self.last_action = Some(action.to_string());
+        self.episode_actions.push(action.to_string());
     }
 }
+
+// ── Watchdog snapshot for API visibility ───────────────────────────────────
+
+/// A single watchdog event for the snapshot log.
+#[derive(Debug, Clone, Serialize)]
+pub struct WatchdogEvent {
+    pub timestamp: u64,
+    pub symptom: String,
+    pub action: String,
+    pub detail: String,
+}
+
+/// Watchdog state snapshot, updated every tick. Exposed via `/api/lte`.
+#[derive(Debug, Clone, Serialize)]
+pub struct WatchdogSnapshot {
+    pub state: String,
+    pub disconnect_secs: Option<u64>,
+    pub last_symptom: Option<String>,
+    pub last_action: Option<String>,
+    pub last_action_secs_ago: Option<u64>,
+    pub l3_attempts: u32,
+    pub episode_actions: Vec<String>,
+    pub recent_events: VecDeque<WatchdogEvent>,
+}
+
+impl WatchdogSnapshot {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: "idle".into(),
+            disconnect_secs: None,
+            last_symptom: None,
+            last_action: None,
+            last_action_secs_ago: None,
+            l3_attempts: 0,
+            episode_actions: Vec::new(),
+            recent_events: VecDeque::with_capacity(MAX_SNAPSHOT_EVENTS),
+        }
+    }
+
+    fn push_event(&mut self, symptom: &str, action: &str, detail: &str) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if self.recent_events.len() >= MAX_SNAPSHOT_EVENTS {
+            self.recent_events.pop_front();
+        }
+        self.recent_events.push_back(WatchdogEvent {
+            timestamp,
+            symptom: symptom.into(),
+            action: action.into(),
+            detail: detail.into(),
+        });
+    }
+}
+
+impl Default for WatchdogSnapshot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Registration status parsing ────────────────────────────────────────────
 
 /// EPS network registration status from AT+CEREG?.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,8 +402,9 @@ pub fn parse_cereg(response: &str) -> Result<RegistrationStatus, String> {
     })
 }
 
+// ── Helper functions ───────────────────────────────────────────────────────
+
 /// Read current band config from modem. Returns (bands, priority).
-/// Only returns `None` if we can't read bands at all — bandpri is best-effort.
 async fn read_current_bands(modem: &Modem) -> Option<(Vec<u16>, Option<u16>)> {
     let band_resp = modem.command("AT+QCFG=\"band\"").await.ok()?;
     let bands = crate::lte::parse_band_config(&band_resp);
@@ -225,9 +420,6 @@ async fn read_current_bands(modem: &Modem) -> Option<(Vec<u16>, Option<u16>)> {
 }
 
 /// Apply a band config via AT commands with COPS re-registration and data path verification.
-/// Returns true if bands were applied AND data connectivity (IPv4) was confirmed.
-/// Rejects empty band lists to prevent accidentally disabling all LTE bands.
-/// Skips destructive COPS commands if tunnel reconnects mid-apply.
 async fn apply_band_config(
     modem: &Modem,
     bands: &[u16],
@@ -239,10 +431,12 @@ async fn apply_band_config(
         warn!("LTE watchdog: refusing to apply empty band config");
         return false;
     }
-    let hex = crate::lte::bands_to_hex(bands);
-    let cmd = format!("AT+QCFG=\"band\",0x260,{hex},0");
-    if modem.command(&cmd).await.is_err() {
-        return false;
+    match crate::lte::verified_set_bands(modem, bands).await {
+        Ok(actual) => info!("LTE watchdog: bands set and verified: {actual:?}"),
+        Err(e) => {
+            warn!("LTE watchdog: band write failed: {e}");
+            return false;
+        }
     }
     if let Some(pri) = priority {
         let _ = modem.command(&format!("AT+QCFG=\"bandpri\",{pri}")).await;
@@ -250,18 +444,15 @@ async fn apply_band_config(
         let _ = modem.command("AT+QCFG=\"bandpri\",0").await;
     }
 
-    // Skip destructive COPS re-registration if tunnel reconnected
     if tunnel_stats.connected.load(Ordering::Relaxed) {
         info!("apply_band_config: tunnel connected, skipping re-registration (bands set)");
         return false;
     }
 
-    // Force re-registration on new bands
     let _ = modem.command("AT+COPS=2").await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     let _ = modem.command("AT+COPS=0").await;
 
-    // Wait for registration (up to 30s), abort if tunnel reconnects
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(30) {
         if tunnel_stats.connected.load(Ordering::Relaxed) {
@@ -271,14 +462,12 @@ async fn apply_band_config(
         if let Ok(resp) = modem.command("AT+CEREG?").await {
             if let Ok(status) = parse_cereg(&resp) {
                 if status.is_registered() {
-                    // Registered — check for IPv4
                     for _ in 0..5 {
                         if interface_has_ipv4(interface) {
                             return true;
                         }
                         tokio::time::sleep(Duration::from_secs(2)).await;
                     }
-                    // No IPv4 — nudge interface
                     action_restart_interface(interface, false, None).await;
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     return interface_has_ipv4(interface);
@@ -299,8 +488,10 @@ fn fmt_bands(bands: &[u16]) -> String {
         .join(",")
 }
 
+// ── Main watchdog loop ─────────────────────────────────────────────────────
+
 /// Spawn the LTE watchdog task. Returns a `JoinHandle` for abort on shutdown.
-#[allow(clippy::needless_pass_by_value)] // config is moved into spawned task
+#[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn spawn_lte_watchdog(
     modem: Modem,
@@ -311,22 +502,24 @@ pub fn spawn_lte_watchdog(
     config: LteConfig,
     data_dir: String,
     tunnel_url: Option<String>,
+    snapshot: Arc<Mutex<WatchdogSnapshot>>,
 ) -> tokio::task::JoinHandle<()> {
     let interface = config.interface.clone();
     let device_path = config.device.clone();
     let reachability_host = config.reachability_host.clone();
     let interface_restart_cmd = config.interface_restart_cmd.clone();
     let openwrt = is_openwrt();
+    let grace = Duration::from_secs(config.watchdog_grace_secs);
 
     tokio::spawn(async move {
         let mut modem = modem;
-        // Determine reachability target: config override > relay host > 8.8.8.8
         let reachability_target = reachability_host
             .or_else(|| tunnel_url.as_deref().and_then(extract_relay_host))
             .unwrap_or_else(|| "8.8.8.8".to_string());
         info!(
             "LTE watchdog started (interface: {interface}, reachability: {reachability_target}, \
-             openwrt: {openwrt})"
+             grace: {}s, openwrt: {openwrt})",
+            grace.as_secs()
         );
 
         let mut state = WatchdogState::new();
@@ -335,12 +528,18 @@ pub fn spawn_lte_watchdog(
         loop {
             ticker.tick().await;
 
-            // Skip watchdog actions while a band scan is running or a manual
-            // band change is in progress (band_action_until).
-            // Safety valve: if a scan has been running > 30 min, force-clear it
-            // so the watchdog can recover connectivity.
-            {
+            // ── Skip while scan running or manual band change in progress ──
+            let skip_tick = {
+                let lock_started = Instant::now();
                 let mut lte = lte_state.lock().await;
+                #[allow(clippy::cast_possible_truncation)]
+                let lock_wait_ms = lock_started.elapsed().as_millis() as u64;
+                if lock_wait_ms >= 100 {
+                    warn!(
+                        lock_wait_ms,
+                        "LTE watchdog: slow lte_state lock in skip_tick"
+                    );
+                }
                 if let Some(ref scan) = lte.scan_status {
                     if scan.state == "running" {
                         let now_epoch = std::time::SystemTime::now()
@@ -354,46 +553,81 @@ pub fn spawn_lte_watchdog(
                                 completed_at: Some(now_epoch),
                                 ..scan.clone()
                             });
+                            false
                         } else {
-                            continue;
+                            true
                         }
+                    } else {
+                        false
                     }
+                } else if let Some(until) = lte.band_action_until {
+                    Instant::now() < until
+                } else {
+                    false
                 }
-                if let Some(until) = lte.band_action_until {
-                    if Instant::now() < until {
-                        continue;
-                    }
-                }
+            };
+            if skip_tick {
+                update_snapshot(&snapshot, &state, "suppressed_scan").await;
+                continue;
+            }
+
+            // ── User activity suppression ──
+            let user_suppressed = {
+                let lte = lte_state.lock().await;
+                lte.last_user_action_at
+                    .is_some_and(|t| t.elapsed() < USER_ACTIVITY_SUPPRESSION)
+            };
+            if user_suppressed {
+                update_snapshot(&snapshot, &state, "suppressed_user").await;
+                continue;
             }
 
             let tunnel_connected = tunnel_stats.connected.load(Ordering::Relaxed);
 
-            // ── Tunnel connected path: track stability for safe-bands promotion ──
+            // ── Tunnel connected: track stability + safe-bands promotion ──
             if tunnel_connected {
-                if state.tunnel_disconnect_since.is_some() {
-                    let was_dormant = state.dormant;
-                    let saved_l3_attempts = state.l3_attempts;
-                    info!("LTE watchdog: tunnel reconnected, resetting escalation");
-                    state.reset();
-                    if was_dormant {
-                        state.l3_attempts = saved_l3_attempts;
-                    }
+                if state.tunnel_connected_since.is_none() {
+                    state.tunnel_connected_since = Some(Instant::now());
+                }
 
-                    // Check for exhaustion report to emit on reconnect
-                    if was_dormant || check_exhaustion_file(&data_dir) {
-                        emit_watchdog_report(&data_dir, &session_events);
+                let connected_duration = state
+                    .tunnel_connected_since
+                    .map_or(Duration::ZERO, |s| s.elapsed());
+
+                // Tiered reset: light at 90s, heavy at 300s
+                if state.tunnel_disconnect_since.is_some() {
+                    if connected_duration >= SAFE_PROMOTE_THRESHOLD {
+                        let was_dormant = state.dormant;
+                        info!("LTE watchdog: tunnel stable for 5+ min, heavy reset");
+                        state.heavy_reset();
+
+                        if was_dormant || check_exhaustion_file(&data_dir) {
+                            emit_watchdog_report(&data_dir, &session_events);
+                        }
+                    } else if connected_duration >= LIGHT_RESET_THRESHOLD {
+                        info!("LTE watchdog: tunnel stable for 90s, light reset");
+                        let saved_l3 = state.l3_attempts;
+                        let saved_dormant = state.dormant;
+                        state.light_reset();
+                        state.l3_attempts = saved_l3;
+                        state.dormant = saved_dormant;
                     }
                 }
 
-                // Safe-bands promotion: if tunnel has been stable for 5+ min,
-                // promote current bands to safe_bands.
-                // Uses cached band config from the LTE poller's last reading
-                // to avoid running AT commands while the tunnel is connected.
+                // Safe-bands promotion (uses cached band config, no AT commands)
                 {
+                    let lock_started = Instant::now();
                     let mut lte = lte_state.lock().await;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let lock_wait_ms = lock_started.elapsed().as_millis() as u64;
+                    if lock_wait_ms >= 100 {
+                        warn!(
+                            lock_wait_ms,
+                            "LTE watchdog: slow lte_state lock in connected path"
+                        );
+                    }
                     if lte.band_stable_since.is_none() {
                         lte.band_stable_since = Some(Instant::now());
-                        // Snapshot bands from cached signal data (last poller reading)
                         if lte.bands_at_connect.is_none() {
                             if let Some(ref sig) = lte.signal {
                                 if let Some(ref bc) = sig.band_config {
@@ -412,7 +646,6 @@ pub fn spawn_lte_watchdog(
                             };
                             if needs_promote {
                                 if let Some(ref current_bands) = lte.bands_at_connect.clone() {
-                                    // Use cached priority and RSRP from signal data
                                     let priority = lte
                                         .signal
                                         .as_ref()
@@ -432,49 +665,62 @@ pub fn spawn_lte_watchdog(
                                     );
                                 }
                             }
-                            // Reset stability tracking — promotion done or not needed
                             lte.band_stable_since = None;
                             lte.bands_at_connect = None;
                         }
                     }
                 }
+
+                update_snapshot(&snapshot, &state, "connected").await;
                 continue;
             }
 
             // ── Tunnel disconnected path ──
 
-            // Clear stability tracking on disconnect
+            state.tunnel_connected_since = None;
             {
                 let mut lte = lte_state.lock().await;
                 lte.band_stable_since = None;
                 lte.bands_at_connect = None;
             }
 
-            // Track disconnect start
             if state.tunnel_disconnect_since.is_none() {
                 state.tunnel_disconnect_since = Some(Instant::now());
             }
 
-            // Wait for grace period before acting
             let disconnect_duration = state
                 .tunnel_disconnect_since
                 .map_or(Duration::ZERO, |t| t.elapsed());
-            if disconnect_duration < DISCONNECT_GRACE {
+            let disconnect_secs = disconnect_duration.as_secs();
+
+            // ── Grace period ──
+            // Base grace is configurable (default 120s).
+            // Extended by 180s while modem is actively searching (roaming handover).
+            let effective_grace = if modem
+                .command("AT+CEREG?")
+                .await
+                .ok()
+                .and_then(|r| parse_cereg(&r).ok())
+                .is_some_and(|s| s == RegistrationStatus::Searching)
+            {
+                // Track searching start time
+                if state.searching_since.is_none() {
+                    state.searching_since = Some(Instant::now());
+                    info!("LTE watchdog: modem searching (roaming handover?), extending grace");
+                }
+                grace + SEARCHING_GRACE_EXTENSION
+            } else {
+                state.searching_since = None;
+                grace
+            };
+
+            if disconnect_duration < effective_grace {
+                update_snapshot(&snapshot, &state, "grace").await;
                 continue;
             }
 
-            // Check modem responsiveness with a lightweight AT command.
-            // The tunnel is already down, so AT commands can't make things worse.
-            // This replaces the old signal_stale check which depended on the
-            // background poller (now disabled while tunnel is connected).
-            let modem_responsive = modem.command("AT").await.is_ok();
-
-            let disconnect_secs = disconnect_duration.as_secs();
-
-            // ── Pre-change revert: if a band change happened within 3min, revert ──
-            // Skip if the tunnel was already down before the band change — the user
-            // likely changed bands trying to fix it, so reverting would undo their fix.
-            if modem_responsive && !state.tried_prechange_revert {
+            // ── Pre-change revert (before diagnosis) ──
+            if !state.tried_prechange_revert {
                 let revert_info = {
                     let lte = lte_state.lock().await;
                     match (&lte.last_band_change_at, &lte.pre_change_bands) {
@@ -507,47 +753,52 @@ pub fn spawn_lte_watchdog(
                     )
                     .await
                     {
-                        // Record this as a watchdog change (doesn't overwrite pre_change_bands)
                         {
                             let mut lte = lte_state.lock().await;
                             lte.record_band_change(
                                 BandChangeSource::Watchdog,
-                                &[], // don't care about "from" for watchdog
+                                &[],
                                 None,
                                 &revert_bands,
                             );
                         }
 
                         let detail = format!(
-                            "level=0.5 action=prechange_revert bands={} disconnect={disconnect_secs}s",
+                            "action=prechange_revert bands={} disconnect={disconnect_secs}s",
                             fmt_bands(&revert_bands)
                         );
-                        info!("LTE watchdog: {detail}");
-                        tunnel_stats
-                            .push_event(TunnelEventType::WatchdogAction, detail)
-                            .await;
-                        let _ = session_events.send(serde_json::json!({
-                            "type": "lte.watchdog",
-                            "level": 0,
-                            "action": "prechange_revert",
-                            "bands": revert_bands,
-                            "disconnect_secs": disconnect_secs,
-                        }));
+                        log_action(
+                            &detail,
+                            &tunnel_stats,
+                            &session_events,
+                            &mut state,
+                            "prechange_revert",
+                            0,
+                            disconnect_secs,
+                        )
+                        .await;
+                        update_snapshot_event(
+                            &snapshot,
+                            &mut state,
+                            "prechange_revert",
+                            "prechange_revert",
+                            &detail,
+                        )
+                        .await;
 
-                        // Wait for registration + tunnel recovery
                         tokio::time::sleep(Duration::from_secs(10)).await;
                         if verify_recovery(&interface, &tunnel_stats, Duration::from_secs(30)).await
                         {
                             info!("LTE watchdog: prechange_revert recovered tunnel");
-                            state.reset();
+                            state.light_reset();
                             continue;
                         }
                     }
                 }
             }
 
-            // ── Safe-bands revert: if safe bands exist and differ from current config ──
-            if modem_responsive && !state.tried_safe_revert {
+            // ── Safe-bands revert ──
+            if !state.tried_safe_revert {
                 let revert_info = {
                     let lte = lte_state.lock().await;
                     lte.safe_bands
@@ -556,7 +807,6 @@ pub fn spawn_lte_watchdog(
                 };
 
                 if let Some((safe_bands, safe_priority)) = revert_info {
-                    // Check if current config differs from safe config
                     let current = read_current_bands(&modem).await;
                     let differs = match &current {
                         Some((bands, _)) => *bands != safe_bands,
@@ -591,27 +841,34 @@ pub fn spawn_lte_watchdog(
                             }
 
                             let detail = format!(
-                                "level=0.5 action=safe_revert bands={} disconnect={disconnect_secs}s",
+                                "action=safe_revert bands={} disconnect={disconnect_secs}s",
                                 fmt_bands(&safe_bands)
                             );
-                            info!("LTE watchdog: {detail}");
-                            tunnel_stats
-                                .push_event(TunnelEventType::WatchdogAction, detail)
-                                .await;
-                            let _ = session_events.send(serde_json::json!({
-                                "type": "lte.watchdog",
-                                "level": 0,
-                                "action": "safe_revert",
-                                "bands": safe_bands,
-                                "disconnect_secs": disconnect_secs,
-                            }));
+                            log_action(
+                                &detail,
+                                &tunnel_stats,
+                                &session_events,
+                                &mut state,
+                                "safe_revert",
+                                0,
+                                disconnect_secs,
+                            )
+                            .await;
+                            update_snapshot_event(
+                                &snapshot,
+                                &mut state,
+                                "safe_revert",
+                                "safe_revert",
+                                &detail,
+                            )
+                            .await;
 
                             tokio::time::sleep(Duration::from_secs(10)).await;
                             if verify_recovery(&interface, &tunnel_stats, Duration::from_secs(30))
                                 .await
                             {
                                 info!("LTE watchdog: safe_revert recovered tunnel");
-                                state.reset();
+                                state.light_reset();
                                 continue;
                             }
                         }
@@ -619,194 +876,179 @@ pub fn spawn_lte_watchdog(
                 }
             }
 
-            // ── NOCONN fix: registered but no data bearer ──
-            // Interface restart (ifdown/ifup) re-establishes the QMI data session.
-            // Don't wait for signal staleness — NOCONN means the radio is fine but
-            // the data path is broken.
-            if !state.tried_noconn_fix && disconnect_duration > Duration::from_secs(90) {
-                let is_noconn = {
-                    let lte = lte_state.lock().await;
-                    lte.signal
-                        .as_ref()
-                        .and_then(|s| s.connection_state.as_deref())
-                        == Some("NOCONN")
-                };
+            // ── Diagnose the problem ──
+            let (symptom, reg_status) = diagnose(
+                &modem,
+                &lte_state,
+                &tunnel_stats,
+                &interface,
+                &reachability_target,
+                &state,
+            )
+            .await;
 
-                if is_noconn {
-                    info!("LTE watchdog: NOCONN — restarting interface for QMI data session");
-                    action_restart_interface(&interface, openwrt, interface_restart_cmd.as_deref())
-                        .await;
-                    state.tried_noconn_fix = true;
+            state.last_symptom = Some(symptom);
+            let reg_str = reg_status.map_or("unknown", |s| s.as_str());
 
-                    let detail = format!("action=noconn_fix disconnect={disconnect_secs}s");
-                    info!("LTE watchdog: {detail}");
-                    tunnel_stats
-                        .push_event(TunnelEventType::WatchdogAction, detail)
-                        .await;
-                    let _ = session_events.send(serde_json::json!({
-                        "type": "lte.watchdog",
-                        "level": 0,
-                        "action": "noconn_fix",
-                        "disconnect_secs": disconnect_secs,
-                    }));
-
-                    // Verify recovery
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    if verify_recovery(&interface, &tunnel_stats, Duration::from_secs(30)).await {
-                        info!("LTE watchdog: noconn_fix recovered tunnel");
-                        state.reset();
-                        continue;
-                    }
-                    // If interface restart didn't fix it, fall through to standard escalation
-                }
-            }
-
-            // ── Reachability check: is the problem the modem or the relay? ──
-            // Before escalating past L0, check if we can reach the internet.
-            // If internet works but tunnel is down, the modem is fine — skip escalation.
-            if modem_responsive && interface_has_ipv4(&interface) && state.level > 0 {
-                let reachable = check_reachability(&reachability_target).await;
-                if reachable {
-                    if !state.internet_reachable {
-                        info!(
-                            "LTE watchdog: internet reachable ({reachability_target}), \
-                             problem is relay/app — pausing modem escalation"
-                        );
-                        state.internet_reachable = true;
-                        state.internet_reachable_since = Some(Instant::now());
-                    }
-                    // Internet works — don't cycle the modem, just wait
-                    continue;
-                }
-                // Internet not reachable — clear the flag and proceed with escalation
-                if state.internet_reachable {
-                    info!("LTE watchdog: internet no longer reachable, resuming escalation");
-                    state.internet_reachable = false;
-                    state.internet_reachable_since = None;
-                }
-            }
-
-            // ── Standard escalation (L0-L3) ──
-
-            // Skip L2+ (interface/USB actions) while tunnel client is mid-reconnect
-            // and we still have IP connectivity — disrupting the modem would kill
-            // the reconnection attempt.
-            if state.level >= 2
-                && tunnel_stats.reconnecting.load(Ordering::Relaxed)
-                && interface_has_ipv4(&interface)
-            {
-                info!(
-                    "LTE watchdog: tunnel reconnecting with IP, skipping L{} action",
-                    state.level
-                );
-                continue;
-            }
-
-            // Only escalate if signal is stale/missing — if signal is fresh,
-            // the problem is likely not the modem (could be relay down, DNS, etc.)
-            // Exception: allow one L0 re-register per disconnect episode after 2min
-            if modem_responsive && state.level == 0 {
-                if disconnect_duration < Duration::from_secs(120) || state.tried_fresh_reregister {
-                    continue;
-                }
-                state.tried_fresh_reregister = true;
-            }
-
-            // Check cooldown
-            if !state.cooldown_elapsed() {
-                continue;
-            }
-
-            // If AT commands keep failing, skip directly to interface/USB reset
-            let effective_level =
-                if state.consecutive_at_failures >= AT_FAILURE_SKIP_THRESHOLD && state.level < 2 {
-                    warn!(
-                        "LTE watchdog: {} consecutive AT failures, skipping to level 2",
-                        state.consecutive_at_failures
-                    );
-                    state.level = 2;
-                    2
-                } else {
-                    state.level
-                };
-
-            // Check registration status for diagnostics
-            let reg_status = match modem.command("AT+CEREG?").await {
-                Ok(resp) => match parse_cereg(&resp) {
-                    Ok(s) => {
-                        state.consecutive_at_failures = 0;
-                        Some(s)
-                    }
-                    Err(e) => {
-                        warn!("LTE watchdog: CEREG parse error: {e}");
-                        None
-                    }
-                },
-                Err(e) => {
-                    state.consecutive_at_failures += 1;
-                    warn!(
-                        "LTE watchdog: CEREG failed ({e}), AT failures: {}",
-                        state.consecutive_at_failures
-                    );
-                    None
-                }
-            };
-
-            let reg_str = reg_status.map_or("at_error", |s| s.as_str());
-
-            // Skip L3 (USB cycle) when modem is actively searching for a cell,
-            // unless it's been stuck searching for too long (hardware fault).
-            if effective_level >= 3 {
-                if let Some(RegistrationStatus::Searching) = reg_status {
-                    let searching_elapsed = state
-                        .searching_since
-                        .get_or_insert(Instant::now())
-                        .elapsed();
-                    if searching_elapsed < STUCK_SEARCHING_TIMEOUT {
+            // ── Symptom-based dispatch ──
+            let (action, level, new_modem): (&str, u8, Option<Modem>) = match symptom {
+                Symptom::Searching { secs } => {
+                    if secs < SEARCHING_ACTION_THRESHOLD.as_secs() {
                         let detail = format!(
-                            "level=3 action=skip_searching reg=searching \
-                             disconnect={disconnect_secs}s modem_responsive={modem_responsive} \
-                             searching_secs={}",
-                            searching_elapsed.as_secs()
+                            "symptom=searching secs={secs} action=wait disconnect={disconnect_secs}s"
                         );
-                        info!(
-                            "LTE watchdog: CEREG=Searching, skipping USB cycle (modem is scanning)"
-                        );
-                        tunnel_stats
-                            .push_event(TunnelEventType::WatchdogAction, detail)
+                        info!("LTE watchdog: modem searching ({secs}s), waiting");
+                        update_snapshot_event(&snapshot, &mut state, "searching", "wait", &detail)
                             .await;
-                        let _ = session_events.send(serde_json::json!({
-                            "type": "lte.watchdog",
-                            "level": 3,
-                            "action": "skip_searching",
-                            "registration": "searching",
-                            "disconnect_secs": disconnect_secs,
-                            "modem_responsive": modem_responsive,
-                            "searching_secs": searching_elapsed.as_secs(),
-                        }));
-                        state.last_action_at = Some(Instant::now());
+                        update_snapshot(&snapshot, &state, "waiting").await;
                         continue;
                     }
-                    info!(
-                        "LTE watchdog: CEREG=Searching for {}s, allowing USB cycle",
-                        searching_elapsed.as_secs()
-                    );
-                    state.searching_since = None;
-                } else {
-                    state.searching_since = None;
+                    // Stuck searching — try airplane cycle
+                    if state.airplane_cycles >= MAX_AIRPLANE_CYCLES_PER_EPISODE {
+                        info!("LTE watchdog: searching too long, airplane cap reached");
+                        update_snapshot(&snapshot, &state, "acting").await;
+                        // Fall through to USB cycle below
+                        if !state.cooldown_elapsed(3) {
+                            continue;
+                        }
+                        let result = action_usb_power_cycle(&device_path).await;
+                        (result.0, 3, result.1)
+                    } else if !state.cooldown_elapsed(1) {
+                        continue;
+                    } else {
+                        state.airplane_cycles += 1;
+                        (action_airplane_cycle(&modem, &mut state).await, 1, None)
+                    }
                 }
-            }
 
-            // Execute recovery action
-            let (action, new_modem): (&str, Option<Modem>) = match effective_level {
-                0 => (action_reregister(&modem, &mut state).await, None),
-                1 => (action_airplane_cycle(&modem, &mut state).await, None),
-                2 => (
-                    action_restart_interface(&interface, openwrt, interface_restart_cmd.as_deref())
-                        .await,
-                    None,
-                ),
-                _ => action_usb_power_cycle(&device_path).await,
+                Symptom::RegisteredNoData => {
+                    // Interface restart is the right fix — skip straight to it
+                    if state.iface_restarts >= MAX_IFACE_RESTARTS_PER_EPISODE {
+                        // Exhausted iface restarts, try airplane cycle
+                        if state.airplane_cycles >= MAX_AIRPLANE_CYCLES_PER_EPISODE {
+                            if !state.cooldown_elapsed(3) {
+                                continue;
+                            }
+                            let result = action_usb_power_cycle(&device_path).await;
+                            (result.0, 3, result.1)
+                        } else if !state.cooldown_elapsed(1) {
+                            continue;
+                        } else {
+                            state.airplane_cycles += 1;
+                            (action_airplane_cycle(&modem, &mut state).await, 1, None)
+                        }
+                    } else if !state.cooldown_elapsed(2) {
+                        continue;
+                    } else {
+                        state.iface_restarts += 1;
+                        info!("LTE watchdog: NOCONN — restarting interface for QMI data session");
+                        (
+                            action_restart_interface(
+                                &interface,
+                                openwrt,
+                                interface_restart_cmd.as_deref(),
+                            )
+                            .await,
+                            2,
+                            None,
+                        )
+                    }
+                }
+
+                Symptom::NotRegistered => {
+                    if state.reregisters < MAX_REREGISTERS_PER_EPISODE {
+                        if !state.cooldown_elapsed(0) {
+                            continue;
+                        }
+                        state.reregisters += 1;
+                        (action_reregister(&modem, &mut state).await, 0, None)
+                    } else if state.airplane_cycles < MAX_AIRPLANE_CYCLES_PER_EPISODE {
+                        if !state.cooldown_elapsed(1) {
+                            continue;
+                        }
+                        state.airplane_cycles += 1;
+                        (action_airplane_cycle(&modem, &mut state).await, 1, None)
+                    } else {
+                        if !state.cooldown_elapsed(3) {
+                            continue;
+                        }
+                        let result = action_usb_power_cycle(&device_path).await;
+                        (result.0, 3, result.1)
+                    }
+                }
+
+                Symptom::Unresponsive => {
+                    state.consecutive_at_failures += 1;
+                    if state.consecutive_at_failures < AT_FAILURE_SKIP_THRESHOLD {
+                        if state.iface_restarts < MAX_IFACE_RESTARTS_PER_EPISODE {
+                            if !state.cooldown_elapsed(2) {
+                                continue;
+                            }
+                            state.iface_restarts += 1;
+                            (
+                                action_restart_interface(
+                                    &interface,
+                                    openwrt,
+                                    interface_restart_cmd.as_deref(),
+                                )
+                                .await,
+                                2,
+                                None,
+                            )
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        if !state.cooldown_elapsed(3) {
+                            continue;
+                        }
+                        let result = action_usb_power_cycle(&device_path).await;
+                        (result.0, 3, result.1)
+                    }
+                }
+
+                Symptom::RelayProblem => {
+                    info!(
+                        "LTE watchdog: internet reachable, problem is relay/app — not acting \
+                         (disconnect={disconnect_secs}s)"
+                    );
+                    update_snapshot_event(
+                        &snapshot,
+                        &mut state,
+                        "relay_problem",
+                        "wait",
+                        &format!("symptom=relay_problem disconnect={disconnect_secs}s"),
+                    )
+                    .await;
+                    update_snapshot(&snapshot, &state, "waiting").await;
+                    continue;
+                }
+
+                Symptom::TunnelReconnecting => {
+                    info!(
+                        "LTE watchdog: tunnel reconnecting with IP, not acting \
+                         (disconnect={disconnect_secs}s)"
+                    );
+                    update_snapshot(&snapshot, &state, "waiting").await;
+                    continue;
+                }
+
+                Symptom::Unknown => {
+                    // Unknown after grace — try airplane cycle, then escalate
+                    if state.airplane_cycles < MAX_AIRPLANE_CYCLES_PER_EPISODE {
+                        if !state.cooldown_elapsed(1) {
+                            continue;
+                        }
+                        state.airplane_cycles += 1;
+                        (action_airplane_cycle(&modem, &mut state).await, 1, None)
+                    } else {
+                        if !state.cooldown_elapsed(3) {
+                            continue;
+                        }
+                        let result = action_usb_power_cycle(&device_path).await;
+                        (result.0, 3, result.1)
+                    }
+                }
             };
 
             // Handle modem replacement after USB cycle
@@ -816,29 +1058,31 @@ pub fn spawn_lte_watchdog(
                 info!("LTE watchdog: modem handle refreshed via watch channel");
             }
 
+            // Reset AT failure counter on successful action (not Unresponsive)
+            if symptom != Symptom::Unresponsive {
+                state.consecutive_at_failures = 0;
+            }
+
             let detail = format!(
-                "level={effective_level} action={action} reg={reg_str} \
-                 disconnect={disconnect_secs}s modem_responsive={modem_responsive}"
+                "symptom={} level={level} action={action} reg={reg_str} \
+                 disconnect={disconnect_secs}s",
+                symptom.as_str()
             );
 
-            info!("LTE watchdog: {detail}");
+            log_action(
+                &detail,
+                &tunnel_stats,
+                &session_events,
+                &mut state,
+                action,
+                level,
+                disconnect_secs,
+            )
+            .await;
+            update_snapshot_event(&snapshot, &mut state, symptom.as_str(), action, &detail).await;
 
-            tunnel_stats
-                .push_event(TunnelEventType::WatchdogAction, detail.clone())
-                .await;
-
-            let _ = session_events.send(serde_json::json!({
-                "type": "lte.watchdog",
-                "level": effective_level,
-                "action": action,
-                "registration": reg_str,
-                "disconnect_secs": disconnect_secs,
-                "modem_responsive": modem_responsive,
-            }));
-
-            // Implicit interface nudge after radio recovery (L0/L1):
-            // modem may be registered but QMI data session didn't restart
-            if effective_level <= 1 {
+            // Implicit interface nudge after radio recovery (L0/L1)
+            if level <= 1 {
                 tokio::time::sleep(Duration::from_secs(15)).await;
                 if !interface_has_ipv4(&interface) {
                     info!("LTE watchdog: registered but no IP, nudging {interface}");
@@ -847,8 +1091,8 @@ pub fn spawn_lte_watchdog(
                 }
             }
 
-            // Post-action verification: actively poll for recovery before escalating
-            let verify_timeout = match effective_level {
+            // Post-action recovery verification
+            let verify_timeout = match level {
                 0 | 2 => Duration::from_secs(30),
                 1 => Duration::from_secs(45),
                 _ => Duration::from_secs(60),
@@ -856,14 +1100,13 @@ pub fn spawn_lte_watchdog(
 
             if verify_recovery(&interface, &tunnel_stats, verify_timeout).await {
                 info!("LTE watchdog: recovery verified after {action}");
-                state.reset();
+                state.light_reset();
+                update_snapshot(&snapshot, &state, "recovered").await;
                 continue;
             }
 
-            state.last_action_at = Some(Instant::now());
-
-            // Track L3 attempts for exhaustion detection
-            if effective_level >= 3 {
+            // Track L3 attempts for exhaustion
+            if level >= 3 {
                 state.l3_attempts += 1;
                 if state.l3_attempts >= MAX_L3_ATTEMPTS {
                     warn!(
@@ -875,8 +1118,7 @@ pub fn spawn_lte_watchdog(
                     state.dormant = true;
 
                     let detail = format!(
-                        "WATCHDOG_EXHAUSTED l3_attempts={} disconnect={disconnect_secs}s \
-                         modem_responsive={modem_responsive}",
+                        "WATCHDOG_EXHAUSTED l3_attempts={} disconnect={disconnect_secs}s",
                         state.l3_attempts
                     );
                     tunnel_stats
@@ -886,26 +1128,80 @@ pub fn spawn_lte_watchdog(
                         "type": "lte.watchdog_exhausted",
                         "l3_attempts": state.l3_attempts,
                         "disconnect_secs": disconnect_secs,
-                        "modem_responsive": modem_responsive,
                     }));
 
-                    // Persist exhaustion state for post-mortem
                     persist_exhaustion_state(
                         &data_dir,
                         state.l3_attempts,
                         disconnect_secs,
-                        modem_responsive,
+                        symptom != Symptom::Unresponsive,
                         reg_str,
                     );
                 }
-            } else {
-                state.level = (effective_level + 1).min(3);
             }
+
+            update_snapshot(
+                &snapshot,
+                &state,
+                if state.dormant { "dormant" } else { "acting" },
+            )
+            .await;
         }
     })
 }
 
-/// Level 0: Force network re-registration via AT+COPS=0.
+// ── Snapshot update helpers ────────────────────────────────────────────────
+
+async fn update_snapshot(snapshot: &Mutex<WatchdogSnapshot>, state: &WatchdogState, status: &str) {
+    let mut snap = snapshot.lock().await;
+    snap.state = status.into();
+    snap.disconnect_secs = state.tunnel_disconnect_since.map(|t| t.elapsed().as_secs());
+    snap.last_symptom = state.last_symptom.map(|s| s.as_str().into());
+    snap.last_action.clone_from(&state.last_action);
+    snap.last_action_secs_ago = state.last_action_at.map(|t| t.elapsed().as_secs());
+    snap.l3_attempts = state.l3_attempts;
+    snap.episode_actions.clone_from(&state.episode_actions);
+}
+
+async fn update_snapshot_event(
+    snapshot: &Mutex<WatchdogSnapshot>,
+    state: &mut WatchdogState,
+    symptom: &str,
+    action: &str,
+    detail: &str,
+) {
+    let mut snap = snapshot.lock().await;
+    snap.push_event(symptom, action, detail);
+    drop(snap);
+    // Also update the state tracking (not the snapshot, just for `last_action` field)
+    state.last_action = Some(action.to_string());
+}
+
+async fn log_action(
+    detail: &str,
+    tunnel_stats: &TunnelStats,
+    session_events: &broadcast::Sender<Value>,
+    state: &mut WatchdogState,
+    action: &str,
+    level: u8,
+    disconnect_secs: u64,
+) {
+    info!("LTE watchdog: {detail}");
+    tunnel_stats
+        .push_event(TunnelEventType::WatchdogAction, detail.to_string())
+        .await;
+    let _ = session_events.send(serde_json::json!({
+        "type": "lte.watchdog",
+        "level": level,
+        "action": action,
+        "disconnect_secs": disconnect_secs,
+    }));
+    state.record_action(action);
+}
+
+// ── Recovery actions ───────────────────────────────────────────────────────
+
+/// Re-register: AT+COPS=0.
 async fn action_reregister(modem: &Modem, state: &mut WatchdogState) -> &'static str {
     match modem.command("AT+COPS=0").await {
         Ok(_) => {
@@ -920,7 +1216,7 @@ async fn action_reregister(modem: &Modem, state: &mut WatchdogState) -> &'static
     }
 }
 
-/// Level 1: Airplane mode cycle — AT+CFUN=0 → 5s → AT+CFUN=1.
+/// Airplane cycle: AT+CFUN=0 → 5s → AT+CFUN=1.
 async fn action_airplane_cycle(modem: &Modem, state: &mut WatchdogState) -> &'static str {
     match modem.command("AT+CFUN=0").await {
         Ok(_) => {
@@ -951,12 +1247,7 @@ async fn action_airplane_cycle(modem: &Modem, state: &mut WatchdogState) -> &'st
     }
 }
 
-/// Level 2: Restart the network interface.
-///
-/// Uses the appropriate method based on the platform:
-/// - Custom command: if `interface_restart_cmd` is configured
-/// - OpenWrt: `ifdown {interface} && sleep 2 && ifup {interface}` (netifd manages QMI bearer)
-/// - Generic Linux: `ip link set down/up` (only toggles kernel interface)
+/// Restart the network interface (netifd or generic ip link).
 pub(crate) async fn action_restart_interface(
     interface: &str,
     openwrt: bool,
@@ -984,30 +1275,29 @@ pub(crate) async fn action_restart_interface(
             }
         }
     } else if openwrt {
-        // OpenWrt: ifdown/ifup properly tears down and re-establishes the QMI data bearer
-        info!("LTE watchdog: restarting {interface} via netifd (ifdown/ifup)");
+        let netifd_name = resolve_netifd_interface(interface).await;
+        info!("LTE watchdog: restarting {interface} via netifd (ifdown/ifup {netifd_name})");
         let down = tokio::process::Command::new("ifdown")
-            .arg(interface)
+            .arg(&netifd_name)
             .output()
             .await;
         if let Err(e) = &down {
-            warn!("LTE watchdog: ifdown {interface} failed: {e}");
+            warn!("LTE watchdog: ifdown {netifd_name} failed: {e}");
             return "iface_restart_failed";
         }
 
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         let up = tokio::process::Command::new("ifup")
-            .arg(interface)
+            .arg(&netifd_name)
             .output()
             .await;
         if let Err(e) = &up {
-            warn!("LTE watchdog: ifup {interface} failed: {e}");
+            warn!("LTE watchdog: ifup {netifd_name} failed: {e}");
             return "iface_restart_partial";
         }
         "iface_restart_netifd"
     } else {
-        // Generic Linux: ip link set (only toggles kernel interface, no QMI)
         let down = tokio::process::Command::new("ip")
             .args(["link", "set", interface, "down"])
             .output()
@@ -1031,8 +1321,30 @@ pub(crate) async fn action_restart_interface(
     }
 }
 
-/// Level 3: USB modem power cycle — toggle sysfs `authorized` for the Quectel device.
-/// Returns the action string and optionally a newly opened modem handle.
+/// Resolve a kernel interface name (e.g. "wwan0") to its OpenWrt netifd name (e.g. "wwan").
+pub(crate) async fn resolve_netifd_interface(kernel_iface: &str) -> String {
+    if let Ok(output) = tokio::process::Command::new("sh")
+        .args([
+            "-c",
+            &format!(
+                "ubus call network.interface dump 2>/dev/null | \
+                 jsonfilter -e '@.interface[@.l3_device=\"{kernel_iface}\"].interface' | \
+                 head -1"
+            ),
+        ])
+        .output()
+        .await
+    {
+        let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !name.is_empty() {
+            return name;
+        }
+    }
+
+    kernel_iface.trim_end_matches(char::is_numeric).to_string()
+}
+
+/// USB modem power cycle — toggle sysfs `authorized` for the Quectel device.
 async fn action_usb_power_cycle(device_path: &str) -> (&'static str, Option<Modem>) {
     let Some(auth_path) = find_quectel_usb_auth().await else {
         warn!("LTE watchdog: Quectel USB device not found in sysfs");
@@ -1041,7 +1353,6 @@ async fn action_usb_power_cycle(device_path: &str) -> (&'static str, Option<Mode
 
     info!("LTE watchdog: power cycling USB device at {auth_path}");
 
-    // Deauthorize (power off)
     if let Err(e) = tokio::fs::write(&auth_path, "0").await {
         warn!("LTE watchdog: failed to write 0 to {auth_path}: {e}");
         return ("usb_cycle_failed", None);
@@ -1049,14 +1360,11 @@ async fn action_usb_power_cycle(device_path: &str) -> (&'static str, Option<Mode
 
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // Reauthorize (power on)
     if let Err(e) = tokio::fs::write(&auth_path, "1").await {
         warn!("LTE watchdog: failed to write 1 to {auth_path}: {e}");
         return ("usb_cycle_partial", None);
     }
 
-    // Wait for device to re-enumerate on USB (poll every 2s, up to 30s).
-    // After power cycle, ttyUSB numbering may shift — auto-detect the port.
     let mut new_modem = None;
     for i in 0..15 {
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1087,6 +1395,8 @@ async fn action_usb_power_cycle(device_path: &str) -> (&'static str, Option<Mode
 
     ("usb_cycle", new_modem)
 }
+
+// ── Utility functions ──────────────────────────────────────────────────────
 
 /// Find the sysfs `authorized` path for the Quectel USB device (vendor 2c7c).
 async fn find_quectel_usb_auth() -> Option<String> {
@@ -1142,7 +1452,6 @@ pub(crate) fn interface_has_ipv4(iface: &str) -> bool {
 }
 
 /// Poll for recovery indicators after a watchdog action.
-/// Returns `true` if interface has IPv4 AND tunnel reconnected within timeout.
 async fn verify_recovery(interface: &str, tunnel_stats: &TunnelStats, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -1157,13 +1466,10 @@ async fn verify_recovery(interface: &str, tunnel_stats: &TunnelStats, timeout: D
 }
 
 /// Extract the host/IP from a tunnel relay URL for reachability checks.
-/// E.g. `wss://relay.example.com/api/tunnel/register` → `relay.example.com`
 fn extract_relay_host(url: &str) -> Option<String> {
-    // Strip scheme
     let after_scheme = url
         .strip_prefix("wss://")
         .or_else(|| url.strip_prefix("ws://"))?;
-    // Take host (before first '/' or ':')
     let host = after_scheme.split('/').next()?.split(':').next()?;
     if host.is_empty() {
         None
@@ -1173,7 +1479,6 @@ fn extract_relay_host(url: &str) -> Option<String> {
 }
 
 /// Check internet reachability by pinging a target host.
-/// Uses ICMP ping with a 3s timeout.
 async fn check_reachability(target: &str) -> bool {
     let result = tokio::process::Command::new("ping")
         .args(["-c", "1", "-W", "3", target])
@@ -1185,7 +1490,7 @@ async fn check_reachability(target: &str) -> bool {
 }
 
 /// Detect if running on OpenWrt (check for /etc/openwrt_release).
-fn is_openwrt() -> bool {
+pub(crate) fn is_openwrt() -> bool {
     std::path::Path::new("/etc/openwrt_release").exists()
 }
 
@@ -1302,7 +1607,6 @@ mod tests {
 
     #[test]
     fn test_parse_cereg_extended_format() {
-        // Some modems return extended info: +CEREG: <n>,<stat>,<tac>,<ci>,<AcT>
         let resp = "+CEREG: 2,1,\"A1B2\",\"0123ABCD\",7\r\nOK";
         assert_eq!(
             parse_cereg(resp).unwrap(),
@@ -1361,7 +1665,6 @@ mod tests {
 
     #[test]
     fn test_is_openwrt() {
-        // Just verify it doesn't panic — result depends on host system
         let _ = is_openwrt();
     }
 
@@ -1370,35 +1673,76 @@ mod tests {
         let mut state = WatchdogState::new();
         state.dormant = true;
         state.last_action_at = Some(Instant::now());
-        // Just set, should not be elapsed yet
-        assert!(!state.cooldown_elapsed());
+        assert!(!state.cooldown_elapsed(3));
     }
 
     #[test]
     fn test_watchdog_cooldown_l3_backoff() {
         let mut state = WatchdogState::new();
-        state.level = 3;
         state.l3_attempts = 1;
         state.last_action_at = Some(Instant::now());
         // L3 backoff: 300 * 2^1 = 600s, should not be elapsed
-        assert!(!state.cooldown_elapsed());
+        assert!(!state.cooldown_elapsed(3));
     }
 
     #[test]
-    fn test_watchdog_reset_clears_all() {
+    fn test_watchdog_light_reset() {
         let mut state = WatchdogState::new();
-        state.level = 3;
+        state.reregisters = 1;
+        state.iface_restarts = 2;
+        state.airplane_cycles = 1;
+        state.l3_attempts = 2;
+        state.dormant = true;
+        state.tried_prechange_revert = true;
+        state.tried_safe_revert = true;
+        state.episode_actions.push("test".into());
+
+        state.light_reset();
+
+        assert_eq!(state.reregisters, 0);
+        assert_eq!(state.iface_restarts, 0);
+        assert_eq!(state.airplane_cycles, 0);
+        assert!(!state.tried_prechange_revert);
+        assert!(!state.tried_safe_revert);
+        assert!(state.episode_actions.is_empty());
+        // L3 and dormant preserved
+        assert_eq!(state.l3_attempts, 2);
+        assert!(state.dormant);
+    }
+
+    #[test]
+    fn test_watchdog_heavy_reset() {
+        let mut state = WatchdogState::new();
         state.l3_attempts = 5;
         state.dormant = true;
-        state.internet_reachable = true;
-        state.internet_reachable_since = Some(Instant::now());
-        state.searching_since = Some(Instant::now());
-        state.reset();
-        assert_eq!(state.level, 0);
+        state.reregisters = 1;
+
+        state.heavy_reset();
+
         assert_eq!(state.l3_attempts, 0);
         assert!(!state.dormant);
-        assert!(!state.internet_reachable);
-        assert!(state.internet_reachable_since.is_none());
-        assert!(state.searching_since.is_none());
+        assert_eq!(state.reregisters, 0);
+    }
+
+    #[test]
+    fn test_symptom_as_str() {
+        assert_eq!(Symptom::Searching { secs: 10 }.as_str(), "searching");
+        assert_eq!(Symptom::RegisteredNoData.as_str(), "registered_no_data");
+        assert_eq!(Symptom::NotRegistered.as_str(), "not_registered");
+        assert_eq!(Symptom::Unresponsive.as_str(), "unresponsive");
+        assert_eq!(Symptom::RelayProblem.as_str(), "relay_problem");
+        assert_eq!(Symptom::TunnelReconnecting.as_str(), "tunnel_reconnecting");
+        assert_eq!(Symptom::Unknown.as_str(), "unknown");
+    }
+
+    #[test]
+    fn test_snapshot_event_ring() {
+        let mut snap = WatchdogSnapshot::new();
+        for i in 0..25 {
+            snap.push_event("test", "action", &format!("event {i}"));
+        }
+        assert_eq!(snap.recent_events.len(), MAX_SNAPSHOT_EVENTS);
+        // Oldest should be event 5 (0-4 evicted)
+        assert_eq!(snap.recent_events.front().unwrap().detail, "event 5");
     }
 }
