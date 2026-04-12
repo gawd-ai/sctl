@@ -100,7 +100,8 @@ async fn main() {
 }
 
 /// Acquire exclusive process lock. Returns the held file (must not be dropped).
-/// Exits with code 99 if another instance holds the lock.
+/// Retries 3 times with 1s delay to handle the race between old process dying
+/// and new process starting (e.g. during upgrades). Exits with code 99 if still locked.
 #[cfg(unix)]
 fn acquire_process_lock(data_dir: &str) -> std::fs::File {
     use std::os::unix::io::AsRawFd;
@@ -110,12 +111,21 @@ fn acquire_process_lock(data_dir: &str) -> std::fs::File {
         eprintln!("Failed to create lock file {lock_path}: {e}");
         std::process::exit(1);
     });
-    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        eprintln!("Another sctl instance is already running (lock: {lock_path})");
-        std::process::exit(99);
+    for attempt in 0..3 {
+        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return f;
+        }
+        if attempt < 2 {
+            eprintln!(
+                "Lock held by another instance, retrying in 1s ({}/3)",
+                attempt + 1
+            );
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
     }
-    f
+    eprintln!("Another sctl instance is already running (lock: {lock_path})");
+    std::process::exit(99);
 }
 
 async fn run_supervisor_mode(config_path: Option<&str>) -> ! {
@@ -162,6 +172,16 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     info!("sctl v{} starting", env!("CARGO_PKG_VERSION"));
     info!("Device serial: {}", config.device.serial);
     info!("Listening on {}", config.server.listen);
+
+    if let Some(tc) = &config.tunnel {
+        if !tc.relay && tc.heartbeat_interval_secs > 15 {
+            warn!(
+                configured_secs = tc.heartbeat_interval_secs,
+                effective_secs = config.effective_client_heartbeat_interval_secs(),
+                "Tunnel client heartbeat interval too high for LTE/CGNAT; clamping to safe keepalive interval"
+            );
+        }
+    }
 
     if config.auth.api_key == "change-me" {
         warn!("Using default API key — set SCTL_API_KEY or update config");
@@ -259,6 +279,8 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         lte_poll_notify: None,
         relay_history: None,
         device_snapshots: None,
+        relay_state: None,
+        watchdog_snapshot: None,
     };
 
     // Build router
@@ -314,6 +336,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         .route("/api/lte", get(routes::lte::lte))
         .route("/api/lte/bands", post(routes::lte::set_bands))
         .route("/api/lte/scan", post(routes::lte::start_scan))
+        .route("/api/lte/speedtest", post(routes::lte::speed_test))
         .layer(middleware::from_fn(sctl::auth::require_api_key));
 
     let ws_route = Router::new().route("/api/ws", get(ws::ws_upgrade));
@@ -353,6 +376,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
             relay_state.history.seed_from_journal().await;
             state.relay_history = Some(relay_state.history.clone());
             state.device_snapshots = Some(relay_state.device_snapshots.clone());
+            state.relay_state = Some(relay_state.clone());
             relay_state_opt = Some(relay_state);
         }
     }
@@ -417,40 +441,67 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         .and_then(|lc| get_modem(&mut modems, &lc.device));
     state.modem = lte_modem.clone();
 
-    // Startup: if safe_bands.json exists and modem's current bands differ, restore them.
-    // Covers the case where a bad band change persisted in modem NV memory across a reboot.
     if let (Some(ref modem), Some(ref ls)) = (&lte_modem, &state.lte_state) {
-        let safe = ls.lock().await.safe_bands.clone();
-        if let Some(safe) = safe {
-            if let Ok(resp) = modem.command("AT+QCFG=\"band\"").await {
-                let current = lte::parse_band_config(&resp);
-                if !current.is_empty() && current != safe.bands {
-                    warn!(
-                        "Modem bands [{}] differ from safe bands [{}], restoring",
-                        current
-                            .iter()
-                            .map(|b| format!("B{b}"))
-                            .collect::<Vec<_>>()
-                            .join(","),
-                        safe.bands
-                            .iter()
-                            .map(|b| format!("B{b}"))
-                            .collect::<Vec<_>>()
-                            .join(","),
-                    );
-                    let hex = lte::bands_to_hex(&safe.bands);
-                    let _ = modem
-                        .command(&format!("AT+QCFG=\"band\",0x260,{hex},0"))
-                        .await;
-                    if let Some(pri) = safe.priority_band {
-                        let _ = modem.command(&format!("AT+QCFG=\"bandpri\",{pri}")).await;
-                    } else {
-                        let _ = modem.command("AT+QCFG=\"bandpri\",0").await;
+        // SIM change detection — must run BEFORE safe-bands restore so stale
+        // carrier-specific bands are cleared before we try to apply them.
+        let lte_cfg = state.config.lte.as_ref().unwrap();
+        let sim_changed = lte::detect_sim_change(modem, ls, &data_dir, lte_cfg).await;
+
+        if sim_changed {
+            info!("Startup: SIM changed, skipping safe-bands restore");
+        } else {
+            let safe = ls.lock().await.safe_bands.clone();
+            if let Some(ref safe_cfg) = safe {
+                let safe_hex = lte::bands_to_hex(&safe_cfg.bands);
+                match modem.command("AT+QCFG=\"band\"").await {
+                    Ok(resp) => {
+                        let current = lte::parse_band_config(&resp);
+                        let current_hex = lte::bands_to_hex(&current);
+                        if current_hex == safe_hex {
+                            info!(bands = %current_hex, "Startup: bands match safe config");
+                        } else {
+                            info!(
+                                current = %current_hex,
+                                safe = %safe_hex,
+                                "Startup: bands differ from safe config, restoring"
+                            );
+                            match lte::verified_set_bands(modem, &safe_cfg.bands).await {
+                                Ok(actual) => {
+                                    info!("Startup: safe bands restored and verified: {actual:?}")
+                                }
+                                Err(e) => warn!("Startup: safe bands restore failed: {e}"),
+                            }
+                            if let Some(pri) = safe_cfg.priority_band {
+                                let pri_cmd = format!("AT+QCFG=\"bandpri\",{pri}");
+                                if let Err(e) = modem.command(&pri_cmd).await {
+                                    warn!("Startup: failed to set band priority: {e}");
+                                }
+                            }
+                            if let Err(e) = modem.command("AT+COPS=0").await {
+                                warn!("Startup: failed to re-register network: {e}");
+                            }
+                        }
                     }
-                    let _ = modem.command("AT+COPS=0").await;
+                    Err(e) => {
+                        warn!("Startup: failed to query current bands: {e}");
+                    }
                 }
+            } else {
+                info!("Startup: no safe bands saved, skipping restore");
             }
         }
+    }
+
+    // Pre-create watchdog snapshot so the router clone of state includes it.
+    // The actual watchdog task is spawned later; it receives the same Arc.
+    let will_run_watchdog = state.config.lte.as_ref().is_some_and(|lc| lc.watchdog)
+        && tunnel_config
+            .as_ref()
+            .is_some_and(|tc| tc.url.is_some() && !tc.relay);
+    if will_run_watchdog {
+        state.watchdog_snapshot = Some(Arc::new(tokio::sync::Mutex::new(
+            sctl::lte_watchdog::WatchdogSnapshot::new(),
+        )));
     }
 
     let mut app = Router::new()
@@ -522,7 +573,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         .is_some_and(|tc| tc.url.is_some() && !tc.relay);
 
     // GPS poller (only when [gps] config is present)
-    // Like the LTE poller, AT commands are suppressed while the tunnel is connected.
+    // Polls at reduced rate when LTE data path is active to avoid QMI disruption.
     let gps_task =
         if let (Some(gc), Some(ref gs), Some(modem)) = (gps_config, &state.gps_state, &gps_modem) {
             let modem_rx = modems
@@ -530,19 +581,14 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
                 .expect("modem must exist in map")
                 .1
                 .subscribe();
-            // Only pass tunnel_stats if this is a tunnel client (device behind CGNAT)
-            let ts = if is_tunnel_client {
-                Some(state.tunnel_stats.clone())
-            } else {
-                None
-            };
+            let lte_iface = state.config.lte.as_ref().map(|lc| lc.interface.clone());
             Some(gps::spawn_gps_poller(
                 gc,
                 modem.clone(),
                 gs.clone(),
                 state.session_events.clone(),
                 modem_rx,
-                ts,
+                lte_iface,
             ))
         } else {
             None
@@ -588,6 +634,10 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
                 .1;
             info!("LTE watchdog enabled (interface: {})", lc.interface);
             let tunnel_url = tunnel_config.as_ref().and_then(|tc| tc.url.clone());
+            let wd_snapshot = state
+                .watchdog_snapshot
+                .clone()
+                .expect("watchdog_snapshot must be pre-created");
             Some(sctl::lte_watchdog::spawn_lte_watchdog(
                 modem.clone(),
                 modem_tx,
@@ -597,6 +647,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
                 lc,
                 data_dir.clone(),
                 tunnel_url,
+                wd_snapshot,
             ))
         } else {
             None

@@ -29,6 +29,8 @@ use super::{decode_binary_frame, encode_binary_frame, TunnelMessage, TunnelRespo
 
 /// Maximum number of connection sessions to retain in history.
 const MAX_CONNECTION_HISTORY: usize = 100;
+/// Max time to wait to enqueue a request onto a device's tunnel queue.
+const DEVICE_QUEUE_SEND_TIMEOUT_SECS: u64 = 5;
 
 /// A recorded device connection session (connect → disconnect).
 #[derive(Clone, Debug)]
@@ -277,6 +279,22 @@ pub struct DeviceSnapshot {
     pub last_seen: u64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct LiveDeviceStatus {
+    pub serial: String,
+    pub connected: bool,
+    pub connected_at: u64,
+    pub connected_since_ms: u64,
+    pub last_heartbeat_age_ms: u64,
+    pub pending_requests_count: usize,
+    pub session_subscription_count: usize,
+    pub subscribed_client_count: usize,
+    pub client_count: usize,
+    pub dropped_messages: u64,
+    pub last_gps_fix: Option<Value>,
+    pub last_lte_signal: Option<Value>,
+}
+
 /// Maximum age of a snapshot before it gets pruned (7 days).
 const SNAPSHOT_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 
@@ -297,6 +315,8 @@ pub struct RelayState {
     pub history: Arc<RelayConnectionHistory>,
     /// Last-known device state, survives disconnects and relay restarts.
     pub device_snapshots: Arc<RwLock<HashMap<String, DeviceSnapshot>>>,
+    /// Monotonic connection generation counter used to fence stale handlers.
+    pub next_connection_id: Arc<AtomicU64>,
     /// Dirty flag for debounced snapshot persistence.
     pub snapshots_dirty: Arc<AtomicBool>,
     /// Path to snapshot persistence file (None if no data_dir configured).
@@ -305,6 +325,7 @@ pub struct RelayState {
 
 /// A device connected to the relay via its outbound WS tunnel.
 pub struct ConnectedDevice {
+    pub connection_id: u64,
     pub serial: String,
     pub api_key: String,
     /// Send messages to the device over the tunnel WS.
@@ -386,6 +407,7 @@ impl RelayState {
             epoch: Instant::now(),
             history: Arc::new(RelayConnectionHistory::new()),
             device_snapshots: Arc::new(RwLock::new(snapshots)),
+            next_connection_id: Arc::new(AtomicU64::new(1)),
             snapshots_dirty: Arc::new(AtomicBool::new(false)),
             snapshots_path,
         }
@@ -472,6 +494,19 @@ impl RelayState {
         devices.clear();
     }
 
+    /// Touch a device's snapshot `last_seen` timestamp (e.g. on device registration).
+    pub async fn touch_snapshot(&self, serial: &str) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut snapshots = self.device_snapshots.write().await;
+        if let Some(snap) = snapshots.get_mut(serial) {
+            snap.last_seen = now;
+            self.snapshots_dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// Update a device's snapshot with telemetry data.
     pub async fn update_snapshot(&self, serial: &str, field: &str, value: &Value) {
         let now = SystemTime::now()
@@ -509,6 +544,52 @@ impl RelayState {
         let snapshots = self.device_snapshots.read().await;
         save_snapshots(path, &snapshots);
         true
+    }
+
+    /// Snapshot currently connected devices for health/status surfaces.
+    pub async fn live_device_statuses(&self) -> Vec<LiveDeviceStatus> {
+        #[allow(clippy::cast_possible_truncation)]
+        let now_ms = self.epoch.elapsed().as_millis() as u64;
+        let devices = self.devices.read().await;
+        let mut list = Vec::with_capacity(devices.len());
+
+        for device in devices.values() {
+            let last_hb_ms = device.last_heartbeat_ms.load(Ordering::Relaxed);
+            let last_heartbeat_age_ms = now_ms.saturating_sub(last_hb_ms);
+            #[allow(clippy::cast_possible_truncation)]
+            let connected_since_ms = device.connected_since.elapsed().as_millis() as u64;
+            let pending_requests_count = device.pending_requests.lock().await.len();
+            let client_count = device.clients.read().await.len();
+            let subs = device.session_subscriptions.read().await;
+            let session_subscription_count = subs.len();
+            let subscribed_client_count = subs.values().map(HashSet::len).sum();
+            let last_gps_fix = device.last_gps_fix.read().await.clone();
+            let last_lte_signal = device.last_lte_signal.read().await.clone();
+
+            let connected_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_sub(connected_since_ms / 1000);
+
+            list.push(LiveDeviceStatus {
+                serial: device.serial.clone(),
+                connected: true,
+                connected_at,
+                connected_since_ms,
+                last_heartbeat_age_ms,
+                pending_requests_count,
+                session_subscription_count,
+                subscribed_client_count,
+                client_count,
+                dropped_messages: device.dropped_messages.load(Ordering::Relaxed),
+                last_gps_fix,
+                last_lte_signal,
+            });
+        }
+
+        list.sort_by(|a, b| a.serial.cmp(&b.serial));
+        list
     }
 }
 
@@ -608,6 +689,7 @@ pub fn relay_router(relay_state: RelayState) -> Router {
         .route("/d/{serial}/api/lte", get(proxy_lte))
         .route("/d/{serial}/api/lte/bands", post(proxy_lte_bands))
         .route("/d/{serial}/api/lte/scan", post(proxy_lte_scan))
+        .route("/d/{serial}/api/lte/speedtest", post(proxy_lte_speedtest))
         .route("/d/{serial}/api/ws", get(proxy_ws));
 
     tunnel_admin.merge(device_proxy).with_state(relay_state)
@@ -719,8 +801,10 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
         }
     };
 
+    let connection_id = state.next_connection_id.fetch_add(1, Ordering::Relaxed);
     let pong_count = Arc::new(AtomicU64::new(0));
     let device = ConnectedDevice {
+        connection_id,
         serial: serial.clone(),
         api_key,
         device_tx: device_tx.clone(),
@@ -1010,6 +1094,13 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                             if let Some(colon_pos) = request_id.find(':') {
                                 let client_id = &request_id[..colon_pos];
                                 let original_rid = &request_id[colon_pos + 1..];
+                                info!(
+                                    serial = %serial,
+                                    client_id,
+                                    msg_type = t,
+                                    request_id = original_rid,
+                                    "Relay WS response routed to client"
+                                );
 
                                 // Route to the specific client
                                 let clients_read = clients.read().await;
@@ -1086,6 +1177,14 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                             if let Some(colon_pos) = rid.find(':') {
                                 let client_id = &rid[..colon_pos];
                                 let original_rid = &rid[colon_pos + 1..];
+                                info!(
+                                    serial = %serial,
+                                    client_id,
+                                    msg_type,
+                                    request_id = original_rid,
+                                    session_id = parsed["session_id"].as_str().unwrap_or(""),
+                                    "Relay WS lifecycle message routed to client"
+                                );
                                 let clients_read = clients.read().await;
                                 if let Some(client_tx) = clients_read.get(client_id) {
                                     let mut msg = parsed.clone();
@@ -1151,10 +1250,18 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
 
     // Check if this handler was replaced by a new connection, regardless of
     // which select! branch fired. The new handler sends `true` on shutdown_tx
-    // before inserting itself, so has_changed() is definitive. Without this,
-    // the old handler could exit via pong timeout (setting disconnect_reason
-    // to something else) and remove the NEW device from the map.
-    let replaced = shutdown_rx.has_changed().unwrap_or(false) || disconnect_reason == "replaced";
+    // before inserting itself, but stale timeout branches can still race with
+    // reconnect. Fence cleanup by connection_id so an old handler never drains
+    // the newly-registered device for the same serial.
+    let map_points_to_newer_connection = {
+        let devices = state.devices.read().await;
+        devices
+            .get(&serial)
+            .is_some_and(|d| d.connection_id != connection_id)
+    };
+    let replaced = shutdown_rx.has_changed().unwrap_or(false)
+        || disconnect_reason == "replaced"
+        || map_points_to_newer_connection;
     if replaced {
         state
             .history
@@ -1174,7 +1281,17 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
         };
         // Single write lock: remove then drain. Avoids TOCTOU between read→write
         // and prevents holding a read lock across the async drain_device call.
-        let removed = state.devices.write().await.remove(&serial);
+        let removed = {
+            let mut devices = state.devices.write().await;
+            if devices
+                .get(&serial)
+                .is_some_and(|d| d.connection_id == connection_id)
+            {
+                devices.remove(&serial)
+            } else {
+                None
+            }
+        };
         if let Some(device) = removed {
             drain_device(&device, "device disconnected").await;
         }
@@ -1273,17 +1390,30 @@ pub async fn tunnel_request(
         guard.insert(request_id.clone(), tx);
     }
 
-    if device
-        .device_tx
-        .send(TunnelMessage::Text(msg))
-        .await
-        .is_err()
+    match tokio::time::timeout(
+        Duration::from_secs(DEVICE_QUEUE_SEND_TIMEOUT_SECS),
+        device.device_tx.send(TunnelMessage::Text(msg)),
+    )
+    .await
     {
-        pending.lock().await.remove(&request_id);
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "Failed to send to device", "code": "DEVICE_SEND_FAILED"})),
-        ));
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            pending.lock().await.remove(&request_id);
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "Failed to send to device", "code": "DEVICE_SEND_FAILED"})),
+            ));
+        }
+        Err(_) => {
+            pending.lock().await.remove(&request_id);
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "error": "Device request queue stalled",
+                    "code": "DEVICE_QUEUE_STALLED"
+                })),
+            ));
+        }
     }
 
     drop(devices); // Release read lock while waiting
@@ -1342,18 +1472,43 @@ pub async fn tunnel_request_binary(
     })?;
 
     let (tx, rx) = oneshot::channel();
-    device
-        .pending_requests
-        .lock()
-        .await
-        .insert(request_id.to_string(), tx);
+    {
+        let mut pending = device.pending_requests.lock().await;
+        if pending.len() >= 256 {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(
+                    json!({"error": "Device has too many pending requests", "code": "OVERLOADED"}),
+                ),
+            ));
+        }
+        pending.insert(request_id.to_string(), tx);
+    }
 
-    if device.device_tx.send(msg).await.is_err() {
-        device.pending_requests.lock().await.remove(request_id);
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "Failed to send to device", "code": "DEVICE_SEND_FAILED"})),
-        ));
+    match tokio::time::timeout(
+        Duration::from_secs(DEVICE_QUEUE_SEND_TIMEOUT_SECS),
+        device.device_tx.send(msg),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            device.pending_requests.lock().await.remove(request_id);
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "Failed to send to device", "code": "DEVICE_SEND_FAILED"})),
+            ));
+        }
+        Err(_) => {
+            device.pending_requests.lock().await.remove(request_id);
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "error": "Device request queue stalled",
+                    "code": "DEVICE_QUEUE_STALLED"
+                })),
+            ));
+        }
     }
 
     drop(devices);
@@ -1438,9 +1593,38 @@ async fn proxy_health(
 }
 
 /// `GET /d/{serial}/api/info` — proxied system info.
+#[derive(Deserialize)]
+struct InfoProxyQuery {
+    groups: Option<String>,
+}
+
+fn parse_info_groups_csv(groups: Option<&str>) -> Vec<String> {
+    let mut parsed = groups
+        .unwrap_or("core,interfaces,disk,tunnel,gps,lte")
+        .split(',')
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if parsed.is_empty() || parsed.iter().any(|g| g == "all") {
+        return vec![
+            "core".to_string(),
+            "interfaces".to_string(),
+            "disk".to_string(),
+            "tunnel".to_string(),
+            "gps".to_string(),
+            "lte".to_string(),
+        ];
+    }
+    parsed.sort();
+    parsed.dedup();
+    parsed
+}
+
 async fn proxy_info(
     State(state): State<RelayState>,
     AxumPath(serial): AxumPath<String>,
+    Query(query): Query<InfoProxyQuery>,
     request: Request<Body>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let auth_header = request
@@ -1454,15 +1638,46 @@ async fn proxy_info(
         validate_device_auth(&devices, &serial, auth_header.as_deref())?;
     }
 
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let msg = json!({
-        "type": "tunnel.info",
-        "request_id": request_id,
-    });
+    let groups = parse_info_groups_csv(query.groups.as_deref());
+    let mut merged = serde_json::Map::new();
 
-    let response =
-        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
-    proxy_response_to_http(&response)
+    // Fan out per-group info requests in parallel. Each group is a separate
+    // tunnel.info message so a slow group doesn't block the others.
+    let mut futures = Vec::with_capacity(groups.len());
+    for group in &groups {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let msg = json!({
+            "type": "tunnel.info",
+            "request_id": request_id,
+            "groups": [group],
+        });
+        futures.push(tunnel_request_json(&state, &serial, msg, 10));
+    }
+
+    let results = futures::future::join_all(futures).await;
+    for result in results {
+        let response = result?;
+        let status = response["status"].as_u64().unwrap_or(200);
+        let body = response["body"].clone();
+        if status != 200 {
+            #[allow(clippy::cast_possible_truncation)]
+            return Err((
+                StatusCode::from_u16(status as u16).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                Json(body),
+            ));
+        }
+        let body_obj = body.as_object().ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "Invalid device info response", "code": "INVALID_DEVICE_RESPONSE"})),
+            )
+        })?;
+        for (key, value) in body_obj {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+
+    Ok(Json(Value::Object(merged)))
 }
 
 /// Query parameters for the diagnostics proxy endpoint.
@@ -2354,6 +2569,40 @@ async fn proxy_lte_scan(
     proxy_response_to_http(&response)
 }
 
+/// `POST /d/{serial}/api/lte/speedtest` — proxied speed test (no body needed).
+async fn proxy_lte_speedtest(
+    State(state): State<RelayState>,
+    AxumPath(serial): AxumPath<String>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "tunnel.lte.speedtest",
+        "request_id": request_id,
+    });
+
+    // Longer timeout — speed test takes ~20s (10s download + 10s upload)
+    let response = tunnel_request_json(
+        &state,
+        &serial,
+        msg,
+        state.tunnel_proxy_timeout_secs.max(30),
+    )
+    .await?;
+    proxy_response_to_http(&response)
+}
+
 /// `GET /d/{serial}/api/ws?token=<api_key>` — WS proxy to device.
 async fn proxy_ws(
     State(state): State<RelayState>,
@@ -2444,6 +2693,14 @@ async fn handle_client_ws(
                 // Tag request_id with client_id for routing responses back
                 let tagged_rid = format!("{client_id}:{original_rid}");
                 parsed["request_id"] = json!(tagged_rid);
+                info!(
+                    serial = %serial,
+                    client_id = %client_id,
+                    msg_type = %msg_type,
+                    request_id = %original_rid,
+                    session_id = parsed["session_id"].as_str().unwrap_or(""),
+                    "Relay WS client request forwarded to device"
+                );
 
                 // Track session subscriptions for output routing
                 match msg_type.as_str() {
@@ -2471,8 +2728,23 @@ async fn handle_client_ws(
                 }
 
                 // Forward to device
-                if device_tx.send(TunnelMessage::Text(parsed)).await.is_err() {
-                    break; // Device disconnected
+                match tokio::time::timeout(
+                    Duration::from_secs(DEVICE_QUEUE_SEND_TIMEOUT_SECS),
+                    device_tx.send(TunnelMessage::Text(parsed)),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => break, // Device disconnected
+                    Err(_) => {
+                        warn!(
+                            serial = %serial,
+                            client_id = %client_id,
+                            msg_type = %msg_type,
+                            "Relay WS client forward timed out waiting for device queue"
+                        );
+                        break;
+                    }
                 }
             }
             axum::extract::ws::Message::Close(_) => break,
@@ -2514,12 +2786,33 @@ async fn handle_client_ws(
             .get(session_id)
             .is_none_or(HashSet::is_empty);
         if should_detach {
-            let _ = device_tx
-                .send(TunnelMessage::Text(json!({
+            match tokio::time::timeout(
+                Duration::from_secs(DEVICE_QUEUE_SEND_TIMEOUT_SECS),
+                device_tx.send(TunnelMessage::Text(json!({
                     "type": "session.detach",
                     "session_id": session_id,
-                })))
-                .await;
+                }))),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    warn!(
+                        serial = %serial,
+                        client_id = %client_id,
+                        session_id = %session_id,
+                        "Relay WS detach failed: device disconnected"
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        serial = %serial,
+                        client_id = %client_id,
+                        session_id = %session_id,
+                        "Relay WS detach timed out waiting for device queue"
+                    );
+                }
+            }
         }
     }
 

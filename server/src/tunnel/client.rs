@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, Semaphore};
 use tracing::{error, info, warn};
 
 use crate::activity::{self, ActivityType, CachedExecResult};
@@ -29,6 +29,16 @@ use super::{decode_binary_frame, encode_binary_frame};
 
 /// Static heartbeat message — avoids serde allocation on every heartbeat tick.
 const PING_TEXT: &str = r#"{"type":"tunnel.ping"}"#;
+/// LTE paths can stall transiently under output bursts without being truly dead.
+/// Keep the local socket/write deadlines comfortably above the relay's liveness
+/// window so the device does not self-abort first.
+const TUNNEL_TCP_USER_TIMEOUT_MS: libc::c_int = 15_000;
+const TUNNEL_WRITER_SEND_TIMEOUT_SECS: u64 = 20;
+/// Coalesce adjacent PTY output chunks into larger tunnel frames. LTE links are
+/// much less tolerant of hundreds of tiny JSON WS frames than a handful of
+/// larger ones carrying the same bytes.
+const TUNNEL_STREAM_BATCH_MAX_ENTRIES: usize = 32;
+const TUNNEL_STREAM_BATCH_MAX_BYTES: usize = 8 * 1024;
 
 /// Resolve a `bind_address` config value to a concrete IP address.
 ///
@@ -82,10 +92,16 @@ async fn is_local_address_available(addr: &std::net::IpAddr) -> bool {
         .is_ok()
 }
 
-/// Channel-based WS sender — eliminates mutex contention between subscriber
-/// tasks, heartbeat, and response handlers.  All writers push messages into
-/// this channel; a dedicated writer task drains it to the actual WS sink.
-type WsSink = mpsc::Sender<tokio_tungstenite::tungstenite::Message>;
+/// Channel-based WS sender with separate lanes for control, request/ack, and
+/// stream output traffic. This keeps liveness and acks responsive even when a
+/// PTY is producing a large amount of output.
+#[derive(Clone)]
+#[allow(clippy::struct_field_names)]
+struct WsSink {
+    priority_tx: mpsc::Sender<tokio_tungstenite::tungstenite::Message>,
+    request_tx: mpsc::Sender<tokio_tungstenite::tungstenite::Message>,
+    stream_tx: mpsc::Sender<tokio_tungstenite::tungstenite::Message>,
+}
 
 /// Spawn the tunnel client task. Returns a `JoinHandle` that runs until cancelled.
 pub fn spawn(state: AppState, tunnel_config: TunnelConfig) -> tokio::task::JoinHandle<()> {
@@ -288,6 +304,7 @@ impl std::fmt::Display for ConnectError {
 /// a silent NAT expiry kills the connection and the relay won't see heartbeats.
 /// Parameters: start probing after `idle` seconds, probe every `interval` seconds,
 /// give up after `count` failed probes.
+///
 #[cfg(unix)]
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn set_tcp_keepalive(stream: &TcpStream, idle: u32, interval: u32, count: u32) {
@@ -335,7 +352,7 @@ fn set_tcp_keepalive(stream: &TcpStream, idle: u32, interval: u32, count: u32) {
         // keepalive (requires idle connection) nor application-level timeouts
         // (writer only sees local buffer) can detect it. Worst case detection
         // is heartbeat_interval + 15s.
-        let user_timeout: libc::c_int = 15_000; // milliseconds
+        let user_timeout = TUNNEL_TCP_USER_TIMEOUT_MS;
         libc::setsockopt(
             fd,
             libc::IPPROTO_TCP,
@@ -635,15 +652,37 @@ async fn connect_and_run(
         }
     }
 
-    // Channel-based writer: all tasks send through ws_sink (channel sender),
-    // a dedicated writer task drains to the real WS sink. This eliminates
-    // mutex contention between subscriber tasks, heartbeat, and responses.
-    let (ws_sink, mut ws_out_rx) = mpsc::channel::<tokio_tungstenite::tungstenite::Message>(512);
+    // Channel-based writer: bulk traffic goes through ws_sink, while control
+    // frames (heartbeat ping/pong) use a small priority lane. Without this,
+    // session output can fill the main queue and cause relay pongs to be
+    // dropped, which looks like a dead write path and forces a reconnect.
+    let (request_tx, mut request_rx) =
+        mpsc::channel::<tokio_tungstenite::tungstenite::Message>(256);
+    let (stream_tx, mut stream_rx) = mpsc::channel::<tokio_tungstenite::tungstenite::Message>(1024);
+    let (priority_tx, mut priority_rx) =
+        mpsc::channel::<tokio_tungstenite::tungstenite::Message>(16);
+    let ws_sink = WsSink {
+        priority_tx: priority_tx.clone(),
+        request_tx: request_tx.clone(),
+        stream_tx: stream_tx.clone(),
+    };
     let (writer_exit_tx, mut writer_exit_rx) = oneshot::channel::<()>();
     let writer_stats = state.tunnel_stats.clone();
     let writer_task = tokio::spawn(async move {
-        while let Some(msg) = ws_out_rx.recv().await {
-            match tokio::time::timeout(Duration::from_secs(15), raw_ws_sink.send(msg)).await {
+        loop {
+            let msg = tokio::select! {
+                biased;
+                Some(msg) = priority_rx.recv() => msg,
+                Some(msg) = request_rx.recv() => msg,
+                Some(msg) = stream_rx.recv() => msg,
+                else => break,
+            };
+            match tokio::time::timeout(
+                Duration::from_secs(TUNNEL_WRITER_SEND_TIMEOUT_SECS),
+                raw_ws_sink.send(msg),
+            )
+            .await
+            {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     warn!("Tunnel: writer task WS send failed: {e}");
@@ -653,11 +692,14 @@ async fn connect_and_run(
                     break;
                 }
                 Err(_) => {
-                    warn!("Tunnel: writer task WS send timed out (15s)");
+                    warn!(
+                        timeout_secs = TUNNEL_WRITER_SEND_TIMEOUT_SECS,
+                        "Tunnel: writer task WS send timed out"
+                    );
                     writer_stats
                         .push_event(
                             TunnelEventType::WriterFailed,
-                            "WS send timeout (15s)".into(),
+                            format!("WS send timeout ({TUNNEL_WRITER_SEND_TIMEOUT_SECS}s)"),
                         )
                         .await;
                     break;
@@ -675,6 +717,7 @@ async fn connect_and_run(
     // Track subscriber tasks for session output forwarding
     let subscriber_tasks: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    let handler_permits = Arc::new(Semaphore::new(32));
 
     // Heartbeat failure notification channel
     let (heartbeat_cancel_tx, mut heartbeat_cancel_rx) = watch::channel(false);
@@ -689,9 +732,10 @@ async fn connect_and_run(
     // Heartbeat task — uses a static string to avoid serde allocation per tick.
     // Includes pong watchdog: if no pong arrives within 3× heartbeat interval,
     // the connection is assumed dead and we force a reconnect.
-    let heartbeat_sink = ws_sink.clone();
-    let heartbeat_interval = Duration::from_secs(config.heartbeat_interval_secs);
-    let pong_timeout_ms = config.heartbeat_interval_secs * 3 * 1000;
+    let heartbeat_sink = ws_sink.priority_tx.clone();
+    let heartbeat_interval_secs = state.config.effective_client_heartbeat_interval_secs();
+    let heartbeat_interval = Duration::from_secs(heartbeat_interval_secs);
+    let pong_timeout_ms = (heartbeat_interval_secs * 3).max(15) * 1000;
     let heartbeat_epoch = connection_epoch;
     let heartbeat_last_pong = last_pong_ms.clone();
     let heartbeat_ping_sent = last_ping_sent_ms.clone();
@@ -736,9 +780,13 @@ async fn connect_and_run(
             }
 
             // 3.4: Monitor writer channel capacity — early congestion indicator
-            let capacity = heartbeat_ws_sink.capacity();
-            if capacity < 128 {
-                warn!("Tunnel: writer channel backpressure ({capacity}/512 slots free)");
+            let request_capacity = heartbeat_ws_sink.request_tx.capacity();
+            let stream_capacity = heartbeat_ws_sink.stream_tx.capacity();
+            if request_capacity < 64 || stream_capacity < 128 {
+                warn!(
+                    request_capacity,
+                    stream_capacity, "Tunnel: writer channel backpressure"
+                );
             }
 
             match heartbeat_sink.try_send(tokio_tungstenite::tungstenite::Message::Text(
@@ -777,33 +825,12 @@ async fn connect_and_run(
 
     let mut disconnect_reason = DisconnectReason::WsClose;
 
-    // Re-subscribe to all running sessions after reconnect
-    {
-        let sessions = state.session_manager.list_sessions().await;
-        for s in &sessions {
-            if s.status == "running" {
-                if let Some(buffer) = state.session_manager.get_buffer(&s.session_id).await {
-                    let last_seq = {
-                        let buf = buffer.lock().await;
-                        buf.next_seq().saturating_sub(1)
-                    };
-                    let sink_clone = ws_sink.clone();
-                    let sid = s.session_id.clone();
-                    let task = tokio::spawn(tunnel_subscriber_task(
-                        sid.clone(),
-                        buffer,
-                        sink_clone,
-                        last_seq,
-                    ));
-                    subscriber_tasks.lock().await.insert(sid, task);
-                }
-            }
-        }
-        let count = subscriber_tasks.lock().await.len();
-        if count > 0 {
-            info!("Tunnel: re-subscribed to {count} running sessions");
-        }
-    }
+    // Do not auto-subscribe running sessions on reconnect.
+    //
+    // The relay/browser side re-attaches sessions explicitly when a client is
+    // actually watching them. Auto-subscribing every running session here
+    // leaks ghost subscribers across tunnel reconnects and can leave PTYs
+    // effectively "attached" even when no browser client exists.
 
     loop {
         tokio::select! {
@@ -862,7 +889,7 @@ async fn connect_and_run(
                                 let pong = tokio_tungstenite::tungstenite::Message::Text(
                                     r#"{"type":"tunnel.pong"}"#.into(),
                                 );
-                                if let Err(e) = ws_sink.try_send(pong) {
+                                if let Err(e) = ws_sink.priority_tx.try_send(pong) {
                                     warn!("Tunnel: pong dropped (channel: {e}), write path likely stuck");
                                 }
                             }
@@ -873,7 +900,9 @@ async fn connect_and_run(
                                 let st = state.clone();
                                 let tx = ws_sink.clone();
                                 let tasks = subscriber_tasks.clone();
+                                let permits = handler_permits.clone();
                                 tokio::spawn(async move {
+                                    let _permit = permits.acquire_owned().await.ok();
                                     if let Err(e) = AssertUnwindSafe(
                                         handle_relay_message(&st, &tx, &tasks, parsed)
                                     ).catch_unwind().await {
@@ -887,8 +916,10 @@ async fn connect_and_run(
                         if let Some((header, payload)) = decode_binary_frame(&data) {
                             let st = state.clone();
                             let tx = ws_sink.clone();
+                            let permits = handler_permits.clone();
                             let payload = payload.to_vec();
                             tokio::spawn(async move {
+                                let _permit = permits.acquire_owned().await.ok();
                                 if let Err(e) = AssertUnwindSafe(
                                     handle_relay_binary(&st, &tx, header, &payload)
                                 ).catch_unwind().await {
@@ -906,7 +937,7 @@ async fn connect_and_run(
                     // Forward session lifecycle events to relay
                     let text = serde_json::to_string(&event)
                         .unwrap_or_else(|_| r#"{"type":"error","message":"serialize failed"}"#.to_string());
-                    if let Err(e) = ws_sink.try_send(tokio_tungstenite::tungstenite::Message::Text(
+                    if let Err(e) = ws_sink.request_tx.try_send(tokio_tungstenite::tungstenite::Message::Text(
                         text.into(),
                     )) {
                         warn!("Tunnel: session event dropped (channel: {e})");
@@ -932,9 +963,16 @@ async fn connect_and_run(
     // Cleanup
     heartbeat_task.abort();
     writer_task.abort();
-    let tasks = subscriber_tasks.lock().await;
-    for (_, task) in tasks.iter() {
-        task.abort();
+    let attached_sessions: Vec<String> = {
+        let tasks = subscriber_tasks.lock().await;
+        let ids = tasks.keys().cloned().collect();
+        for (_, task) in tasks.iter() {
+            task.abort();
+        }
+        ids
+    };
+    if !attached_sessions.is_empty() {
+        state.session_manager.detach_all(&attached_sessions).await;
     }
 
     // Pause all active transfers on tunnel disconnect
@@ -985,7 +1023,7 @@ async fn handle_relay_message(
             handle_tunnel_exec_batch(state, ws_sink, &msg, request_id.as_deref()).await;
         }
         "tunnel.info" => {
-            handle_tunnel_info(state, ws_sink, request_id.as_deref()).await;
+            handle_tunnel_info(state, ws_sink, &msg, request_id.as_deref()).await;
         }
         "tunnel.health" => {
             handle_tunnel_health(state, ws_sink, request_id.as_deref()).await;
@@ -1047,6 +1085,9 @@ async fn handle_relay_message(
         "tunnel.lte.scan" => {
             handle_tunnel_lte_scan(state, ws_sink, &msg, request_id.as_deref()).await;
         }
+        "tunnel.lte.speedtest" => {
+            handle_tunnel_lte_speedtest(state, ws_sink, request_id.as_deref()).await;
+        }
         // gawdxfer transfer protocol messages
         "gx.download.init" => {
             handle_gx_download_init(state, ws_sink, &msg, request_id.as_deref()).await;
@@ -1097,13 +1138,46 @@ fn tunnel_headers(msg: &Value) -> axum::http::HeaderMap {
     headers
 }
 
-/// Send a JSON response back through the tunnel WS channel (non-blocking).
+/// Send a JSON response back through the tunnel WS channel.
+///
+/// Fast path uses `try_send` to avoid scheduler hops. If the request lane is
+/// full, falls back to async `.send()` so request/ack traffic remains lossless
+/// without blocking Tokio worker threads.
 #[allow(clippy::needless_pass_by_value)]
-fn send_response(ws_sink: &WsSink, msg: Value) {
+async fn send_response_async(ws_sink: &WsSink, msg: Value) -> bool {
+    let msg_type = msg["type"].as_str().unwrap_or("unknown");
+    let request_id = msg["request_id"].as_str().unwrap_or("");
     let text = serde_json::to_string(&msg)
         .unwrap_or_else(|_| r#"{"type":"error","message":"serialize failed"}"#.to_string());
-    if let Err(e) = ws_sink.try_send(tokio_tungstenite::tungstenite::Message::Text(text.into())) {
-        warn!("Tunnel: response dropped (channel: {e})");
+    let body_len = text.len();
+    let msg = tokio_tungstenite::tungstenite::Message::Text(text.into());
+    match ws_sink.request_tx.try_send(msg) {
+        Ok(()) => true,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
+            warn!(
+                msg_type,
+                request_id,
+                body_len,
+                "Tunnel: request lane full, awaiting ordered response delivery"
+            );
+            if let Err(e) = ws_sink.request_tx.send(msg).await {
+                warn!(
+                    msg_type,
+                    request_id,
+                    body_len,
+                    "Tunnel: async response send failed after backpressure: {e}"
+                );
+                return false;
+            }
+            true
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            warn!(
+                msg_type,
+                request_id, body_len, "Tunnel: async response dropped (request lane closed)"
+            );
+            false
+        }
     }
 }
 
@@ -1265,7 +1339,7 @@ async fn handle_tunnel_exec(
         }
     };
 
-    send_response(ws_sink, result);
+    send_response_async(ws_sink, result).await;
 }
 
 /// Handle `tunnel.exec_batch` — batch command execution
@@ -1276,7 +1350,7 @@ async fn handle_tunnel_exec_batch(
     request_id: Option<&str>,
 ) {
     let Some(commands) = msg["commands"].as_array() else {
-        send_response(
+        send_response_async(
             ws_sink,
             json!({
                 "type": "tunnel.exec_batch.result",
@@ -1284,12 +1358,13 @@ async fn handle_tunnel_exec_batch(
                 "status": 400,
                 "body": {"error": "commands array is required", "code": "INVALID_REQUEST"}
             }),
-        );
+        )
+        .await;
         return;
     };
 
     if commands.len() > state.config.server.max_batch_size {
-        send_response(
+        send_response_async(
             ws_sink,
             json!({
                 "type": "tunnel.exec_batch.result",
@@ -1300,7 +1375,7 @@ async fn handle_tunnel_exec_batch(
                     "code": "BATCH_TOO_LARGE"
                 }
             }),
-        );
+        ).await;
         return;
     }
 
@@ -1401,7 +1476,7 @@ async fn handle_tunnel_exec_batch(
         }
     }
 
-    send_response(
+    send_response_async(
         ws_sink,
         json!({
             "type": "tunnel.exec_batch.result",
@@ -1409,15 +1484,42 @@ async fn handle_tunnel_exec_batch(
             "status": 200,
             "body": {"results": results}
         }),
-    );
+    )
+    .await;
 }
 
 /// Handle tunnel.info — system information
-async fn handle_tunnel_info(state: &AppState, ws_sink: &WsSink, request_id: Option<&str>) {
+async fn handle_tunnel_info(
+    state: &AppState,
+    ws_sink: &WsSink,
+    msg: &Value,
+    request_id: Option<&str>,
+) {
+    let start = std::time::Instant::now();
+    let groups = msg["groups"].as_array().map(|items| {
+        items
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    });
     // Call the info handler directly — it returns JSON
-    match crate::routes::info::info(axum::extract::State(state.clone())).await {
+    match crate::routes::info::info(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(crate::routes::info::InfoQuery { groups }),
+    )
+    .await
+    {
         Ok(axum::Json(body)) => {
-            send_response(
+            let elapsed = start.elapsed();
+            let body_len = serde_json::to_string(&body).map(|s| s.len()).unwrap_or(0);
+            info!(
+                "tunnel.info: handler completed in {}ms, body={}B, rid={:?}",
+                elapsed.as_millis(),
+                body_len,
+                request_id
+            );
+            let queued = send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.info.result",
@@ -1425,10 +1527,22 @@ async fn handle_tunnel_info(state: &AppState, ws_sink: &WsSink, request_id: Opti
                     "status": 200,
                     "body": body,
                 }),
+            )
+            .await;
+            info!(
+                queued,
+                body_len,
+                rid = ?request_id,
+                "tunnel.info: response queue result"
             );
         }
         Err(status) => {
-            send_response(
+            warn!(
+                "tunnel.info: handler failed with {} in {}ms",
+                status,
+                start.elapsed().as_millis()
+            );
+            let queued = send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.info.result",
@@ -1436,7 +1550,9 @@ async fn handle_tunnel_info(state: &AppState, ws_sink: &WsSink, request_id: Opti
                     "status": status.as_u16(),
                     "body": {"error": "Failed to get info"},
                 }),
-            );
+            )
+            .await;
+            info!(queued, rid = ?request_id, "tunnel.info: error response queue result");
         }
     }
 }
@@ -1444,7 +1560,7 @@ async fn handle_tunnel_info(state: &AppState, ws_sink: &WsSink, request_id: Opti
 /// Handle tunnel.health — health check
 async fn handle_tunnel_health(state: &AppState, ws_sink: &WsSink, request_id: Option<&str>) {
     let axum::Json(body) = crate::routes::health::health(axum::extract::State(state.clone())).await;
-    send_response(
+    send_response_async(
         ws_sink,
         json!({
             "type": "tunnel.health.result",
@@ -1452,7 +1568,8 @@ async fn handle_tunnel_health(state: &AppState, ws_sink: &WsSink, request_id: Op
             "status": 200,
             "body": body,
         }),
-    );
+    )
+    .await;
 }
 
 /// Handle tunnel.diagnostics — server diagnostics snapshot
@@ -1475,7 +1592,7 @@ async fn handle_tunnel_diagnostics(
     .await
     {
         Ok(axum::Json(body)) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.diagnostics.result",
@@ -1483,10 +1600,11 @@ async fn handle_tunnel_diagnostics(
                     "status": 200,
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
         Err(status) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.diagnostics.result",
@@ -1494,7 +1612,8 @@ async fn handle_tunnel_diagnostics(
                     "status": status.as_u16(),
                     "body": {"error": "Failed to get diagnostics"},
                 }),
-            );
+            )
+            .await;
         }
     }
 }
@@ -1528,7 +1647,7 @@ async fn handle_tunnel_file_read(
     .await
     {
         Ok(axum::Json(body)) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.file.read.result",
@@ -1536,10 +1655,11 @@ async fn handle_tunnel_file_read(
                     "status": 200,
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
         Err((status, axum::Json(body))) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.file.read.result",
@@ -1547,7 +1667,8 @@ async fn handle_tunnel_file_read(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
     }
 }
@@ -1581,7 +1702,7 @@ async fn handle_tunnel_file_write(
     .await
     {
         Ok(axum::Json(body)) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.file.write.result",
@@ -1589,10 +1710,11 @@ async fn handle_tunnel_file_write(
                     "status": 200,
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
         Err((status, axum::Json(body))) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.file.write.result",
@@ -1600,7 +1722,8 @@ async fn handle_tunnel_file_write(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
     }
 }
@@ -1619,7 +1742,7 @@ async fn handle_tunnel_activity(
         .read_since(since_id, limit.min(200))
         .await;
 
-    send_response(
+    send_response_async(
         ws_sink,
         json!({
             "type": "tunnel.activity.result",
@@ -1627,7 +1750,8 @@ async fn handle_tunnel_activity(
             "status": 200,
             "body": { "entries": entries },
         }),
-    );
+    )
+    .await;
 }
 
 /// Handle tunnel.exec_result — cached exec result lookup
@@ -1641,7 +1765,7 @@ async fn handle_tunnel_exec_result(
 
     match state.exec_results_cache.get(activity_id).await {
         Some(result) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.exec_result.result",
@@ -1649,10 +1773,11 @@ async fn handle_tunnel_exec_result(
                     "status": 200,
                     "body": result,
                 }),
-            );
+            )
+            .await;
         }
         None => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.exec_result.result",
@@ -1660,7 +1785,8 @@ async fn handle_tunnel_exec_result(
                     "status": 404,
                     "body": {"error": "Exec result not found or evicted", "code": "NOT_FOUND"},
                 }),
-            );
+            )
+            .await;
         }
     }
 }
@@ -1669,7 +1795,7 @@ async fn handle_tunnel_exec_result(
 async fn handle_tunnel_sessions(state: &AppState, ws_sink: &WsSink, request_id: Option<&str>) {
     let axum::Json(body) =
         crate::routes::sessions::list_sessions(axum::extract::State(state.clone())).await;
-    send_response(
+    send_response_async(
         ws_sink,
         json!({
             "type": "tunnel.sessions.result",
@@ -1677,14 +1803,15 @@ async fn handle_tunnel_sessions(state: &AppState, ws_sink: &WsSink, request_id: 
             "status": 200,
             "body": body,
         }),
-    );
+    )
+    .await;
 }
 
 /// Handle tunnel.shells — shell list
 async fn handle_tunnel_shells(state: &AppState, ws_sink: &WsSink, request_id: Option<&str>) {
     let axum::Json(body) =
         crate::routes::shells::list_shells(axum::extract::State(state.clone())).await;
-    send_response(
+    send_response_async(
         ws_sink,
         json!({
             "type": "tunnel.shells.result",
@@ -1692,7 +1819,8 @@ async fn handle_tunnel_shells(state: &AppState, ws_sink: &WsSink, request_id: Op
             "status": 200,
             "body": body,
         }),
-    );
+    )
+    .await;
 }
 
 /// Handle tunnel.session.signal — signal a session
@@ -1716,7 +1844,7 @@ async fn handle_tunnel_session_signal(
     .await
     {
         Ok(axum::Json(body)) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.session.signal.result",
@@ -1724,10 +1852,11 @@ async fn handle_tunnel_session_signal(
                     "status": 200,
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
         Err((status, axum::Json(body))) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.session.signal.result",
@@ -1735,7 +1864,8 @@ async fn handle_tunnel_session_signal(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
     }
 }
@@ -1756,7 +1886,7 @@ async fn handle_tunnel_session_kill(
     .await
     {
         Ok(axum::Json(body)) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.session.kill.result",
@@ -1764,10 +1894,11 @@ async fn handle_tunnel_session_kill(
                     "status": 200,
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
         Err((status, axum::Json(body))) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.session.kill.result",
@@ -1775,7 +1906,8 @@ async fn handle_tunnel_session_kill(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
     }
 }
@@ -1804,7 +1936,7 @@ async fn handle_tunnel_session_patch(
     .await
     {
         Ok(axum::Json(body)) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.session.patch.result",
@@ -1812,10 +1944,11 @@ async fn handle_tunnel_session_patch(
                     "status": 200,
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
         Err((status, axum::Json(body))) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.session.patch.result",
@@ -1823,7 +1956,8 @@ async fn handle_tunnel_session_patch(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
     }
 }
@@ -1845,7 +1979,7 @@ async fn handle_tunnel_file_delete(
     .await
     {
         Ok(axum::Json(body)) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.file.delete.result",
@@ -1853,10 +1987,11 @@ async fn handle_tunnel_file_delete(
                     "status": 200,
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
         Err((status, axum::Json(body))) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.file.delete.result",
@@ -1864,7 +1999,8 @@ async fn handle_tunnel_file_delete(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
     }
 }
@@ -1898,7 +2034,7 @@ async fn handle_gx_download_init(
 
     match state.transfer_manager.init_download(path, chunk_size).await {
         Ok(result) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "gx.download.init.result",
@@ -1906,13 +2042,15 @@ async fn handle_gx_download_init(
                     "status": 200,
                     "body": serde_json::to_value(&result).unwrap_or_default(),
                 }),
-            );
+            )
+            .await;
         }
         Err(e) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 gx_error_response("gx.download.init.result", request_id, &e),
-            );
+            )
+            .await;
         }
     }
 }
@@ -1938,7 +2076,7 @@ async fn handle_gx_upload_init(
 
     match state.transfer_manager.init_upload(req).await {
         Ok(result) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "gx.upload.init.result",
@@ -1946,13 +2084,15 @@ async fn handle_gx_upload_init(
                     "status": 200,
                     "body": serde_json::to_value(&result).unwrap_or_default(),
                 }),
-            );
+            )
+            .await;
         }
         Err(e) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 gx_error_response("gx.upload.init.result", request_id, &e),
-            );
+            )
+            .await;
         }
     }
 }
@@ -1983,14 +2123,22 @@ async fn handle_gx_chunk_request(
                 "chunk_hash": chunk_header.chunk_hash,
             });
             let frame = encode_binary_frame(&header, &data);
-            if let Err(e) = ws_sink.try_send(tokio_tungstenite::tungstenite::Message::Binary(
-                frame.into(),
-            )) {
-                warn!("Tunnel: binary chunk dropped (channel: {e})");
+            let msg = tokio_tungstenite::tungstenite::Message::Binary(frame.into());
+            match ws_sink.request_tx.try_send(msg) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
+                    warn!("Tunnel: binary chunk request lane full, awaiting delivery");
+                    if let Err(e) = ws_sink.request_tx.send(msg).await {
+                        warn!("Tunnel: binary chunk send failed after backpressure: {e}");
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    warn!("Tunnel: binary chunk dropped (request lane closed)");
+                }
             }
         }
         Err(e) => {
-            send_response(ws_sink, gx_error_response("gx.chunk.ack", request_id, &e));
+            send_response_async(ws_sink, gx_error_response("gx.chunk.ack", request_id, &e)).await;
         }
     }
 }
@@ -2014,17 +2162,18 @@ async fn handle_gx_chunk_receive(
         .await
     {
         Ok(ack) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "gx.chunk.ack",
                     "request_id": request_id,
                     "body": serde_json::to_value(&ack).unwrap_or_default(),
                 }),
-            );
+            )
+            .await;
         }
         Err(e) => {
-            send_response(ws_sink, gx_error_response("gx.chunk.ack", request_id, &e));
+            send_response_async(ws_sink, gx_error_response("gx.chunk.ack", request_id, &e)).await;
         }
     }
 }
@@ -2039,7 +2188,7 @@ async fn handle_gx_resume(
     let transfer_id = msg["transfer_id"].as_str().unwrap_or("");
     match state.transfer_manager.resume(transfer_id).await {
         Ok(result) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "gx.resume.result",
@@ -2047,13 +2196,15 @@ async fn handle_gx_resume(
                     "status": 200,
                     "body": serde_json::to_value(&result).unwrap_or_default(),
                 }),
-            );
+            )
+            .await;
         }
         Err(e) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 gx_error_response("gx.resume.result", request_id, &e),
-            );
+            )
+            .await;
         }
     }
 }
@@ -2069,7 +2220,7 @@ async fn handle_gx_abort(
     let reason = msg["reason"].as_str().unwrap_or("remote abort");
     match state.transfer_manager.abort(transfer_id, reason).await {
         Ok(()) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "gx.abort.result",
@@ -2077,13 +2228,15 @@ async fn handle_gx_abort(
                     "status": 200,
                     "body": {"ok": true, "transfer_id": transfer_id},
                 }),
-            );
+            )
+            .await;
         }
         Err(e) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 gx_error_response("gx.abort.result", request_id, &e),
-            );
+            )
+            .await;
         }
     }
 }
@@ -2098,7 +2251,7 @@ async fn handle_gx_status(
     let transfer_id = msg["transfer_id"].as_str().unwrap_or("");
     match state.transfer_manager.status(transfer_id).await {
         Ok(result) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "gx.status.result",
@@ -2106,13 +2259,15 @@ async fn handle_gx_status(
                     "status": 200,
                     "body": serde_json::to_value(&result).unwrap_or_default(),
                 }),
-            );
+            )
+            .await;
         }
         Err(e) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 gx_error_response("gx.status.result", request_id, &e),
-            );
+            )
+            .await;
         }
     }
 }
@@ -2120,7 +2275,7 @@ async fn handle_gx_status(
 /// Handle gx.list — list all transfers.
 async fn handle_gx_list(state: &AppState, ws_sink: &WsSink, request_id: Option<&str>) {
     let result = state.transfer_manager.list().await;
-    send_response(
+    send_response_async(
         ws_sink,
         json!({
             "type": "gx.list.result",
@@ -2128,7 +2283,8 @@ async fn handle_gx_list(state: &AppState, ws_sink: &WsSink, request_id: Option<&
             "status": 200,
             "body": serde_json::to_value(&result).unwrap_or_default(),
         }),
-    );
+    )
+    .await;
 }
 
 /// Build a JSON error response for gx.* messages.
@@ -2204,6 +2360,23 @@ async fn handle_forwarded_session_message(
                 .unwrap_or(&state.config.shell.default_shell);
             let allows_ai = user_allows_ai.unwrap_or(true);
 
+            info!(
+                request_id = request_id.as_deref().unwrap_or(""),
+                shell = sh,
+                working_dir = dir,
+                pty = use_pty,
+                rows,
+                cols,
+                persistent,
+                "Tunnel: session.start received"
+            );
+
+            info!(
+                request_id = request_id.as_deref().unwrap_or(""),
+                shell = sh,
+                working_dir = dir,
+                "Tunnel: session.start spawning PTY"
+            );
             match state
                 .session_manager
                 .create_session_with_pty(
@@ -2220,6 +2393,12 @@ async fn handle_forwarded_session_message(
                 .await
             {
                 Ok((session_id, pid)) => {
+                    info!(
+                        request_id = request_id.as_deref().unwrap_or(""),
+                        session_id = %session_id,
+                        pid,
+                        "Tunnel: session.start PTY spawn succeeded"
+                    );
                     if !allows_ai {
                         let _ = state
                             .session_manager
@@ -2244,19 +2423,31 @@ async fn handle_forwarded_session_message(
                     if let Some(ref rid) = request_id {
                         resp["request_id"] = json!(rid);
                     }
-                    send_response(ws_sink, resp);
+                    let queued = send_response_async(ws_sink, resp).await;
+                    info!(
+                        request_id = request_id.as_deref().unwrap_or(""),
+                        session_id = %session_id,
+                        queued,
+                        "Tunnel: session.started queued"
+                    );
 
                     // Now start subscriber for output forwarding
                     if let Some(buffer) = state.session_manager.get_buffer(&session_id).await {
                         let sink_clone = ws_sink.clone();
                         let sid = session_id.clone();
                         let task = tokio::spawn(tunnel_subscriber_task(
+                            state.clone(),
                             sid.clone(),
                             buffer,
                             sink_clone,
                             0,
                         ));
                         subscriber_tasks.lock().await.insert(sid, task);
+                        info!(
+                            request_id = request_id.as_deref().unwrap_or(""),
+                            session_id = %session_id,
+                            "Tunnel: session.start subscriber task started"
+                        );
                     }
 
                     // Broadcast
@@ -2274,6 +2465,13 @@ async fn handle_forwarded_session_message(
                     let _ = state.session_events.send(broadcast);
                 }
                 Err(e) => {
+                    warn!(
+                        request_id = request_id.as_deref().unwrap_or(""),
+                        shell = sh,
+                        working_dir = dir,
+                        error = %e,
+                        "Tunnel: session.start PTY spawn failed"
+                    );
                     let mut resp = json!({
                         "type": "error",
                         "code": "SESSION_LIMIT",
@@ -2282,7 +2480,7 @@ async fn handle_forwarded_session_message(
                     if let Some(ref rid) = request_id {
                         resp["request_id"] = json!(rid);
                     }
-                    send_response(ws_sink, resp);
+                    send_response_async(ws_sink, resp).await;
                 }
             }
         }
@@ -2304,7 +2502,7 @@ async fn handle_forwarded_session_message(
                 if let Some(ref rid) = request_id {
                     resp["request_id"] = json!(rid);
                 }
-                send_response(ws_sink, resp);
+                send_response_async(ws_sink, resp).await;
             } else {
                 let mut resp = json!({
                     "type": "session.exec.ack",
@@ -2313,7 +2511,7 @@ async fn handle_forwarded_session_message(
                 if let Some(ref rid) = request_id {
                     resp["request_id"] = json!(rid);
                 }
-                send_response(ws_sink, resp);
+                send_response_async(ws_sink, resp).await;
             }
         }
         "session.stdin" => {
@@ -2326,7 +2524,7 @@ async fn handle_forwarded_session_message(
                     .send_to_session(session_id, data)
                     .await
                 {
-                    send_response(
+                    send_response_async(
                         ws_sink,
                         json!({
                             "type": "error",
@@ -2334,7 +2532,8 @@ async fn handle_forwarded_session_message(
                             "session_id": session_id,
                             "message": e,
                         }),
-                    );
+                    )
+                    .await;
                 }
             }
         }
@@ -2351,7 +2550,7 @@ async fn handle_forwarded_session_message(
                     if let Some(ref rid) = request_id {
                         resp["request_id"] = json!(rid);
                     }
-                    send_response(ws_sink, resp);
+                    send_response_async(ws_sink, resp).await;
                     let _ = state.session_events.send(json!({
                         "type": "session.destroyed",
                         "session_id": session_id,
@@ -2371,7 +2570,7 @@ async fn handle_forwarded_session_message(
                     if let Some(ref rid) = request_id {
                         resp["request_id"] = json!(rid);
                     }
-                    send_response(ws_sink, resp);
+                    send_response_async(ws_sink, resp).await;
                 }
             }
         }
@@ -2395,7 +2594,7 @@ async fn handle_forwarded_session_message(
                         if let Some(ref rid) = request_id {
                             resp["request_id"] = json!(rid);
                         }
-                        send_response(ws_sink, resp);
+                        send_response_async(ws_sink, resp).await;
                     }
                     Err(e) => {
                         let mut resp = json!({
@@ -2407,7 +2606,7 @@ async fn handle_forwarded_session_message(
                         if let Some(ref rid) = request_id {
                             resp["request_id"] = json!(rid);
                         }
-                        send_response(ws_sink, resp);
+                        send_response_async(ws_sink, resp).await;
                     }
                 }
             }
@@ -2421,7 +2620,7 @@ async fn handle_forwarded_session_message(
                     task.abort();
                 }
 
-                if let Some(buffer) = state.session_manager.attach(session_id).await {
+                if let Some(buffer) = state.session_manager.attach_shared(session_id).await {
                     let (entries, dropped) = {
                         let buf = buffer.lock().await;
                         buf.read_since(since)
@@ -2441,12 +2640,13 @@ async fn handle_forwarded_session_message(
                     if let Some(ref rid) = request_id {
                         resp["request_id"] = json!(rid);
                     }
-                    send_response(ws_sink, resp);
+                    send_response_async(ws_sink, resp).await;
 
                     // Start subscriber
                     let sink_clone = ws_sink.clone();
                     let sid = session_id.to_string();
                     let task = tokio::spawn(tunnel_subscriber_task(
+                        state.clone(),
                         sid.clone(),
                         buffer,
                         sink_clone,
@@ -2463,7 +2663,7 @@ async fn handle_forwarded_session_message(
                     if let Some(ref rid) = request_id {
                         resp["request_id"] = json!(rid);
                     }
-                    send_response(ws_sink, resp);
+                    send_response_async(ws_sink, resp).await;
                 }
             }
         }
@@ -2513,7 +2713,7 @@ async fn handle_forwarded_session_message(
             if let Some(ref rid) = request_id {
                 resp["request_id"] = json!(rid);
             }
-            send_response(ws_sink, resp);
+            send_response_async(ws_sink, resp).await;
         }
         "session.resize" => {
             let session_id = msg["session_id"].as_str().unwrap_or("");
@@ -2537,7 +2737,7 @@ async fn handle_forwarded_session_message(
                         if let Some(ref rid) = request_id {
                             resp["request_id"] = json!(rid);
                         }
-                        send_response(ws_sink, resp);
+                        send_response_async(ws_sink, resp).await;
                     }
                     Err(e) => {
                         let mut resp = json!({
@@ -2549,7 +2749,7 @@ async fn handle_forwarded_session_message(
                         if let Some(ref rid) = request_id {
                             resp["request_id"] = json!(rid);
                         }
-                        send_response(ws_sink, resp);
+                        send_response_async(ws_sink, resp).await;
                     }
                 }
             }
@@ -2573,7 +2773,7 @@ async fn handle_forwarded_session_message(
                             if let Some(ref rid) = request_id {
                                 resp["request_id"] = json!(rid);
                             }
-                            send_response(ws_sink, resp);
+                            send_response_async(ws_sink, resp).await;
                             let _ = state.session_events.send(json!({
                                 "type": "session.ai_permission_changed",
                                 "session_id": session_id,
@@ -2597,7 +2797,7 @@ async fn handle_forwarded_session_message(
                             if let Some(ref rid) = request_id {
                                 resp["request_id"] = json!(rid);
                             }
-                            send_response(ws_sink, resp);
+                            send_response_async(ws_sink, resp).await;
                         }
                     }
                 }
@@ -2630,7 +2830,7 @@ async fn handle_forwarded_session_message(
                             if let Some(ref rid) = request_id {
                                 resp["request_id"] = json!(rid);
                             }
-                            send_response(ws_sink, resp);
+                            send_response_async(ws_sink, resp).await;
                             let mut broadcast = json!({
                                 "type": "session.ai_status_changed",
                                 "session_id": session_id,
@@ -2654,7 +2854,7 @@ async fn handle_forwarded_session_message(
                             if let Some(ref rid) = request_id {
                                 resp["request_id"] = json!(rid);
                             }
-                            send_response(ws_sink, resp);
+                            send_response_async(ws_sink, resp).await;
                         }
                     }
                 }
@@ -2674,7 +2874,7 @@ async fn handle_forwarded_session_message(
                         if let Some(ref rid) = request_id {
                             resp["request_id"] = json!(rid);
                         }
-                        send_response(ws_sink, resp);
+                        send_response_async(ws_sink, resp).await;
                         let _ = state.session_events.send(json!({
                             "type": "session.renamed",
                             "session_id": session_id,
@@ -2691,7 +2891,7 @@ async fn handle_forwarded_session_message(
                         if let Some(ref rid) = request_id {
                             resp["request_id"] = json!(rid);
                         }
-                        send_response(ws_sink, resp);
+                        send_response_async(ws_sink, resp).await;
                     }
                 }
             }
@@ -2706,7 +2906,7 @@ async fn handle_forwarded_session_message(
             if let Some(ref rid) = request_id {
                 resp["request_id"] = json!(rid);
             }
-            send_response(ws_sink, resp);
+            send_response_async(ws_sink, resp).await;
         }
         _ => {
             warn!(msg_type, "Unknown forwarded session message type");
@@ -2725,6 +2925,67 @@ fn entry_to_ws_message(session_id: &str, entry: &OutputEntry) -> Value {
     })
 }
 
+fn batch_output_entries(session_id: &str, entries: &[OutputEntry]) -> Vec<String> {
+    let mut batched = Vec::new();
+    let mut current_stream = None;
+    let mut current_data = String::new();
+    let mut current_seq = 0u64;
+    let mut current_timestamp_ms = 0u64;
+    let mut current_count = 0usize;
+
+    let flush_current = |batched: &mut Vec<String>,
+                         current_stream: &mut Option<crate::sessions::buffer::OutputStream>,
+                         current_data: &mut String,
+                         current_seq: &mut u64,
+                         current_timestamp_ms: &mut u64,
+                         current_count: &mut usize| {
+        if let Some(stream) = current_stream.take() {
+            let msg = json!({
+                "type": format!("session.{}", stream.as_str()),
+                "session_id": session_id,
+                "data": std::mem::take(current_data),
+                "seq": *current_seq,
+                "timestamp_ms": *current_timestamp_ms,
+            });
+            let text = serde_json::to_string(&msg)
+                .unwrap_or_else(|_| r#"{"type":"error","message":"serialize failed"}"#.to_string());
+            batched.push(text);
+            *current_count = 0;
+        }
+    };
+
+    for entry in entries {
+        let same_stream = current_stream == Some(entry.stream);
+        let fits_bytes = current_data.len() + entry.data.len() <= TUNNEL_STREAM_BATCH_MAX_BYTES;
+        let fits_count = current_count < TUNNEL_STREAM_BATCH_MAX_ENTRIES;
+        if !same_stream || !fits_bytes || !fits_count {
+            flush_current(
+                &mut batched,
+                &mut current_stream,
+                &mut current_data,
+                &mut current_seq,
+                &mut current_timestamp_ms,
+                &mut current_count,
+            );
+            current_stream = Some(entry.stream);
+        }
+        current_data.push_str(&entry.data);
+        current_seq = entry.seq;
+        current_timestamp_ms = entry.timestamp_ms;
+        current_count += 1;
+    }
+
+    flush_current(
+        &mut batched,
+        &mut current_stream,
+        &mut current_data,
+        &mut current_seq,
+        &mut current_timestamp_ms,
+        &mut current_count,
+    );
+    batched
+}
+
 /// Handle `tunnel.playbooks.list`
 async fn handle_tunnel_playbooks_list(
     state: &AppState,
@@ -2739,7 +3000,7 @@ async fn handle_tunnel_playbooks_list(
     .await
     {
         Ok(axum::Json(body)) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.playbooks.list.result",
@@ -2747,10 +3008,11 @@ async fn handle_tunnel_playbooks_list(
                     "status": 200,
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
         Err((status, axum::Json(body))) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.playbooks.list.result",
@@ -2758,7 +3020,8 @@ async fn handle_tunnel_playbooks_list(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
     }
 }
@@ -2779,7 +3042,7 @@ async fn handle_tunnel_playbooks_get(
     .await
     {
         Ok(axum::Json(body)) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.playbooks.get.result",
@@ -2787,10 +3050,11 @@ async fn handle_tunnel_playbooks_get(
                     "status": 200,
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
         Err((status, axum::Json(body))) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.playbooks.get.result",
@@ -2798,7 +3062,8 @@ async fn handle_tunnel_playbooks_get(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
     }
 }
@@ -2821,7 +3086,7 @@ async fn handle_tunnel_playbooks_put(
     .await
     {
         Ok(axum::Json(body)) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.playbooks.put.result",
@@ -2829,10 +3094,11 @@ async fn handle_tunnel_playbooks_put(
                     "status": 200,
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
         Err((status, axum::Json(body))) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.playbooks.put.result",
@@ -2840,7 +3106,8 @@ async fn handle_tunnel_playbooks_put(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
     }
 }
@@ -2861,7 +3128,7 @@ async fn handle_tunnel_playbooks_delete(
     .await
     {
         Ok(axum::Json(body)) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.playbooks.delete.result",
@@ -2869,10 +3136,11 @@ async fn handle_tunnel_playbooks_delete(
                     "status": 200,
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
         Err((status, axum::Json(body))) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.playbooks.delete.result",
@@ -2880,7 +3148,8 @@ async fn handle_tunnel_playbooks_delete(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
     }
 }
@@ -2889,7 +3158,7 @@ async fn handle_tunnel_playbooks_delete(
 async fn handle_tunnel_gps(state: &AppState, ws_sink: &WsSink, request_id: Option<&str>) {
     match crate::routes::gps::gps(axum::extract::State(state.clone())).await {
         Ok(axum::Json(body)) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.gps.result",
@@ -2897,10 +3166,11 @@ async fn handle_tunnel_gps(state: &AppState, ws_sink: &WsSink, request_id: Optio
                     "status": 200,
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
         Err((status, axum::Json(body))) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.gps.result",
@@ -2908,7 +3178,8 @@ async fn handle_tunnel_gps(state: &AppState, ws_sink: &WsSink, request_id: Optio
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
     }
 }
@@ -2922,7 +3193,7 @@ async fn handle_tunnel_lte(state: &AppState, ws_sink: &WsSink, request_id: Optio
     .await
     {
         Ok(axum::Json(body)) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.lte.result",
@@ -2930,10 +3201,11 @@ async fn handle_tunnel_lte(state: &AppState, ws_sink: &WsSink, request_id: Optio
                     "status": 200,
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
         Err((status, axum::Json(body))) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.lte.result",
@@ -2941,7 +3213,8 @@ async fn handle_tunnel_lte(state: &AppState, ws_sink: &WsSink, request_id: Optio
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
     }
 }
@@ -2957,7 +3230,7 @@ async fn handle_tunnel_lte_bands(
     let req: crate::routes::lte::SetBandsRequest = match serde_json::from_value(body) {
         Ok(r) => r,
         Err(e) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.lte.bands.result",
@@ -2965,7 +3238,8 @@ async fn handle_tunnel_lte_bands(
                     "status": 400,
                     "body": {"error": format!("invalid request: {e}")},
                 }),
-            );
+            )
+            .await;
             return;
         }
     };
@@ -2973,7 +3247,7 @@ async fn handle_tunnel_lte_bands(
     match crate::routes::lte::set_bands(axum::extract::State(state.clone()), axum::Json(req)).await
     {
         Ok(axum::Json(body)) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.lte.bands.result",
@@ -2981,10 +3255,11 @@ async fn handle_tunnel_lte_bands(
                     "status": 200,
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
         Err((status, axum::Json(body))) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.lte.bands.result",
@@ -2992,7 +3267,8 @@ async fn handle_tunnel_lte_bands(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
     }
 }
@@ -3008,7 +3284,7 @@ async fn handle_tunnel_lte_scan(
     let req: crate::routes::lte::StartScanRequest = match serde_json::from_value(body) {
         Ok(r) => r,
         Err(e) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.lte.scan.result",
@@ -3016,7 +3292,8 @@ async fn handle_tunnel_lte_scan(
                     "status": 400,
                     "body": {"error": format!("invalid request: {e}")},
                 }),
-            );
+            )
+            .await;
             return;
         }
     };
@@ -3024,7 +3301,7 @@ async fn handle_tunnel_lte_scan(
     match crate::routes::lte::start_scan(axum::extract::State(state.clone()), axum::Json(req)).await
     {
         Ok(axum::Json(body)) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.lte.scan.result",
@@ -3032,10 +3309,11 @@ async fn handle_tunnel_lte_scan(
                     "status": 200,
                     "body": body,
                 }),
-            );
+            )
+            .await;
         }
         Err((status, axum::Json(body))) => {
-            send_response(
+            send_response_async(
                 ws_sink,
                 json!({
                     "type": "tunnel.lte.scan.result",
@@ -3043,7 +3321,38 @@ async fn handle_tunnel_lte_scan(
                     "status": status.as_u16(),
                     "body": body,
                 }),
-            );
+            )
+            .await;
+        }
+    }
+}
+
+/// Handle `tunnel.lte.speedtest` — run a quick download+upload speed test.
+async fn handle_tunnel_lte_speedtest(state: &AppState, ws_sink: &WsSink, request_id: Option<&str>) {
+    match crate::routes::lte::speed_test(axum::extract::State(state.clone())).await {
+        Ok(axum::Json(body)) => {
+            send_response_async(
+                ws_sink,
+                json!({
+                    "type": "tunnel.lte.speedtest.result",
+                    "request_id": request_id,
+                    "status": 200,
+                    "body": body,
+                }),
+            )
+            .await;
+        }
+        Err((status, axum::Json(body))) => {
+            send_response_async(
+                ws_sink,
+                json!({
+                    "type": "tunnel.lte.speedtest.result",
+                    "request_id": request_id,
+                    "status": status.as_u16(),
+                    "body": body,
+                }),
+            )
+            .await;
         }
     }
 }
@@ -3055,12 +3364,15 @@ async fn handle_tunnel_lte_scan(
 /// entries, and flushes periodically (every ~50 entries) to coalesce TCP writes.
 /// This avoids per-entry lock acquisition + syscall overhead on the slow RISC-V CPU.
 async fn tunnel_subscriber_task(
+    state: AppState,
     session_id: String,
     buffer: Arc<tokio::sync::Mutex<OutputBuffer>>,
     ws_sink: WsSink,
     since: u64,
 ) {
     let mut cursor = since;
+    let mut logged_first_output = false;
+    let mut backpressure_active = false;
     loop {
         let (entries, notify) = {
             let buf = buffer.lock().await;
@@ -3072,23 +3384,41 @@ async fn tunnel_subscriber_task(
             }
         };
         if !entries.is_empty() {
-            for entry in &entries {
-                let msg = entry_to_ws_message(&session_id, entry);
-                let text = serde_json::to_string(&msg).unwrap_or_else(|_| {
-                    r#"{"type":"error","message":"serialize failed"}"#.to_string()
-                });
-                match ws_sink.try_send(tokio_tungstenite::tungstenite::Message::Text(text.into())) {
-                    Ok(()) => {}
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        tracing::warn!(
-                            session_id = %session_id,
-                            "Tunnel: session output dropped (writer channel full)"
-                        );
-                        return;
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        return;
-                    }
+            if !logged_first_output {
+                logged_first_output = true;
+                info!(
+                    session_id = %session_id,
+                    entry_count = entries.len(),
+                    "Tunnel: session subscriber emitting first output"
+                );
+            }
+            let batched_messages = batch_output_entries(&session_id, &entries);
+            for text in batched_messages {
+                let stream_capacity = ws_sink.stream_tx.capacity();
+                if stream_capacity == 0 && !backpressure_active {
+                    backpressure_active = true;
+                    state
+                        .tunnel_stats
+                        .stream_backpressure_events
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        session_id = %session_id,
+                        "Tunnel: session stream backpressure engaged"
+                    );
+                } else if stream_capacity > 0 && backpressure_active {
+                    backpressure_active = false;
+                    tracing::info!(
+                        session_id = %session_id,
+                        "Tunnel: session stream backpressure cleared"
+                    );
+                }
+                if ws_sink
+                    .stream_tx
+                    .send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
             }
             // Always advance cursor — dropped entries are gone (the relay
