@@ -467,7 +467,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
                             );
                             match lte::verified_set_bands(modem, &safe_cfg.bands).await {
                                 Ok(actual) => {
-                                    info!("Startup: safe bands restored and verified: {actual:?}")
+                                    info!("Startup: safe bands restored and verified: {actual:?}");
                                 }
                                 Err(e) => warn!("Startup: safe bands restore failed: {e}"),
                             }
