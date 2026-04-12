@@ -285,9 +285,17 @@ impl SessionManager {
 
     /// Send data to a session's stdin.
     pub async fn send_to_session(&self, session_id: &str, data: &str) -> Result<(), String> {
-        let sessions = self.sessions.read().await;
-        match sessions.get(session_id) {
-            Some(entry) => entry.session.write_stdin(data).await,
+        let stdin_tx = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(session_id)
+                .map(|entry| entry.session.stdin_sender())
+        };
+        match stdin_tx {
+            Some(tx) => tx
+                .send(data.as_bytes().to_vec())
+                .await
+                .map_err(|_| "Session stdin closed".to_string()),
             None => Err(format!("Session {session_id} not found")),
         }
     }
@@ -295,14 +303,18 @@ impl SessionManager {
     /// Send a command to a session, appending the appropriate line ending
     /// (`\r` for PTY sessions, `\n` for pipe sessions).
     pub async fn exec_command(&self, session_id: &str, command: &str) -> Result<(), String> {
-        let sessions = self.sessions.read().await;
-        match sessions.get(session_id) {
-            Some(entry) => {
-                let line_ending = if entry.session.is_pty() { "\r" } else { "\n" };
-                entry
-                    .session
-                    .write_stdin(&format!("{command}{line_ending}"))
+        let session = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(session_id)
+                .map(|entry| (entry.session.stdin_sender(), entry.session.is_pty()))
+        };
+        match session {
+            Some((tx, is_pty)) => {
+                let line_ending = if is_pty { "\r" } else { "\n" };
+                tx.send(format!("{command}{line_ending}").into_bytes())
                     .await
+                    .map_err(|_| "Session stdin closed".to_string())
             }
             None => Err(format!("Session {session_id} not found")),
         }
@@ -402,6 +414,26 @@ impl SessionManager {
         }
     }
 
+    /// Mark a session as attached for the shared tunnel/relay subscriber path.
+    ///
+    /// Unlike [`Self::attach`], this clamps the attachment count to `1`. The
+    /// relay fans out a single device-side subscriber to many browser clients,
+    /// so repeated re-attachs for the same session must not leak attachment
+    /// count on the device.
+    pub async fn attach_shared(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<tokio::sync::Mutex<OutputBuffer>>> {
+        let mut sessions = self.sessions.write().await;
+        if let Some(entry) = sessions.get_mut(session_id) {
+            entry.attached_count = 1;
+            entry.last_activity = Instant::now();
+            Some(Arc::clone(&entry.session.buffer))
+        } else {
+            None
+        }
+    }
+
     /// Detach from a session — marks it as not attached.
     pub async fn detach(&self, session_id: &str) {
         let mut sessions = self.sessions.write().await;
@@ -424,14 +456,18 @@ impl SessionManager {
 
     /// Get the status and exit code of a session.
     pub async fn get_status(&self, session_id: &str) -> Option<(SessionStatus, Option<i32>)> {
-        let sessions = self.sessions.read().await;
-        if let Some(entry) = sessions.get(session_id) {
-            let status = *entry.session.status.lock().await;
-            let code = *entry.session.exit_code.lock().await;
-            Some((status, code))
-        } else {
-            None
-        }
+        let handles = {
+            let sessions = self.sessions.read().await;
+            sessions.get(session_id).map(|entry| {
+                (
+                    entry.session.status_handle(),
+                    entry.session.exit_code_handle(),
+                )
+            })
+        }?;
+        let status = *handles.0.lock().await;
+        let code = *handles.1.lock().await;
+        Some((status, code))
     }
 
     /// Check whether a session is persistent.
@@ -536,19 +572,60 @@ impl SessionManager {
 
     /// List all active sessions (used by the `session.list` WS message).
     pub async fn list_sessions(&self) -> Vec<SessionListItem> {
-        let sessions = self.sessions.read().await;
+        let sessions_snapshot = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .iter()
+                .map(|(id, entry)| {
+                    (
+                        id.clone(),
+                        entry.session.pid,
+                        entry.persistent,
+                        entry.session.is_pty(),
+                        entry.attached_count,
+                        entry.idle_timeout,
+                        entry.name.clone(),
+                        entry.created_at,
+                        entry.user_allows_ai,
+                        entry.ai_is_working,
+                        entry.ai_activity.clone(),
+                        entry.ai_status_message.clone(),
+                        entry.last_activity,
+                        entry.session.status_handle(),
+                        entry.session.exit_code_handle(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
         let idle_threshold = std::time::Duration::from_secs(60);
-        let mut items = Vec::with_capacity(sessions.len());
-        for (id, entry) in sessions.iter() {
-            let status = *entry.session.status.lock().await;
-            let exit_code = *entry.session.exit_code.lock().await;
-            let attached = entry.attached_count > 0;
-            let idle = !attached && entry.last_activity.elapsed() > idle_threshold;
+        let mut items = Vec::with_capacity(sessions_snapshot.len());
+        for (
+            id,
+            pid,
+            persistent,
+            pty,
+            attached_count,
+            idle_timeout,
+            name,
+            created_at,
+            user_allows_ai,
+            ai_is_working,
+            ai_activity,
+            ai_status_message,
+            last_activity,
+            status_handle,
+            exit_code_handle,
+        ) in sessions_snapshot
+        {
+            let status = *status_handle.lock().await;
+            let exit_code = *exit_code_handle.lock().await;
+            let attached = attached_count > 0;
+            let idle = !attached && last_activity.elapsed() > idle_threshold;
             items.push(SessionListItem {
-                session_id: id.clone(),
-                pid: entry.session.pid,
-                persistent: entry.persistent,
-                pty: entry.session.is_pty(),
+                session_id: id,
+                pid,
+                persistent,
+                pty,
                 attached,
                 status: match status {
                     session::SessionStatus::Running => "running".to_string(),
@@ -556,13 +633,13 @@ impl SessionManager {
                 },
                 exit_code,
                 idle,
-                idle_timeout: entry.idle_timeout,
-                name: entry.name.clone(),
-                created_at: entry.created_at,
-                user_allows_ai: entry.user_allows_ai,
-                ai_is_working: entry.ai_is_working,
-                ai_activity: entry.ai_activity.clone(),
-                ai_status_message: entry.ai_status_message.clone(),
+                idle_timeout,
+                name,
+                created_at,
+                user_allows_ai,
+                ai_is_working,
+                ai_activity,
+                ai_status_message,
             });
         }
         items

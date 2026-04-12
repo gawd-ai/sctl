@@ -11,6 +11,7 @@
 		visible: boolean;
 		connectionStatus: ConnectionStatus;
 		deviceInfo: DeviceInfo | null;
+		deviceBusyReason?: string | null;
 		activity: ActivityEntry[];
 		restClient: SctlRestClient | null;
 		relayHealth: RelayHealthInfo | null;
@@ -46,6 +47,7 @@
 		visible,
 		connectionStatus,
 		deviceInfo,
+		deviceBusyReason = null,
 		activity,
 		restClient,
 		relayHealth,
@@ -106,20 +108,10 @@
 		if (!relayDiagnostics) relayDiagLoading = false;
 	}
 
-	// Auto-fetch diagnostics when dashboard first becomes visible (device view)
-	$effect(() => {
-		if (visible && activeView === 'device' &&
-			connectionStatus === 'connected' && !serverDiagnostics && !diagLoading) {
-			doFetchDiagnostics();
-		}
-	});
-	// Auto-fetch diagnostics when logs tab selected or dashboard visible (relay view)
-	$effect(() => {
-		if (visible && activeView === 'relay' &&
-			hasRelayApiKey && !relayDiagnostics && !relayDiagLoading) {
-			doFetchRelayDiagnostics();
-		}
-	});
+	// Diagnostics are intentionally manual.
+	// On fragile LTE tunnel devices, auto-fetching logs/process diagnostics on
+	// dashboard open adds expensive requests (`journalctl` / `logread`) right
+	// when the UI is also fetching info/health/session data.
 
 	// Auto-switch back to device view when it reconnects after being offline
 	$effect(() => {
@@ -135,6 +127,10 @@
 
 	$effect(() => {
 		if (!visible || connectionStatus !== 'connected') return;
+		// Fetch immediately if we don't have device info yet
+		if (!deviceInfo) {
+			onrefreshinfo?.();
+		}
 		refreshCountdown = 30;
 		const interval = setInterval(() => {
 			refreshCountdown--;
@@ -178,13 +174,17 @@
 	// ── LTE band management state ───────────────────────────────────
 
 	let lteData = $state<LteData | null>(null);
-	let lteBandAction: 'idle' | 'switching' | 'scanning' = $state('idle');
+	let lteBandAction: 'idle' | 'switching' | 'scanning' | 'testing' = $state('idle');
+	let lteBandActionStartedAt: number | null = $state(null);
 	let lteBandError: string | null = $state(null);
 	let lteLoading = $state(false);
 	let lteExpanded = $state(false);
-	let lteConfirm: 'auto' | 'scan' | 'restore' | 'multi-lock' | number | null = $state(null);
+	let lteConfirm: 'auto' | 'scan' | 'restore' | 'multi-lock' | 'speed' | number | null = $state(null);
 	let lteSpeedTest = $state(false);
 	let lteScanStartedAt: number | null = $state(null);
+	let lteSpeedResult: { download_bps: number | null; upload_bps: number | null } | null = $state(null);
+	let lteRegistering = $state(false);
+	let lteRegisteringStartedAt: number | null = $state(null);
 	// Multi-band selection
 	let lteSelectionMode = $state(false);
 	let lteSelectedBands: Set<number> = $state(new Set());
@@ -198,7 +198,17 @@
 			// If a scan was running and is now completed, clear scanning state
 			if (lteBandAction === 'scanning' && lteData.scan_status?.state !== 'running') {
 				lteBandAction = 'idle';
+				lteBandActionStartedAt = null;
 				lteScanStartedAt = null;
+			}
+			// Sync lteRegistering with server's registration_pending flag
+			if (lteRegistering && !lteData.registration_pending) {
+				lteRegistering = false;
+				lteRegisteringStartedAt = null;
+			}
+			if (!lteRegistering && lteData.registration_pending) {
+				lteRegistering = true;
+				lteRegisteringStartedAt = lteRegisteringStartedAt ?? Date.now();
 			}
 		} catch {
 			// Silently fail — device might be mid-scan and disconnected
@@ -207,48 +217,95 @@
 		}
 	}
 
-	// Poll LTE data when panel is expanded and device has LTE
+	// Poll LTE data — always fetch when device has LTE, not just when expanded.
+	// Collapsed: 30s poll for summary display. Expanded: 5s during operations, 30s otherwise.
 	$effect(() => {
-		if (!visible || !lteExpanded || !deviceInfo?.lte || connectionStatus !== 'connected') return;
+		if (!visible || !deviceInfo?.lte || connectionStatus !== 'connected') return;
+		// Seed lteData from deviceInfo if not yet loaded (ensures optimistic updates have a target)
+		if (!lteData && deviceInfo.lte.band_config) {
+			lteData = { signal: { band_config: deviceInfo.lte.band_config } } as LteData;
+		}
 		// Fetch immediately
 		fetchLteData();
-		// Poll: 5s during scan, 30s otherwise
+		// Poll: 5s during any active operation or registration (expanded only), 30s otherwise
+		const fastPoll = lteExpanded && (lteBandAction !== 'idle' || lteRegistering);
 		const interval = setInterval(() => {
+			// Safety: unstick lteBandAction after 90s
+			if (lteBandAction !== 'idle' && lteBandActionStartedAt && Date.now() - lteBandActionStartedAt > 90_000) {
+				lteBandAction = 'idle';
+				lteBandActionStartedAt = null;
+				lteBandError = 'operation timed out';
+			}
+			// Safety: unstick lteRegistering after 60s
+			if (lteRegistering && lteRegisteringStartedAt && Date.now() - lteRegisteringStartedAt > 60_000) {
+				lteRegistering = false;
+				lteRegisteringStartedAt = null;
+			}
 			fetchLteData();
-		}, lteBandAction === 'scanning' ? 5000 : 30000);
+		}, fastPoll ? 5000 : 30000);
 		return () => clearInterval(interval);
 	});
 
 	/** Switch bands (auto or locked). */
 	async function handleSetBands(mode: 'auto' | 'locked', bands?: number[], priorityBand?: number) {
-		if (!restClient || lteBandAction !== 'idle') return;
+		if (!restClient || lteBandAction !== 'idle' || lteRegistering) return;
 		lteBandAction = 'switching';
+		lteBandActionStartedAt = Date.now();
 		lteBandError = null;
 		try {
-			await restClient.setLteBands({ mode, bands, priority_band: priorityBand });
-			await fetchLteData();
+			const result = await restClient.setLteBands({ mode, bands, priority_band: priorityBand, force: true });
+			// Optimistic update — bands are verified by server
+			if (lteData?.signal) {
+				lteData.signal.band_config = result.band_config;
+				lteData = lteData;
+			}
+			// Show registration progress if pending
+			if (result.registration === 'pending') {
+				lteRegistering = true;
+				lteRegisteringStartedAt = Date.now();
+			}
 			onrefreshinfo?.();
 		} catch (e) {
 			lteBandError = e instanceof Error ? e.message : String(e);
 		} finally {
 			lteBandAction = 'idle';
+			lteBandActionStartedAt = null;
 		}
 	}
 
 	/** Start a band scan. */
 	async function handleStartScan(bands?: number[], includeSpeedTest = false) {
-		if (!restClient || lteBandAction !== 'idle') return;
+		if (!restClient || lteBandAction !== 'idle' || lteRegistering) return;
 		lteBandAction = 'scanning';
+		lteBandActionStartedAt = Date.now();
 		lteBandError = null;
 		lteScanStartedAt = Date.now();
 		try {
-			await restClient.startLteScan({ bands, include_speed_test: includeSpeedTest });
+			await restClient.startLteScan({ bands, include_speed_test: includeSpeedTest, force: true });
 			// Start polling for scan progress
 			await fetchLteData();
 		} catch (e) {
 			lteBandError = e instanceof Error ? e.message : String(e);
 			lteBandAction = 'idle';
+			lteBandActionStartedAt = null;
 			lteScanStartedAt = null;
+		}
+	}
+
+	/** Run a quick speed test on the current band. */
+	async function handleSpeedTest() {
+		if (!restClient || lteBandAction !== 'idle' || lteRegistering) return;
+		lteBandAction = 'testing';
+		lteBandActionStartedAt = Date.now();
+		lteBandError = null;
+		lteSpeedResult = null;
+		try {
+			lteSpeedResult = await restClient.runSpeedTest();
+		} catch (e) {
+			lteBandError = e instanceof Error ? e.message : String(e);
+		} finally {
+			lteBandAction = 'idle';
+			lteBandActionStartedAt = null;
 		}
 	}
 
@@ -261,7 +318,7 @@
 
 	/** Handle clicking a band row. */
 	function handleBandClick(entry: UnifiedBandEntry) {
-		if (lteBandAction !== 'idle') return;
+		if (lteBandAction !== 'idle' || lteRegistering) return;
 		if (lteSelectionMode) {
 			if (!entry.lockable) return;
 			const next = new Set(lteSelectedBands);
@@ -270,16 +327,23 @@
 			lteSelectedBands = next;
 			return;
 		}
-		const currentBands = deviceInfo?.lte?.band_config?.enabled_bands ?? [];
-		const currentPriority = deviceInfo?.lte?.band_config?.priority_band;
-		if (entry.enabled && !entry.serving) {
-			// Drop this band from the lock set
-			if (currentBands.length <= 1) return; // can't drop the last band
+		const currentBands = lteData?.signal?.band_config?.enabled_bands
+			?? deviceInfo?.lte?.band_config?.enabled_bands ?? [];
+		const currentPriority = lteData?.signal?.band_config?.priority_band
+			?? deviceInfo?.lte?.band_config?.priority_band;
+		if (entry.serving && currentBands.length > 1) {
+			// Lock to only this band
 			if (lteConfirm === entry.band) {
 				lteConfirm = null;
-				const newBands = currentBands.filter(b => b !== entry.band);
-				const priority = currentPriority === entry.band ? undefined : (currentPriority ?? undefined);
-				handleSetBands('locked', newBands, priority);
+				handleSetBands('locked', [entry.band]);
+			} else {
+				lteConfirm = entry.band;
+			}
+		} else if (entry.enabled && !entry.serving) {
+			// Lock to only this band (switch serving to it)
+			if (lteConfirm === entry.band) {
+				lteConfirm = null;
+				handleSetBands('locked', [entry.band]);
 			} else {
 				lteConfirm = entry.band;
 			}
@@ -299,7 +363,8 @@
 	function handleMultiBandLock() {
 		if (lteConfirm === 'multi-lock') {
 			const bands = [...lteSelectedBands].sort((a, b) => a - b);
-			const currentPriority = deviceInfo?.lte?.band_config?.priority_band;
+			const currentPriority = lteData?.signal?.band_config?.priority_band
+				?? deviceInfo?.lte?.band_config?.priority_band;
 			const priority = currentPriority && lteSelectedBands.has(currentPriority) ? currentPriority : undefined;
 			lteConfirm = null;
 			lteSelectionMode = false;
@@ -313,8 +378,9 @@
 	function enterSelectionMode() {
 		lteSelectionMode = true;
 		lteConfirm = null;
-		// Pre-populate with currently enabled bands
-		const enabled = deviceInfo?.lte?.band_config?.enabled_bands ?? [];
+		// Pre-populate with currently enabled bands (prefer fresh lteData)
+		const enabled = lteData?.signal?.band_config?.enabled_bands
+			?? deviceInfo?.lte?.band_config?.enabled_bands ?? [];
 		lteSelectedBands = new Set(enabled);
 	}
 
@@ -428,18 +494,21 @@
 		onprobedevice?.();
 	}
 
-	// On a relay, tunnel.connected is always false (relay isn't a tunnel client).
-	// Derive device connectivity from connection_history (disconnected_at === null means live).
-	let relayDeviceConnected = $derived.by(() => {
-		if (!relayHealth?.connection_history) return relayHealth?.tunnel.connected ?? false;
-		return relayHealth.connection_history.some(
-			(s) => s.disconnected_at === null && s.serial === relaySerial
-		);
+	let liveRelayDevice = $derived.by(() => {
+		if (!relayHealth?.live_devices || !relaySerial) return null;
+		return relayHealth.live_devices.find((d) => d.serial === relaySerial) ?? null;
 	});
 
-	// Device snapshot for the connected serial (relay mode)
+	// On a relay, tunnel.connected is always false (relay isn't a tunnel client).
+	// Use relay live device status as the source of truth for current connectivity.
+	let relayDeviceConnected = $derived.by(() => {
+		if (liveRelayDevice) return liveRelayDevice.connected;
+		return relayHealth?.tunnel.connected ?? false;
+	});
+
+	// Device snapshot for the current serial (offline-only status surface)
 	let offlineSnapshot = $derived.by(() => {
-		if (!relayHealth?.device_snapshots || !relaySerial) return null;
+		if (relayDeviceConnected || !relayHealth?.device_snapshots || !relaySerial) return null;
 		return relayHealth.device_snapshots[relaySerial] ?? null;
 	});
 
@@ -674,17 +743,23 @@ function dotColor(status: ConnectionStatus): string {
 		topReasonCount: number;
 	}
 
+	function sanitizeSessions(sessions: RelayConnectionSession[]): RelayConnectionSession[] {
+		return sessions.filter((s) => !(s.reason === 'replaced' && s.duration_secs === 0));
+	}
+
 	function buildTimeline(sessions: RelayConnectionSession[], includeSerial: boolean): TimelineEntry[] {
-		if (!sessions.length) return [];
+		const sanitized = sanitizeSessions(sessions);
+		if (!sanitized.length) return [];
+		const ordered = [...sanitized].sort((a, b) => a.connected_at - b.connected_at);
 
 		const nowEpoch = Math.floor(Date.now() / 1000);
 		const entries: TimelineEntry[] = [];
 
-		for (let i = 0; i < sessions.length; i++) {
-			const s = sessions[i];
+		for (let i = 0; i < ordered.length; i++) {
+			const s = ordered[i];
 
 			if (i > 0) {
-				const prev = sessions[i - 1];
+				const prev = ordered[i - 1];
 				const prevEnd = prev.disconnected_at ?? nowEpoch;
 				const gapSecs = s.connected_at - prevEnd;
 				if (gapSecs > 0) {
@@ -710,8 +785,8 @@ function dotColor(status: ConnectionStatus): string {
 			});
 		}
 
-		if (sessions.length > 0) {
-			const last = sessions[sessions.length - 1];
+		if (ordered.length > 0) {
+			const last = ordered[ordered.length - 1];
 			if (last.disconnected_at != null) {
 				const offlineSecs = nowEpoch - last.disconnected_at;
 				if (offlineSecs > 0) {
@@ -728,17 +803,19 @@ function dotColor(status: ConnectionStatus): string {
 	}
 
 	function buildHistorySummary(sessions: RelayConnectionSession[]): HistorySummary | null {
-		if (!sessions.length) return null;
+		const sanitized = sanitizeSessions(sessions);
+		if (!sanitized.length) return null;
+		const ordered = [...sanitized].sort((a, b) => a.connected_at - b.connected_at);
 
 		const nowEpoch = Math.floor(Date.now() / 1000);
-		const first = sessions[0];
+		const first = ordered[0];
 		const totalSpan = nowEpoch - first.connected_at;
 		if (totalSpan <= 0) return null;
 
 		let connectedSecs = 0;
 		const reasonCounts: Record<string, number> = {};
 
-		for (const s of sessions) {
+		for (const s of ordered) {
 			const end = s.disconnected_at ?? nowEpoch;
 			connectedSecs += end - s.connected_at;
 			if (s.reason) {
@@ -757,7 +834,7 @@ function dotColor(status: ConnectionStatus): string {
 
 		return {
 			uptimePct: Math.round((connectedSecs / totalSpan) * 1000) / 10,
-			sessionCount: sessions.length,
+			sessionCount: ordered.length,
 			topReason,
 			topReasonCount,
 		};
@@ -805,22 +882,27 @@ function dotColor(status: ConnectionStatus): string {
 
 	let tunnelDevices: TunnelDevice[] = $derived.by(() => {
 		void tick;
-		const sessions = relayHealth?.connection_history;
-		if (!sessions?.length) return [];
+		const liveDevices = relayHealth?.live_devices ?? [];
+		const snapshots = relayHealth?.device_snapshots ?? {};
+		if (liveDevices.length === 0 && Object.keys(snapshots).length === 0) return [];
 
 		const nowEpoch = Math.floor(Date.now() / 1000);
 		const deviceMap = new Map<string, { connected: boolean; connectedAt: number; lastSeen: number }>();
 
-		for (const s of sessions) {
-			const isActive = s.disconnected_at == null;
-			const existing = deviceMap.get(s.serial);
+		for (const dev of liveDevices) {
+			deviceMap.set(dev.serial, {
+				connected: true,
+				connectedAt: dev.connected_at,
+				lastSeen: nowEpoch,
+			});
+		}
 
-			if (!existing || isActive || s.connected_at > existing.connectedAt) {
-				const snapshot = relayHealth?.device_snapshots?.[s.serial];
-				deviceMap.set(s.serial, {
-					connected: isActive,
-					connectedAt: s.connected_at,
-					lastSeen: snapshot?.last_seen ?? (s.disconnected_at ?? s.connected_at),
+		for (const [serial, snapshot] of Object.entries(snapshots)) {
+			if (!deviceMap.has(serial)) {
+				deviceMap.set(serial, {
+					connected: false,
+					connectedAt: snapshot.last_seen,
+					lastSeen: snapshot.last_seen,
 				});
 			}
 		}
@@ -876,7 +958,7 @@ function dotColor(status: ConnectionStatus): string {
 					<span class="w-6 text-right text-[9px] text-neutral-600">{label}</span>
 					<div class="flex-1 h-1.5 bg-neutral-800 rounded-full overflow-hidden">
 						<div
-							class="h-full rounded-full transition-all {loadColor(val)}"
+							class="h-full rounded-full {loadColor(val)}"
 							style="width: {Math.min(val / maxLoad * 100, 100)}%"
 						></div>
 					</div>
@@ -895,7 +977,7 @@ function dotColor(status: ConnectionStatus): string {
 		</div>
 		<div class="h-2 bg-neutral-800 rounded-full overflow-hidden">
 			<div
-				class="h-full rounded-full transition-all {usageColor(memPct)}"
+				class="h-full rounded-full {usageColor(memPct)}"
 				style="width: {memPct}%"
 			></div>
 		</div>
@@ -915,7 +997,7 @@ function dotColor(status: ConnectionStatus): string {
 		</div>
 		<div class="h-2 bg-neutral-800 rounded-full overflow-hidden">
 			<div
-				class="h-full rounded-full transition-all {usageColor(diskPct)}"
+				class="h-full rounded-full {usageColor(diskPct)}"
 				style="width: {diskPct}%"
 			></div>
 		</div>
@@ -1077,7 +1159,9 @@ function dotColor(status: ConnectionStatus): string {
 								</div>
 								<div class="flex items-center gap-2">
 									{#if lteBandAction === 'switching'}
-										<span class="text-[9px] text-amber-400 animate-pulse">switching...</span>
+										<span class="text-[9px] text-amber-400 animate-pulse">writing...</span>
+									{:else if lteRegistering}
+										<span class="text-[9px] text-neutral-500 animate-pulse">registering...</span>
 									{:else if lteBandAction === 'scanning'}
 										<span class="text-[9px] text-cyan-400 animate-pulse">scanning...</span>
 									{/if}
@@ -1184,8 +1268,8 @@ function dotColor(status: ConnectionStatus): string {
 							{/if}
 
 							<!-- Collapsed summary line -->
-							{#if !lteExpanded && lte.band_config}
-								{@const bc = lte.band_config}
+							{#if !lteExpanded && (lteData?.signal?.band_config || lte.band_config)}
+								{@const bc = (lteData?.signal?.band_config ?? lte.band_config)!}
 								{@const isAuto = bc.enabled_bands.length >= 20}
 								<div class="text-[10px] tabular-nums">
 									{#if isAuto}
@@ -1211,8 +1295,8 @@ function dotColor(status: ConnectionStatus): string {
 								<div class="border-t border-neutral-800/40 pt-1.5 mt-1.5" onmouseleave={() => { lteConfirm = null; lteSpeedTest = false; }}>
 									<div class="flex items-center gap-1.5 flex-wrap">
 										<!-- Mode indicator -->
-										{#if lte.band_config}
-											{@const bc = lte.band_config}
+										{#if lteData?.signal?.band_config || lte.band_config}
+											{@const bc = (lteData?.signal?.band_config ?? lte.band_config)!}
 											{@const isAuto = bc.enabled_bands.length >= 20}
 											<span class="text-[9px] {isAuto ? 'text-neutral-500' : 'text-amber-400/80'}">
 												{isAuto ? 'mode: auto' : `locked → B${bc.enabled_bands.join(', B')}`}
@@ -1231,12 +1315,12 @@ function dotColor(status: ConnectionStatus): string {
 										{/if}
 										<button
 											class="px-1.5 py-0.5 text-[9px] rounded border transition-colors
-												{lteBandAction !== 'idle'
+												{(lteBandAction !== 'idle' || lteRegistering)
 													? 'border-neutral-800 text-neutral-700 cursor-not-allowed'
 													: lteConfirm === 'auto'
 														? 'border-amber-600 text-amber-400 bg-amber-500/10'
 														: 'border-neutral-700 text-neutral-400 hover:text-neutral-200 hover:border-neutral-600'}"
-											disabled={lteBandAction !== 'idle'}
+											disabled={lteBandAction !== 'idle' || lteRegistering}
 											onclick={() => {
 												if (lteConfirm === 'auto') { lteConfirm = null; handleSetBands('auto'); }
 												else { lteConfirm = 'auto'; }
@@ -1244,20 +1328,47 @@ function dotColor(status: ConnectionStatus): string {
 										>{lteConfirm === 'auto' ? 'auto? ⚠' : 'auto'}</button>
 										<button
 											class="px-1.5 py-0.5 text-[9px] rounded border transition-colors
-												{lteBandAction !== 'idle'
+												{(lteBandAction !== 'idle' || lteRegistering)
 													? 'border-neutral-800 text-neutral-700 cursor-not-allowed'
 													: lteConfirm === 'scan'
 														? 'border-red-600 text-red-400 bg-red-500/10'
 														: 'border-neutral-700 text-neutral-400 hover:text-neutral-200 hover:border-neutral-600'}"
-											disabled={lteBandAction !== 'idle'}
+											disabled={lteBandAction !== 'idle' || lteRegistering}
 											onclick={() => {
 												if (lteConfirm === 'scan') { lteConfirm = null; handleStartScan(undefined, lteSpeedTest); lteSpeedTest = false; }
 												else { lteConfirm = 'scan'; }
 											}}
 										>{lteConfirm === 'scan' ? 'scan? drops conn' : 'scan'} {#if lteConfirm !== 'scan'}<span class="text-amber-500/70">!</span>{/if}</button>
+										<button
+											class="px-1.5 py-0.5 text-[9px] rounded border transition-colors
+												{(lteBandAction !== 'idle' || lteRegistering)
+													? 'border-neutral-800 text-neutral-700 cursor-not-allowed'
+													: lteConfirm === 'speed'
+														? 'border-cyan-600 text-cyan-400 bg-cyan-500/10'
+														: 'border-neutral-700 text-neutral-400 hover:text-neutral-200 hover:border-neutral-600'}"
+											disabled={lteBandAction !== 'idle' || lteRegistering}
+											onclick={() => {
+												if (lteConfirm === 'speed') { lteConfirm = null; handleSpeedTest(); }
+												else { lteConfirm = 'speed'; }
+											}}
+										>{lteConfirm === 'speed' ? 'test? ~10s' : 'speed'}</button>
 									</div>
 									{#if lteBandError}
-										<div class="text-[9px] text-red-400 mt-1">{lteBandError}</div>
+										<div class="text-[11px] text-red-400 bg-red-500/10 rounded px-2 py-1 mt-1 border border-red-500/20">{lteBandError}</div>
+									{/if}
+									{#if lteBandAction === 'switching'}
+										<div class="text-[10px] text-amber-400 animate-pulse mt-0.5">writing bands...</div>
+									{:else if lteRegistering}
+										<div class="text-[10px] text-neutral-400 animate-pulse mt-0.5">registering on network...</div>
+									{:else if lteBandAction === 'testing'}
+										<div class="text-[10px] text-cyan-400 animate-pulse mt-0.5">testing speed... (~10s)</div>
+									{/if}
+									{#if lteSpeedResult}
+										<div class="text-[10px] text-neutral-300 mt-0.5">
+											{#if lteSpeedResult.download_bps != null}↓{(lteSpeedResult.download_bps / 1000).toFixed(0)}KB/s{/if}
+											{#if lteSpeedResult.upload_bps != null} ↑{(lteSpeedResult.upload_bps / 1000).toFixed(0)}KB/s{/if}
+											{#if lteSpeedResult.download_bps == null && lteSpeedResult.upload_bps == null}<span class="text-neutral-600">no data — check signal &amp; LTE interface</span>{/if}
+										</div>
 									{/if}
 								</div>
 
@@ -1269,12 +1380,13 @@ function dotColor(status: ConnectionStatus): string {
 								{/if}
 
 								<!-- Unified band list -->
-								{#if lte.band_config}
-									{@const enabledCount = lte.band_config.enabled_bands.length}
+								{#if lte.band_config || lteData?.signal?.band_config}
+									{@const bandConfig = (lteData?.signal?.band_config ?? lte.band_config)!}
+									{@const enabledCount = bandConfig.enabled_bands.length}
 									{@const completedScanResults = lteData?.scan_status?.state === 'completed' ? (lteData.scan_status.results ?? []) : []}
 									{@const unified = unifiedBandOverview({
-										enabledBands: lte.band_config.enabled_bands,
-										priorityBand: lte.band_config.priority_band,
+										enabledBands: bandConfig.enabled_bands,
+										priorityBand: bandConfig.priority_band,
 										servingBand: lte.freq_band,
 										servingRsrp: lte.rsrp,
 										neighbors: lte.neighbors ?? [],
@@ -1298,7 +1410,7 @@ function dotColor(status: ConnectionStatus): string {
 															{lteConfirm === 'multi-lock'
 																? 'text-amber-400 border-amber-600 bg-amber-500/10'
 																: 'text-neutral-400 border-neutral-700 hover:text-neutral-200 hover:border-neutral-600'}"
-														disabled={lteBandAction !== 'idle'}
+														disabled={lteBandAction !== 'idle' || lteRegistering}
 														onclick={handleMultiBandLock}
 													>{lteConfirm === 'multi-lock' ? `lock ${lteSelectedBands.size}? ⚠` : `lock ${lteSelectedBands.size} →`}</button>
 												{/if}
@@ -1311,18 +1423,19 @@ function dotColor(status: ConnectionStatus): string {
 											{/if}
 										</div>
 										{#each unified as entry}
-											{@const canDrop = entry.enabled && !entry.serving && enabledCount > 1}
+											{@const canServe = entry.enabled && !entry.serving}
 											{@const canAdd = !entry.enabled && entry.lockable}
-											{@const isClickable = lteSelectionMode ? entry.lockable : (canDrop || canAdd)}
+											{@const canLockSingle = entry.serving && enabledCount > 1}
+											{@const isClickable = lteSelectionMode ? entry.lockable : (canServe || canAdd || canLockSingle)}
 											{@const isConfirming = !lteSelectionMode && lteConfirm === entry.band}
 											{@const isSelected = lteSelectionMode && lteSelectedBands.has(entry.band)}
 											<button
 												class="flex items-center w-full pl-2 py-0.5 rounded transition-colors
 													{entry.serving ? '' : entry.enabled ? '' : entry.lockable ? 'opacity-60' : 'opacity-25'}
-													{!isClickable ? 'cursor-default' : lteBandAction !== 'idle' ? 'cursor-not-allowed' : isConfirming ? (canDrop ? 'bg-red-500/10' : 'bg-amber-500/10') : isSelected ? 'bg-neutral-800/60' : 'hover:bg-neutral-800/50 cursor-pointer'}"
-												disabled={lteBandAction !== 'idle' || !isClickable}
+													{!isClickable ? 'cursor-default' : (lteBandAction !== 'idle' || lteRegistering) ? 'cursor-not-allowed' : isConfirming ? (canServe ? 'bg-cyan-500/10' : canAdd ? 'bg-amber-500/10' : 'bg-green-500/10') : isSelected ? 'bg-neutral-800/60' : 'hover:bg-neutral-800/50 cursor-pointer'}"
+												disabled={lteBandAction !== 'idle' || lteRegistering || !isClickable}
 												onclick={() => handleBandClick(entry)}
-												title={!entry.lockable ? `B${entry.band} — no registration` : canDrop ? `Remove B${entry.band} from lock set` : canAdd ? `Add B${entry.band} to lock set` : ''}
+												title={!entry.lockable ? `B${entry.band} — no registration` : canLockSingle ? `Lock to only B${entry.band}` : canServe ? `Switch to B${entry.band}` : canAdd ? `Add B${entry.band} to lock set` : ''}
 											>
 												<span class="w-7 text-left {entry.serving ? 'text-green-400' : entry.enabled ? 'text-neutral-400' : entry.lockable ? 'text-neutral-500' : 'text-neutral-700'}">B{entry.band}</span>
 												{#if entry.frequencyMhz != null}
@@ -1347,14 +1460,18 @@ function dotColor(status: ConnectionStatus): string {
 												{#if entry.cellCount > 0}
 													<span class="text-neutral-600 ml-1.5">{entry.cellCount}c</span>
 												{/if}
-												{#if entry.scan?.downloadBps != null}
-													<span class="text-neutral-500 ml-1.5">{(entry.scan.downloadBps / 1_000_000).toFixed(1)}Mbps</span>
+												{#if entry.scan?.downloadBps != null || entry.scan?.uploadBps != null}
+													<span class="text-neutral-500 ml-1.5">{#if entry.scan?.downloadBps != null}↓{(entry.scan.downloadBps / 1000).toFixed(0)}KB/s{/if}{#if entry.scan?.uploadBps != null}{#if entry.scan?.downloadBps != null} {/if}↑{(entry.scan.uploadBps / 1000).toFixed(0)}KB/s{/if}</span>
+												{:else if entry.scan?.registered}
+													<span class="text-neutral-700 ml-1.5 text-[8px]">no spd</span>
 												{/if}
 												<!-- Right edge: context-dependent -->
 												{#if lteSelectionMode}
 													<span class="ml-auto text-[9px] {isSelected ? 'text-neutral-300' : 'text-neutral-700'}">{isSelected ? '[x]' : entry.lockable ? '[ ]' : ''}</span>
-												{:else if isConfirming && canDrop}
-													<span class="ml-auto text-red-400 text-[9px]">drop?</span>
+												{:else if isConfirming && canLockSingle}
+													<span class="ml-auto text-green-400 text-[9px]">lock?</span>
+												{:else if isConfirming && canServe}
+													<span class="ml-auto text-cyan-400 text-[9px]">serve?</span>
 												{:else if isConfirming && canAdd}
 													<span class="ml-auto text-amber-400 text-[9px]">add?</span>
 												{:else if entry.history}
@@ -1426,7 +1543,7 @@ function dotColor(status: ConnectionStatus): string {
 												{lteConfirm === 'restore'
 													? 'text-amber-400 border-amber-600 bg-amber-500/10'
 													: 'text-neutral-600 hover:text-neutral-300 border-neutral-800/60'}"
-											disabled={lteBandAction !== 'idle'}
+											disabled={lteBandAction !== 'idle' || lteRegistering}
 											onclick={() => {
 												if (lteConfirm === 'restore') { lteConfirm = null; handleRestoreBands(); }
 												else { lteConfirm = 'restore'; }
@@ -1511,7 +1628,7 @@ function dotColor(status: ConnectionStatus): string {
 
 				{:else if connectionStatus === 'connected'}
 					<div class="flex items-center justify-center h-32 text-[10px] text-neutral-600">
-						loading system info...
+						{deviceBusyReason ? `waiting: ${deviceBusyReason}` : 'loading system info...'}
 					</div>
 				{:else if offlineSnapshot}
 					{@const snap = offlineSnapshot}
@@ -1537,7 +1654,7 @@ function dotColor(status: ConnectionStatus): string {
 									{/if}
 								</div>
 							{/if}
-							{#if snap.last_watchdog}
+							{#if snap.last_watchdog && (Date.now() / 1000 - snap.last_seen) < 300}
 								<div class="flex items-center gap-1.5">
 									<span class="text-amber-500/80">watchdog</span>
 									<span class="text-amber-400/80">L{snap.last_watchdog.level}</span>
@@ -1626,6 +1743,11 @@ function dotColor(status: ConnectionStatus): string {
 						{#if relayHealth.tunnel.dropped_outbound != null && relayHealth.tunnel.dropped_outbound > 0}
 							<div class="text-[10px] text-amber-500/80 tabular-nums">
 								{relayHealth.tunnel.dropped_outbound} dropped outbound
+							</div>
+						{/if}
+						{#if relayHealth.tunnel.stream_backpressure_events != null && relayHealth.tunnel.stream_backpressure_events > 0}
+							<div class="text-[10px] text-amber-500/80 tabular-nums">
+								{relayHealth.tunnel.stream_backpressure_events} stream backpressure event{relayHealth.tunnel.stream_backpressure_events !== 1 ? 's' : ''}
 							</div>
 						{/if}
 					</div>

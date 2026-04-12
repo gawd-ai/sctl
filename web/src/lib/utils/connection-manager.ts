@@ -146,6 +146,8 @@ export interface ConnectionManagerEvents {
 export class ConnectionManager {
 	private connections = new Map<string, ServerConnection>();
 	private unsubscribers = new Map<string, (() => void)[]>();
+	private deviceInfoInflight = new Map<string, Promise<DeviceInfo | null>>();
+	private activityInflight = new Map<string, Promise<ActivityEntry[]>>();
 	private readonly config: Required<Omit<ConnectionManagerConfig, 'reconnect' | 'sessionDefaults'>>;
 	private readonly reconnectConfig?: Partial<ReconnectConfig>;
 	private readonly sessionDefaults?: Partial<SessionStartOptions>;
@@ -211,9 +213,13 @@ export class ConnectionManager {
 
 	/** Build a fingerprint of relay health for dedup (excludes uptime which always changes). */
 	private relayHealthFingerprint(h: RelayHealthInfo): string {
+		const liveDevices = h.live_devices ?? [];
 		const parts: (string | number | boolean | null | undefined)[] = [
-			h.status, h.sessions, h.tunnel.connected, h.tunnel.reconnects,
+			h.status, h.sessions, h.tunnel.connected, h.tunnel.reconnects, liveDevices.length,
 		];
+		for (const dev of liveDevices) {
+			parts.push(dev.serial, dev.connected, dev.pending_requests_count, dev.dropped_messages);
+		}
 		if (h.lte) {
 			parts.push(h.lte.signal_bars, h.lte.rsrp, h.lte.sinr, h.lte.band, h.lte.operator);
 		}
@@ -474,9 +480,13 @@ export class ConnectionManager {
 	 * Updates the connection's `deviceInfo` field and emits `onDeviceInfo`.
 	 */
 	async fetchDeviceInfo(serverId: string): Promise<DeviceInfo | null> {
+		const existing = this.deviceInfoInflight.get(serverId);
+		if (existing) return existing;
+
 		const conn = this.connections.get(serverId);
 		if (!conn) return null;
-		try {
+		const promise = (async () => {
+			try {
 			const info = await conn.restClient.getInfo();
 			conn.deviceInfo = info;
 			this.events.onDeviceInfo?.(serverId, info);
@@ -511,7 +521,7 @@ export class ConnectionManager {
 					`${info.tunnel.connected ? 'connected' : 'disconnected'}${url ? ` → ${url}` : ''}`);
 			}
 			return info;
-		} catch (err) {
+			} catch (err) {
 			// Only clear deviceInfo if we never had data — don't nuke stale data
 			// on transient refresh errors (causes "loading system info" flash).
 			if (!conn.deviceInfo) {
@@ -521,7 +531,14 @@ export class ConnectionManager {
 			this.logEvent(serverId, 'error', 'failed to fetch device info',
 				err instanceof Error ? err.message : String(err));
 			return conn.deviceInfo;
-		}
+			}
+		})().finally(() => {
+			if (this.deviceInfoInflight.get(serverId) === promise) {
+				this.deviceInfoInflight.delete(serverId);
+			}
+		});
+		this.deviceInfoInflight.set(serverId, promise);
+		return promise;
 	}
 
 	/**
@@ -577,8 +594,9 @@ export class ConnectionManager {
 							// Update detail to reflect current uptime
 							let detail = entry.detail;
 							if (entry.message.startsWith('relay health:')) {
-								const tunnelDetail = health.tunnel.connected
-									? `tunnel: connected, ${health.sessions} session(s)`
+								const liveCount = health.live_devices?.length ?? 0;
+								const tunnelDetail = liveCount > 0
+									? `tunnel: ${liveCount} device${liveCount !== 1 ? 's' : ''} live, ${health.sessions} session(s)`
 									: `tunnel: no device, ${health.tunnel.reconnects} reconnect(s)`;
 								detail = `v${health.version}, up ${this.formatDuration(health.uptime_secs * 1000)}, ${tunnelDetail}`;
 							}
@@ -593,8 +611,9 @@ export class ConnectionManager {
 			} else {
 				// Health changed — log new entries
 				const startId = this.eventIdCounter + 1;
-				const tunnelDetail = health.tunnel.connected
-					? `tunnel: connected, ${health.sessions} session(s)`
+				const liveCount = health.live_devices?.length ?? 0;
+				const tunnelDetail = liveCount > 0
+					? `tunnel: ${liveCount} device${liveCount !== 1 ? 's' : ''} live, ${health.sessions} session(s)`
 					: `tunnel: no device, ${health.tunnel.reconnects} reconnect(s)`;
 				this.logEvent(serverId, 'info', `relay health: ${health.status}`,
 					`v${health.version}, up ${this.formatDuration(health.uptime_secs * 1000)}, ${tunnelDetail}`);
@@ -724,17 +743,32 @@ export class ConnectionManager {
 	 * Updates the connection's `activity` field and emits `onActivity`.
 	 */
 	async fetchActivity(serverId: string, sinceId = 0, limit = 100): Promise<ActivityEntry[]> {
+		if (sinceId === 0) {
+			const existing = this.activityInflight.get(serverId);
+			if (existing) return existing;
+		}
+
 		const conn = this.connections.get(serverId);
 		if (!conn) return [];
-		try {
+		const promise = (async () => {
+			try {
 			const entries = await conn.restClient.getActivity(sinceId, limit);
 			conn.activity = entries;
 			this.events.onActivity?.(serverId, entries);
 			return entries;
-		} catch (err) {
+			} catch (err) {
 			this.events.onError?.(serverId, err instanceof Error ? err : new Error(String(err)));
 			return [];
+			}
+		})().finally(() => {
+			if (sinceId === 0 && this.activityInflight.get(serverId) === promise) {
+				this.activityInflight.delete(serverId);
+			}
+		});
+		if (sinceId === 0) {
+			this.activityInflight.set(serverId, promise);
 		}
+		return promise;
 	}
 
 	/**

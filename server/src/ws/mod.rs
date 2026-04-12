@@ -719,6 +719,17 @@ async fn handle_session_start(
     let sh = shell.unwrap_or(&state.config.shell.default_shell);
     let allows_ai = user_allows_ai.unwrap_or(true);
 
+    tracing::info!(
+        request_id = request_id.unwrap_or(""),
+        shell = sh,
+        working_dir = dir,
+        pty = use_pty,
+        rows,
+        cols,
+        persistent,
+        "WS: session.start received"
+    );
+
     match state
         .session_manager
         .create_session_with_pty(
@@ -735,6 +746,12 @@ async fn handle_session_start(
         .await
     {
         Ok((session_id, pid)) => {
+            tracing::info!(
+                request_id = request_id.unwrap_or(""),
+                session_id = %session_id,
+                pid,
+                "WS: session.start PTY spawn succeeded"
+            );
             // Override default AI permission if explicitly disabled
             if !allows_ai {
                 let _ = state
@@ -758,7 +775,13 @@ async fn handle_session_start(
             if let Some(rid) = request_id {
                 resp["request_id"] = json!(rid);
             }
-            let _ = tx.send(resp).await;
+            let queued = tx.send(resp).await.is_ok();
+            tracing::info!(
+                request_id = request_id.unwrap_or(""),
+                session_id = %session_id,
+                queued,
+                "WS: session.started queued"
+            );
 
             // Broadcast session.created to all connected clients
             let mut broadcast = json!({
@@ -792,6 +815,13 @@ async fn handle_session_start(
             Some(session_id)
         }
         Err(e) => {
+            tracing::warn!(
+                request_id = request_id.unwrap_or(""),
+                shell = sh,
+                working_dir = dir,
+                error = %e,
+                "WS: session.start PTY spawn failed"
+            );
             let mut resp = json!({
                 "type": "error",
                 "code": "SESSION_LIMIT",

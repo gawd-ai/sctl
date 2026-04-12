@@ -6,6 +6,7 @@ import type {
 	WsServerMsg,
 	WsSessionStartedMsg,
 	WsSessionAttachedMsg,
+	WsSessionGapMsg,
 	WsSessionOutputMsg,
 	WsSessionClosedMsg,
 	WsSessionExitedMsg,
@@ -303,6 +304,13 @@ export class SctlWsClient {
 			return () => set.delete(handler as (msg: never) => void);
 		});
 		return () => unsubs.forEach((u) => u());
+	}
+
+	/** Subscribe to output-gap notifications for a specific session. */
+	onSessionGap(sessionId: string, cb: (msg: WsSessionGapMsg) => void): () => void {
+		return this.on('session.gap', (m) => {
+			if (m.session_id === sessionId) cb(m);
+		});
 	}
 
 	// ── Send helpers ────────────────────────────────────────────────

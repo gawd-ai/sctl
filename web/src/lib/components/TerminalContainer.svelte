@@ -48,6 +48,7 @@
 	let terminalRows = $state(0);
 	let terminalCols = $state(0);
 	let remoteSessions: RemoteSessionInfo[] = $state([]);
+	let sessionStartInFlight = false;
 
 	// Plain object for Terminal component references — NOT $state.
 	// Indexed by session.key (locally unique UUID).
@@ -58,6 +59,7 @@
 
 	// Non-reactive seq tracking — avoids re-rendering on every output message
 	const seqMap = new Map<string, number>();
+	const attachInFlight = new Set<string>();
 
 	// Buffer for output that arrives before xterm is ready inside the Terminal.
 	const outputBuffer = new Map<string, string[]>();
@@ -65,6 +67,18 @@
 	// Suppress xterm input responses while replaying old output on reattach.
 	const suppressedInput = new Set<string>();
 	const suppressOnFlush = new Set<string>();
+
+	// Track which sessions are non-PTY so we can fix line endings for xterm.
+	// Non-PTY output has bare \n (no \r), which causes xterm to "staircase"
+	// text to the right instead of returning to column 0.
+	const nonPtySessions = new Set<string>();
+
+	/** Convert bare \\n to \\r\\n for non-PTY sessions so xterm renders correctly. */
+	function fixLineEndings(sessionId: string, data: string): string {
+		if (!nonPtySessions.has(sessionId)) return data;
+		// Replace \n that isn't preceded by \r
+		return data.replace(/\r?\n/g, '\r\n');
+	}
 
 	// Store unsubscribe functions per session for attach/detach lifecycle
 	const subscriptionCleanups = new Map<string, (() => void)[]>();
@@ -174,7 +188,9 @@
 
 	/** Start a new PTY session, optionally specifying a shell path. Opens a new tab. */
 	export async function startSession(shell?: string): Promise<void> {
+		if (sessionStartInFlight) return;
 		containerError = null;
+		sessionStartInFlight = true;
 		try {
 			const defaults = config.sessionDefaults ?? {};
 
@@ -217,6 +233,7 @@
 			};
 
 			keyForSession.set(session.sessionId, key);
+			if (!session.pty) nonPtySessions.add(session.sessionId);
 			sessions = [...sessions, session];
 			setActiveKey(key);
 
@@ -233,12 +250,16 @@
 			containerError = msg;
 			config.callbacks?.onError?.({ type: 'error', code: 'session_start_failed', message: msg });
 			console.error('Failed to start session:', err);
+		} finally {
+			sessionStartInFlight = false;
 		}
 	}
 
 	/** Attach to a server session by its server-assigned sessionId.
 	 *  Accepts sessionId because the session may not be local yet. */
 	export async function attachSession(sessionId: string): Promise<void> {
+		if (attachInFlight.has(sessionId)) return;
+		attachInFlight.add(sessionId);
 		let existing = sessions.find((s) => s.sessionId === sessionId);
 
 		// If no local tab exists, create one immediately so the user sees feedback
@@ -249,7 +270,7 @@
 				key,
 				sessionId,
 				persistent: true,
-				pty: true,
+				pty: remote?.pty ?? true,
 				userAllowsAi: remote?.user_allows_ai ?? true,
 				aiIsWorking: remote?.ai_is_working ?? false,
 				aiActivity: remote?.ai_activity,
@@ -259,6 +280,7 @@
 				attached: false // not yet attached — will be set true after WS attach
 			};
 			keyForSession.set(sessionId, key);
+			if (!session.pty) nonPtySessions.add(sessionId);
 			sessions = [...sessions, session];
 			setActiveKey(key);
 			existing = session;
@@ -294,7 +316,7 @@
 					suppressInputForReplay(sessionId);
 					let maxSeq = since;
 					for (const entry of result.entries) {
-						ref.write(entry.data);
+						ref.write(fixLineEndings(sessionId, entry.data));
 						if (entry.seq > maxSeq) maxSeq = entry.seq;
 					}
 					updateSessionSeq(sessionId, maxSeq);
@@ -321,6 +343,8 @@
 					? { ...s, dead: true, attached: false, aiIsWorking: false, aiActivity: undefined, aiStatusMessage: undefined }
 					: s
 			);
+		} finally {
+			attachInFlight.delete(sessionId);
 		}
 	}
 
@@ -340,7 +364,7 @@
 			key,
 			sessionId,
 			persistent: true,
-			pty: true,
+			pty: remote?.pty ?? true,
 			userAllowsAi: remote?.user_allows_ai ?? false,
 			aiIsWorking: remote?.ai_is_working ?? false,
 			aiActivity: remote?.ai_activity,
@@ -350,29 +374,9 @@
 			attached: false
 		};
 		keyForSession.set(sessionId, key);
+		if (!session.pty) nonPtySessions.add(sessionId);
 		sessions = [...sessions, session];
 		setActiveKey(key);
-
-		// Fetch output history for read-only viewing
-		try {
-			const result = await client.attachSession(sessionId, 0);
-			if (result.entries && result.entries.length > 0) {
-				let buf = outputBuffer.get(sessionId);
-				if (!buf) {
-					buf = [];
-					outputBuffer.set(sessionId, buf);
-				}
-				let maxSeq = 0;
-				for (const entry of result.entries) {
-					buf.push(entry.data);
-					if (entry.seq > maxSeq) maxSeq = entry.seq;
-				}
-				updateSessionSeq(sessionId, maxSeq);
-				tick().then(() => flushBuffer(sessionId));
-			}
-		} catch {
-			// History fetch failed — tab opens empty
-		}
 	}
 
 	// ── Public methods (key-based) ──────────────────────────────────
@@ -456,6 +460,7 @@
 		}
 		seqMap.delete(sessionId);
 		outputBuffer.delete(sessionId);
+		nonPtySessions.delete(sessionId);
 		subscriptionCleanups.delete(sessionId);
 
 		// Handle split group cleanup before removing
@@ -495,10 +500,10 @@
 				// Flush any earlier buffered output, then write new data
 				const buf = outputBuffer.get(sessionId);
 				if (buf) {
-					for (const data of buf) ref.write(data);
+					for (const data of buf) ref.write(fixLineEndings(sessionId, data));
 					outputBuffer.delete(sessionId);
 				}
-				ref.write(msg.data);
+				ref.write(fixLineEndings(sessionId, msg.data));
 			} else {
 				// Terminal component hasn't mounted yet — buffer the output
 				let buf = outputBuffer.get(sessionId);
@@ -514,6 +519,12 @@
 		cleanups.push(client.onSessionEnd(sessionId, () => {
 			outputBuffer.delete(sessionId);
 			removeSession(sessionId);
+		}));
+
+		cleanups.push(client.onSessionGap(sessionId, () => {
+			const session = sessions.find((s) => s.sessionId === sessionId);
+			if (!session || session.dead || !session.attached) return;
+			void attachSession(sessionId);
 		}));
 
 		subscriptionCleanups.set(sessionId, cleanups);
@@ -535,7 +546,7 @@
 			suppressInputForReplay(sessionId);
 		}
 		if (buf && ref) {
-			for (const data of buf) ref.write(data);
+			for (const data of buf) ref.write(fixLineEndings(sessionId, data));
 			outputBuffer.delete(sessionId);
 		}
 	}
@@ -636,7 +647,8 @@
 			terminalRows = rows;
 			terminalCols = cols;
 		}
-		if (connectionStatus === 'connected') {
+		const session = sessions.find((s) => s.sessionId === sessionId);
+		if (connectionStatus === 'connected' && session?.attached && !session.dead) {
 			client.resizeSession(sessionId, rows, cols).catch(() => {});
 		}
 		config.callbacks?.onResize?.(sessionId, rows, cols);
@@ -946,18 +958,34 @@
 			config.callbacks?.onConnectionChange?.(status);
 
 			if (status === 'connected') {
-				// Fetch remote sessions first, then reconcile before re-attaching
+				// Fetch remote sessions first, then reconcile.
+				// Do not auto-attach prior sessions here: on fragile relay/LTE paths,
+				// replaying stale attaches during reconnect creates WS churn right
+				// before the user requests a fresh shell.
 				fetchRemoteSessions().then((remote) => {
-					if (sessions.length > 0) {
-						reconcileWithRemote(remote);
-						// Only re-attach non-dead sessions
-						for (const session of sessions) {
-							if (!session.dead) {
-								attachSession(session.sessionId);
-							}
-						}
-					}
+					if (sessions.length > 0) reconcileWithRemote(remote);
 				});
+			} else {
+				// Connection dropped or is in-flight: stop local subscriptions and
+				// clear stale local tabs on relay-backed devices so reconnect
+				// doesn't replay resizes/attaches for sessions the user did not
+				// explicitly reopen.
+				for (const session of sessions) unsubscribeSession(session.sessionId);
+				const isRelay = config.wsUrl.includes('/d/');
+				if (isRelay) {
+					for (const session of sessions) {
+						seqMap.delete(session.sessionId);
+						outputBuffer.delete(session.sessionId);
+						subscriptionCleanups.delete(session.sessionId);
+						keyForSession.delete(session.sessionId);
+					}
+					sessions = [];
+					activeKey = null;
+				} else {
+					sessions = sessions.map((s) =>
+						s.attached ? { ...s, attached: false } : s
+					);
+				}
 			}
 		});
 

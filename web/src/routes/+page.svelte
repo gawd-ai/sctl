@@ -201,6 +201,7 @@
 
 	// Master AI toggle (per server)
 	let serverMasterAi: Record<string, boolean> = $state({});
+	let serverFragileOps: Record<string, string | null> = $state({});
 
 	// Toast
 	let toastRef: ToastContainer | undefined = $state();
@@ -210,7 +211,10 @@
 
 	// Connection manager (framework-agnostic orchestrator)
 	const manager = new ConnectionManager(
-		{ maxActivityEntries: 200 },
+		{
+			maxActivityEntries: 200,
+			autoFetchActivity: false
+		},
 		{
 			onConnectionChange: (id, status) => {
 				const prevStatus = connectionStatuses[id];
@@ -621,29 +625,49 @@
 
 	// ── Session actions ──────────────────────────────────────────────
 
+	function setFragileOp(serverId: string, kind: string | null): void {
+		serverFragileOps = { ...serverFragileOps, [serverId]: kind };
+	}
+
+	function withFragileOp<T>(serverId: string, kind: string, action: () => Promise<T>): Promise<T> {
+		if (serverFragileOps[serverId]) {
+			return Promise.reject(new Error(`busy: ${serverFragileOps[serverId]}`));
+		}
+		setFragileOp(serverId, kind);
+		return action().finally(() => {
+			if (serverFragileOps[serverId] === kind) {
+				setFragileOp(serverId, null);
+			}
+		});
+	}
+
 	/** Wait for a container ref and connected status, then execute an action. */
-	function withContainer(serverId: string, action: (ref: TerminalContainer) => void): void {
+	function withContainer<T>(serverId: string, action: (ref: TerminalContainer) => T | Promise<T>): Promise<T | undefined> {
 		activeServerId = serverId;
 		// If container is ready and connected, execute immediately
 		const ref = containerRefs[serverId];
 		if (ref && connectionStatuses[serverId] === 'connected') {
-			action(ref);
-			return;
+			return Promise.resolve(action(ref));
 		}
 		// Server not connected — connect first
 		if (!serverConfigs[serverId]) {
 			connectServer(serverId);
 		}
 		// Wait for connection + container to be ready
-		const unsub = $effect.root(() => {
-			$effect(() => {
-				if (connectionStatuses[serverId] === 'connected' && containerRefs[serverId]) {
-					unsub();
-					action(containerRefs[serverId]!);
-				}
+		return new Promise<T | undefined>((resolve, reject) => {
+			const unsub = $effect.root(() => {
+				$effect(() => {
+					if (connectionStatuses[serverId] === 'connected' && containerRefs[serverId]) {
+						unsub();
+						Promise.resolve(action(containerRefs[serverId]!)).then(resolve, reject);
+					}
+				});
 			});
+			setTimeout(() => {
+				try { unsub(); } catch {}
+				reject(new Error('Timed out waiting for terminal container'));
+			}, 15000);
 		});
-		setTimeout(() => { try { unsub(); } catch {} }, 15000);
 	}
 
 	function selectSession(serverId: string, sessionId: string): void {
@@ -655,7 +679,11 @@
 
 	function attachSession(serverId: string, sessionId: string): void {
 		serverDashboardActive = { ...serverDashboardActive, [serverId]: false };
-		withContainer(serverId, (ref) => ref.attachSession(sessionId));
+		void withFragileOp(serverId, 'session-attach', () =>
+			withContainer(serverId, (ref) => ref.attachSession(sessionId))
+		).catch((err) => {
+			console.error('[sctlin] attachSession blocked:', err);
+		});
 	}
 
 	function killSession(serverId: string, sessionId: string): void {
@@ -675,7 +703,18 @@
 
 	function newSession(serverId: string, shell?: string): void {
 		serverDashboardActive = { ...serverDashboardActive, [serverId]: false };
-		withContainer(serverId, (ref) => ref.startSession(shell));
+		void withFragileOp(serverId, 'session-start', () =>
+			withContainer(serverId, (ref) => ref.startSession(shell))
+		).catch((err) => {
+			console.error('[sctlin] startSession blocked:', err);
+		});
+	}
+
+	async function refreshDeviceInfo(serverId: string): Promise<void> {
+		if (serverFragileOps[serverId]) return;
+		void withFragileOp(serverId, 'device-info', () => manager.fetchDeviceInfo(serverId)).catch((err) => {
+			console.error('[sctlin] fetchDeviceInfo blocked:', err);
+		});
 	}
 
 	async function listShells(serverId: string): Promise<{ shells: string[]; defaultShell: string }> {
@@ -890,6 +929,7 @@
 
 	function resetState(): void {
 		try { localStorage.removeItem(STORAGE_KEY); } catch {}
+		try { localStorage.removeItem(REMOVED_SEEDS_KEY); } catch {}
 		location.reload();
 	}
 
@@ -1185,6 +1225,7 @@
 								visible={!!isDashVisible}
 								connectionStatus={connectionStatuses[server.id] ?? 'disconnected'}
 								deviceInfo={serverDeviceInfo[server.id] ?? null}
+								deviceBusyReason={serverFragileOps[server.id]}
 								activity={serverActivity[server.id] ?? []}
 								restClient={manager.get(server.id)?.restClient ?? null}
 								relayHealth={serverRelayHealth[server.id] ?? null}
@@ -1198,7 +1239,7 @@
 								onrefreshrelayhealth={() => manager.fetchRelayHealth(server.id)}
 								onrefreshrelayinfo={() => manager.fetchRelayInfo(server.id)}
 								onprobedevice={() => manager.probeRelayDevice(server.id)}
-								onrefreshinfo={() => manager.fetchDeviceInfo(server.id)}
+								onrefreshinfo={() => refreshDeviceInfo(server.id)}
 								serverDiagnostics={serverDiagnostics[server.id] ?? null}
 								onfetchdiagnostics={async () => {
 									const diag = await manager.fetchDiagnostics(server.id);
@@ -1348,4 +1389,3 @@
 	shortcuts={keyboard.getAll()}
 	onclose={() => { commandPaletteVisible = false; }}
 />
-

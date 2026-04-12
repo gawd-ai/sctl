@@ -344,6 +344,12 @@ export interface WsSessionOutputMsg {
 	timestamp_ms?: number;
 }
 
+export interface WsSessionGapMsg {
+	type: 'session.gap';
+	session_id: string;
+	reason: string;
+}
+
 export interface WsSessionExitedMsg {
 	type: 'session.exited';
 	session_id: string;
@@ -521,6 +527,22 @@ export interface RelayConnectionSession {
 	disconnected_at: number | null;
 	duration_secs: number;
 	reason: string | null;
+	last_heartbeat_age_ms?: number | null;
+}
+
+export interface RelayLiveDevice {
+	serial: string;
+	connected: boolean;
+	connected_at: number;
+	connected_since_ms: number;
+	last_heartbeat_age_ms: number;
+	pending_requests_count: number;
+	session_subscription_count: number;
+	subscribed_client_count: number;
+	client_count: number;
+	dropped_messages: number;
+	last_gps_fix: Record<string, unknown> | null;
+	last_lte_signal: { rssi_dbm?: number; rsrp?: number; sinr?: number; signal_bars?: number; band?: string; operator?: string } | null;
 }
 
 /** Health response from a relay's /api/health endpoint. */
@@ -538,12 +560,15 @@ export interface RelayHealthInfo {
 		messages_received?: number;
 		last_pong_age_ms?: number;
 		dropped_outbound?: number;
+		stream_backpressure_events?: number;
+		stream_replay_events?: number;
 		rtt_median_ms?: number;
 		rtt_p95_ms?: number;
 		recent_events?: { time: string; event: string; detail?: string }[];
 	};
 	gps: { status: string; has_fix: boolean; fix_age_secs?: number; satellites?: number } | null;
 	lte: { rssi_dbm?: number; rsrp?: number; sinr?: number; signal_bars?: number; band?: string; operator?: string; status?: string } | null;
+	live_devices?: RelayLiveDevice[];
 	connection_history?: RelayConnectionSession[];
 	device_snapshots?: Record<string, DeviceSnapshot>;
 }
@@ -701,6 +726,7 @@ export type WsServerMsg =
 	| WsSessionOutputMsg
 	| WsSessionExitedMsg
 	| WsSessionClosedMsg
+	| WsSessionGapMsg
 	| WsSessionSignalAckMsg
 	| WsSessionAttachedMsg
 	| WsSessionResizeAckMsg
@@ -907,7 +933,7 @@ export interface ScanBandResult {
 
 /** Status of a running or completed band scan. */
 export interface ScanStatus {
-	state: 'running' | 'completed';
+	state: 'running' | 'completed' | 'aborted';
 	started_at: number;
 	completed_at?: number | null;
 	bands_to_scan: number[];
@@ -955,6 +981,7 @@ export interface LteData {
 	last_error?: string | null;
 	band_history: BandHistoryEntry[];
 	scan_status?: ScanStatus | null;
+	registration_pending?: boolean;
 }
 
 /** Request body for `POST /api/lte/bands`. */
@@ -962,6 +989,7 @@ export interface SetBandsRequest {
 	mode: 'auto' | 'locked';
 	bands?: number[];
 	priority_band?: number;
+	force?: boolean;
 }
 
 /** Response from `POST /api/lte/bands`. */
@@ -969,6 +997,7 @@ export interface SetBandsResult {
 	status: string;
 	mode: string;
 	band_config: { enabled_bands: number[]; priority_band?: number | null };
+	registration?: 'pending' | 'registered';
 	error?: string;
 }
 
@@ -976,6 +1005,7 @@ export interface SetBandsResult {
 export interface StartScanRequest {
 	bands?: number[];
 	include_speed_test?: boolean;
+	force?: boolean;
 }
 
 /** Response from `POST /api/lte/scan`. */

@@ -66,7 +66,9 @@ export class SctlRestClient {
 
 	/** Fetch device system information (hostname, CPU, memory, disk, interfaces). */
 	async getInfo(): Promise<DeviceInfo> {
-		const res = await this.fetch('/api/info');
+		// Relay connections fan out per-group (6 sequential requests), so need more
+		// than the 10s that direct connections use. 30s covers the worst case.
+		const res = await this.fetch('/api/info', undefined, 30_000);
 		return res.json();
 	}
 
@@ -217,13 +219,13 @@ export class SctlRestClient {
 		return res.json();
 	}
 
-	/** Switch LTE bands (auto or locked). Uses 45s timeout for modem registration wait. */
+	/** Switch LTE bands (auto or locked). Uses 60s timeout for modem registration + rollback. */
 	async setLteBands(req: SetBandsRequest): Promise<SetBandsResult> {
 		const res = await this.fetch('/api/lte/bands', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify(req)
-		}, 45_000);
+		}, 60_000);
 		return res.json();
 	}
 
@@ -234,6 +236,12 @@ export class SctlRestClient {
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify(req)
 		});
+		return res.json();
+	}
+
+	/** Run a quick download+upload speed test on the current band. ~10s, no AT commands. */
+	async runSpeedTest(): Promise<{ download_bps: number | null; upload_bps: number | null }> {
+		const res = await this.fetch('/api/lte/speedtest', { method: 'POST' }, 30_000);
 		return res.json();
 	}
 

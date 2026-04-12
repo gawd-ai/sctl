@@ -161,6 +161,8 @@ async fn collect_logs(max_lines: u32, since: &str) -> (Vec<Value>, Value) {
     (vec![], json!({ "errors": 0, "warnings": 0, "total": 0 }))
 }
 
+const DIAGNOSTICS_LOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Try journalctl for log retrieval.
 ///
 /// Prefers unit-based query (`-u sctl*`) which includes logs across restarts
@@ -180,16 +182,20 @@ async fn try_journalctl(max_lines: u32, since: &str) -> Option<Vec<Value>> {
 
     // Fallback: current PID only (no systemd unit configured)
     let pid = std::process::id();
-    let output = tokio::process::Command::new("journalctl")
-        .args([
-            &format!("_PID={pid}"),
-            "--output=json",
-            &format!("--since={since_arg}"),
-            "--no-pager",
-        ])
-        .output()
-        .await
-        .ok()?;
+    let output = tokio::time::timeout(
+        DIAGNOSTICS_LOG_TIMEOUT,
+        tokio::process::Command::new("journalctl")
+            .args([
+                &format!("_PID={pid}"),
+                "--output=json",
+                &format!("--since={since_arg}"),
+                "--no-pager",
+            ])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
 
     if !output.status.success() {
         return None;
@@ -309,16 +315,20 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
 async fn try_journalctl_unit(max_lines: u32, since_arg: &str) -> Option<Vec<Value>> {
     // Don't use -n here: lifecycle noise filtering means we need all entries in
     // the time window, then truncate after filtering. --since bounds the volume.
-    let output = tokio::process::Command::new("journalctl")
-        .args([
-            "_COMM=sctl",
-            "--output=json",
-            &format!("--since={since_arg}"),
-            "--no-pager",
-        ])
-        .output()
-        .await
-        .ok()?;
+    let output = tokio::time::timeout(
+        DIAGNOSTICS_LOG_TIMEOUT,
+        tokio::process::Command::new("journalctl")
+            .args([
+                "_COMM=sctl",
+                "--output=json",
+                &format!("--since={since_arg}"),
+                "--no-pager",
+            ])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
 
     if !output.status.success() || output.stdout.is_empty() {
         return None;
@@ -355,11 +365,15 @@ async fn try_journalctl_unit(max_lines: u32, since_arg: &str) -> Option<Vec<Valu
 
 /// Try logread (OpenWrt/BusyBox syslog).
 async fn try_logread(max_lines: u32) -> Option<Vec<Value>> {
-    let output = tokio::process::Command::new("logread")
-        .args(["-e", "sctl"])
-        .output()
-        .await
-        .ok()?;
+    let output = tokio::time::timeout(
+        DIAGNOSTICS_LOG_TIMEOUT,
+        tokio::process::Command::new("logread")
+            .args(["-e", "sctl"])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
 
     if !output.status.success() {
         return None;

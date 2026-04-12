@@ -16,9 +16,10 @@ use crate::config::Config;
 use crate::gawdxfer::manager::TransferManager;
 use crate::gps::GpsState;
 use crate::lte::LteState;
+use crate::lte_watchdog::WatchdogSnapshot;
 use crate::modem::Modem;
 use crate::sessions::SessionManager;
-use crate::tunnel::relay::{DeviceSnapshot, RelayConnectionHistory};
+use crate::tunnel::relay::{DeviceSnapshot, RelayConnectionHistory, RelayState};
 
 /// Shared application state for the sctl server.
 #[derive(Clone)]
@@ -54,6 +55,10 @@ pub struct AppState {
     pub relay_history: Option<Arc<RelayConnectionHistory>>,
     /// Device snapshots (relay mode only) — last-known telemetry for offline devices.
     pub device_snapshots: Option<Arc<tokio::sync::RwLock<HashMap<String, DeviceSnapshot>>>>,
+    /// Relay state (relay mode only) — used for truthful live device health.
+    pub relay_state: Option<RelayState>,
+    /// LTE watchdog snapshot — updated every tick for API visibility.
+    pub watchdog_snapshot: Option<Arc<Mutex<WatchdogSnapshot>>>,
 }
 
 /// Tunnel connection event types.
@@ -112,6 +117,8 @@ pub struct TunnelStats {
     pub last_pong_age_ms: AtomicU64,
     pub current_uptime_ms: AtomicU64,
     pub dropped_outbound: AtomicU64,
+    pub stream_backpressure_events: AtomicU64,
+    pub stream_replay_events: AtomicU64,
     /// Epoch for computing relative timestamps in events.
     pub epoch: Instant,
     pub events: Mutex<VecDeque<ConnectionEvent>>,
@@ -135,6 +142,8 @@ impl TunnelStats {
             last_pong_age_ms: AtomicU64::new(0),
             current_uptime_ms: AtomicU64::new(0),
             dropped_outbound: AtomicU64::new(0),
+            stream_backpressure_events: AtomicU64::new(0),
+            stream_replay_events: AtomicU64::new(0),
             epoch: Instant::now(),
             events: Mutex::new(VecDeque::with_capacity(MAX_TUNNEL_EVENTS)),
             rtt_samples: Mutex::new(VecDeque::with_capacity(MAX_RTT_SAMPLES)),

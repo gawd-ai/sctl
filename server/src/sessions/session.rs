@@ -17,10 +17,12 @@
 //! This enables TUI programs, `isatty()` detection, and terminal resize. The
 //! PTY merges stdout+stderr into a single stream.
 
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
+use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Child;
 use tokio::sync::{mpsc, Mutex};
@@ -57,6 +59,23 @@ pub struct ManagedSession {
 }
 
 impl ManagedSession {
+    fn set_nonblocking(fd: RawFd) -> Result<(), String> {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(format!(
+                "fcntl(F_GETFL) failed for fd {fd}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(format!(
+                "fcntl(F_SETFL,O_NONBLOCK) failed for fd {fd}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+
     /// Spawn a new pipe-backed managed session from an already-created `Child`.
     ///
     /// Takes ownership of the child's stdio handles and spawns four background
@@ -206,23 +225,36 @@ impl ManagedSession {
             ));
         }
 
-        // Convert to tokio async file handles (File wraps std::fs::File → tokio)
-        // SAFETY: we own these file descriptors via dup
-        let master_write =
-            tokio::fs::File::from_std(unsafe { std::fs::File::from_raw_fd(writer_fd) });
-        let master_read =
-            tokio::fs::File::from_std(unsafe { std::fs::File::from_raw_fd(reader_fd) });
+        Self::set_nonblocking(writer_fd)?;
+        Self::set_nonblocking(reader_fd)?;
+
+        // SAFETY: we own these file descriptors via dup.
+        let master_write = AsyncFd::new(unsafe { std::fs::File::from_raw_fd(writer_fd) })
+            .map_err(|e| format!("AsyncFd::new(writer) failed: {e}"))?;
+        let master_read = AsyncFd::new(unsafe { std::fs::File::from_raw_fd(reader_fd) })
+            .map_err(|e| format!("AsyncFd::new(reader) failed: {e}"))?;
 
         // stdin writer task: mpsc → PTY master (write side)
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(64);
         let stdin_task = tokio::spawn(async move {
-            let mut writer = master_write;
+            let writer = master_write;
             while let Some(data) = stdin_rx.recv().await {
-                if writer.write_all(&data).await.is_err() {
-                    break;
-                }
-                if writer.flush().await.is_err() {
-                    break;
+                let mut written = 0usize;
+                while written < data.len() {
+                    let Ok(mut guard) = writer.writable().await else {
+                        return;
+                    };
+                    match guard.try_io(|inner| inner.get_ref().write(&data[written..])) {
+                        Ok(Ok(0)) => return,
+                        Ok(Ok(n)) => written += n,
+                        Ok(Err(e)) => {
+                            if e.kind() == std::io::ErrorKind::WouldBlock {
+                                continue;
+                            }
+                            return;
+                        }
+                        Err(_would_block) => {}
+                    }
                 }
             }
         });
@@ -231,15 +263,32 @@ impl ManagedSession {
         let sid_out = session_id.clone();
         let buf_out = Arc::clone(&buffer);
         let output_task = tokio::spawn(async move {
-            let mut reader = master_read;
-            let mut tmp = [0u8; 4096];
             loop {
-                match reader.read(&mut tmp).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let data = String::from_utf8_lossy(&tmp[..n]).into_owned();
+                let Ok(mut guard) = master_read.readable().await else {
+                    break;
+                };
+                match guard.try_io(|inner| {
+                    let mut tmp = [0u8; 4096];
+                    inner
+                        .get_ref()
+                        .read(&mut tmp)
+                        .map(|n| (n, tmp[..n].to_vec()))
+                }) {
+                    Ok(Ok((0, _))) => break,
+                    Ok(Ok((n, bytes))) => {
+                        let data = String::from_utf8_lossy(&bytes[..n]).into_owned();
                         buf_out.lock().await.push(OutputStream::Stdout, data);
                     }
+                    Ok(Err(e)) => {
+                        if e.raw_os_error() == Some(libc::EIO) {
+                            break;
+                        }
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            continue;
+                        }
+                        break;
+                    }
+                    Err(_would_block) => {}
                 }
             }
             info!("Session {sid_out} PTY output closed");
@@ -317,6 +366,24 @@ impl ManagedSession {
             .send(data)
             .await
             .map_err(|_| "Session stdin closed".to_string())
+    }
+
+    /// Clone the stdin sender so callers can drop outer locks before awaiting.
+    #[must_use]
+    pub fn stdin_sender(&self) -> mpsc::Sender<Vec<u8>> {
+        self.stdin_tx.clone()
+    }
+
+    /// Clone the shared status handle for out-of-lock inspection.
+    #[must_use]
+    pub fn status_handle(&self) -> Arc<Mutex<SessionStatus>> {
+        Arc::clone(&self.status)
+    }
+
+    /// Clone the shared exit-code handle for out-of-lock inspection.
+    #[must_use]
+    pub fn exit_code_handle(&self) -> Arc<Mutex<Option<i32>>> {
+        Arc::clone(&self.exit_code)
     }
 
     /// Send a signal to the entire process group.

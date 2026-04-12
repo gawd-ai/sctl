@@ -163,6 +163,7 @@ export interface UnifiedBandEntry {
 		rsrp: number | null;
 		sinr: number | null;
 		downloadBps: number | null;
+		uploadBps: number | null;
 		registrationTimeMs: number;
 	} | null;
 	history: {
@@ -281,6 +282,7 @@ export function unifiedBandOverview(params: {
 			rsrp: r.rsrp ?? null,
 			sinr: r.sinr ?? null,
 			downloadBps: r.download_bps ?? null,
+			uploadBps: r.upload_bps ?? null,
 			registrationTimeMs: r.registration_time_ms,
 		};
 		// For new bands from scan: lockable only if registered

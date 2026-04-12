@@ -6,7 +6,6 @@
 //! (`AT+QGPS=1`) and disabled on shutdown (`AT+QGPSEND`).
 
 use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,7 +14,6 @@ use tokio::sync::{broadcast, watch, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::config::GpsConfig;
-use crate::state::TunnelStats;
 
 /// A single GPS fix from `AT+QGPSLOC=2`.
 #[derive(Debug, Clone, Serialize)]
@@ -177,20 +175,18 @@ fn parse_qgpsloc(response: &str) -> Result<GpsFix, String> {
 }
 
 /// Spawn the background GPS poller. Returns a `JoinHandle` for abort on shutdown.
-#[allow(clippy::needless_pass_by_value)] // config is moved into spawned task
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 /// Spawn the background GPS poller.
 ///
-/// Like the LTE poller, GPS AT commands are skipped while the tunnel is
-/// connected — even a single AT command on the shared serial port can disrupt
-/// the QMI data path. GPS fixes use the cached last-known position during
-/// connected periods.
+/// When the LTE data path is active (IPv4 on the LTE interface), GPS polls
+/// at a reduced rate to minimize AT command interference with QMI.
 pub fn spawn_gps_poller(
     config: GpsConfig,
     modem: Modem,
     gps_state: Arc<Mutex<GpsState>>,
     session_events: broadcast::Sender<serde_json::Value>,
     mut modem_rx: watch::Receiver<Modem>,
-    tunnel_stats: Option<Arc<TunnelStats>>,
+    lte_interface: Option<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = tokio::time::Duration::from_secs(config.poll_interval_secs);
@@ -295,12 +291,16 @@ pub fn spawn_gps_poller(
                 }
             }
 
-            // Skip polling while tunnel is connected — AT commands on the shared
-            // serial port can disrupt the QMI data path and kill the LTE connection.
-            if let Some(ref ts) = tunnel_stats {
-                if ts.connected.load(Ordering::Relaxed) {
-                    continue;
-                }
+            // When the LTE data path is active, use a longer interval to reduce
+            // AT command interference with QMI. A single AT+QGPSLOC=2 is low-risk
+            // but we space it out as a precaution.
+            let data_active = lte_interface
+                .as_deref()
+                .is_some_and(crate::lte_watchdog::interface_has_ipv4);
+            if data_active {
+                // Sleep for an extra interval to effectively double the poll period
+                // when data path is active (30s → 60s, or whatever interval is configured)
+                tokio::time::sleep(interval).await;
             }
 
             match modem.command("AT+QGPSLOC=2").await {
