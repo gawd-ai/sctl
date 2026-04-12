@@ -3,30 +3,32 @@
   "version": "0.2.0",
   "description": "Web interface for sctl with interactive AI and terminal",
   "type": "module",
-  "svelte": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "svelte": "./src/lib/index.ts",
+  "types": "./src/lib/index.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "svelte": "./dist/index.js",
+      "types": "./src/lib/index.ts",
+      "svelte": "./src/lib/index.ts",
       "default": "./dist/index.js"
     },
     "./components": {
-      "types": "./dist/components/index.d.ts",
-      "svelte": "./dist/components/index.js",
+      "types": "./src/lib/components/index.ts",
+      "svelte": "./src/lib/components/index.ts",
       "default": "./dist/components/index.js"
     },
     "./types": {
-      "types": "./dist/types/index.d.ts",
+      "types": "./src/lib/types/index.ts",
+      "svelte": "./src/lib/types/index.ts",
       "default": "./dist/types/index.js"
     },
     "./utils": {
-      "types": "./dist/utils/index.d.ts",
+      "types": "./src/lib/utils/index.ts",
+      "svelte": "./src/lib/utils/index.ts",
       "default": "./dist/utils/index.js"
     },
     "./widgets": {
-      "types": "./dist/widgets/index.d.ts",
-      "svelte": "./dist/widgets/index.js",
+      "types": "./src/lib/widgets/index.ts",
+      "svelte": "./src/lib/widgets/index.ts",
       "default": "./dist/widgets/index.js"
     }
   },
