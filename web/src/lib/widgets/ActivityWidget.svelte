@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import type { DeviceConnectionConfig } from '../types/widget.types';
 	import type { ActivityEntry, WsActivityNewMsg } from '../types/terminal.types';
 	import { SctlRestClient } from '../utils/rest-client';
@@ -25,26 +26,46 @@
 
 	let restClient: SctlRestClient | null = null;
 	let wsClient: SctlWsClient | null = null;
-	let unsubscribe: (() => void) | null = null;
+	let unsubWs: (() => void) | null = null;
+
+	let _prevWsUrl = '';
+	let _prevApiKey = '';
 
 	$effect(() => {
-		restClient = new SctlRestClient(config.wsUrl, config.apiKey);
-		fetchActivity();
+		const wsUrl = config.wsUrl;
+		const apiKey = config.apiKey;
+		const autoConnect = config.autoConnect;
+		const rt = realtime;
+		const max = maxEntries;
 
-		if (realtime) {
-			wsClient = new SctlWsClient(config.wsUrl, config.apiKey);
-			if (config.autoConnect !== false) {
-				wsClient.connect();
+		untrack(() => {
+			if (wsUrl !== _prevWsUrl || apiKey !== _prevApiKey) {
+				_prevWsUrl = wsUrl;
+				_prevApiKey = apiKey;
+
+				// Cleanup previous
+				if (unsubWs) { unsubWs(); unsubWs = null; }
+				if (wsClient) { wsClient.disconnect(); wsClient = null; }
+
+				restClient = new SctlRestClient(wsUrl, apiKey);
+				fetchActivity();
+
+				if (rt) {
+					wsClient = new SctlWsClient(wsUrl, apiKey);
+					if (autoConnect !== false) {
+						wsClient.connect();
+					}
+					unsubWs = wsClient.on('activity.new', (msg: WsActivityNewMsg) => {
+						entries = [...entries, msg.entry].slice(-max);
+					});
+				}
 			}
-			unsubscribe = wsClient.on('activity.new', (msg: WsActivityNewMsg) => {
-				entries = [...entries, msg.entry].slice(-maxEntries);
-			});
-		}
+		});
 
 		return () => {
-			if (unsubscribe) {
-				unsubscribe();
-				unsubscribe = null;
+			if (unsubWs) {
+				unsubWs();
+				unsubWs = null;
 			}
 			if (wsClient) {
 				wsClient.disconnect();

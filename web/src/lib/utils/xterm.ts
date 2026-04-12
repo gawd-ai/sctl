@@ -68,6 +68,7 @@ export async function createTerminal(
 		theme: toXtermTheme(resolved),
 		fontFamily: resolved.fontFamily ?? DEFAULT_THEME.fontFamily,
 		fontSize: resolved.fontSize ?? DEFAULT_THEME.fontSize,
+		scrollback: 5000,
 		cursorBlink: true,
 		allowProposedApi: true
 	});

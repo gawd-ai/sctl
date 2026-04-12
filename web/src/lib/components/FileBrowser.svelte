@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import type { SctlRestClient } from '../utils/rest-client';
 	import type { DirEntry } from '../types/terminal.types';
 	import { TransferTracker } from '../utils/transfer';
@@ -40,16 +41,12 @@
 	}: Props = $props();
 
 	// ── Directory state ────────────────────────────────────────────
-	let currentPath = $state('/');
+	let currentPath = $state(initialPath);
 	let entries: DirEntry[] = $state([]);
 	let dirLoading = $state(false);
 	let dirError: string | null = $state(null);
 	let filterText = $state('');
-	let showHidden = $state(false);
-
-	// Sync props → local state when they change
-	$effect(() => { currentPath = initialPath; });
-	$effect(() => { showHidden = showHiddenProp; });
+	let showHidden = $state(showHiddenProp);
 
 	// ── File preview/edit state ────────────────────────────────────
 	let previewPath: string | null = $state(null);
@@ -96,11 +93,14 @@
 	let tracker = $derived(trackerProp ?? internalTracker);
 
 	$effect(() => {
-		if (!trackerProp && restClient) {
-			const t = new TransferTracker(restClient);
+		const client = restClient;
+		const hasProp = !!trackerProp;
+		if (!hasProp && client) {
+			const t = new TransferTracker(client);
 			t.onerror = (_ct, msg) => { onerror?.(msg); };
 			internalTracker = t;
-		} else if (!trackerProp) {
+			return () => { internalTracker = null; };
+		} else if (!hasProp) {
 			internalTracker = null;
 		}
 	});
@@ -145,15 +145,22 @@
 	// ── Effects ────────────────────────────────────────────────────
 
 	$effect(() => {
-		if (visible && restClient) {
-			if (restClient !== lastRestClient) {
-				lastRestClient = restClient;
-				lastLoadedPath = null;
-				currentPath = initialPath;
-			}
-			if (lastLoadedPath !== currentPath) {
-				loadDir(currentPath);
-			}
+		// Read dependencies explicitly
+		const vis = visible;
+		const client = restClient;
+		const path = currentPath;
+
+		if (vis && client) {
+			untrack(() => {
+				if (client !== lastRestClient) {
+					lastRestClient = client;
+					lastLoadedPath = null;
+					currentPath = initialPath;
+					loadDir(initialPath);
+				} else if (lastLoadedPath !== path) {
+					loadDir(path);
+				}
+			});
 		}
 	});
 

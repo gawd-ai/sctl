@@ -186,7 +186,6 @@
 	}
 </script>
 
-<!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
 	bind:this={treeContainer}
 	class="flex-1 overflow-y-auto min-h-0"
@@ -288,7 +287,7 @@
 
 				<!-- Name (or rename input) -->
 				{#if isRenaming}
-					<!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
+					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div class="flex-1 min-w-0" onclick={(e) => e.stopPropagation()}>
 						<input
 							bind:this={renameInput}

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import type { DeviceConnectionConfig } from '../types/widget.types';
 	import type { PlaybookSummary, PlaybookDetail, ExecResult } from '../types/terminal.types';
 	import { SctlRestClient } from '../utils/rest-client';
@@ -25,11 +26,24 @@
 	let error: string | null = $state(null);
 	let view: 'list' | 'detail' | 'execute' = $state('list');
 
+	let _prevWsUrl = '';
+	let _prevApiKey = '';
+
 	$effect(() => {
-		restClient = new SctlRestClient(config.wsUrl, config.apiKey);
-		if (config.autoConnect !== false) {
-			fetchPlaybooks();
-		}
+		const wsUrl = config.wsUrl;
+		const apiKey = config.apiKey;
+		const autoConnect = config.autoConnect;
+
+		untrack(() => {
+			if (wsUrl !== _prevWsUrl || apiKey !== _prevApiKey) {
+				_prevWsUrl = wsUrl;
+				_prevApiKey = apiKey;
+				restClient = new SctlRestClient(wsUrl, apiKey);
+				if (autoConnect !== false) {
+					fetchPlaybooks();
+				}
+			}
+		});
 	});
 
 	async function fetchPlaybooks() {

@@ -70,15 +70,6 @@
 				}
 				instance = inst;
 
-				// Flush any writes that arrived while xterm was loading
-				for (const data of earlyWrites) {
-					inst.terminal.write(data);
-				}
-				earlyWrites = [];
-
-				// Signal that xterm is ready to receive writes
-				onready?.();
-
 				// Forward user input
 				inst.terminal.onData((data) => {
 					_ondata?.(data);
@@ -100,11 +91,36 @@
 				// is immediate to correct the initial fit if layout settled
 				// after createTerminal. Subsequent resizes are debounced to
 				// prevent garbling complex prompts (e.g. powerlevel10k).
+				// onready is deferred until after the initial fit so sessions
+				// start with the correct terminal dimensions.
 				let initialFit = true;
-				resizeObserver = new ResizeObserver(() => {
-					if (initialFit) {
-						initialFit = false;
+				let wasHidden = false;
+				resizeObserver = new ResizeObserver((entries) => {
+					const entry = entries[0];
+					const w = entry?.contentRect?.width ?? 0;
+
+					if (w === 0) {
+						// Container hidden (display:none) — skip fit, mark for
+						// immediate refit when visible again.
+						wasHidden = true;
+						return;
+					}
+
+					if (initialFit || wasHidden) {
+						// First fit, or becoming visible after display:none — fit
+						// immediately so the terminal never shows at wrong size.
+						wasHidden = false;
 						inst.fitAddon.fit();
+
+						if (initialFit) {
+							initialFit = false;
+							// Flush early writes and signal ready after first proper fit
+							for (const data of earlyWrites) {
+								inst.terminal.write(data);
+							}
+							earlyWrites = [];
+							onready?.();
+						}
 					} else {
 						clearTimeout(fitTimer);
 						fitTimer = setTimeout(() => {
@@ -290,6 +306,25 @@
 
 	.sctlin-terminal :global(.xterm) {
 		height: 100%;
+	}
+
+	/* Ensure xterm scrollbar is always visible against dark bg */
+	.sctlin-terminal :global(.xterm-viewport) {
+		scrollbar-width: thin;
+		scrollbar-color: #555 transparent;
+	}
+	.sctlin-terminal :global(.xterm-viewport)::-webkit-scrollbar {
+		width: 8px;
+	}
+	.sctlin-terminal :global(.xterm-viewport)::-webkit-scrollbar-track {
+		background: transparent;
+	}
+	.sctlin-terminal :global(.xterm-viewport)::-webkit-scrollbar-thumb {
+		background: #444;
+		border-radius: 4px;
+	}
+	.sctlin-terminal :global(.xterm-viewport)::-webkit-scrollbar-thumb:hover {
+		background: #666;
 	}
 
 	.sctlin-terminal-error {

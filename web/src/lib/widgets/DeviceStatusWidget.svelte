@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import type { DeviceConnectionConfig } from '../types/widget.types';
 	import type { DeviceInfo } from '../types/terminal.types';
 	import { SctlRestClient } from '../utils/rest-client';
@@ -19,23 +20,35 @@
 	let info: DeviceInfo | null = $state(null);
 	let loading = $state(true);
 	let error: string | null = $state(null);
-	let client: SctlRestClient | null = $state(null);
+	let client: SctlRestClient | null = null;
 	let intervalId: ReturnType<typeof setInterval> | null = null;
 
+	let _prevWsUrl = '';
+	let _prevApiKey = '';
+
 	$effect(() => {
-		if (intervalId) {
-			clearInterval(intervalId);
-			intervalId = null;
-		}
+		const wsUrl = config.wsUrl;
+		const apiKey = config.apiKey;
+		const autoConnect = config.autoConnect;
+		const poll = pollInterval;
 
-		client = new SctlRestClient(config.wsUrl, config.apiKey);
-		if (config.autoConnect !== false) {
-			fetchInfo();
-		}
+		untrack(() => {
+			if (wsUrl !== _prevWsUrl || apiKey !== _prevApiKey) {
+				_prevWsUrl = wsUrl;
+				_prevApiKey = apiKey;
 
-		if (pollInterval > 0) {
-			intervalId = setInterval(fetchInfo, pollInterval);
-		}
+				if (intervalId) { clearInterval(intervalId); intervalId = null; }
+
+				client = new SctlRestClient(wsUrl, apiKey);
+				if (autoConnect !== false) {
+					fetchInfo();
+				}
+
+				if (poll > 0) {
+					intervalId = setInterval(fetchInfo, poll);
+				}
+			}
+		});
 
 		return () => {
 			if (intervalId) clearInterval(intervalId);
