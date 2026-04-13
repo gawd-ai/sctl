@@ -15,6 +15,7 @@ use crate::activity::{ActivityLog, ExecResultsCache};
 use crate::config::Config;
 use crate::gawdxfer::manager::TransferManager;
 use crate::gps::GpsState;
+use crate::infra::InfraState;
 use crate::lte::LteState;
 use crate::lte_watchdog::WatchdogSnapshot;
 use crate::modem::Modem;
@@ -59,6 +60,8 @@ pub struct AppState {
     pub relay_state: Option<RelayState>,
     /// LTE watchdog snapshot — updated every tick for API visibility.
     pub watchdog_snapshot: Option<Arc<Mutex<WatchdogSnapshot>>>,
+    /// Infrastructure monitoring state (always present, activates on config push).
+    pub infra_state: Option<Arc<Mutex<InfraState>>>,
 }
 
 /// Tunnel connection event types.

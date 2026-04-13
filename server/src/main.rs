@@ -43,7 +43,7 @@ use sctl::{
     activity::ActivityLog,
     auth::ApiKey,
     config::Config,
-    gps, lte, routes, sessions,
+    gps, infra, lte, routes, sessions,
     sessions::SessionManager,
     state::{AppState, TunnelStats},
     tunnel, ws, ExecResultsCache,
@@ -263,6 +263,13 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     tun_stats.events = tokio::sync::Mutex::new(TunnelStats::load_events(&events_path));
     tun_stats.events_path = Some(events_path);
 
+    // ─── Infra monitoring state ───────────────────────────────────
+    let infra_state = {
+        let mut is = infra::InfraState::new(&config.server.data_dir);
+        is.load_config();
+        Arc::new(tokio::sync::Mutex::new(is))
+    };
+
     let mut state = AppState {
         session_manager,
         config: Arc::new(config),
@@ -281,6 +288,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         device_snapshots: None,
         relay_state: None,
         watchdog_snapshot: None,
+        infra_state: Some(infra_state.clone()),
     };
 
     // Build router
@@ -337,6 +345,16 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         .route("/api/lte/bands", post(routes::lte::set_bands))
         .route("/api/lte/scan", post(routes::lte::start_scan))
         .route("/api/lte/speedtest", post(routes::lte::speed_test))
+        .route(
+            "/api/infra/config",
+            post(infra::routes::push_config).delete(infra::routes::delete_config),
+        )
+        .route("/api/infra/results", get(infra::routes::get_results))
+        .route(
+            "/api/infra/check/{target_id}",
+            post(infra::routes::check_target),
+        )
+        .route("/api/infra/discover", post(infra::discovery::discover))
         .layer(middleware::from_fn(sctl::auth::require_api_key));
 
     let ws_route = Router::new().route("/api/ws", get(ws::ws_upgrade));
@@ -655,6 +673,20 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     } else {
         None
     };
+
+    // Start infra monitor if config was loaded from disk
+    {
+        let mut guard = infra_state.lock().await;
+        if let Some(ref cfg) = guard.config {
+            info!(
+                "Infra: resuming monitoring with {} targets (config v{})",
+                cfg.targets.len(),
+                cfg.version
+            );
+            let handle = infra::monitor::spawn_monitor(infra_state.clone(), cfg.clone());
+            guard.monitor_handle = Some(handle);
+        }
+    }
 
     // Periodic sweep: clean up sessions whose process has exited + stale transfers
     let mgr = state.session_manager.clone();

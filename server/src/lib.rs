@@ -29,6 +29,7 @@ pub mod auth;
 pub mod config;
 pub mod gawdxfer;
 pub mod gps;
+pub mod infra;
 pub mod lte;
 pub mod lte_watchdog;
 pub mod modem;
