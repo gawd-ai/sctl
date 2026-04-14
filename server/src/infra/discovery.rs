@@ -4,13 +4,16 @@
 //! in `InfraState` until the next scan.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use super::checks;
+use super::{DiscoveryProgress, InfraState};
 use crate::AppState;
 
 /// A discovered LAN device.
@@ -37,7 +40,7 @@ pub struct DiscoveryResults {
 /// Accepts an optional `subnets` array in the request body. If omitted,
 /// scans the local ARP table only.
 pub async fn discover(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(payload): Json<Value>,
 ) -> Result<Json<DiscoveryResults>, (StatusCode, Json<Value>)> {
     let subnets: Vec<String> = payload
@@ -45,10 +48,28 @@ pub async fn discover(
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
+    let infra = state.infra_state.clone();
     info!("Starting LAN discovery scan (subnets: {:?})", subnets);
     let start = std::time::Instant::now();
+    let started_at = super::now_iso();
 
-    // Step 1: ARP table scan
+    // Helper: update progress in shared state (non-blocking)
+    let mk_progress = |phase: &str, num: u8, devices: &HashMap<String, DiscoveredDevice>| {
+        #[allow(clippy::cast_possible_truncation)]
+        DiscoveryProgress {
+            active: true,
+            phase: phase.to_string(),
+            phase_number: num,
+            total_phases: 4,
+            hosts_found: devices.len(),
+            devices: devices.values().cloned().collect(),
+            started_at: Some(started_at.clone()),
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        }
+    };
+
+    // Phase 1: ARP table scan
+    set_progress(&infra, mk_progress("arp", 1, &HashMap::new()));
     let mut devices: HashMap<String, DiscoveredDevice> = HashMap::new();
     if let Ok(arp_entries) = scan_arp().await {
         for (ip, mac) in arp_entries {
@@ -65,8 +86,10 @@ pub async fn discover(
             );
         }
     }
+    set_progress(&infra, mk_progress("arp", 1, &devices));
 
-    // Step 2: Ping sweep (if subnets provided)
+    // Phase 2: Ping sweep (if subnets provided)
+    set_progress(&infra, mk_progress("ping", 2, &devices));
     for subnet in &subnets {
         if let Ok(ips) = ping_sweep(subnet).await {
             for ip in ips {
@@ -83,8 +106,10 @@ pub async fn discover(
             }
         }
     }
+    set_progress(&infra, mk_progress("ping", 2, &devices));
 
-    // Step 3: Port probe on discovered IPs
+    // Phase 3: Port probe on discovered IPs
+    set_progress(&infra, mk_progress("ports", 3, &devices));
     let ips: Vec<String> = devices.keys().cloned().collect();
     if !ips.is_empty() {
         if let Ok(port_map) = probe_ports(&ips).await {
@@ -96,8 +121,10 @@ pub async fn discover(
             }
         }
     }
+    set_progress(&infra, mk_progress("ports", 3, &devices));
 
-    // Step 4: Hostname resolution via reverse DNS
+    // Phase 4: Hostname resolution via reverse DNS
+    set_progress(&infra, mk_progress("hostname", 4, &devices));
     for dev in devices.values_mut() {
         if let Ok(hostname) = resolve_hostname(&dev.ip).await {
             dev.hostname = Some(hostname);
@@ -113,12 +140,36 @@ pub async fn discover(
         scan_duration_ms,
     };
 
+    // Mark scan complete
+    set_progress(
+        &infra,
+        DiscoveryProgress {
+            active: false,
+            phase: "complete".to_string(),
+            phase_number: 4,
+            total_phases: 4,
+            hosts_found: results.devices.len(),
+            devices: results.devices.clone(),
+            started_at: Some(started_at),
+            elapsed_ms: scan_duration_ms,
+        },
+    );
+
     info!(
         "Discovery complete: {} devices found in {scan_duration_ms}ms",
         results.devices.len()
     );
 
     Ok(Json(results))
+}
+
+/// Update discovery progress in shared InfraState (non-blocking).
+fn set_progress(infra: &Option<Arc<Mutex<InfraState>>>, progress: DiscoveryProgress) {
+    if let Some(ref infra) = infra {
+        if let Ok(mut g) = infra.try_lock() {
+            g.discovery_progress = progress;
+        }
+    }
 }
 
 // ─── Scan implementations ────────────────────────────────────────────

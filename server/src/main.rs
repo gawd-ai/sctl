@@ -355,6 +355,10 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
             post(infra::routes::check_target),
         )
         .route("/api/infra/discover", post(infra::discovery::discover))
+        .route(
+            "/api/infra/discover/progress",
+            get(infra::routes::discover_progress),
+        )
         .layer(middleware::from_fn(sctl::auth::require_api_key));
 
     let ws_route = Router::new().route("/api/ws", get(ws::ws_upgrade));

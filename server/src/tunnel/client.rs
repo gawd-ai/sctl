@@ -1088,6 +1088,25 @@ async fn handle_relay_message(
         "tunnel.lte.speedtest" => {
             handle_tunnel_lte_speedtest(state, ws_sink, request_id.as_deref()).await;
         }
+        // Infra monitoring tunnel messages
+        "tunnel.infra.results" => {
+            handle_tunnel_infra_results(state, ws_sink, request_id.as_deref()).await;
+        }
+        "tunnel.infra.discover" => {
+            handle_tunnel_infra_discover(state, ws_sink, &msg, request_id.as_deref()).await;
+        }
+        "tunnel.infra.discover.progress" => {
+            handle_tunnel_infra_discover_progress(state, ws_sink, request_id.as_deref()).await;
+        }
+        "tunnel.infra.config" => {
+            handle_tunnel_infra_config(state, ws_sink, &msg, request_id.as_deref()).await;
+        }
+        "tunnel.infra.config.delete" => {
+            handle_tunnel_infra_config_delete(state, ws_sink, request_id.as_deref()).await;
+        }
+        "tunnel.infra.check" => {
+            handle_tunnel_infra_check(state, ws_sink, &msg, request_id.as_deref()).await;
+        }
         // gawdxfer transfer protocol messages
         "gx.download.init" => {
             handle_gx_download_init(state, ws_sink, &msg, request_id.as_deref()).await;
@@ -3347,6 +3366,230 @@ async fn handle_tunnel_lte_speedtest(state: &AppState, ws_sink: &WsSink, request
                 ws_sink,
                 json!({
                     "type": "tunnel.lte.speedtest.result",
+                    "request_id": request_id,
+                    "status": status.as_u16(),
+                    "body": body,
+                }),
+            )
+            .await;
+        }
+    }
+}
+
+// ─── Infra Monitoring Tunnel Handlers ────────────────────────────────────────
+
+/// Handle `tunnel.infra.results` — return latest monitoring results.
+async fn handle_tunnel_infra_results(state: &AppState, ws_sink: &WsSink, request_id: Option<&str>) {
+    match crate::infra::routes::get_results(axum::extract::State(state.clone())).await {
+        Ok(axum::Json(body)) => {
+            let body_value = serde_json::to_value(&body).unwrap_or_default();
+            send_response_async(
+                ws_sink,
+                json!({
+                    "type": "tunnel.infra.results.result",
+                    "request_id": request_id,
+                    "status": 200,
+                    "body": body_value,
+                }),
+            )
+            .await;
+        }
+        Err((status, axum::Json(body))) => {
+            send_response_async(
+                ws_sink,
+                json!({
+                    "type": "tunnel.infra.results.result",
+                    "request_id": request_id,
+                    "status": status.as_u16(),
+                    "body": body,
+                }),
+            )
+            .await;
+        }
+    }
+}
+
+/// Handle `tunnel.infra.discover.progress` — return current scan progress.
+async fn handle_tunnel_infra_discover_progress(
+    state: &AppState,
+    ws_sink: &WsSink,
+    request_id: Option<&str>,
+) {
+    let body = crate::infra::routes::discover_progress(axum::extract::State(state.clone())).await;
+    send_response_async(
+        ws_sink,
+        json!({
+            "type": "tunnel.infra.discover.progress.result",
+            "request_id": request_id,
+            "status": 200,
+            "body": body.0,
+        }),
+    )
+    .await;
+}
+
+/// Handle `tunnel.infra.discover` — trigger LAN discovery scan.
+async fn handle_tunnel_infra_discover(
+    state: &AppState,
+    ws_sink: &WsSink,
+    msg: &Value,
+    request_id: Option<&str>,
+) {
+    match crate::infra::discovery::discover(
+        axum::extract::State(state.clone()),
+        axum::Json(msg.clone()),
+    )
+    .await
+    {
+        Ok(axum::Json(body)) => {
+            let body_value = serde_json::to_value(&body).unwrap_or_default();
+            send_response_async(
+                ws_sink,
+                json!({
+                    "type": "tunnel.infra.discover.result",
+                    "request_id": request_id,
+                    "status": 200,
+                    "body": body_value,
+                }),
+            )
+            .await;
+        }
+        Err((status, axum::Json(body))) => {
+            send_response_async(
+                ws_sink,
+                json!({
+                    "type": "tunnel.infra.discover.result",
+                    "request_id": request_id,
+                    "status": status.as_u16(),
+                    "body": body,
+                }),
+            )
+            .await;
+        }
+    }
+}
+
+/// Handle `tunnel.infra.config` — push monitoring config.
+async fn handle_tunnel_infra_config(
+    state: &AppState,
+    ws_sink: &WsSink,
+    msg: &Value,
+    request_id: Option<&str>,
+) {
+    // Deserialize InfraConfig from the tunnel message (serde ignores extra fields like type/request_id)
+    let config = match serde_json::from_value::<crate::infra::InfraConfig>(msg.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            send_response_async(
+                ws_sink,
+                json!({
+                    "type": "tunnel.infra.config.result",
+                    "request_id": request_id,
+                    "status": 400,
+                    "body": {"error": format!("Invalid infra config: {e}")},
+                }),
+            )
+            .await;
+            return;
+        }
+    };
+
+    match crate::infra::routes::push_config(axum::extract::State(state.clone()), axum::Json(config))
+        .await
+    {
+        Ok(axum::Json(body)) => {
+            send_response_async(
+                ws_sink,
+                json!({
+                    "type": "tunnel.infra.config.result",
+                    "request_id": request_id,
+                    "status": 200,
+                    "body": body,
+                }),
+            )
+            .await;
+        }
+        Err((status, axum::Json(body))) => {
+            send_response_async(
+                ws_sink,
+                json!({
+                    "type": "tunnel.infra.config.result",
+                    "request_id": request_id,
+                    "status": status.as_u16(),
+                    "body": body,
+                }),
+            )
+            .await;
+        }
+    }
+}
+
+/// Handle `tunnel.infra.config.delete` — stop monitoring, remove config.
+async fn handle_tunnel_infra_config_delete(
+    state: &AppState,
+    ws_sink: &WsSink,
+    request_id: Option<&str>,
+) {
+    match crate::infra::routes::delete_config(axum::extract::State(state.clone())).await {
+        Ok(axum::Json(body)) => {
+            send_response_async(
+                ws_sink,
+                json!({
+                    "type": "tunnel.infra.config.delete.result",
+                    "request_id": request_id,
+                    "status": 200,
+                    "body": body,
+                }),
+            )
+            .await;
+        }
+        Err((status, axum::Json(body))) => {
+            send_response_async(
+                ws_sink,
+                json!({
+                    "type": "tunnel.infra.config.delete.result",
+                    "request_id": request_id,
+                    "status": status.as_u16(),
+                    "body": body,
+                }),
+            )
+            .await;
+        }
+    }
+}
+
+/// Handle `tunnel.infra.check` — on-demand check for one target.
+async fn handle_tunnel_infra_check(
+    state: &AppState,
+    ws_sink: &WsSink,
+    msg: &Value,
+    request_id: Option<&str>,
+) {
+    let target_id = msg["target_id"].as_str().unwrap_or("").to_string();
+
+    match crate::infra::routes::check_target(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(target_id),
+    )
+    .await
+    {
+        Ok(axum::Json(body)) => {
+            send_response_async(
+                ws_sink,
+                json!({
+                    "type": "tunnel.infra.check.result",
+                    "request_id": request_id,
+                    "status": 200,
+                    "body": body,
+                }),
+            )
+            .await;
+        }
+        Err((status, axum::Json(body))) => {
+            send_response_async(
+                ws_sink,
+                json!({
+                    "type": "tunnel.infra.check.result",
                     "request_id": request_id,
                     "status": status.as_u16(),
                     "body": body,

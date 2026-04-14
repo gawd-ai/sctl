@@ -202,6 +202,27 @@ pub struct InfraResults {
 
 // ─── Shared state ────────────────────────────────────────────────────
 
+/// Real-time progress of a running discovery scan.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DiscoveryProgress {
+    /// Whether a scan is currently running.
+    pub active: bool,
+    /// Current phase: "arp", "ping", "ports", "hostname", "complete", "error".
+    pub phase: String,
+    /// 1-based phase number (1–4 during scan, 0 when idle).
+    pub phase_number: u8,
+    /// Total phases in the scan.
+    pub total_phases: u8,
+    /// Number of hosts discovered so far.
+    pub hosts_found: usize,
+    /// Partial results accumulated so far.
+    pub devices: Vec<discovery::DiscoveredDevice>,
+    /// When the scan started (ISO 8601).
+    pub started_at: Option<String>,
+    /// Wall-clock time elapsed since scan start.
+    pub elapsed_ms: u64,
+}
+
 /// Shared infra monitoring state, held behind `Arc<Mutex<>>` on `AppState`.
 pub struct InfraState {
     /// Current config (None until first push).
@@ -214,6 +235,8 @@ pub struct InfraState {
     pub config_path: PathBuf,
     /// Handle to the monitoring task (so we can abort and restart on config change).
     pub monitor_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Real-time discovery scan progress (polled by UI).
+    pub discovery_progress: DiscoveryProgress,
 }
 
 const MAX_RECOVERY_LOG: usize = 50;
@@ -231,6 +254,7 @@ impl InfraState {
             recovery_tracker: HashMap::new(),
             config_path: Path::new(data_dir).join("infra-monitor.json"),
             monitor_handle: None,
+            discovery_progress: DiscoveryProgress::default(),
         }
     }
 

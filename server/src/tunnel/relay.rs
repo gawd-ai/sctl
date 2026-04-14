@@ -690,6 +690,21 @@ pub fn relay_router(relay_state: RelayState) -> Router {
         .route("/d/{serial}/api/lte/bands", post(proxy_lte_bands))
         .route("/d/{serial}/api/lte/scan", post(proxy_lte_scan))
         .route("/d/{serial}/api/lte/speedtest", post(proxy_lte_speedtest))
+        // Infra monitoring proxy endpoints
+        .route(
+            "/d/{serial}/api/infra/config",
+            post(proxy_infra_config_push).delete(proxy_infra_config_delete),
+        )
+        .route("/d/{serial}/api/infra/results", get(proxy_infra_results))
+        .route("/d/{serial}/api/infra/discover", post(proxy_infra_discover))
+        .route(
+            "/d/{serial}/api/infra/discover/progress",
+            get(proxy_infra_discover_progress),
+        )
+        .route(
+            "/d/{serial}/api/infra/check/{target_id}",
+            post(proxy_infra_check),
+        )
         .route("/d/{serial}/api/ws", get(proxy_ws));
 
     tunnel_admin.merge(device_proxy).with_state(relay_state)
@@ -2600,6 +2615,210 @@ async fn proxy_lte_speedtest(
         state.tunnel_proxy_timeout_secs.max(30),
     )
     .await?;
+    proxy_response_to_http(&response)
+}
+
+// ─── Infra Monitoring Proxy Endpoints ────────────────────────────────────────
+
+/// `GET /d/{serial}/api/infra/results` — proxied infra monitoring results.
+async fn proxy_infra_results(
+    State(state): State<RelayState>,
+    AxumPath(serial): AxumPath<String>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "tunnel.infra.results",
+        "request_id": request_id,
+    });
+
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
+}
+
+/// `GET /d/{serial}/api/infra/discover/progress` — poll scan progress.
+async fn proxy_infra_discover_progress(
+    State(state): State<RelayState>,
+    AxumPath(serial): AxumPath<String>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let response = tunnel_request_json(
+        &state,
+        &serial,
+        json!({
+            "type": "tunnel.infra.discover.progress",
+            "request_id": request_id,
+        }),
+        10,
+    )
+    .await?;
+    proxy_response_to_http(&response)
+}
+
+/// `POST /d/{serial}/api/infra/discover` — trigger LAN discovery scan.
+async fn proxy_infra_discover(
+    State(state): State<RelayState>,
+    AxumPath(serial): AxumPath<String>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Failed to read request body"})),
+            )
+        })?;
+
+    let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Invalid JSON"})),
+        )
+    })?;
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let mut msg = payload;
+    msg["type"] = json!("tunnel.infra.discover");
+    msg["request_id"] = json!(request_id);
+
+    // Discovery can run nmap ping sweep + port probe — allow 120s
+    let response = tunnel_request_json(&state, &serial, msg, 120).await?;
+    proxy_response_to_http(&response)
+}
+
+/// `POST /d/{serial}/api/infra/config` — push monitoring config to device.
+async fn proxy_infra_config_push(
+    State(state): State<RelayState>,
+    AxumPath(serial): AxumPath<String>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Failed to read request body"})),
+            )
+        })?;
+
+    let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Invalid JSON"})),
+        )
+    })?;
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let mut msg = payload;
+    msg["type"] = json!("tunnel.infra.config");
+    msg["request_id"] = json!(request_id);
+
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
+}
+
+/// `DELETE /d/{serial}/api/infra/config` — stop monitoring, remove config.
+async fn proxy_infra_config_delete(
+    State(state): State<RelayState>,
+    AxumPath(serial): AxumPath<String>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "tunnel.infra.config.delete",
+        "request_id": request_id,
+    });
+
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+    proxy_response_to_http(&response)
+}
+
+/// `POST /d/{serial}/api/infra/check/{target_id}` — on-demand check for one target.
+async fn proxy_infra_check(
+    State(state): State<RelayState>,
+    AxumPath((serial, target_id)): AxumPath<(String, String)>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let msg = json!({
+        "type": "tunnel.infra.check",
+        "request_id": request_id,
+        "target_id": target_id,
+    });
+
+    // Single check — 30s timeout
+    let response = tunnel_request_json(&state, &serial, msg, 30).await?;
     proxy_response_to_http(&response)
 }
 

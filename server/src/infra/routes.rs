@@ -121,6 +121,18 @@ pub async fn check_target(
     })))
 }
 
+/// `GET /api/infra/discover/progress` — return current discovery scan progress.
+pub async fn discover_progress(State(state): State<AppState>) -> Json<Value> {
+    let Some(ref infra) = state.infra_state else {
+        return Json(json!({"active": false, "phase": "idle"}));
+    };
+    let guard = infra.lock().await;
+    Json(
+        serde_json::to_value(&guard.discovery_progress)
+            .unwrap_or(json!({"active": false, "phase": "idle"})),
+    )
+}
+
 /// `DELETE /api/infra/config` — stop monitoring and remove config.
 pub async fn delete_config(
     State(state): State<AppState>,
