@@ -1093,7 +1093,15 @@ async fn handle_relay_message(
             handle_tunnel_infra_results(state, ws_sink, request_id.as_deref()).await;
         }
         "tunnel.infra.discover" => {
-            handle_tunnel_infra_discover(state, ws_sink, &msg, request_id.as_deref()).await;
+            // Spawn as task — scan can take 60s+ and must not block the message loop
+            // (otherwise progress queries can't get through)
+            let s = state.clone();
+            let sink = ws_sink.clone();
+            let m = msg.clone();
+            let rid = request_id.clone();
+            tokio::spawn(async move {
+                handle_tunnel_infra_discover(&s, &sink, &m, rid.as_deref()).await;
+            });
         }
         "tunnel.infra.discover.progress" => {
             handle_tunnel_infra_discover_progress(state, ws_sink, request_id.as_deref()).await;
