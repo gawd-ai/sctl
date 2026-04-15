@@ -48,6 +48,11 @@ SCTL_DIR="$REPO_DIR/server"
 MCP_DIR="$REPO_DIR/mcp"
 WEB_DIR="$REPO_DIR/web"
 
+# Stamp the host's git commit count into the binary. `cross build` runs
+# inside a container that can't see the host's .git dir, so build.rs
+# would fall back to "0" unless we pass this through (see Cross.toml).
+export SCTL_BUILD_NUMBER="$(git -C "$REPO_DIR" rev-list --count HEAD 2>/dev/null || echo 0)"
+
 # Dev config
 API_KEY="dev-key"
 LISTEN="127.0.0.1:1337"

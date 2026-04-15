@@ -1,0 +1,6 @@
+# Pass the host's commit-count through to the cross container so build.rs
+# can stamp the correct `SCTL_BUILD_NUMBER` into the binary. Without this,
+# git inside the container can't see the host's .git dir and we'd fall
+# back to "0.4.0.0".
+[build.env]
+passthrough = ["SCTL_BUILD_NUMBER"]
