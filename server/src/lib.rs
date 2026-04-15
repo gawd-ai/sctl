@@ -24,6 +24,10 @@
 //! - `shell` — process spawning and PTY management
 //! - `gawdxfer` — chunked file transfer
 
+/// Full version: `<cargo-version>.<git-commit-count>`. Bumps on every commit
+/// so a fresh binary is never mistaken for an older one.
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ".", env!("SCTL_BUILD_NUMBER"));
+
 pub mod activity;
 pub mod auth;
 pub mod config;

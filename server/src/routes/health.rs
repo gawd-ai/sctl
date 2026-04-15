@@ -193,7 +193,7 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
     let mut resp = json!({
         "status": "ok",
         "uptime_secs": uptime,
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": crate::VERSION,
         "sessions": sessions,
         "tunnel": tunnel,
         "gps": gps,

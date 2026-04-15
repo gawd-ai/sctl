@@ -49,9 +49,11 @@ use sctl::{
     tunnel, ws, ExecResultsCache,
 };
 
+use sctl::VERSION;
+
 /// Remote shell control service for Linux devices.
 #[derive(Parser)]
-#[command(name = "sctl", version)]
+#[command(name = "sctl", version = VERSION)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -169,7 +171,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         Some(acquire_process_lock(&config.server.data_dir))
     };
 
-    info!("sctl v{} starting", env!("CARGO_PKG_VERSION"));
+    info!("sctl v{} starting", VERSION);
     info!("Device serial: {}", config.device.serial);
     info!("Listening on {}", config.server.listen);
 
@@ -358,6 +360,10 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         .route(
             "/api/infra/discover/progress",
             get(infra::routes::discover_progress),
+        )
+        .route(
+            "/api/infra/discover/subnets",
+            get(infra::routes::discover_subnets),
         )
         .layer(middleware::from_fn(sctl::auth::require_api_key));
 
