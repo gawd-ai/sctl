@@ -702,6 +702,10 @@ pub fn relay_router(relay_state: RelayState) -> Router {
             get(proxy_infra_discover_progress),
         )
         .route(
+            "/d/{serial}/api/infra/discover/subnets",
+            get(proxy_infra_discover_subnets),
+        )
+        .route(
             "/d/{serial}/api/infra/check/{target_id}",
             post(proxy_infra_check),
         )
@@ -2671,6 +2675,37 @@ async fn proxy_infra_discover_progress(
         &serial,
         json!({
             "type": "tunnel.infra.discover.progress",
+            "request_id": request_id,
+        }),
+        10,
+    )
+    .await?;
+    proxy_response_to_http(&response)
+}
+
+/// `GET /d/{serial}/api/infra/discover/subnets` — auto-detected LAN subnets.
+async fn proxy_infra_discover_subnets(
+    State(state): State<RelayState>,
+    AxumPath(serial): AxumPath<String>,
+    request: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let response = tunnel_request_json(
+        &state,
+        &serial,
+        json!({
+            "type": "tunnel.infra.discover.subnets",
             "request_id": request_id,
         }),
         10,

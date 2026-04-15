@@ -43,15 +43,46 @@ pub async fn discover(
     State(state): State<AppState>,
     Json(payload): Json<Value>,
 ) -> Result<Json<DiscoveryResults>, (StatusCode, Json<Value>)> {
-    let subnets: Vec<String> = payload
+    let mut subnets: Vec<String> = payload
         .get("subnets")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
+
+    // Auto-detect LAN subnets if none provided
+    if subnets.is_empty() {
+        subnets = auto_detect_subnets().await;
+    }
 
     let infra = state.infra_state.clone();
     info!("Starting LAN discovery scan (subnets: {:?})", subnets);
     let start = std::time::Instant::now();
     let started_at = super::now_iso();
+
+    // Background task: tick elapsed_ms every 500ms so progress endpoint stays fresh
+    let elapsed_ticker = {
+        let infra = infra.clone();
+        let start = start;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if let Some(ref infra) = infra {
+                    if let Ok(mut g) = infra.try_lock() {
+                        if g.discovery_progress.active {
+                            #[allow(clippy::cast_possible_truncation)]
+                            {
+                                g.discovery_progress.elapsed_ms =
+                                    start.elapsed().as_millis() as u64;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+        })
+    };
 
     // Helper: update progress in shared state (non-blocking)
     let mk_progress = |phase: &str, num: u8, devices: &HashMap<String, DiscoveredDevice>| {
@@ -88,7 +119,7 @@ pub async fn discover(
     }
     set_progress(&infra, mk_progress("arp", 1, &devices));
 
-    // Phase 2: Ping sweep (if subnets provided)
+    // Phase 2: Ping sweep — update progress every 500ms as hosts respond
     set_progress(&infra, mk_progress("ping", 2, &devices));
     for subnet in &subnets {
         if let Ok(ips) = ping_sweep(subnet).await {
@@ -105,6 +136,7 @@ pub async fn discover(
                     });
             }
         }
+        set_progress(&infra, mk_progress("ping", 2, &devices));
     }
     set_progress(&infra, mk_progress("ping", 2, &devices));
 
@@ -140,6 +172,9 @@ pub async fn discover(
         scan_duration_ms,
     };
 
+    // Stop the elapsed ticker
+    elapsed_ticker.abort();
+
     // Mark scan complete
     set_progress(
         &infra,
@@ -174,6 +209,56 @@ fn set_progress(infra: &Option<Arc<Mutex<InfraState>>>, progress: DiscoveryProgr
 
 // ─── Scan implementations ────────────────────────────────────────────
 
+/// Auto-detect LAN subnets from network interfaces (public for routes module).
+///
+/// Looks for IPv4 addresses on bridge (br-lan, br-*) and LAN interfaces,
+/// excluding WAN, loopback, WireGuard, and tunnel interfaces.
+pub async fn auto_detect_subnets() -> Vec<String> {
+    let output = checks::exec_simple_pub(
+        "ip -4 addr show | awk '/^[0-9]+:/ {iface=$2} /inet / {print iface, $2}'",
+        5000,
+    )
+    .await;
+
+    let Ok(output) = output else {
+        info!("Failed to detect LAN subnets");
+        return Vec::new();
+    };
+
+    let skip_prefixes = ["lo:", "wg", "wwan", "docker", "veth", "tun"];
+
+    let subnets: Vec<String> = output
+        .1
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 2 {
+                return None;
+            }
+            let iface = parts[0].trim_end_matches(':');
+            let cidr = parts[1];
+
+            // Skip non-LAN interfaces
+            if skip_prefixes.iter().any(|p| iface.starts_with(p)) {
+                return None;
+            }
+            // Skip /32 point-to-point and loopback
+            if cidr.ends_with("/32") || cidr.starts_with("127.") {
+                return None;
+            }
+            // Validate it's a real CIDR
+            if checks::validate_cidr(cidr) {
+                Some(cidr.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    info!("Auto-detected LAN subnets: {:?}", subnets);
+    subnets
+}
+
 /// Parse the ARP table for IP→MAC mappings.
 async fn scan_arp() -> Result<Vec<(String, String)>, String> {
     let output = checks::exec_simple_pub(
@@ -188,7 +273,12 @@ async fn scan_arp() -> Result<Vec<(String, String)>, String> {
         .filter_map(|line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 2 && parts[1].contains(':') {
-                Some((parts[0].to_string(), parts[1].to_string()))
+                let ip = parts[0];
+                // Skip IPv6 link-local — not useful for infrastructure discovery
+                if ip.starts_with("fe80:") || ip.contains(':') {
+                    return None;
+                }
+                Some((ip.to_string(), parts[1].to_string()))
             } else {
                 None
             }
@@ -199,79 +289,117 @@ async fn scan_arp() -> Result<Vec<(String, String)>, String> {
     Ok(entries)
 }
 
-/// Ping sweep a subnet using nmap or fping.
+/// Ping sweep a subnet — tries nmap, falls back to busybox-compatible parallel ping.
 async fn ping_sweep(subnet: &str) -> Result<Vec<String>, String> {
     if !checks::validate_cidr(subnet) {
         return Err(format!("invalid subnet CIDR: {subnet}"));
     }
-    // Try nmap first, fall back to manual ping
-    let output = checks::exec_simple_pub(
-        &format!(
-            "nmap -sn -n {subnet} -oG - 2>/dev/null | grep 'Status: Up' | awk '{{print $2}}' || \
-             (for i in $(seq 1 254); do \
-                ip=$(echo {subnet} | sed 's|/.*||' | sed 's/\\.[0-9]*$//').$i; \
-                ping -c 1 -W 1 $ip >/dev/null 2>&1 && echo $ip & \
-             done; wait)"
-        ),
+
+    // Try nmap first (fast + reliable)
+    let nmap_result = checks::exec_simple_pub(
+        &format!("command -v nmap >/dev/null 2>&1 && nmap -sn -n {subnet} -oG - 2>/dev/null | grep 'Status: Up' | awk '{{print $2}}'"),
         60000,
     )
-    .await?;
+    .await;
 
-    let ips: Vec<String> = output
-        .1
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| l.trim().to_string())
-        .filter(|l| l.chars().all(|c| c.is_ascii_digit() || c == '.'))
-        .collect();
-
-    debug!("Ping sweep {subnet}: {} hosts up", ips.len());
-    Ok(ips)
-}
-
-/// Probe common ports on a set of IPs.
-async fn probe_ports(ips: &[String]) -> Result<HashMap<String, Vec<u16>>, String> {
-    for ip in ips {
-        if !checks::validate_ipv4(ip) {
-            return Err(format!("invalid IP in probe list: {ip}"));
+    if let Ok(ref output) = nmap_result {
+        let ips: Vec<String> = output
+            .1
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.trim().to_string())
+            .filter(|l| checks::validate_ipv4(l))
+            .collect();
+        if !ips.is_empty() {
+            debug!("Ping sweep {subnet} (nmap): {} hosts up", ips.len());
+            return Ok(ips);
         }
     }
 
-    let ports = "22,80,443,554,8080,8443,161,53,3389";
+    // Fallback: parallel ping using tokio — updates progress as hosts respond
+    let base = subnet
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .rsplitn(2, '.')
+        .nth(1)
+        .unwrap_or("");
+    if base.is_empty() {
+        return Err(format!("cannot extract base from subnet: {subnet}"));
+    }
 
-    // Use args-based execution to avoid shell injection on IP list
-    let ip_refs: Vec<&str> = ips.iter().map(|s| s.as_str()).collect();
-    let mut args: Vec<&str> = vec!["-p", ports, "--open", "-n", "-oG", "-"];
-    args.extend(&ip_refs);
+    let found = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
 
-    let Ok(output) = checks::exec_args_pub("nmap", &args, 60000).await else {
-        return Ok(HashMap::new()); // nmap not available, skip
-    };
+    // Ping all 254 IPs in parallel via individual ping commands
+    let mut handles = Vec::new();
+    for i in 1..=254u16 {
+        let ip = format!("{base}.{i}");
+        let found = found.clone();
+        handles.push(tokio::spawn(async move {
+            let output = checks::exec_simple_pub(
+                &format!("ping -c 1 -W 1 {ip} >/dev/null 2>&1 && echo UP"),
+                3000,
+            )
+            .await;
+            if let Ok(out) = output {
+                if out.1.contains("UP") {
+                    if let Ok(mut f) = found.lock() {
+                        f.push(ip);
+                    }
+                }
+            }
+        }));
+    }
+
+    // Wait for all pings to complete
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    let ips = found.lock().map(|f| f.clone()).unwrap_or_default();
+    debug!("Ping sweep {subnet} (ping): {} hosts up", ips.len());
+    Ok(ips)
+}
+
+/// Probe common ports on a set of IPs using native TCP connects.
+async fn probe_ports(ips: &[String]) -> Result<HashMap<String, Vec<u16>>, String> {
+    let port_list: Vec<u16> = vec![22, 80, 443, 554, 8080, 8443, 161, 53, 3389, 1337];
 
     let mut result: HashMap<String, Vec<u16>> = HashMap::new();
 
-    // Parse nmap greppable output: "Host: 192.168.1.1 ()	Ports: 22/open/tcp//ssh///, 80/open/tcp//http///"
-    for line in output.1.lines() {
-        if !line.starts_with("Host:") || !line.contains("Ports:") {
-            continue;
-        }
-        let ip = line.split_whitespace().nth(1).unwrap_or("").to_string();
-
-        let ports_part = line.split("Ports:").nth(1).unwrap_or("");
-        let open_ports: Vec<u16> = ports_part
-            .split(',')
-            .filter_map(|p| {
-                let port_str = p.trim().split('/').next()?;
-                if p.contains("open") {
-                    port_str.parse().ok()
-                } else {
-                    None
+    let mut handles = Vec::new();
+    for ip in ips {
+        let ip = ip.clone();
+        let ports = port_list.clone();
+        handles.push(tokio::spawn(async move {
+            let mut open = Vec::new();
+            let mut port_handles = Vec::new();
+            for port in ports {
+                let ip = ip.clone();
+                port_handles.push(tokio::spawn(async move {
+                    let addr = format!("{ip}:{port}");
+                    let connect = tokio::net::TcpStream::connect(&addr);
+                    match tokio::time::timeout(std::time::Duration::from_secs(2), connect).await {
+                        Ok(Ok(_stream)) => Some(port),
+                        _ => None,
+                    }
+                }));
+            }
+            for h in port_handles {
+                if let Ok(Some(port)) = h.await {
+                    open.push(port);
                 }
-            })
-            .collect();
+            }
+            open.sort();
+            (ip, open)
+        }));
+    }
 
-        if !open_ports.is_empty() {
-            result.insert(ip, open_ports);
+    for handle in handles {
+        if let Ok((ip, ports)) = handle.await {
+            if !ports.is_empty() {
+                result.insert(ip, ports);
+            }
         }
     }
 

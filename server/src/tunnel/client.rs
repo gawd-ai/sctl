@@ -1106,6 +1106,9 @@ async fn handle_relay_message(
         "tunnel.infra.discover.progress" => {
             handle_tunnel_infra_discover_progress(state, ws_sink, request_id.as_deref()).await;
         }
+        "tunnel.infra.discover.subnets" => {
+            handle_tunnel_infra_discover_subnets(ws_sink, request_id.as_deref()).await;
+        }
         "tunnel.infra.config" => {
             handle_tunnel_infra_config(state, ws_sink, &msg, request_id.as_deref()).await;
         }
@@ -3431,6 +3434,21 @@ async fn handle_tunnel_infra_discover_progress(
             "request_id": request_id,
             "status": 200,
             "body": body.0,
+        }),
+    )
+    .await;
+}
+
+/// Handle `tunnel.infra.discover.subnets` — return auto-detected LAN subnets.
+async fn handle_tunnel_infra_discover_subnets(ws_sink: &WsSink, request_id: Option<&str>) {
+    let subnets = crate::infra::discovery::auto_detect_subnets().await;
+    send_response_async(
+        ws_sink,
+        json!({
+            "type": "tunnel.infra.discover.subnets.result",
+            "request_id": request_id,
+            "status": 200,
+            "body": { "subnets": subnets },
         }),
     )
     .await;
