@@ -919,11 +919,9 @@ impl TransferManager {
         let chunks_done = transfer.progress.chunks_done.iter().filter(|&&v| v).count() as u32;
         #[allow(clippy::cast_possible_truncation)]
         let elapsed_ms = transfer.spec.created_at.elapsed().as_millis() as u64;
-        let rate_bps = if elapsed_ms > 0 {
-            transfer.progress.bytes_transferred * 1000 / elapsed_ms
-        } else {
-            0
-        };
+        let rate_bps = (transfer.progress.bytes_transferred * 1000)
+            .checked_div(elapsed_ms)
+            .unwrap_or(0);
 
         Progress {
             transfer_id: transfer.spec.transfer_id.clone(),

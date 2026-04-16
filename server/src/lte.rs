@@ -896,7 +896,7 @@ pub async fn verified_set_bands(
         .map_err(|e| format!("AT+QCFG band write failed: {e}"))?;
 
     // Delay before read-back — give modem time to apply and reduces QMI disruption
-    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     // Read back and verify
     let resp = modem
@@ -1029,7 +1029,7 @@ pub async fn apply_bands_fast(
     priority_band: Option<u16>,
 ) -> Result<(BandConfig, Vec<u16>, Option<u16>, bool), String> {
     // Space AT commands to minimize QMI data path disruption.
-    let cmd_delay = Duration::from_millis(1000);
+    let cmd_delay = Duration::from_secs(1);
 
     // 1. Read current config for rollback reference
     let old_bands_resp = modem

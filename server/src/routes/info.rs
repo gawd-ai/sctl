@@ -262,9 +262,7 @@ pub(crate) async fn info_with_groups(
     }
 
     let serialize_started = Instant::now();
-    let response_body_len = serde_json::to_string(&response)
-        .map(|s| s.len())
-        .unwrap_or(0);
+    let response_body_len = serde_json::to_string(&response).map_or(0, |s| s.len());
     #[allow(clippy::cast_possible_truncation)]
     let serialize_ms = serialize_started.elapsed().as_millis() as u64;
     info!(

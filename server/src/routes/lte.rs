@@ -31,7 +31,7 @@ pub async fn lte(
         if let Some(ref notify) = state.lte_poll_notify {
             notify.notify_one();
             // Brief wait for the poller to complete one cycle
-            tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
     }
 
@@ -206,7 +206,7 @@ pub async fn set_bands(
         if let Some(serving) = serving_band {
             let pri_cmd = format!("AT+QCFG=\"bandpri\",{serving}");
             let _ = modem.command(&pri_cmd).await;
-            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
 
         let hex = lte::bands_to_hex(&new_bands);
@@ -221,7 +221,7 @@ pub async fn set_bands(
         // If user requested a different priority than the serving anchor, set it
         if let Some(pri) = new_priority {
             if new_priority != serving_band {
-                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 let pri_cmd = format!("AT+QCFG=\"bandpri\",{pri}");
                 let _ = modem.command(&pri_cmd).await;
             }

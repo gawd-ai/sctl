@@ -1542,7 +1542,7 @@ async fn handle_tunnel_info(
     {
         Ok(axum::Json(body)) => {
             let elapsed = start.elapsed();
-            let body_len = serde_json::to_string(&body).map(|s| s.len()).unwrap_or(0);
+            let body_len = serde_json::to_string(&body).map_or(0, |s| s.len());
             info!(
                 "tunnel.info: handler completed in {}ms, body={}B, rid={:?}",
                 elapsed.as_millis(),

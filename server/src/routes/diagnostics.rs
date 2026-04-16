@@ -57,9 +57,7 @@ fn collect_process_info(state: &AppState) -> Value {
     let threads = parse_proc_status_field_u32(&status, "Threads:");
 
     // Open file descriptors
-    let open_fds = std::fs::read_dir("/proc/self/fd")
-        .map(|entries| entries.count())
-        .unwrap_or(0);
+    let open_fds = std::fs::read_dir("/proc/self/fd").map_or(0, |entries| entries.count());
 
     json!({
         "pid": pid,
