@@ -61,7 +61,6 @@ pub async fn discover(
     // Background task: tick elapsed_ms every 500ms so progress endpoint stays fresh
     let elapsed_ticker = {
         let infra = infra.clone();
-        let start = start;
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -100,7 +99,7 @@ pub async fn discover(
     };
 
     // Phase 1: ARP table scan
-    set_progress(&infra, mk_progress("arp", 1, &HashMap::new()));
+    set_progress(infra.as_ref(), mk_progress("arp", 1, &HashMap::new()));
     let mut devices: HashMap<String, DiscoveredDevice> = HashMap::new();
     if let Ok(arp_entries) = scan_arp().await {
         for (ip, mac) in arp_entries {
@@ -117,10 +116,10 @@ pub async fn discover(
             );
         }
     }
-    set_progress(&infra, mk_progress("arp", 1, &devices));
+    set_progress(infra.as_ref(), mk_progress("arp", 1, &devices));
 
     // Phase 2: Ping sweep — update progress every 500ms as hosts respond
-    set_progress(&infra, mk_progress("ping", 2, &devices));
+    set_progress(infra.as_ref(), mk_progress("ping", 2, &devices));
     for subnet in &subnets {
         if let Ok(ips) = ping_sweep(subnet).await {
             for ip in ips {
@@ -136,12 +135,12 @@ pub async fn discover(
                     });
             }
         }
-        set_progress(&infra, mk_progress("ping", 2, &devices));
+        set_progress(infra.as_ref(), mk_progress("ping", 2, &devices));
     }
-    set_progress(&infra, mk_progress("ping", 2, &devices));
+    set_progress(infra.as_ref(), mk_progress("ping", 2, &devices));
 
     // Phase 3: Port probe on discovered IPs
-    set_progress(&infra, mk_progress("ports", 3, &devices));
+    set_progress(infra.as_ref(), mk_progress("ports", 3, &devices));
     let ips: Vec<String> = devices.keys().cloned().collect();
     if !ips.is_empty() {
         if let Ok(port_map) = probe_ports(&ips).await {
@@ -153,10 +152,10 @@ pub async fn discover(
             }
         }
     }
-    set_progress(&infra, mk_progress("ports", 3, &devices));
+    set_progress(infra.as_ref(), mk_progress("ports", 3, &devices));
 
     // Phase 4: Hostname resolution via reverse DNS
-    set_progress(&infra, mk_progress("hostname", 4, &devices));
+    set_progress(infra.as_ref(), mk_progress("hostname", 4, &devices));
     for dev in devices.values_mut() {
         if let Ok(hostname) = resolve_hostname(&dev.ip).await {
             dev.hostname = Some(hostname);
@@ -177,7 +176,7 @@ pub async fn discover(
 
     // Mark scan complete
     set_progress(
-        &infra,
+        infra.as_ref(),
         DiscoveryProgress {
             active: false,
             phase: "complete".to_string(),
@@ -199,8 +198,8 @@ pub async fn discover(
 }
 
 /// Update discovery progress in shared InfraState (non-blocking).
-fn set_progress(infra: &Option<Arc<Mutex<InfraState>>>, progress: DiscoveryProgress) {
-    if let Some(ref infra) = infra {
+fn set_progress(infra: Option<&Arc<Mutex<InfraState>>>, progress: DiscoveryProgress) {
+    if let Some(infra) = infra {
         if let Ok(mut g) = infra.try_lock() {
             g.discovery_progress = progress;
         }
@@ -321,9 +320,8 @@ async fn ping_sweep(subnet: &str) -> Result<Vec<String>, String> {
         .split('/')
         .next()
         .unwrap_or("")
-        .rsplitn(2, '.')
-        .nth(1)
-        .unwrap_or("");
+        .rsplit_once('.')
+        .map_or("", |x| x.0);
     if base.is_empty() {
         return Err(format!("cannot extract base from subnet: {subnet}"));
     }
@@ -390,7 +388,7 @@ async fn probe_ports(ips: &[String]) -> Result<HashMap<String, Vec<u16>>, String
                     open.push(port);
                 }
             }
-            open.sort();
+            open.sort_unstable();
             (ip, open)
         }));
     }
