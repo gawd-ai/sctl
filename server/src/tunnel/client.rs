@@ -3441,14 +3441,17 @@ async fn handle_tunnel_infra_discover_progress(
 
 /// Handle `tunnel.infra.discover.subnets` — return auto-detected LAN subnets.
 async fn handle_tunnel_infra_discover_subnets(ws_sink: &WsSink, request_id: Option<&str>) {
-    let subnets = crate::infra::discovery::auto_detect_subnets().await;
+    let (status, body) = match crate::infra::discovery::auto_detect_subnets().await {
+        Ok(subnets) => (200, json!({ "subnets": subnets })),
+        Err(e) => (503, json!({ "error": e, "reason": "ip_command_failed" })),
+    };
     send_response_async(
         ws_sink,
         json!({
             "type": "tunnel.infra.discover.subnets.result",
             "request_id": request_id,
-            "status": 200,
-            "body": { "subnets": subnets },
+            "status": status,
+            "body": body,
         }),
     )
     .await;

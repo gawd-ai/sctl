@@ -50,7 +50,9 @@ pub async fn discover(
 
     // Auto-detect LAN subnets if none provided
     if subnets.is_empty() {
-        subnets = auto_detect_subnets().await;
+        if let Ok(entries) = auto_detect_subnets().await {
+            subnets = entries.into_iter().map(|e| e.cidr).collect();
+        }
     }
 
     let infra = state.infra_state.clone();
@@ -208,26 +210,55 @@ fn set_progress(infra: Option<&Arc<Mutex<InfraState>>>, progress: DiscoveryProgr
 
 // ─── Scan implementations ────────────────────────────────────────────
 
-/// Auto-detect LAN subnets from network interfaces (public for routes module).
+/// A detected L3 subnet with its owning interface.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubnetEntry {
+    pub iface: String,
+    /// Network CIDR (normalized — host bits masked off).
+    pub cidr: String,
+}
+
+/// Normalize a host CIDR like `192.168.1.5/24` into the network form `192.168.1.0/24`.
+fn normalize_cidr(cidr: &str) -> Option<String> {
+    let (ip, prefix) = cidr.split_once('/')?;
+    let ip: std::net::Ipv4Addr = ip.parse().ok()?;
+    let prefix: u8 = prefix.parse().ok()?;
+    if prefix > 32 {
+        return None;
+    }
+    let mask = if prefix == 0 {
+        0u32
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    let net = std::net::Ipv4Addr::from(u32::from(ip) & mask);
+    Some(format!("{net}/{prefix}"))
+}
+
+/// Auto-detect L3 subnets from every UP interface with an IPv4 address
+/// (public for routes module).
 ///
-/// Looks for IPv4 addresses on bridge (br-lan, br-*) and LAN interfaces,
-/// excluding WAN, loopback, WireGuard, and tunnel interfaces.
-pub async fn auto_detect_subnets() -> Vec<String> {
-    let output = checks::exec_simple_pub(
+/// Includes physical LAN/WAN bridges, cellular (`wwan*`), and WireGuard
+/// overlay peers (`wg*`). Skips loopback, docker bridges, veth pairs, and
+/// legacy tunnel devices.
+pub async fn auto_detect_subnets() -> Result<Vec<SubnetEntry>, String> {
+    let (code, stdout, stderr) = checks::exec_simple_pub(
         "ip -4 addr show | awk '/^[0-9]+:/ {iface=$2} /inet / {print iface, $2}'",
         5000,
     )
-    .await;
+    .await
+    .map_err(|e| format!("ip command failed: {e}"))?;
 
-    let Ok(output) = output else {
-        info!("Failed to detect LAN subnets");
-        return Vec::new();
-    };
+    if code != 0 {
+        return Err(format!(
+            "ip command exited {code}: {}",
+            stderr.trim().lines().next().unwrap_or("")
+        ));
+    }
 
-    let skip_prefixes = ["lo:", "wg", "wwan", "docker", "veth", "tun"];
+    let skip_prefixes = ["lo", "docker", "veth", "tun"];
 
-    let subnets: Vec<String> = output
-        .1
+    let subnets: Vec<SubnetEntry> = stdout
         .lines()
         .filter_map(|line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -237,25 +268,27 @@ pub async fn auto_detect_subnets() -> Vec<String> {
             let iface = parts[0].trim_end_matches(':');
             let cidr = parts[1];
 
-            // Skip non-LAN interfaces
+            // Skip loopback + container / legacy-tunnel noise
             if skip_prefixes.iter().any(|p| iface.starts_with(p)) {
                 return None;
             }
-            // Skip /32 point-to-point and loopback
-            if cidr.ends_with("/32") || cidr.starts_with("127.") {
+            // Skip 127.0.0.0/8 regardless of iface
+            if cidr.starts_with("127.") {
                 return None;
             }
-            // Validate it's a real CIDR
-            if checks::validate_cidr(cidr) {
-                Some(cidr.to_string())
-            } else {
-                None
+            if !checks::validate_cidr(cidr) {
+                return None;
             }
+            let normalized = normalize_cidr(cidr)?;
+            Some(SubnetEntry {
+                iface: iface.to_string(),
+                cidr: normalized,
+            })
         })
         .collect();
 
     info!("Auto-detected LAN subnets: {:?}", subnets);
-    subnets
+    Ok(subnets)
 }
 
 /// Parse the ARP table for IP→MAC mappings.

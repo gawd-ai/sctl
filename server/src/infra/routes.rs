@@ -134,9 +134,14 @@ pub async fn discover_progress(State(state): State<AppState>) -> Json<Value> {
 }
 
 /// `GET /api/infra/discover/subnets` — return auto-detected LAN subnets.
-pub async fn discover_subnets() -> Json<Value> {
-    let subnets = super::discovery::auto_detect_subnets().await;
-    Json(json!({ "subnets": subnets }))
+pub async fn discover_subnets() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match super::discovery::auto_detect_subnets().await {
+        Ok(subnets) => Ok(Json(json!({ "subnets": subnets }))),
+        Err(e) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": e, "reason": "ip_command_failed" })),
+        )),
+    }
 }
 
 /// `DELETE /api/infra/config` — stop monitoring and remove config.
