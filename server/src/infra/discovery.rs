@@ -496,6 +496,47 @@ async fn find_subnet_iface(cidr: &str) -> Option<(String, String)> {
         .map(|e| (e.iface, e.host_ip))
 }
 
+/// Candidate LAN interfaces for source-any ARP scanning. Returns every UP
+/// bridge or physical ethernet that isn't a loopback / docker / veth / tun.
+/// Used when a manually-entered subnet isn't in auto-detect — we don't know
+/// which iface reaches it, so we try them in order and take the first that
+/// returns hosts. Bridges are preferred because they reach every enslaved
+/// port with a single scan.
+async fn candidate_lan_ifaces() -> Vec<String> {
+    let Ok((code, stdout, _)) = checks::exec_simple_pub("ip -br link show", 5000).await else {
+        return Vec::new();
+    };
+    if code != 0 {
+        return Vec::new();
+    }
+    let skip_prefixes = ["lo", "docker", "veth", "tun", "wg", "wwan"];
+    let mut bridges = Vec::new();
+    let mut physical = Vec::new();
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let Some(iface) = parts[0].split('@').next() else {
+            continue;
+        };
+        if skip_prefixes.iter().any(|p| iface.starts_with(p)) {
+            continue;
+        }
+        let state = parts[1];
+        if state != "UP" && state != "UNKNOWN" {
+            continue;
+        }
+        if iface.starts_with("br") || iface.starts_with("bond") {
+            bridges.push(iface.to_string());
+        } else if iface.starts_with("eth") || iface.starts_with("en") || iface.starts_with("lan") {
+            physical.push(iface.to_string());
+        }
+    }
+    bridges.extend(physical);
+    bridges
+}
+
 /// Source-any ARP scan for a subnet the agent has no IP on. Uses `arp-scan`
 /// with `--arpspa=0.0.0.0` so replies route back to our MAC even though our
 /// L3 identity isn't on this subnet. Requires the `arp-scan` binary; silently
@@ -591,14 +632,16 @@ async fn ping_sweep(subnet: &str) -> Result<Vec<String>, String> {
         }
     }
 
-    // Source-any ARP scan fallback for addressless subnets. We consult
-    // auto-detect to find the right iface for this CIDR; if we have a
-    // host_ip on it, nmap/ping should have worked and we skip the ARP
-    // path. If host_ip is empty we're on a route-learned subnet and the
-    // standard probes won't source correctly — that's where --arpspa=0
-    // earns its keep.
-    if let Some((iface, host_ip)) = find_subnet_iface(subnet).await {
-        if host_ip.is_empty() {
+    // Source-any ARP scan fallback. Two distinct cases:
+    //   1. Auto-detect knows this CIDR but host_ip is empty (Route-sourced /
+    //      downstream topology) — scan on that iface.
+    //   2. Auto-detect doesn't know the CIDR at all (user manually entered an
+    //      upstream subnet that only the bridge-forwarding side sees; e.g.
+    //      BPI plugged into a WiFi router's LAN, scanning the WiFi's /24).
+    //      Iterate candidate LAN interfaces and return the first that finds
+    //      hosts. Bridges go first since they reach every enslaved port.
+    match find_subnet_iface(subnet).await {
+        Some((iface, host_ip)) if host_ip.is_empty() => {
             if let Ok(ips) = arp_scan_addressless(&iface, subnet).await {
                 if !ips.is_empty() {
                     debug!(
@@ -609,6 +652,20 @@ async fn ping_sweep(subnet: &str) -> Result<Vec<String>, String> {
                 }
             }
         }
+        None => {
+            for iface in candidate_lan_ifaces().await {
+                if let Ok(ips) = arp_scan_addressless(&iface, subnet).await {
+                    if !ips.is_empty() {
+                        debug!(
+                            "Ping sweep {subnet} (arp-scan manual subnet via {iface}): {} hosts up",
+                            ips.len()
+                        );
+                        return Ok(ips);
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 
     // Fallback: parallel ping using tokio — updates progress as hosts respond
