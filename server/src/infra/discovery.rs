@@ -123,13 +123,20 @@ pub async fn discover(
     // Phase 2: Ping sweep — update progress every 500ms as hosts respond
     set_progress(infra.as_ref(), mk_progress("ping", 2, &devices));
     for subnet in &subnets {
-        if let Ok(ips) = ping_sweep(subnet).await {
-            for ip in ips {
+        if let Ok(hosts) = ping_sweep(subnet).await {
+            for (ip, mac) in hosts {
                 devices
                     .entry(ip.clone())
+                    .and_modify(|dev| {
+                        // Prefer an existing MAC (e.g. from Phase 1 ARP table)
+                        // but fill in if we learned one now and didn't before.
+                        if dev.mac.is_none() {
+                            dev.mac.clone_from(&mac);
+                        }
+                    })
                     .or_insert_with(|| DiscoveredDevice {
                         ip,
-                        mac: None,
+                        mac,
                         hostname: None,
                         open_ports: Vec::new(),
                         inferred_type: "other".to_string(),
@@ -707,7 +714,12 @@ fn is_usable_sender(ip: std::net::Ipv4Addr) -> bool {
 /// with `--arpspa=0.0.0.0` so replies route back to our MAC even though our
 /// L3 identity isn't on this subnet. Requires the `arp-scan` binary; silently
 /// returns empty if it's not installed so scans don't break on minimal BPIs.
-async fn arp_scan_addressless(iface: &str, cidr: &str) -> Result<Vec<String>, String> {
+///
+/// Returns `(ip, mac)` pairs. arp-scan always reports the MAC for each
+/// reply — we extract it from column 2 of the output. (The kernel ARP table
+/// doesn't get populated with `--arpspa=0.0.0.0` scans, so `ip neigh show`
+/// after the scan is empty; we must take the MAC directly from arp-scan.)
+async fn arp_scan_addressless(iface: &str, cidr: &str) -> Result<Vec<(String, String)>, String> {
     if !checks::validate_cidr(cidr) {
         return Err(format!("invalid cidr: {cidr}"));
     }
@@ -722,16 +734,26 @@ async fn arp_scan_addressless(iface: &str, cidr: &str) -> Result<Vec<String>, St
         "command -v arp-scan >/dev/null 2>&1 && \
          arp-scan --interface={iface} --arpspa=0.0.0.0 \
                   --destaddr=ff:ff:ff:ff:ff:ff --retry=2 --timeout=300 {cidr} \
-                  2>/dev/null | awk '/^[0-9]+\\./ {{print $1}}'"
+                  2>/dev/null"
     );
     let (_code, stdout, _stderr) = checks::exec_simple_pub(&cmd, 60_000).await?;
-    let ips: Vec<String> = stdout
+    let pairs: Vec<(String, String)> = stdout
         .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| l.trim().to_string())
-        .filter(|l| checks::validate_ipv4(l))
+        .filter_map(|line| {
+            // arp-scan reply lines look like "192.168.58.1\te8:da:00:0e:cf:80\t(Unknown)"
+            let mut fields = line.split('\t');
+            let ip = fields.next()?.trim();
+            let mac = fields.next()?.trim();
+            if !checks::validate_ipv4(ip) {
+                return None;
+            }
+            if mac.len() != 17 || !mac.contains(':') {
+                return None;
+            }
+            Some((ip.to_string(), mac.to_ascii_lowercase()))
+        })
         .collect();
-    Ok(ips)
+    Ok(pairs)
 }
 
 /// Parse the ARP table for IP→MAC mappings.
@@ -766,13 +788,18 @@ async fn scan_arp() -> Result<Vec<(String, String)>, String> {
 
 /// Ping sweep a subnet — tries nmap, falls back to busybox-compatible parallel ping.
 ///
+/// Returns `(ip, Option<mac>)` pairs. MAC is `Some` only for the
+/// `arp-scan` addressless fallback path; nmap / ping have no cheap way to
+/// learn the peer MAC on a subnet we don't route, so those pairs carry `None`
+/// and the caller keeps any MAC it already had from Phase 1 ARP-table scan.
+///
 /// For subnets the agent has no IPv4 address on (Pass #8 Phase A route-
 /// inferred subnets, downstream-topology deployments), if the standard
 /// probes come up empty we follow up with a source-any ARP scan —
 /// `arp-scan --arpspa=0.0.0.0` forges source IP 0.0.0.0 in the ARP request
 /// so neighbours still reply even though the BPI isn't participating in the
 /// subnet L3-wise.
-async fn ping_sweep(subnet: &str) -> Result<Vec<String>, String> {
+async fn ping_sweep(subnet: &str) -> Result<Vec<(String, Option<String>)>, String> {
     if !checks::validate_cidr(subnet) {
         return Err(format!("invalid subnet CIDR: {subnet}"));
     }
@@ -794,7 +821,7 @@ async fn ping_sweep(subnet: &str) -> Result<Vec<String>, String> {
             .collect();
         if !ips.is_empty() {
             debug!("Ping sweep {subnet} (nmap): {} hosts up", ips.len());
-            return Ok(ips);
+            return Ok(ips.into_iter().map(|ip| (ip, None)).collect());
         }
     }
 
@@ -808,25 +835,25 @@ async fn ping_sweep(subnet: &str) -> Result<Vec<String>, String> {
     //      hosts. Bridges go first since they reach every enslaved port.
     match find_subnet_iface(subnet).await {
         Some((iface, host_ip)) if host_ip.is_empty() => {
-            if let Ok(ips) = arp_scan_addressless(&iface, subnet).await {
-                if !ips.is_empty() {
+            if let Ok(pairs) = arp_scan_addressless(&iface, subnet).await {
+                if !pairs.is_empty() {
                     debug!(
                         "Ping sweep {subnet} (arp-scan addressless via {iface}): {} hosts up",
-                        ips.len()
+                        pairs.len()
                     );
-                    return Ok(ips);
+                    return Ok(pairs.into_iter().map(|(ip, mac)| (ip, Some(mac))).collect());
                 }
             }
         }
         None => {
             for iface in candidate_lan_ifaces().await {
-                if let Ok(ips) = arp_scan_addressless(&iface, subnet).await {
-                    if !ips.is_empty() {
+                if let Ok(pairs) = arp_scan_addressless(&iface, subnet).await {
+                    if !pairs.is_empty() {
                         debug!(
                             "Ping sweep {subnet} (arp-scan manual subnet via {iface}): {} hosts up",
-                            ips.len()
+                            pairs.len()
                         );
-                        return Ok(ips);
+                        return Ok(pairs.into_iter().map(|(ip, mac)| (ip, Some(mac))).collect());
                     }
                 }
             }
@@ -875,7 +902,7 @@ async fn ping_sweep(subnet: &str) -> Result<Vec<String>, String> {
 
     let ips = found.lock().map(|f| f.clone()).unwrap_or_default();
     debug!("Ping sweep {subnet} (ping): {} hosts up", ips.len());
-    Ok(ips)
+    Ok(ips.into_iter().map(|ip| (ip, None)).collect())
 }
 
 /// Probe common ports on a set of IPs using native TCP connects.
