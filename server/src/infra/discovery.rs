@@ -393,8 +393,49 @@ pub async fn auto_detect_subnets() -> Result<Vec<SubnetEntry>, String> {
         }
     }
 
+    // Pass #8 Phase C — passive sniff. Listens on each candidate LAN iface
+    // for a few seconds, parses sender IPs from ARP + common broadcast UDP
+    // (DHCP, mDNS, SSDP, NetBIOS, UBNT discovery). Any /24 that doesn't
+    // overlap an existing Addr/Route entry joins the list as source=Arp so
+    // the UI shows it with a ⚡ observed badge.
+    //
+    // Catches the downstream-bridge topology the default-gateway inference
+    // can't reach: BPI in br-lan bridging eth5 to a WiFi router's LAN, the
+    // WiFi router advertising on 192.168.58.1 — passive capture sees that
+    // broadcast even though the BPI has no L3 identity on that subnet.
+    //
+    // Bounded 5s. Silent no-op when tcpdump isn't installed so auto-detect
+    // doesn't break on minimal BPIs.
+    for (iface, cidr) in passive_sniff_subnets(5).await {
+        let already_known = subnets.iter().any(|s| cidr_overlaps(&s.cidr, &cidr));
+        if !already_known {
+            let mac = macs.get(&iface).cloned();
+            subnets.push(SubnetEntry {
+                iface,
+                cidr,
+                host_ip: String::new(),
+                mac,
+                source: SubnetSource::Arp,
+            });
+        }
+    }
+
     info!("Auto-detected LAN subnets: {:?}", subnets);
     Ok(subnets)
+}
+
+/// True iff two CIDRs share any addresses (either contains the other's
+/// network address). Used to dedup sniff-learned /24s against Addr/Route
+/// entries that might already cover the same range at a different prefix.
+fn cidr_overlaps(a: &str, b: &str) -> bool {
+    let parse = |c: &str| -> Option<std::net::Ipv4Addr> {
+        let (ip, _) = c.split_once('/')?;
+        ip.parse().ok()
+    };
+    match (parse(a), parse(b)) {
+        (Some(ip_a), Some(ip_b)) => cidr_contains(a, ip_b) || cidr_contains(b, ip_a),
+        _ => false,
+    }
 }
 
 /// True iff `ip` falls within the network described by `cidr`.
@@ -535,6 +576,131 @@ async fn candidate_lan_ifaces() -> Vec<String> {
     }
     bridges.extend(physical);
     bridges
+}
+
+/// Passive sniff on every candidate LAN iface for `secs` seconds. Returns
+/// `(iface, cidr/24)` tuples for every distinct /24 observed from sender
+/// IPs in ARP + common broadcast UDP protocols (DHCP, mDNS, SSDP, NetBIOS,
+/// UBNT discovery). Silent no-op when `tcpdump` isn't installed.
+///
+/// Sniffs run per-iface in parallel (Linux kernels don't support promisc
+/// mode on the `any` pseudo-iface). Each iface's capture is bounded by
+/// wall-clock `secs + 2` via the exec timeout, so total auto-detect
+/// latency is ~`secs + 1` regardless of iface count.
+async fn passive_sniff_subnets(secs: u64) -> Vec<(String, String)> {
+    let ifaces = candidate_lan_ifaces().await;
+    if ifaces.is_empty() {
+        return Vec::new();
+    }
+
+    let handles: Vec<_> = ifaces
+        .into_iter()
+        .map(|iface| tokio::spawn(async move { sniff_iface(iface, secs).await }))
+        .collect();
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for h in handles {
+        if let Ok(observations) = h.await {
+            for (iface, cidr) in observations {
+                let key = format!("{iface}|{cidr}");
+                if seen.insert(key) {
+                    out.push((iface, cidr));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Sniff a single iface for `secs` seconds. Parses sender IPs from tcpdump
+/// text output and groups by /24. Reserved / link-local / multicast sender
+/// IPs are filtered out.
+async fn sniff_iface(iface: String, secs: u64) -> Vec<(String, String)> {
+    if !iface
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Vec::new();
+    }
+
+    let filter = "arp or (udp and (port 67 or port 68 or port 5353 or port 1900 or port 137 or port 138 or portrange 5245-5246))";
+    let tmp = format!("/tmp/sctl-sniff-{iface}.out");
+    let cmd = format!(
+        "command -v tcpdump >/dev/null 2>&1 && \
+         ( tcpdump -i {iface} -nn -l -c 200 '{filter}' > {tmp} 2>/dev/null & \
+           P=$!; sleep {secs}; kill -TERM $P 2>/dev/null; wait $P 2>/dev/null; \
+           cat {tmp} 2>/dev/null; rm -f {tmp} )"
+    );
+
+    let exec_timeout_ms = secs * 1000 + 3000;
+    let Ok((_code, stdout, _stderr)) = checks::exec_simple_pub(&cmd, exec_timeout_ms).await else {
+        return Vec::new();
+    };
+
+    let mut cidrs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in stdout.lines() {
+        if let Some(ip) = parse_sender_ip(line) {
+            if !is_usable_sender(ip) {
+                continue;
+            }
+            let octets = ip.octets();
+            let net = std::net::Ipv4Addr::new(octets[0], octets[1], octets[2], 0);
+            cidrs.insert(format!("{net}/24"));
+        }
+    }
+    cidrs.into_iter().map(|c| (iface.clone(), c)).collect()
+}
+
+/// Extract the most plausible sender IPv4 from one tcpdump text line.
+/// Handles both `IP <sender>[.<port>] > <dest>[.<port>]: ...` and ARP's
+/// `Request who-has <tgt> tell <sender>` / `Reply <sender> is-at ...` forms.
+fn parse_sender_ip(line: &str) -> Option<std::net::Ipv4Addr> {
+    // ARP "tell <sender>" — the sender is unambiguous
+    if let Some(rest) = line.split(" tell ").nth(1) {
+        if let Some(ip_token) = rest.split(|c: char| c == ',' || c.is_whitespace()).next() {
+            if let Ok(ip) = ip_token.parse() {
+                return Some(ip);
+            }
+        }
+    }
+    // ARP "Reply <sender> is-at ..." — sender is the first field after Reply
+    if let Some(rest) = line.split("ARP, Reply ").nth(1) {
+        if let Some(ip_token) = rest.split_whitespace().next() {
+            if let Ok(ip) = ip_token.parse() {
+                return Some(ip);
+            }
+        }
+    }
+    // "IP <sender>[.<port>] > ..." form (UDP / most broadcast chatter)
+    if let Some(rest) = line.strip_prefix("IP ").or_else(|| {
+        // Sometimes prefixed with a timestamp like "19:33:49.376452 IP ..."
+        line.split(" IP ").nth(1)
+    }) {
+        if let Some(token) = rest.split_whitespace().next() {
+            // Strip trailing port "192.168.58.1.5246" → "192.168.58.1"
+            let ip_str = token.rsplit_once('.').map_or(token, |(prefix, _)| prefix);
+            if let Ok(ip) = ip_str.parse() {
+                return Some(ip);
+            }
+        }
+    }
+    None
+}
+
+/// Filter sender IPs that wouldn't identify a useful subnet. Excludes
+/// loopback, link-local, multicast, broadcast, and the all-zeros address
+/// that ARP probes sometimes use.
+fn is_usable_sender(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.is_broadcast() {
+        return false;
+    }
+    // 169.254.0.0/16 link-local APIPA
+    if o[0] == 169 && o[1] == 254 {
+        return false;
+    }
+    true
 }
 
 /// Source-any ARP scan for a subnet the agent has no IP on. Uses `arp-scan`
