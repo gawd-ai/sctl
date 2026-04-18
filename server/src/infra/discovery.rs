@@ -216,6 +216,57 @@ pub struct SubnetEntry {
     pub iface: String,
     /// Network CIDR (normalized — host bits masked off).
     pub cidr: String,
+    /// The agent's own IPv4 on this interface (host form). Used by the UI
+    /// to cluster the agent's own IPs in scan results as a single entity.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub host_ip: String,
+    /// The interface's hardware address when one exists. `None` for pure
+    /// L3 interfaces like `wg0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
+}
+
+/// Extract the host IPv4 from a host-form CIDR like `192.168.1.5/24`.
+fn host_ip_of(cidr: &str) -> Option<String> {
+    let (ip, _) = cidr.split_once('/')?;
+    let _: std::net::Ipv4Addr = ip.parse().ok()?;
+    Some(ip.to_string())
+}
+
+/// Read interface MAC addresses via `ip -br link show`. Returns a map
+/// `iface → mac`. MAC is lowercased; interfaces without a MAC are skipped.
+async fn iface_macs() -> std::collections::HashMap<String, String> {
+    let Ok((code, stdout, _)) = checks::exec_simple_pub("ip -br link show", 5000).await else {
+        return std::collections::HashMap::new();
+    };
+    if code != 0 {
+        return std::collections::HashMap::new();
+    }
+    // `ip -br link show` format: `iface@alias  STATE  xx:xx:xx:xx:xx:xx  <flags>`
+    // (alias is optional, separated by `@`). Take the iface name and the
+    // first 17-char MAC-shaped token.
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 3 {
+                return None;
+            }
+            let iface = parts[0].split('@').next()?.to_string();
+            let mac = parts.iter().find(|t| {
+                t.len() == 17
+                    && t.chars().enumerate().all(|(i, c)| match i % 3 {
+                        2 => c == ':',
+                        _ => c.is_ascii_hexdigit(),
+                    })
+            })?;
+            let mac = mac.to_ascii_lowercase();
+            if mac == "00:00:00:00:00:00" {
+                return None;
+            }
+            Some((iface, mac))
+        })
+        .collect()
 }
 
 /// Normalize a host CIDR like `192.168.1.5/24` into the network form `192.168.1.0/24`.
@@ -257,6 +308,7 @@ pub async fn auto_detect_subnets() -> Result<Vec<SubnetEntry>, String> {
     }
 
     let skip_prefixes = ["lo", "docker", "veth", "tun"];
+    let macs = iface_macs().await;
 
     let subnets: Vec<SubnetEntry> = stdout
         .lines()
@@ -280,9 +332,13 @@ pub async fn auto_detect_subnets() -> Result<Vec<SubnetEntry>, String> {
                 return None;
             }
             let normalized = normalize_cidr(cidr)?;
+            let host_ip = host_ip_of(cidr).unwrap_or_default();
+            let mac = macs.get(iface).cloned();
             Some(SubnetEntry {
                 iface: iface.to_string(),
                 cidr: normalized,
+                host_ip,
+                mac,
             })
         })
         .collect();
