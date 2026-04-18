@@ -376,13 +376,19 @@ pub async fn auto_detect_subnets() -> Result<Vec<SubnetEntry>, String> {
     // us the gateway exists + which iface reaches it; we assume /24 (the
     // overwhelmingly common home/SMB case) and surface it so the UI can
     // offer it as a scannable subnet.
-    let known: std::collections::HashSet<(String, String)> = subnets
+    //
+    // Dedup: skip any route candidate whose gateway IP is already covered by
+    // an Addr-sourced subnet on the same iface (e.g. the LTE gateway sits
+    // inside a /28 we already report — a second /24 entry there is spurious).
+    let addr_entries: Vec<(String, String)> = subnets
         .iter()
         .map(|s| (s.iface.clone(), s.cidr.clone()))
         .collect();
-    for entry in detect_route_subnets(&macs).await {
-        let key = (entry.iface.clone(), entry.cidr.clone());
-        if !known.contains(&key) {
+    for (entry, gw_ip) in detect_route_subnets(&macs).await {
+        let overlaps = addr_entries
+            .iter()
+            .any(|(iface, cidr)| *iface == entry.iface && cidr_contains(cidr, gw_ip));
+        if !overlaps {
             subnets.push(entry);
         }
     }
@@ -391,13 +397,39 @@ pub async fn auto_detect_subnets() -> Result<Vec<SubnetEntry>, String> {
     Ok(subnets)
 }
 
-/// Inspect `ip -4 route show default` and return a `SubnetEntry` for every
-/// default-gateway subnet the agent has no local IP on. Gateway subnet is
-/// assumed `/24` — right for essentially all home/SMB deployments; operators
-/// with non-/24 uplinks can still add the correct CIDR manually in the UI.
+/// True iff `ip` falls within the network described by `cidr`.
+fn cidr_contains(cidr: &str, ip: std::net::Ipv4Addr) -> bool {
+    let Some((net, prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(net): Result<std::net::Ipv4Addr, _> = net.parse() else {
+        return false;
+    };
+    let Ok(prefix): Result<u8, _> = prefix.parse() else {
+        return false;
+    };
+    if prefix > 32 {
+        return false;
+    }
+    let mask = if prefix == 0 {
+        0u32
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    (u32::from(ip) & mask) == (u32::from(net) & mask)
+}
+
+/// Inspect `ip -4 route show default` and return `(SubnetEntry, gateway_ip)`
+/// pairs. The caller uses the gateway IP to dedup against Addr-sourced
+/// entries on the same iface (so an LTE gateway inside a /28 we already
+/// have doesn't show up a second time as a redundant /24).
+///
+/// Gateway subnet is assumed `/24` — right for essentially all home/SMB
+/// deployments; operators with non-/24 uplinks can still add the correct
+/// CIDR manually in the UI.
 async fn detect_route_subnets(
     macs: &std::collections::HashMap<String, String>,
-) -> Vec<SubnetEntry> {
+) -> Vec<(SubnetEntry, std::net::Ipv4Addr)> {
     let Ok((code, stdout, _)) = checks::exec_simple_pub("ip -4 route show default", 3000).await
     else {
         return Vec::new();
@@ -439,13 +471,16 @@ async fn detect_route_subnets(
             continue;
         };
         let mac = macs.get(iface).cloned();
-        out.push(SubnetEntry {
-            iface: iface.to_string(),
-            cidr: normalized,
-            host_ip: String::new(),
-            mac,
-            source: SubnetSource::Route,
-        });
+        out.push((
+            SubnetEntry {
+                iface: iface.to_string(),
+                cidr: normalized,
+                host_ip: String::new(),
+                mac,
+                source: SubnetSource::Route,
+            },
+            gw_ip,
+        ));
     }
     out
 }
