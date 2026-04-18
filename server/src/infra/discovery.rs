@@ -218,12 +218,37 @@ pub struct SubnetEntry {
     pub cidr: String,
     /// The agent's own IPv4 on this interface (host form). Used by the UI
     /// to cluster the agent's own IPs in scan results as a single entity.
+    /// Empty when we learned the subnet without having a local address
+    /// (e.g. via default-gateway inference on a downstream topology).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub host_ip: String,
     /// The interface's hardware address when one exists. `None` for pure
     /// L3 interfaces like `wg0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
+    /// How this subnet was learned. Lets the UI show provenance and the
+    /// scanner choose the right probe strategy (e.g. `--arpspa=0.0.0.0`
+    /// for `Route`-sourced subnets where the agent has no local IP).
+    #[serde(default)]
+    pub source: SubnetSource,
+}
+
+/// Provenance of a detected subnet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubnetSource {
+    /// `ip -4 addr show` — the agent has an IPv4 address on this subnet.
+    #[default]
+    Addr,
+    /// `ip -4 route show default` — the agent's default gateway sits here,
+    /// but the agent has no local IP. Common in downstream-of-another-router
+    /// topologies where the BPI is plugged into an existing LAN port.
+    Route,
+    /// Passive ARP sniff learned this subnet from observed traffic.
+    Arp,
+    /// A brief DHCP `DISCOVER` on an unbound port got an `OFFER` —
+    /// the port is on an upstream LAN but isn't configured as a DHCP client.
+    DhcpProbe,
 }
 
 /// Extract the host IPv4 from a host-form CIDR like `192.168.1.5/24`.
@@ -310,7 +335,7 @@ pub async fn auto_detect_subnets() -> Result<Vec<SubnetEntry>, String> {
     let skip_prefixes = ["lo", "docker", "veth", "tun"];
     let macs = iface_macs().await;
 
-    let subnets: Vec<SubnetEntry> = stdout
+    let mut subnets: Vec<SubnetEntry> = stdout
         .lines()
         .filter_map(|line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -339,12 +364,132 @@ pub async fn auto_detect_subnets() -> Result<Vec<SubnetEntry>, String> {
                 cidr: normalized,
                 host_ip,
                 mac,
+                source: SubnetSource::Addr,
             })
         })
         .collect();
 
+    // Pass #8 Phase A — default-gateway subnet inference. Catches the
+    // downstream topology where the BPI is plugged into an existing LAN port
+    // and has no IP on the upstream subnet (e.g. ETH5 in br-lan cabled to a
+    // WiFi router's LAN, WAN side unbound). `ip -4 route show default` tells
+    // us the gateway exists + which iface reaches it; we assume /24 (the
+    // overwhelmingly common home/SMB case) and surface it so the UI can
+    // offer it as a scannable subnet.
+    let known: std::collections::HashSet<(String, String)> = subnets
+        .iter()
+        .map(|s| (s.iface.clone(), s.cidr.clone()))
+        .collect();
+    for entry in detect_route_subnets(&macs).await {
+        let key = (entry.iface.clone(), entry.cidr.clone());
+        if !known.contains(&key) {
+            subnets.push(entry);
+        }
+    }
+
     info!("Auto-detected LAN subnets: {:?}", subnets);
     Ok(subnets)
+}
+
+/// Inspect `ip -4 route show default` and return a `SubnetEntry` for every
+/// default-gateway subnet the agent has no local IP on. Gateway subnet is
+/// assumed `/24` — right for essentially all home/SMB deployments; operators
+/// with non-/24 uplinks can still add the correct CIDR manually in the UI.
+async fn detect_route_subnets(
+    macs: &std::collections::HashMap<String, String>,
+) -> Vec<SubnetEntry> {
+    let Ok((code, stdout, _)) = checks::exec_simple_pub("ip -4 route show default", 3000).await
+    else {
+        return Vec::new();
+    };
+    if code != 0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        // Canonical form: `default via 192.168.58.1 dev br-lan proto dhcp ...`
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let mut gw: Option<&str> = None;
+        let mut iface: Option<&str> = None;
+        let mut i = 0;
+        while i + 1 < parts.len() {
+            match parts[i] {
+                "via" => gw = Some(parts[i + 1]),
+                "dev" => iface = Some(parts[i + 1]),
+                _ => {}
+            }
+            i += 1;
+        }
+        let Some(gw) = gw else { continue };
+        let Some(iface) = iface else { continue };
+
+        // Skip tunnels / loopback for the same reasons as the addr path.
+        let skip_prefixes = ["lo", "docker", "veth", "tun"];
+        if skip_prefixes.iter().any(|p| iface.starts_with(p)) {
+            continue;
+        }
+
+        let gw_ip: std::net::Ipv4Addr = match gw.parse() {
+            Ok(ip) => ip,
+            Err(_) => continue,
+        };
+        let host_form = format!("{gw_ip}/24");
+        let Some(normalized) = normalize_cidr(&host_form) else {
+            continue;
+        };
+        let mac = macs.get(iface).cloned();
+        out.push(SubnetEntry {
+            iface: iface.to_string(),
+            cidr: normalized,
+            host_ip: String::new(),
+            mac,
+            source: SubnetSource::Route,
+        });
+    }
+    out
+}
+
+/// Look up the iface and host IP the agent uses to reach a subnet.
+/// Returns `None` when the CIDR isn't in any auto-detected entry. `host_ip`
+/// will be empty for Route-sourced subnets the agent has no local IP on.
+async fn find_subnet_iface(cidr: &str) -> Option<(String, String)> {
+    let entries = auto_detect_subnets().await.ok()?;
+    entries
+        .into_iter()
+        .find(|e| e.cidr == cidr)
+        .map(|e| (e.iface, e.host_ip))
+}
+
+/// Source-any ARP scan for a subnet the agent has no IP on. Uses `arp-scan`
+/// with `--arpspa=0.0.0.0` so replies route back to our MAC even though our
+/// L3 identity isn't on this subnet. Requires the `arp-scan` binary; silently
+/// returns empty if it's not installed so scans don't break on minimal BPIs.
+async fn arp_scan_addressless(iface: &str, cidr: &str) -> Result<Vec<String>, String> {
+    if !checks::validate_cidr(cidr) {
+        return Err(format!("invalid cidr: {cidr}"));
+    }
+    if !iface
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(format!("invalid iface: {iface}"));
+    }
+
+    let cmd = format!(
+        "command -v arp-scan >/dev/null 2>&1 && \
+         arp-scan --interface={iface} --arpspa=0.0.0.0 \
+                  --destaddr=ff:ff:ff:ff:ff:ff --retry=2 --timeout=300 {cidr} \
+                  2>/dev/null | awk '/^[0-9]+\\./ {{print $1}}'"
+    );
+    let (_code, stdout, _stderr) = checks::exec_simple_pub(&cmd, 60_000).await?;
+    let ips: Vec<String> = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.trim().to_string())
+        .filter(|l| checks::validate_ipv4(l))
+        .collect();
+    Ok(ips)
 }
 
 /// Parse the ARP table for IP→MAC mappings.
@@ -378,6 +523,13 @@ async fn scan_arp() -> Result<Vec<(String, String)>, String> {
 }
 
 /// Ping sweep a subnet — tries nmap, falls back to busybox-compatible parallel ping.
+///
+/// For subnets the agent has no IPv4 address on (Pass #8 Phase A route-
+/// inferred subnets, downstream-topology deployments), if the standard
+/// probes come up empty we follow up with a source-any ARP scan —
+/// `arp-scan --arpspa=0.0.0.0` forges source IP 0.0.0.0 in the ARP request
+/// so neighbours still reply even though the BPI isn't participating in the
+/// subnet L3-wise.
 async fn ping_sweep(subnet: &str) -> Result<Vec<String>, String> {
     if !checks::validate_cidr(subnet) {
         return Err(format!("invalid subnet CIDR: {subnet}"));
@@ -401,6 +553,26 @@ async fn ping_sweep(subnet: &str) -> Result<Vec<String>, String> {
         if !ips.is_empty() {
             debug!("Ping sweep {subnet} (nmap): {} hosts up", ips.len());
             return Ok(ips);
+        }
+    }
+
+    // Source-any ARP scan fallback for addressless subnets. We consult
+    // auto-detect to find the right iface for this CIDR; if we have a
+    // host_ip on it, nmap/ping should have worked and we skip the ARP
+    // path. If host_ip is empty we're on a route-learned subnet and the
+    // standard probes won't source correctly — that's where --arpspa=0
+    // earns its keep.
+    if let Some((iface, host_ip)) = find_subnet_iface(subnet).await {
+        if host_ip.is_empty() {
+            if let Ok(ips) = arp_scan_addressless(&iface, subnet).await {
+                if !ips.is_empty() {
+                    debug!(
+                        "Ping sweep {subnet} (arp-scan addressless via {iface}): {} hosts up",
+                        ips.len()
+                    );
+                    return Ok(ips);
+                }
+            }
         }
     }
 
