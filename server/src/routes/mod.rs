@@ -14,6 +14,7 @@ pub mod health;
 pub mod info;
 pub mod lte;
 pub mod playbooks;
+pub mod safe_mode;
 pub mod sessions;
 pub mod shells;
 pub mod stp;

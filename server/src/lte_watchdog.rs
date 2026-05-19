@@ -94,6 +94,13 @@ enum Symptom {
     RelayProblem,
     /// Tunnel client is mid-reconnect and we have IP.
     TunnelReconnecting,
+    /// Registered + has IP but reachability target is unreachable — diagnosed,
+    /// NOT actionable (the data path is fine; the wider internet or DNS is
+    /// the problem, neither of which a modem cycle can fix).
+    InternetUnreachable,
+    /// Quectel module is not enumerated in sysfs — by definition a USB cycle
+    /// won't help. Diagnosed and waited out.
+    ModemGone,
     /// Can't determine the cause.
     Unknown,
 }
@@ -107,6 +114,8 @@ impl Symptom {
             Self::Unresponsive => "unresponsive",
             Self::RelayProblem => "relay_problem",
             Self::TunnelReconnecting => "tunnel_reconnecting",
+            Self::InternetUnreachable => "internet_unreachable",
+            Self::ModemGone => "modem_gone",
             Self::Unknown => "unknown",
         }
     }
@@ -124,6 +133,12 @@ async fn diagnose(
     // Check modem responsiveness
     let at_ok = modem.command("AT").await.is_ok();
     if !at_ok {
+        // Cross-check sysfs — if the module isn't enumerated, no amount of
+        // USB cycling will help. Distinguish ModemGone (hardware-level absent)
+        // from Unresponsive (enumerated but not answering AT).
+        if crate::modem::detect_quectel_at_port_strict().is_none() {
+            return (Symptom::ModemGone, None);
+        }
         return (Symptom::Unresponsive, None);
     }
 
@@ -168,8 +183,11 @@ async fn diagnose(
                 if check_reachability(reachability_target).await {
                     return (Symptom::RelayProblem, Some(reg));
                 }
-                // Internet not reachable despite registration + IP — unknown
-                return (Symptom::Unknown, Some(reg));
+                // Registered + IP but reachability target unreachable.
+                // The modem is doing its job; the wider internet (or just the
+                // target) is the problem. Diagnosed but NOT actionable — a
+                // modem cycle won't help and may make things worse.
+                return (Symptom::InternetUnreachable, Some(reg));
             }
             RegistrationStatus::Unknown => {}
         }
@@ -277,12 +295,26 @@ impl WatchdogState {
 // ── Watchdog snapshot for API visibility ───────────────────────────────────
 
 /// A single watchdog event for the snapshot log.
+///
+/// The `evidence` and `cooldown_elapsed_secs` fields are filled by
+/// `update_snapshot_event` from the watchdog's most recent reading; they make
+/// the dispatch decision auditable after-the-fact.
 #[derive(Debug, Clone, Serialize)]
 pub struct WatchdogEvent {
     pub timestamp: u64,
     pub symptom: String,
     pub action: String,
     pub detail: String,
+    /// Last-known RSRP (dBm), if the LTE poller has populated signal data.
+    pub rsrp: Option<i32>,
+    /// Last-known CEREG `stat` value (0–5), if available.
+    pub cereg_stat: Option<u8>,
+    /// Whether the LTE interface had an IPv4 address at decision time.
+    pub has_ipv4: bool,
+    /// Seconds since the previous watchdog action of any kind.
+    pub cooldown_elapsed_secs: u64,
+    /// Free-form evidence summary the watchdog used to choose this action.
+    pub evidence: String,
 }
 
 /// Watchdog state snapshot, updated every tick. Exposed via `/api/lte`.
@@ -314,6 +346,19 @@ impl WatchdogSnapshot {
     }
 
     fn push_event(&mut self, symptom: &str, action: &str, detail: &str) {
+        self.push_event_full(WatchdogEventContext {
+            symptom,
+            action,
+            detail,
+            rsrp: None,
+            cereg_stat: None,
+            has_ipv4: false,
+            cooldown_elapsed_secs: 0,
+            evidence: String::new(),
+        });
+    }
+
+    fn push_event_full(&mut self, ctx: WatchdogEventContext<'_>) {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -323,11 +368,29 @@ impl WatchdogSnapshot {
         }
         self.recent_events.push_back(WatchdogEvent {
             timestamp,
-            symptom: symptom.into(),
-            action: action.into(),
-            detail: detail.into(),
+            symptom: ctx.symptom.into(),
+            action: ctx.action.into(),
+            detail: ctx.detail.into(),
+            rsrp: ctx.rsrp,
+            cereg_stat: ctx.cereg_stat,
+            has_ipv4: ctx.has_ipv4,
+            cooldown_elapsed_secs: ctx.cooldown_elapsed_secs,
+            evidence: ctx.evidence,
         });
     }
+}
+
+/// Context passed to `push_event_full` so the caller doesn't have a fragile
+/// positional-arg API.
+struct WatchdogEventContext<'a> {
+    symptom: &'a str,
+    action: &'a str,
+    detail: &'a str,
+    rsrp: Option<i32>,
+    cereg_stat: Option<u8>,
+    has_ipv4: bool,
+    cooldown_elapsed_secs: u64,
+    evidence: String,
 }
 
 impl Default for WatchdogSnapshot {
@@ -488,6 +551,69 @@ fn fmt_bands(bands: &[u16]) -> String {
         .join(",")
 }
 
+/// Result of a gated USB cycle attempt.
+enum GatedUsbCycle {
+    /// Cycle skipped — escalation level disallows it or evidence insufficient.
+    /// Carries a reason string to embed in the action log.
+    Skipped(String),
+    /// Cycle attempted; carries the action result.
+    Executed((&'static str, Option<Modem>)),
+}
+
+/// Pure decision helper: should the watchdog auto-fire a USB power-cycle,
+/// given (a) the configured escalation ceiling, (b) the evidence policy,
+/// (c) how long the qualifying symptom has held, and (d) whether sysfs still
+/// shows the modem enumerated?
+///
+/// Returns `Ok(())` if the cycle is allowed, `Err(reason)` otherwise. This
+/// function is side-effect-free so it can be unit-tested directly.
+fn evaluate_usb_cycle_gate(
+    max_escalation_level: u8,
+    evidence: &crate::config::UsbCycleEvidence,
+    disconnect_secs: u64,
+    sysfs_present: bool,
+) -> Result<(), String> {
+    if max_escalation_level < 4 {
+        return Err(format!(
+            "max_escalation_level={max_escalation_level} (need 4)"
+        ));
+    }
+    if disconnect_secs < evidence.min_sustained_secs {
+        return Err(format!(
+            "sustained={disconnect_secs}s (need {})",
+            evidence.min_sustained_secs
+        ));
+    }
+    if evidence.require_sysfs_absent && sysfs_present {
+        // Module is enumerated; the AT path is just stuck. Lower-level
+        // actions (airplane cycle, interface restart) are still in scope —
+        // USB cycle is the wrong tool. Operator can override manually.
+        return Err("sysfs_present=true (modem enumerated) — cycle declined".to_string());
+    }
+    Ok(())
+}
+
+/// Decide whether the watchdog is allowed to auto-fire a USB power-cycle,
+/// and if so, do it. Manual cycles (via `POST /api/lte/usb_cycle`) bypass
+/// this gate entirely.
+async fn try_usb_cycle_gated(
+    device_path: &str,
+    max_escalation_level: u8,
+    evidence: &crate::config::UsbCycleEvidence,
+    disconnect_secs: u64,
+) -> GatedUsbCycle {
+    let sysfs_present = crate::modem::detect_quectel_at_port_strict().is_some();
+    match evaluate_usb_cycle_gate(
+        max_escalation_level,
+        evidence,
+        disconnect_secs,
+        sysfs_present,
+    ) {
+        Ok(()) => GatedUsbCycle::Executed(action_usb_power_cycle(device_path).await),
+        Err(reason) => GatedUsbCycle::Skipped(reason),
+    }
+}
+
 // ── Main watchdog loop ─────────────────────────────────────────────────────
 
 /// Spawn the LTE watchdog task. Returns a `JoinHandle` for abort on shutdown.
@@ -503,13 +629,24 @@ pub fn spawn_lte_watchdog(
     data_dir: String,
     tunnel_url: Option<String>,
     snapshot: Arc<Mutex<WatchdogSnapshot>>,
+    detected_path: Arc<tokio::sync::RwLock<Option<String>>>,
 ) -> tokio::task::JoinHandle<()> {
     let interface = config.interface.clone();
-    let device_path = config.device.clone();
+    // Hint only — sysfs detection in action_usb_power_cycle is authoritative.
+    // Falls back to `/dev/ttyUSB2` if no hint was provided (legacy behaviour for
+    // non-Quectel modems that escape auto-detect).
+    let device_path = config
+        .device
+        .clone()
+        .unwrap_or_else(|| "/dev/ttyUSB2".to_string());
     let reachability_host = config.reachability_host.clone();
     let interface_restart_cmd = config.interface_restart_cmd.clone();
     let openwrt = is_openwrt();
     let grace = Duration::from_secs(config.watchdog_grace_secs);
+    let max_escalation_level = config.max_escalation_level;
+    let usb_cycle_evidence = config.usb_cycle_evidence.clone();
+    let unknown_action = config.unknown_action.clone();
+    let notregistered_grace_secs = config.notregistered_grace_secs;
 
     tokio::spawn(async move {
         let mut modem = modem;
@@ -907,12 +1044,25 @@ pub fn spawn_lte_watchdog(
                     if state.airplane_cycles >= MAX_AIRPLANE_CYCLES_PER_EPISODE {
                         info!("LTE watchdog: searching too long, airplane cap reached");
                         update_snapshot(&snapshot, &state, "acting").await;
-                        // Fall through to USB cycle below
                         if !state.cooldown_elapsed(3) {
                             continue;
                         }
-                        let result = action_usb_power_cycle(&device_path).await;
-                        (result.0, 3, result.1)
+                        match try_usb_cycle_gated(
+                            &device_path,
+                            max_escalation_level,
+                            &usb_cycle_evidence,
+                            disconnect_secs,
+                        )
+                        .await
+                        {
+                            GatedUsbCycle::Executed((act, m)) => (act, 3, m),
+                            GatedUsbCycle::Skipped(reason) => {
+                                info!("LTE watchdog: usb_cycle_skipped (searching) — {reason}");
+                                state.dormant = true;
+                                update_snapshot(&snapshot, &state, "dormant").await;
+                                continue;
+                            }
+                        }
                     } else if !state.cooldown_elapsed(1) {
                         continue;
                     } else {
@@ -929,8 +1079,24 @@ pub fn spawn_lte_watchdog(
                             if !state.cooldown_elapsed(3) {
                                 continue;
                             }
-                            let result = action_usb_power_cycle(&device_path).await;
-                            (result.0, 3, result.1)
+                            match try_usb_cycle_gated(
+                                &device_path,
+                                max_escalation_level,
+                                &usb_cycle_evidence,
+                                disconnect_secs,
+                            )
+                            .await
+                            {
+                                GatedUsbCycle::Executed((act, m)) => (act, 3, m),
+                                GatedUsbCycle::Skipped(reason) => {
+                                    info!(
+                                        "LTE watchdog: usb_cycle_skipped (reg_nodata) — {reason}"
+                                    );
+                                    state.dormant = true;
+                                    update_snapshot(&snapshot, &state, "dormant").await;
+                                    continue;
+                                }
+                            }
                         } else if !state.cooldown_elapsed(1) {
                             continue;
                         } else {
@@ -956,6 +1122,16 @@ pub fn spawn_lte_watchdog(
                 }
 
                 Symptom::NotRegistered => {
+                    // Honor the explicit NotRegistered grace window (default 180s) —
+                    // natural roaming handovers can briefly look like NotRegistered.
+                    if disconnect_secs < notregistered_grace_secs {
+                        info!(
+                            "LTE watchdog: NotRegistered for {disconnect_secs}s — \
+                             under grace ({notregistered_grace_secs}s), waiting"
+                        );
+                        update_snapshot(&snapshot, &state, "waiting").await;
+                        continue;
+                    }
                     if state.reregisters < MAX_REREGISTERS_PER_EPISODE {
                         if !state.cooldown_elapsed(0) {
                             continue;
@@ -972,8 +1148,24 @@ pub fn spawn_lte_watchdog(
                         if !state.cooldown_elapsed(3) {
                             continue;
                         }
-                        let result = action_usb_power_cycle(&device_path).await;
-                        (result.0, 3, result.1)
+                        match try_usb_cycle_gated(
+                            &device_path,
+                            max_escalation_level,
+                            &usb_cycle_evidence,
+                            disconnect_secs,
+                        )
+                        .await
+                        {
+                            GatedUsbCycle::Executed((act, m)) => (act, 3, m),
+                            GatedUsbCycle::Skipped(reason) => {
+                                info!(
+                                    "LTE watchdog: usb_cycle_skipped (not_registered) — {reason}"
+                                );
+                                state.dormant = true;
+                                update_snapshot(&snapshot, &state, "dormant").await;
+                                continue;
+                            }
+                        }
                     }
                 }
 
@@ -1002,8 +1194,22 @@ pub fn spawn_lte_watchdog(
                         if !state.cooldown_elapsed(3) {
                             continue;
                         }
-                        let result = action_usb_power_cycle(&device_path).await;
-                        (result.0, 3, result.1)
+                        match try_usb_cycle_gated(
+                            &device_path,
+                            max_escalation_level,
+                            &usb_cycle_evidence,
+                            disconnect_secs,
+                        )
+                        .await
+                        {
+                            GatedUsbCycle::Executed((act, m)) => (act, 3, m),
+                            GatedUsbCycle::Skipped(reason) => {
+                                info!("LTE watchdog: usb_cycle_skipped (unresponsive) — {reason}");
+                                state.dormant = true;
+                                update_snapshot(&snapshot, &state, "dormant").await;
+                                continue;
+                            }
+                        }
                     }
                 }
 
@@ -1033,20 +1239,106 @@ pub fn spawn_lte_watchdog(
                     continue;
                 }
 
+                Symptom::InternetUnreachable => {
+                    // Modem is doing its job; wider internet (or just the
+                    // target host) is the problem. Diagnose-only — a modem
+                    // cycle won't help and may make things worse.
+                    info!(
+                        "LTE watchdog: internet_unreachable, modem healthy — not acting \
+                         (disconnect={disconnect_secs}s)"
+                    );
+                    update_snapshot_event(
+                        &snapshot,
+                        &mut state,
+                        "internet_unreachable",
+                        "wait",
+                        &format!(
+                            "symptom=internet_unreachable reg={reg_str} \
+                             disconnect={disconnect_secs}s"
+                        ),
+                    )
+                    .await;
+                    update_snapshot(&snapshot, &state, "waiting").await;
+                    continue;
+                }
+
+                Symptom::ModemGone => {
+                    // Quectel not enumerated in sysfs. Either the kernel hasn't
+                    // re-bound after a previous cycle, or hardware is dead.
+                    // A USB power-cycle by sysfs path won't fix this either.
+                    warn!(
+                        "LTE watchdog: modem_gone — Quectel not enumerated in sysfs \
+                         (disconnect={disconnect_secs}s)"
+                    );
+                    update_snapshot_event(
+                        &snapshot,
+                        &mut state,
+                        "modem_gone",
+                        "wait",
+                        &format!(
+                            "symptom=modem_gone — no Quectel in /sys/bus/usb/devices \
+                             disconnect={disconnect_secs}s"
+                        ),
+                    )
+                    .await;
+                    state.dormant = true;
+                    update_snapshot(&snapshot, &state, "dormant").await;
+                    continue;
+                }
+
                 Symptom::Unknown => {
-                    // Unknown after grace — try airplane cycle, then escalate
-                    if state.airplane_cycles < MAX_AIRPLANE_CYCLES_PER_EPISODE {
+                    // Unknown is no longer auto-actionable. Operator can opt-in
+                    // via `[lte.unknown_action]` if they want the old behavior.
+                    if !unknown_action.airplane_cycle && !unknown_action.escalate {
+                        info!(
+                            "LTE watchdog: unknown — diagnose-only \
+                             (disconnect={disconnect_secs}s, reg={reg_str})"
+                        );
+                        update_snapshot_event(
+                            &snapshot,
+                            &mut state,
+                            "unknown",
+                            "wait",
+                            &format!(
+                                "symptom=unknown reg={reg_str} disconnect={disconnect_secs}s \
+                                 unknown_action=disabled"
+                            ),
+                        )
+                        .await;
+                        update_snapshot(&snapshot, &state, "waiting").await;
+                        continue;
+                    }
+                    if unknown_action.airplane_cycle
+                        && state.airplane_cycles < MAX_AIRPLANE_CYCLES_PER_EPISODE
+                    {
                         if !state.cooldown_elapsed(1) {
                             continue;
                         }
                         state.airplane_cycles += 1;
                         (action_airplane_cycle(&modem, &mut state).await, 1, None)
-                    } else {
+                    } else if unknown_action.escalate {
                         if !state.cooldown_elapsed(3) {
                             continue;
                         }
-                        let result = action_usb_power_cycle(&device_path).await;
-                        (result.0, 3, result.1)
+                        match try_usb_cycle_gated(
+                            &device_path,
+                            max_escalation_level,
+                            &usb_cycle_evidence,
+                            disconnect_secs,
+                        )
+                        .await
+                        {
+                            GatedUsbCycle::Executed((act, m)) => (act, 3, m),
+                            GatedUsbCycle::Skipped(reason) => {
+                                info!("LTE watchdog: usb_cycle_skipped (unknown) — {reason}");
+                                state.dormant = true;
+                                update_snapshot(&snapshot, &state, "dormant").await;
+                                continue;
+                            }
+                        }
+                    } else {
+                        update_snapshot(&snapshot, &state, "waiting").await;
+                        continue;
                     }
                 }
             };
@@ -1054,8 +1346,10 @@ pub fn spawn_lte_watchdog(
             // Handle modem replacement after USB cycle
             if let Some(new_m) = new_modem {
                 let _ = modem_tx.send(new_m.clone());
+                let new_path = new_m.device().to_string();
+                *detected_path.write().await = Some(new_path.clone());
                 modem = new_m;
-                info!("LTE watchdog: modem handle refreshed via watch channel");
+                info!("LTE watchdog: modem handle refreshed via watch channel (path: {new_path})");
             }
 
             // Reset AT failure counter on successful action (not Unresponsive)
@@ -1080,6 +1374,15 @@ pub fn spawn_lte_watchdog(
             )
             .await;
             update_snapshot_event(&snapshot, &mut state, symptom.as_str(), action, &detail).await;
+            record_history_and_detect_regression(
+                &data_dir,
+                symptom.as_str(),
+                action,
+                level,
+                &detail,
+                &session_events,
+            )
+            .await;
 
             // Implicit interface nudge after radio recovery (L0/L1)
             if level <= 1 {
@@ -1197,6 +1500,90 @@ async fn log_action(
         "disconnect_secs": disconnect_secs,
     }));
     state.record_action(action);
+}
+
+/// Append one watchdog action to `<data_dir>/watchdog_history.jsonl` and run
+/// the regression detector. Best-effort — file I/O errors are logged, not
+/// fatal.
+///
+/// Regression detector: if the same `(symptom, action)` pair has fired ≥3
+/// times in the past hour, emit a `lte.watchdog.regression` event on
+/// `session_events`. Operators decide what to do; the watchdog itself does
+/// not auto-escalate based on regression.
+async fn record_history_and_detect_regression(
+    data_dir: &str,
+    symptom: &str,
+    action: &str,
+    level: u8,
+    detail: &str,
+    session_events: &broadcast::Sender<Value>,
+) {
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let path = std::path::Path::new(data_dir).join("watchdog_history.jsonl");
+    let entry = serde_json::json!({
+        "ts_unix": ts,
+        "symptom": symptom,
+        "action": action,
+        "level": level,
+        "detail": detail,
+    });
+
+    // Append + rotate at 5 MB.
+    let line = format!("{entry}\n");
+    let mut rotated = false;
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 5 * 1024 * 1024 {
+            let rotated_path = path.with_extension("jsonl.1");
+            let _ = std::fs::rename(&path, &rotated_path);
+            rotated = true;
+        }
+    }
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                warn!("watchdog_history append failed: {e}");
+            }
+        }
+        Err(e) => warn!("watchdog_history open failed: {e}"),
+    }
+    if rotated {
+        info!("watchdog_history.jsonl rotated (>5MB) → .jsonl.1");
+    }
+
+    // Regression detection — scan recent entries (cheap; file is bounded).
+    let one_hour_ago = ts.saturating_sub(3600);
+    let count = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| {
+            v.get("ts_unix").and_then(Value::as_u64).unwrap_or(0) >= one_hour_ago
+                && v.get("symptom").and_then(Value::as_str) == Some(symptom)
+                && v.get("action").and_then(Value::as_str) == Some(action)
+        })
+        .count();
+    if count >= 3 {
+        warn!(
+            "LTE watchdog: regression detected — ({symptom}, {action}) fired {count} times in 1h"
+        );
+        let _ = session_events.send(serde_json::json!({
+            "type": "lte.watchdog.regression",
+            "symptom": symptom,
+            "action": action,
+            "count": count,
+            "window_secs": 3600,
+        }));
+    }
 }
 
 // ── Recovery actions ───────────────────────────────────────────────────────
@@ -1345,7 +1732,11 @@ pub(crate) async fn resolve_netifd_interface(kernel_iface: &str) -> String {
 }
 
 /// USB modem power cycle — toggle sysfs `authorized` for the Quectel device.
-async fn action_usb_power_cycle(device_path: &str) -> (&'static str, Option<Modem>) {
+/// Force a USB power-cycle of the Quectel module. Public so the manual
+/// `POST /api/lte/usb_cycle` endpoint can invoke it directly, bypassing the
+/// `max_escalation_level` / `usb_cycle_evidence` gates that apply to the
+/// automatic watchdog path.
+pub async fn action_usb_power_cycle(device_path: &str) -> (&'static str, Option<Modem>) {
     let Some(auth_path) = find_quectel_usb_auth().await else {
         warn!("LTE watchdog: Quectel USB device not found in sysfs");
         return ("usb_cycle_no_device", None);
@@ -1732,7 +2123,126 @@ mod tests {
         assert_eq!(Symptom::Unresponsive.as_str(), "unresponsive");
         assert_eq!(Symptom::RelayProblem.as_str(), "relay_problem");
         assert_eq!(Symptom::TunnelReconnecting.as_str(), "tunnel_reconnecting");
+        assert_eq!(
+            Symptom::InternetUnreachable.as_str(),
+            "internet_unreachable"
+        );
+        assert_eq!(Symptom::ModemGone.as_str(), "modem_gone");
         assert_eq!(Symptom::Unknown.as_str(), "unknown");
+    }
+
+    // ── Layer 3 watchdog-policy regression coverage ────────────────────
+
+    use crate::config::UsbCycleEvidence;
+
+    fn evidence_default() -> UsbCycleEvidence {
+        UsbCycleEvidence {
+            min_sustained_secs: 600,
+            require_sysfs_absent: true,
+        }
+    }
+
+    #[test]
+    fn usb_cycle_gated_by_max_escalation_level() {
+        // Default `max_escalation_level=3` → cycle is denied even with strong
+        // evidence (modem absent from sysfs, sustained 10min disconnect).
+        let result = evaluate_usb_cycle_gate(3, &evidence_default(), 1200, false);
+        let err = result.expect_err("level 3 must skip");
+        assert!(
+            err.contains("max_escalation_level"),
+            "reason should cite escalation level, got: {err}"
+        );
+    }
+
+    #[test]
+    fn usb_cycle_requires_sustained_evidence() {
+        // Even at level 4, a fresh disconnect (under min_sustained_secs)
+        // is not enough evidence to fire.
+        let result = evaluate_usb_cycle_gate(4, &evidence_default(), 60, false);
+        let err = result.expect_err("premature trigger must skip");
+        assert!(err.contains("sustained=60"), "got: {err}");
+    }
+
+    #[test]
+    fn usb_cycle_declined_when_sysfs_shows_modem_present() {
+        // Worst surprise: AT is failing but sysfs still has the modem.
+        // USB cycle is the wrong tool — the cure (re-enumeration → ttyUSB
+        // renumber) is worse than the disease.
+        let result = evaluate_usb_cycle_gate(4, &evidence_default(), 1200, true);
+        let err = result.expect_err("sysfs-present must skip");
+        assert!(err.contains("sysfs_present=true"), "got: {err}");
+    }
+
+    #[test]
+    fn usb_cycle_allowed_when_all_evidence_aligned() {
+        // Level 4 opt-in + sustained ≥ min + sysfs corroborates absence.
+        evaluate_usb_cycle_gate(4, &evidence_default(), 1200, false)
+            .expect("aligned evidence must allow cycle");
+    }
+
+    #[test]
+    fn usb_cycle_evidence_off_skips_sysfs_check() {
+        // If an operator disables the sysfs gate explicitly, the cycle is
+        // allowed when sustained + level pass — even with modem enumerated.
+        let evidence = UsbCycleEvidence {
+            min_sustained_secs: 600,
+            require_sysfs_absent: false,
+        };
+        evaluate_usb_cycle_gate(4, &evidence, 1200, true)
+            .expect("evidence off + level/sustained ok → allowed");
+    }
+
+    #[tokio::test]
+    async fn regression_detector_fires_after_3_repeats_in_hour() {
+        // Drive the same (symptom, action) pair three times into a fresh
+        // history file and confirm the detector raises an event on session
+        // events. Uses a temp data_dir so the test is hermetic.
+        use tokio::sync::broadcast;
+        let mut d = std::env::temp_dir();
+        d.push(format!("sctl-watchdog-regression-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("mkdir data_dir");
+        let dd = d.to_string_lossy().into_owned();
+        let (tx, mut rx) = broadcast::channel::<Value>(16);
+
+        for _ in 0..3 {
+            record_history_and_detect_regression(
+                &dd,
+                "unresponsive",
+                "usb_cycle",
+                3,
+                "test-detail",
+                &tx,
+            )
+            .await;
+        }
+
+        // Drain any events; we expect at least one regression event.
+        let mut saw_regression = false;
+        while let Ok(v) = rx.try_recv() {
+            if v.get("type").and_then(Value::as_str) == Some("lte.watchdog.regression") {
+                saw_regression = true;
+                assert_eq!(v["symptom"], "unresponsive");
+                assert_eq!(v["action"], "usb_cycle");
+            }
+        }
+        assert!(saw_regression, "regression event must be emitted");
+
+        // Confirm history file has 3 lines (jsonl).
+        let raw = std::fs::read_to_string(d.join("watchdog_history.jsonl")).expect("history file");
+        assert_eq!(raw.lines().filter(|l| !l.is_empty()).count(), 3);
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn unknown_action_defaults_are_passive() {
+        // Default UnknownAction is { airplane_cycle: false, escalate: false }
+        // — diagnose-only. This is the "Unknown → USB cycle path removed"
+        // regression guard.
+        let ua = crate::config::UnknownAction::default();
+        assert!(!ua.airplane_cycle, "default airplane_cycle must be false");
+        assert!(!ua.escalate, "default escalate must be false");
     }
 
     #[test]

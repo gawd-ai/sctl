@@ -130,6 +130,20 @@ pub(crate) async fn info_with_groups(
         let (mem_total, mem_available) = parse_meminfo(&meminfo);
         let load = parse_loadavg(&loadavg);
         let cpu_model = parse_cpu_model(&cpuinfo);
+        // Inspect safe_mode.flag — best-effort read.
+        let safe_mode_flag_path =
+            std::path::Path::new(&state.config.server.data_dir).join("safe_mode.flag");
+        let safe_mode_block = if safe_mode_flag_path.exists() {
+            std::fs::read_to_string(&safe_mode_flag_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .map_or_else(
+                    || json!({ "active": true }),
+                    |flag| json!({ "active": true, "flag": flag }),
+                )
+        } else {
+            json!({ "active": false })
+        };
         response = json!({
             "serial": state.config.device.serial,
             "hostname": hostname.trim(),
@@ -142,6 +156,7 @@ pub(crate) async fn info_with_groups(
                 "available_bytes": mem_available * 1024,
                 "used_bytes": mem_total.saturating_sub(mem_available) * 1024,
             },
+            "safe_mode": safe_mode_block,
         });
     }
 
@@ -256,6 +271,8 @@ pub(crate) async fn info_with_groups(
                     "iccid": modem.iccid,
                 });
             }
+            let detected_path = state.modem_detected_path.read().await.clone();
+            lte["detected_path"] = json!(detected_path);
             response["lte"] = lte;
             info!(req_id, lte_lock_wait_ms, "api.info: phase lte complete");
         }

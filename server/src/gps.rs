@@ -270,7 +270,8 @@ pub fn spawn_gps_poller(
                     }
                     // Watchdog sender dropped — no one will broadcast, self-recover
                     if modem_rx.has_changed().is_err() {
-                        let actual_path = crate::modem::detect_quectel_at_port(&config.device);
+                        let hint = config.device.as_deref().unwrap_or("/dev/ttyUSB2");
+                        let actual_path = crate::modem::detect_quectel_at_port(hint);
                         match crate::modem::Modem::open(&actual_path) {
                             Ok(new_modem) => {
                                 info!("GPS poller: modem re-opened (no watchdog) at {actual_path}");

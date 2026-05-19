@@ -411,67 +411,190 @@ mod tests {
     }
 }
 
-/// Auto-detect the Quectel AT command port by scanning sysfs.
+/// Abstraction over `/sys/bus/usb/devices` directory traversal so the Quectel
+/// detector can be unit-tested without touching the real sysfs tree.
 ///
-/// Walks `/sys/bus/usb/devices/*/` looking for vendor `2c7c` (Quectel).
-/// The AT command interface is USB interface 2 (third interface).
-/// Returns the ttyUSB device path (e.g. `/dev/ttyUSB3`), or the
-/// configured `fallback` path if detection fails.
-pub fn detect_quectel_at_port(fallback: &str) -> String {
-    let Ok(entries) = std::fs::read_dir("/sys/bus/usb/devices") else {
-        return fallback.to_string();
-    };
+/// The real implementation is `RealSysfs` (below). Tests inject `FakeSysfs`
+/// via the strict-with-scanner variant.
+pub trait SysfsScanner {
+    /// Top-level USB device entries (e.g. names like `1-1.2`).
+    fn usb_device_entries(&self) -> Vec<String>;
+    /// Read `<usb_device>/idVendor`, trimmed.
+    fn read_vendor(&self, device: &str) -> Option<String>;
+    /// List entries under `<usb_device>/<device>:1.2/` (the AT-port interface
+    /// directory). Entries are bare names, not paths.
+    fn list_at_interface(&self, device: &str) -> Vec<String>;
+    /// List entries under `<usb_device>/<device>:1.2/<ttyusb>/tty/`.
+    fn list_tty_subdir(&self, device: &str, ttyusb: &str) -> Vec<String>;
+}
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let vendor_path = path.join("idVendor");
-        if let Ok(vendor) = std::fs::read_to_string(&vendor_path) {
-            if vendor.trim() != "2c7c" {
+/// Production sysfs scanner — reads from `/sys/bus/usb/devices`.
+pub struct RealSysfs;
+
+impl SysfsScanner for RealSysfs {
+    fn usb_device_entries(&self) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir("/sys/bus/usb/devices") else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+    fn read_vendor(&self, device: &str) -> Option<String> {
+        std::fs::read_to_string(format!("/sys/bus/usb/devices/{device}/idVendor"))
+            .ok()
+            .map(|s| s.trim().to_string())
+    }
+    fn list_at_interface(&self, device: &str) -> Vec<String> {
+        let path = format!("/sys/bus/usb/devices/{device}/{device}:1.2");
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+    fn list_tty_subdir(&self, device: &str, ttyusb: &str) -> Vec<String> {
+        let path = format!("/sys/bus/usb/devices/{device}/{device}:1.2/{ttyusb}/tty");
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+}
+
+/// Inner detector — takes a scanner. Returns the absolute device path (e.g.
+/// `/dev/ttyUSB3`) of the Quectel (vendor `2c7c`) AT-command interface
+/// (`:1.2`), or `None` if no Quectel module is enumerated.
+fn detect_quectel_at_port_with_scanner<S: SysfsScanner>(scanner: &S) -> Option<String> {
+    for device in scanner.usb_device_entries() {
+        match scanner.read_vendor(&device) {
+            Some(v) if v == "2c7c" => {}
+            _ => continue,
+        }
+        for entry in scanner.list_at_interface(&device) {
+            if !entry.starts_with("ttyUSB") {
                 continue;
             }
-            // Found Quectel device. The AT port is interface 2.
-            // USB interfaces are named like: 1-1.2:1.2 (bus-port:config.interface)
-            let dev_name = entry.file_name();
-            let dev_str = dev_name.to_string_lossy();
-            let at_iface = format!("{dev_str}:1.2");
-            let iface_path = path.join(&at_iface);
-
-            // Look for ttyUSB* under the interface
-            if let Ok(iface_entries) = std::fs::read_dir(&iface_path) {
-                for ie in iface_entries.flatten() {
-                    let ie_name = ie.file_name();
-                    let ie_str = ie_name.to_string_lossy();
-                    if ie_str.starts_with("ttyUSB") {
-                        // Found it — check for the tty subdir to get the real device
-                        let tty_dir = iface_path.join(&*ie_str).join("tty");
-                        if let Ok(tty_entries) = std::fs::read_dir(&tty_dir) {
-                            for te in tty_entries.flatten() {
-                                let tty_name = te.file_name().to_string_lossy().to_string();
-                                if tty_name.starts_with("ttyUSB") {
-                                    let detected = format!("/dev/{tty_name}");
-                                    if detected != fallback {
-                                        info!(
-                                            "Auto-detected Quectel AT port: {detected} \
-                                             (configured: {fallback})"
-                                        );
-                                    }
-                                    return detected;
-                                }
-                            }
-                        }
-                        // Fallback: the ttyUSB dir itself is the device
-                        let detected = format!("/dev/{ie_str}");
-                        if detected != fallback {
-                            info!(
-                                "Auto-detected Quectel AT port: {detected} (configured: {fallback})"
-                            );
-                        }
-                        return detected;
-                    }
+            // Prefer the tty subdir which names the actual /dev/ttyUSB*.
+            for tty_name in scanner.list_tty_subdir(&device, &entry) {
+                if tty_name.starts_with("ttyUSB") {
+                    return Some(format!("/dev/{tty_name}"));
                 }
             }
+            // Fallback: the ttyUSB dir itself is named after the device.
+            return Some(format!("/dev/{entry}"));
+        }
+    }
+    None
+}
+
+/// Strict Quectel AT-port detector. Returns `None` when no Quectel module is
+/// enumerated — the caller decides whether to fall back to a configured hint
+/// or to wait/retry.
+///
+/// Walks `/sys/bus/usb/devices/*/` looking for vendor `2c7c` (Quectel). The AT
+/// command interface is USB interface 2 (third interface, named `:1.2`).
+#[must_use]
+pub fn detect_quectel_at_port_strict() -> Option<String> {
+    detect_quectel_at_port_with_scanner(&RealSysfs)
+}
+
+/// Auto-detect the Quectel AT command port by scanning sysfs.
+///
+/// Returns the detected ttyUSB device path (e.g. `/dev/ttyUSB3`), or the
+/// supplied `fallback` if detection fails. Kept as a back-compat surface for
+/// poller self-recovery paths that need *some* path to attempt re-open with.
+pub fn detect_quectel_at_port(fallback: &str) -> String {
+    match detect_quectel_at_port_strict() {
+        Some(detected) => {
+            if detected != fallback {
+                info!("Auto-detected Quectel AT port: {detected} (configured: {fallback})");
+            }
+            detected
+        }
+        None => fallback.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod sysfs_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct FakeSysfs {
+        devices: Vec<String>,
+        vendors: HashMap<String, String>,
+        ifaces: HashMap<String, Vec<String>>,
+        ttys: HashMap<String, Vec<String>>,
+    }
+
+    impl SysfsScanner for FakeSysfs {
+        fn usb_device_entries(&self) -> Vec<String> {
+            self.devices.clone()
+        }
+        fn read_vendor(&self, device: &str) -> Option<String> {
+            self.vendors.get(device).cloned()
+        }
+        fn list_at_interface(&self, device: &str) -> Vec<String> {
+            self.ifaces.get(device).cloned().unwrap_or_default()
+        }
+        fn list_tty_subdir(&self, device: &str, ttyusb: &str) -> Vec<String> {
+            self.ttys
+                .get(&format!("{device}/{ttyusb}"))
+                .cloned()
+                .unwrap_or_default()
         }
     }
 
-    fallback.to_string()
+    #[test]
+    fn returns_none_when_no_quectel_present() {
+        let mut sysfs = FakeSysfs::default();
+        sysfs.devices.push("usb1".into());
+        sysfs.vendors.insert("usb1".into(), "1d6b".into()); // Linux Foundation root hub
+        assert_eq!(detect_quectel_at_port_with_scanner(&sysfs), None);
+    }
+
+    #[test]
+    fn finds_at_port_via_tty_subdir() {
+        let mut sysfs = FakeSysfs::default();
+        sysfs.devices.push("1-1.2".into());
+        sysfs.vendors.insert("1-1.2".into(), "2c7c".into());
+        sysfs
+            .ifaces
+            .insert("1-1.2".into(), vec!["ttyUSB-stub".into()]);
+        sysfs
+            .ttys
+            .insert("1-1.2/ttyUSB-stub".into(), vec!["ttyUSB2".into()]);
+        assert_eq!(
+            detect_quectel_at_port_with_scanner(&sysfs),
+            Some("/dev/ttyUSB2".into())
+        );
+    }
+
+    #[test]
+    fn ignores_non_quectel_vendor() {
+        let mut sysfs = FakeSysfs::default();
+        sysfs.devices.push("1-1.1".into());
+        sysfs.devices.push("1-1.2".into());
+        sysfs.vendors.insert("1-1.1".into(), "8087".into()); // Intel
+        sysfs.vendors.insert("1-1.2".into(), "2c7c".into());
+        sysfs.ifaces.insert("1-1.1".into(), vec!["ttyUSB99".into()]);
+        sysfs
+            .ifaces
+            .insert("1-1.2".into(), vec!["ttyUSB-stub".into()]);
+        sysfs
+            .ttys
+            .insert("1-1.2/ttyUSB-stub".into(), vec!["ttyUSB3".into()]);
+        assert_eq!(
+            detect_quectel_at_port_with_scanner(&sysfs),
+            Some("/dev/ttyUSB3".into())
+        );
+    }
 }

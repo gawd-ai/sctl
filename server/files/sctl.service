@@ -2,10 +2,15 @@
 Description=sctl Device Agent
 After=network-online.target
 Wants=network-online.target
+# Last-resort guard against supervisor itself crash-looping. The in-process
+# supervisor handles per-child crash-loop detection via safe_mode.flag.
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/sctl supervise --config /etc/sctl/sctl.toml
+Environment=RUST_BACKTRACE=full
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=15

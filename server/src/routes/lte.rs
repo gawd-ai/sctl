@@ -540,3 +540,65 @@ pub async fn speed_test(
         "upload_bps": upload_bps,
     })))
 }
+
+/// `POST /api/lte/usb_cycle` — manually trigger a USB power-cycle of the
+/// Quectel module.
+///
+/// Bypasses the `max_escalation_level` and `usb_cycle_evidence` gates that
+/// constrain the automatic watchdog. The operator owns the call. Returns the
+/// raw action result string plus the new detected modem path (if the kernel
+/// re-bound a tty before we returned).
+pub async fn manual_usb_cycle(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(ref lte_cfg) = state.config.lte else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "LTE not configured on this device"})),
+        ));
+    };
+    let device_path = lte_cfg
+        .device
+        .clone()
+        .unwrap_or_else(|| "/dev/ttyUSB2".to_string());
+    info!("api.lte.manual_usb_cycle: triggering on {device_path}");
+    let (action, new_modem) = crate::lte_watchdog::action_usb_power_cycle(&device_path).await;
+    let new_path = new_modem.as_ref().map(|m| m.device().to_string());
+    // Update the observable path; the watchdog will pick the new handle up
+    // via its own watch channel on the next tick (the manual path doesn't
+    // own the watch::Sender).
+    if let Some(ref p) = new_path {
+        *state.modem_detected_path.write().await = Some(p.clone());
+    }
+    Ok(Json(json!({
+        "action": action,
+        "detected_path": new_path,
+    })))
+}
+
+/// `GET /api/lte/watchdog/history` — return the rolling watchdog history file.
+///
+/// The watchdog appends each action to `<data_dir>/watchdog_history.jsonl` for
+/// post-mortem inspection. This endpoint streams the file as a JSON array
+/// (parsing line-delimited JSON on the way out). Returns an empty array if
+/// the file does not exist.
+pub async fn watchdog_history(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let path = std::path::Path::new(&state.config.server.data_dir).join("watchdog_history.jsonl");
+    if !path.exists() {
+        return Ok(Json(json!([])));
+    }
+    let contents = std::fs::read_to_string(&path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("read watchdog_history.jsonl: {e}")})),
+        )
+    })?;
+    let entries: Vec<Value> = contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .collect();
+    Ok(Json(json!(entries)))
+}

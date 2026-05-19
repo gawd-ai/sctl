@@ -101,6 +101,58 @@ async fn main() {
     }
 }
 
+/// Install a panic hook that persists the panic trace to disk for post-mortem.
+///
+/// Writes `<data_dir>/last_panic.log` with the panic message, thread name, and
+/// backtrace. Keeps the default tracing output (so logread still shows it).
+fn install_panic_hook(data_dir: &str) {
+    use std::backtrace::Backtrace;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let log_path = std::path::Path::new(data_dir).join("last_panic.log");
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>");
+        let bt = Backtrace::force_capture();
+        let payload =
+            format!("panic at unix={ts}\nthread={thread_name}\n{info}\nbacktrace:\n{bt}\n");
+        // Best-effort — never panic inside the panic hook.
+        let _ = std::fs::write(&log_path, &payload);
+        prev(info);
+    }));
+}
+
+/// Persist the currently-detected modem path for observability/post-mortem.
+///
+/// This file is NOT read on next boot — startup always re-detects via sysfs.
+/// It exists so an operator inspecting a wedged box can see what sctl was
+/// last running against.
+fn persist_modem_state(data_dir: &str, detected_path: &str) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let payload = serde_json::json!({
+        "detected_path": detected_path,
+        "at_unix": ts,
+    });
+    let path = std::path::Path::new(data_dir).join("modem_state.json");
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, payload.to_string()) {
+        warn!("modem_state.json: write tmp failed: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        warn!("modem_state.json: rename failed: {e}");
+    }
+}
+
 /// Acquire exclusive process lock. Returns the held file (must not be dropped).
 /// Retries 3 times with 1s delay to handle the race between old process dying
 /// and new process starting (e.g. during upgrades). Exits with code 99 if still locked.
@@ -152,6 +204,25 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     // Initialize tracing
     let log_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| config.logging.level.clone());
     tracing_subscriber::fmt().with_env_filter(log_filter).init();
+
+    // Install panic hook early so panics in any spawned subsystem leave a
+    // persisted trace on disk for post-mortem. Without this, the supervisor
+    // restarts blindly and the underlying cause is lost.
+    install_panic_hook(&config.server.data_dir);
+
+    // Honor safe-mode flag if the supervisor wrote one (crash-loop). When set
+    // we skip every optional subsystem (modem, GPS, LTE, watchdog, infra) and
+    // keep only the management plane (HTTP + tunnel + sessions) live so an
+    // operator can reach the box, inspect logs, and clear the flag.
+    let safe_mode_flag_path = std::path::Path::new(&config.server.data_dir).join("safe_mode.flag");
+    let safe_mode_active = safe_mode_flag_path.exists();
+    if safe_mode_active {
+        warn!(
+            "==== SAFE MODE ACTIVE ==== modem/GPS/LTE/watchdog/infra subsystems will be skipped. \
+             Flag: {} — clear via DELETE /api/safe_mode/flag (auth required).",
+            safe_mode_flag_path.display()
+        );
+    }
 
     // Validate config before proceeding
     let validation_errors = config.validate();
@@ -241,8 +312,8 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     // GPS state (only when [gps] config is present)
     let gps_state = config.gps.as_ref().map(|gc| {
         info!(
-            "GPS tracking enabled (device: {}, poll: {}s)",
-            gc.device, gc.poll_interval_secs
+            "GPS tracking enabled (poll: {}s, hint: {:?})",
+            gc.poll_interval_secs, gc.device
         );
         Arc::new(tokio::sync::Mutex::new(gps::GpsState::new(gc.history_size)))
     });
@@ -250,8 +321,8 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     // LTE state (only when [lte] config is present)
     let lte_state = config.lte.as_ref().map(|lc| {
         info!(
-            "LTE monitoring enabled (device: {}, poll: {}s)",
-            lc.device, lc.poll_interval_secs
+            "LTE monitoring enabled (poll: {}s, hint: {:?})",
+            lc.poll_interval_secs, lc.device
         );
         let mut ls = lte::LteState::new();
         ls.load_safe_bands(&data_dir);
@@ -272,6 +343,8 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         Arc::new(tokio::sync::Mutex::new(is))
     };
 
+    let modem_detected_path = Arc::new(tokio::sync::RwLock::new(None::<String>));
+
     let mut state = AppState {
         session_manager,
         config: Arc::new(config),
@@ -285,6 +358,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         gps_state,
         lte_state,
         modem: None,
+        modem_detected_path: modem_detected_path.clone(),
         lte_poll_notify: None,
         relay_history: None,
         device_snapshots: None,
@@ -298,6 +372,10 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
 
     let authed_routes = Router::new()
         .route("/api/info", get(routes::info::info))
+        .route(
+            "/api/safe_mode/flag",
+            get(routes::safe_mode::get_flag).delete(routes::safe_mode::clear_flag),
+        )
         .route("/api/diagnostics", get(routes::diagnostics::diagnostics))
         .route("/api/exec", post(routes::exec::exec))
         .route("/api/exec/batch", post(routes::exec::batch_exec))
@@ -347,6 +425,11 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         .route("/api/lte/bands", post(routes::lte::set_bands))
         .route("/api/lte/scan", post(routes::lte::start_scan))
         .route("/api/lte/speedtest", post(routes::lte::speed_test))
+        .route("/api/lte/usb_cycle", post(routes::lte::manual_usb_cycle))
+        .route(
+            "/api/lte/watchdog/history",
+            get(routes::lte::watchdog_history),
+        )
         .route(
             "/api/infra/config",
             post(infra::routes::push_config).delete(infra::routes::delete_config),
@@ -409,64 +492,78 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         }
     }
 
-    // Open modem instances early so state.modem is set before .with_state() clones it.
-    // GPS/LTE pollers and watchdog reference gps_modem/lte_modem (spawned later).
-    let mut modems: std::collections::HashMap<
-        String,
-        (sctl::modem::Modem, watch::Sender<sctl::modem::Modem>),
-    > = std::collections::HashMap::new();
-
-    let get_modem = |modems: &mut std::collections::HashMap<
-        String,
-        (sctl::modem::Modem, watch::Sender<sctl::modem::Modem>),
-    >,
-                     device: &str| {
-        if let Some((m, _)) = modems.get(device) {
-            return Some(m.clone());
-        }
-        // Auto-detect the actual ttyUSB port — USB re-enumeration after power
-        // cycles can shift device numbering (e.g. ttyUSB2 → ttyUSB3).
-        let actual_device = sctl::modem::detect_quectel_at_port(device);
-        // Also check if we already opened this path under a different name
-        if actual_device != device {
-            if let Some((m, _)) = modems.get(&actual_device) {
-                return Some(m.clone());
-            }
-        }
-        // Retry up to 5 times with 2s delay — after USB power cycle, device nodes
-        // take a few seconds to appear.
-        for attempt in 0..5 {
-            match sctl::modem::Modem::open(&actual_device) {
-                Ok(m) => {
-                    if attempt > 0 {
-                        info!("Modem {actual_device}: opened on attempt {}", attempt + 1);
-                    }
-                    let (tx, _rx) = watch::channel(m.clone());
-                    modems.insert(actual_device.clone(), (m.clone(), tx));
-                    return Some(m);
-                }
-                Err(e) => {
-                    if attempt < 4 {
-                        info!("Modem {actual_device}: not ready ({e}), retrying in 2s...");
-                        std::thread::sleep(std::time::Duration::from_secs(2));
-                    } else {
-                        warn!("Failed to open modem {actual_device} after 5 attempts: {e}");
-                    }
-                }
-            }
-        }
-        None
-    };
+    // Open the cellular modem (shared by GPS + LTE). There is at most one
+    // Quectel module per BPI; sysfs is authoritative for the actual ttyUSB
+    // path, with the configured hint as a fallback only when detection fails.
+    //
+    // `modem_tx` broadcasts handle replacements after a USB power cycle (see
+    // lte_watchdog). It is created lazily on first successful open and taken
+    // by the watchdog if one is spawned. If no watchdog is spawned, it is
+    // dropped — pollers self-recover via `detect_quectel_at_port` on
+    // channel-closed.
+    //
+    // In safe mode the modem (and everything that depends on it) is skipped
+    // entirely; the management plane comes up regardless.
+    let mut modem_handle: Option<sctl::modem::Modem> = None;
+    let mut modem_tx: Option<watch::Sender<sctl::modem::Modem>> = None;
 
     let gps_config = state.config.gps.clone();
-    let gps_modem = gps_config
-        .as_ref()
-        .and_then(|gc| get_modem(&mut modems, &gc.device));
-
     let lte_config = state.config.lte.clone();
-    let lte_modem = lte_config
+
+    // Either subsystem being configured is reason enough to attempt to open
+    // the modem. Hint is taken from whichever config has one (LTE first).
+    let want_modem = (gps_config.is_some() || lte_config.is_some()) && !safe_mode_active;
+    let modem_hint: Option<String> = lte_config
         .as_ref()
-        .and_then(|lc| get_modem(&mut modems, &lc.device));
+        .and_then(|c| c.device.clone())
+        .or_else(|| gps_config.as_ref().and_then(|c| c.device.clone()));
+
+    if want_modem {
+        // Detection → hint → None. Three open attempts at the resolved path.
+        let resolved = sctl::modem::detect_quectel_at_port_strict().or_else(|| modem_hint.clone());
+        match resolved {
+            Some(path) => {
+                if let Some(ref hint) = modem_hint {
+                    if hint != &path {
+                        info!("Modem: detected {path} (config hint: {hint}) — using detected path");
+                    }
+                }
+                for attempt in 0..5 {
+                    match sctl::modem::Modem::open(&path) {
+                        Ok(m) => {
+                            if attempt > 0 {
+                                info!("Modem {path}: opened on attempt {}", attempt + 1);
+                            }
+                            let (tx, _rx) = watch::channel(m.clone());
+                            modem_tx = Some(tx);
+                            modem_handle = Some(m);
+                            *modem_detected_path.write().await = Some(path.clone());
+                            // Persist for post-mortem visibility — NOT for next-boot authority.
+                            persist_modem_state(&data_dir, &path);
+                            break;
+                        }
+                        Err(e) => {
+                            if attempt < 4 {
+                                info!("Modem {path}: not ready ({e}), retrying in 2s...");
+                                std::thread::sleep(std::time::Duration::from_secs(2));
+                            } else {
+                                warn!("Failed to open modem {path} after 5 attempts: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+            None => {
+                warn!(
+                    "No Quectel modem detected and no [lte]/[gps] device hint configured — \
+                     GPS/LTE/watchdog will be disabled this boot. Management plane unaffected."
+                );
+            }
+        }
+    }
+
+    let gps_modem = modem_handle.clone();
+    let lte_modem = modem_handle.clone();
     state.modem = lte_modem.clone();
 
     if let (Some(ref modem), Some(ref ls)) = (&lte_modem, &state.lte_state) {
@@ -600,15 +697,16 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         .as_ref()
         .is_some_and(|tc| tc.url.is_some() && !tc.relay);
 
-    // GPS poller (only when [gps] config is present)
+    // GPS poller (only when [gps] config is present AND the modem is open).
     // Polls at reduced rate when LTE data path is active to avoid QMI disruption.
-    let gps_task =
-        if let (Some(gc), Some(ref gs), Some(modem)) = (gps_config, &state.gps_state, &gps_modem) {
-            let modem_rx = modems
-                .get(&gc.device)
-                .expect("modem must exist in map")
-                .1
-                .subscribe();
+    let gps_task = match (
+        gps_config,
+        state.gps_state.as_ref(),
+        gps_modem.as_ref(),
+        modem_tx.as_ref(),
+    ) {
+        (Some(gc), Some(gs), Some(modem), Some(tx)) => {
+            let modem_rx = tx.subscribe();
             let lte_iface = state.config.lte.as_ref().map(|lc| lc.interface.clone());
             Some(gps::spawn_gps_poller(
                 gc,
@@ -618,21 +716,23 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
                 modem_rx,
                 lte_iface,
             ))
-        } else {
+        }
+        (Some(_), _, None, _) => {
+            warn!("GPS poller: not spawning — modem unavailable this boot");
             None
-        };
+        }
+        _ => None,
+    };
 
-    // LTE poller (only when [lte] config is present)
-    // The poller skips AT commands while the tunnel is connected to avoid
-    // disrupting the QMI data path. On-demand polls can be triggered via
-    // lte_poll_notify (e.g. from the /api/lte endpoint).
-    let lte_task =
-        if let (Some(lc), Some(ref ls), Some(modem)) = (lte_config, &state.lte_state, &lte_modem) {
-            let modem_rx = modems
-                .get(&lc.device)
-                .expect("modem must exist in map")
-                .1
-                .subscribe();
+    // LTE poller (only when [lte] config is present AND the modem is open).
+    let lte_task = match (
+        lte_config,
+        state.lte_state.as_ref(),
+        lte_modem.as_ref(),
+        modem_tx.as_ref(),
+    ) {
+        (Some(lc), Some(ls), Some(modem), Some(tx)) => {
+            let modem_rx = tx.subscribe();
             let poll_notify = Arc::new(tokio::sync::Notify::new());
             state.lte_poll_notify = Some(poll_notify.clone());
             Some(lte::spawn_lte_poller(
@@ -645,21 +745,24 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
                 state.tunnel_stats.clone(),
                 poll_notify,
             ))
-        } else {
+        }
+        (Some(_), _, None, _) => {
+            warn!("LTE poller: not spawning — modem unavailable this boot");
             None
-        };
+        }
+        _ => None,
+    };
 
-    // LTE watchdog (only when [lte] watchdog=true AND tunnel client mode active)
-    // Takes ownership of the watch::Sender so it can broadcast new modem handles
-    // after USB power cycle. Receivers in GPS/LTE pollers were already created above.
-    let watchdog_task = if let (Some(lc), Some(ref ls), Some(modem)) =
-        (state.config.lte.clone(), &state.lte_state, &lte_modem)
-    {
-        if lc.watchdog && is_tunnel_client {
-            let modem_tx = modems
-                .remove(&lc.device)
-                .expect("modem must exist in map")
-                .1;
+    // LTE watchdog (only when [lte] watchdog=true AND tunnel client mode active
+    // AND the modem is open). Takes ownership of the watch::Sender so it can
+    // broadcast new modem handles after USB power cycle.
+    let watchdog_task = match (
+        state.config.lte.clone(),
+        state.lte_state.as_ref(),
+        lte_modem.as_ref(),
+        modem_tx.take(),
+    ) {
+        (Some(lc), Some(ls), Some(modem), Some(tx)) if lc.watchdog && is_tunnel_client => {
             info!("LTE watchdog enabled (interface: {})", lc.interface);
             let tunnel_url = tunnel_config.as_ref().and_then(|tc| tc.url.clone());
             let wd_snapshot = state
@@ -668,7 +771,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
                 .expect("watchdog_snapshot must be pre-created");
             Some(sctl::lte_watchdog::spawn_lte_watchdog(
                 modem.clone(),
-                modem_tx,
+                tx,
                 ls.clone(),
                 state.tunnel_stats.clone(),
                 state.session_events.clone(),
@@ -676,16 +779,18 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
                 data_dir.clone(),
                 tunnel_url,
                 wd_snapshot,
+                modem_detected_path.clone(),
             ))
-        } else {
+        }
+        (Some(lc), _, None, _) if lc.watchdog && is_tunnel_client => {
+            warn!("LTE watchdog: not spawning — modem unavailable this boot");
             None
         }
-    } else {
-        None
+        _ => None,
     };
 
-    // Start infra monitor if config was loaded from disk
-    {
+    // Start infra monitor if config was loaded from disk (skipped in safe mode)
+    if !safe_mode_active {
         let mut guard = infra_state.lock().await;
         if let Some(ref cfg) = guard.config {
             info!(

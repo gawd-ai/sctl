@@ -8,7 +8,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{broadcast, Mutex, Notify};
+use tokio::sync::{broadcast, Mutex, Notify, RwLock};
 use tracing::warn;
 
 use crate::activity::{ActivityLog, ExecResultsCache};
@@ -48,8 +48,12 @@ pub struct AppState {
     pub gps_state: Option<Arc<Mutex<GpsState>>>,
     /// LTE signal state (None when `[lte]` not configured).
     pub lte_state: Option<Arc<Mutex<LteState>>>,
-    /// LTE modem handle (None when `[lte]` not configured).
+    /// LTE modem handle (None when `[lte]` not configured or modem unreachable).
     pub modem: Option<Modem>,
+    /// Currently-detected modem device path (e.g. `/dev/ttyUSB2`). Observable
+    /// from HTTP; updated by the watchdog after a successful USB cycle. None
+    /// when no modem is present at startup.
+    pub modem_detected_path: Arc<RwLock<Option<String>>>,
     /// Notify to trigger an on-demand LTE signal poll (None when `[lte]` not configured).
     pub lte_poll_notify: Option<Arc<Notify>>,
     /// Relay connection history (None when not in relay mode).

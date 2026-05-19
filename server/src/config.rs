@@ -234,16 +234,22 @@ pub struct TunnelConfig {
 ///
 /// ```toml
 /// [gps]
-/// device = "/dev/ttyUSB2"
+/// # device is optional. sctl auto-detects the Quectel AT port via sysfs.
 /// poll_interval_secs = 30
 /// history_size = 100
 /// auto_enable = true
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct GpsConfig {
-    /// Serial device for AT commands (default `/dev/ttyUSB2`).
-    #[serde(default = "default_gps_device")]
-    pub device: String,
+    /// Hint for the AT command serial device (e.g. `/dev/ttyUSB2`).
+    ///
+    /// sctl auto-detects the Quectel AT port from sysfs at startup and after USB
+    /// re-enumeration. This field is consulted only as a fallback when sysfs
+    /// detection fails (non-Quectel modem). For Quectel modules (vendor 2c7c),
+    /// this field is ignored — leaving it in legacy `sctl.toml` files is
+    /// harmless.
+    #[serde(default)]
+    pub device: Option<String>,
     /// Seconds between GPS polls (default 30).
     #[serde(default = "default_gps_poll_interval")]
     pub poll_interval_secs: u64,
@@ -269,9 +275,15 @@ pub struct GpsConfig {
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct LteConfig {
-    /// Serial device for AT commands (default `/dev/ttyUSB2`).
-    #[serde(default = "default_lte_device")]
-    pub device: String,
+    /// Hint for the AT command serial device (e.g. `/dev/ttyUSB2`).
+    ///
+    /// sctl auto-detects the Quectel AT port from sysfs at startup and after USB
+    /// re-enumeration. This field is consulted only as a fallback when sysfs
+    /// detection fails (non-Quectel modem). For Quectel modules (vendor 2c7c),
+    /// this field is ignored — leaving it in legacy `sctl.toml` files is
+    /// harmless.
+    #[serde(default)]
+    pub device: Option<String>,
     /// Seconds between LTE signal polls (default 60).
     #[serde(default = "default_lte_poll_interval")]
     pub poll_interval_secs: u64,
@@ -311,11 +323,69 @@ pub struct LteConfig {
     /// Higher values prevent interference during natural roaming handovers.
     #[serde(default = "default_watchdog_grace")]
     pub watchdog_grace_secs: u64,
+    /// Maximum action level the watchdog is allowed to take automatically:
+    ///
+    /// - `1` — soft (re-enable QMI, AT+COPS=0)
+    /// - `2` — airplane-mode cycle (AT+CFUN=0/1)
+    /// - `3` — interface restart (`ifdown`/`ifup`, `ubus call network reload`)
+    /// - `4` — USB power-cycle (deauthorize/reauthorize sysfs)
+    ///
+    /// Default `3` — USB cycle is OPT-IN because re-enumeration can shift the
+    /// `ttyUSB*` minor number and is not idempotent. Manual cycle is always
+    /// available via `POST /api/lte/usb_cycle`.
+    #[serde(default = "default_max_escalation_level")]
+    pub max_escalation_level: u8,
+    /// Evidence requirements that gate an automatic USB power-cycle even when
+    /// `max_escalation_level >= 4`. Applies only to the auto path; manual
+    /// cycle bypasses this gate.
+    #[serde(default)]
+    pub usb_cycle_evidence: UsbCycleEvidence,
+    /// Seconds of `NotRegistered` to tolerate before treating as actionable
+    /// (default 180). Wider window survives natural roaming handovers without
+    /// the watchdog interfering.
+    #[serde(default = "default_notregistered_grace")]
+    pub notregistered_grace_secs: u64,
+    /// What to do when symptom evidence is ambiguous (`Symptom::Unknown`).
+    /// Both knobs default to `false` — diagnose-and-wait rather than mutate.
+    #[serde(default)]
+    pub unknown_action: UnknownAction,
 }
 
-fn default_lte_device() -> String {
-    "/dev/ttyUSB2".to_string()
+/// Evidence gates for the automatic USB power-cycle path. Manual
+/// `POST /api/lte/usb_cycle` ignores these.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsbCycleEvidence {
+    /// Minimum sustained seconds of the qualifying symptom before USB cycle
+    /// is allowed (default 600 = 10 minutes).
+    #[serde(default = "default_evidence_sustained")]
+    pub min_sustained_secs: u64,
+    /// Require sysfs corroboration that the modem is absent or has been at
+    /// the same port for the full sustained window (default true).
+    #[serde(default = "default_evidence_require_sysfs")]
+    pub require_sysfs_absent: bool,
 }
+
+impl Default for UsbCycleEvidence {
+    fn default() -> Self {
+        Self {
+            min_sustained_secs: default_evidence_sustained(),
+            require_sysfs_absent: default_evidence_require_sysfs(),
+        }
+    }
+}
+
+/// What to do when symptom evidence is ambiguous. Defaults are both false —
+/// the watchdog logs the diagnosis and waits for clearer evidence.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UnknownAction {
+    /// Allow airplane-mode cycle on Unknown symptom (default false).
+    #[serde(default)]
+    pub airplane_cycle: bool,
+    /// Allow escalation past airplane-cycle on Unknown symptom (default false).
+    #[serde(default)]
+    pub escalate: bool,
+}
+
 fn default_lte_poll_interval() -> u64 {
     60
 }
@@ -333,6 +403,18 @@ fn default_inter_command_delay() -> u64 {
 }
 fn default_watchdog_grace() -> u64 {
     120
+}
+fn default_max_escalation_level() -> u8 {
+    3
+}
+fn default_notregistered_grace() -> u64 {
+    180
+}
+fn default_evidence_sustained() -> u64 {
+    600
+}
+fn default_evidence_require_sysfs() -> bool {
+    true
 }
 
 fn default_listen() -> String {
@@ -418,9 +500,6 @@ fn default_transfer_max_file_size() -> u64 {
 }
 fn default_transfer_stale_timeout() -> u64 {
     3600 // 1 hour
-}
-fn default_gps_device() -> String {
-    "/dev/ttyUSB2".to_string()
 }
 fn default_gps_poll_interval() -> u64 {
     30
