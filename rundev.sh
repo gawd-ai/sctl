@@ -2793,10 +2793,8 @@ do_relay_upgrade() {
     log "Starting sctl-relay..."
     ssh $ssh_opts "$remote" "systemctl start sctl-relay"
 
-    # Wait for process to be ready
-    sleep 2
-
-    # Verify new PID is different
+    # Verify new PID is different (give systemd a moment to record it)
+    sleep 1
     local new_pid
     new_pid=$(ssh $ssh_opts "$remote" "systemctl show sctl-relay --property=MainPID --value 2>/dev/null") || new_pid="0"
     if [[ "$new_pid" == "0" || "$new_pid" == "$old_pid" ]]; then
@@ -2809,21 +2807,32 @@ do_relay_upgrade() {
     local new_version
     new_version=$(ssh $ssh_opts "$remote" "$RELAY_REMOTE_BIN --version 2>/dev/null || echo unknown") || new_version="unknown"
 
-    # Health check — verify uptime is fresh (< 30s)
-    local health
-    health=$(ssh $ssh_opts "$remote" "curl -sf http://127.0.0.1:8443/api/health" 2>/dev/null) || true
-    if [[ -n "$health" ]]; then
-        local uptime_secs
-        uptime_secs=$(echo "$health" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uptime_secs',999))" 2>/dev/null) || uptime_secs="999"
-        if [[ "$uptime_secs" -lt 30 ]]; then
-            ok "Upgrade complete: $old_version → $new_version (pid $new_pid, uptime ${uptime_secs}s)"
-        else
-            warn "Relay healthy but uptime=${uptime_secs}s — old process may not have been replaced"
-            warn "Check: ssh $remote journalctl -u sctl-relay -n 50"
+    # Health check — poll for up to 60s. The relay can take several seconds
+    # to come ready while it cleans up session journals at startup, so a
+    # single curl right after `systemctl start` will often miss the window.
+    local health=""
+    local waited=0
+    while [[ $waited -lt 60 ]]; do
+        health=$(ssh $ssh_opts "$remote" "curl -sf -m 3 http://127.0.0.1:8443/api/health" 2>/dev/null) || health=""
+        if [[ -n "$health" ]]; then
+            break
         fi
-    else
-        err "Health check failed after upgrade — check logs: ssh $remote journalctl -u sctl-relay -n 50"
+        sleep 2
+        waited=$((waited + 2))
+    done
+
+    if [[ -z "$health" ]]; then
+        err "Health check failed after 60s — check logs: ssh $remote journalctl -u sctl-relay -n 50"
         exit 1
+    fi
+
+    local uptime_secs
+    uptime_secs=$(echo "$health" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uptime_secs',999))" 2>/dev/null) || uptime_secs="999"
+    if [[ "$uptime_secs" -lt 90 ]]; then
+        ok "Upgrade complete: $old_version → $new_version (pid $new_pid, uptime ${uptime_secs}s, waited ${waited}s)"
+    else
+        warn "Relay healthy but uptime=${uptime_secs}s — old process may not have been replaced"
+        warn "Check: ssh $remote journalctl -u sctl-relay -n 50"
     fi
 }
 
