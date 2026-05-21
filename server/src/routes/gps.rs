@@ -5,17 +5,20 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde_json::{json, Value};
 
+use crate::error::{codes, ApiError};
 use crate::AppState;
 
 /// `GET /api/gps` — returns current GPS status, last fix, and history.
 ///
 /// Returns 404 if GPS is not configured on this device.
-pub async fn gps(State(state): State<AppState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn gps(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     let Some(gps_state) = &state.gps_state else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "GPS not configured on this device"})),
-        ));
+        return Err(
+            ApiError::new(codes::NOT_FOUND, "GPS not configured on this device")
+                .into_response_with(StatusCode::NOT_FOUND),
+        );
     };
 
     let gs = gps_state.lock().await;

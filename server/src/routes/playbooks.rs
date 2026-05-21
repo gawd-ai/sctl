@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::activity::{request_id_from_headers, source_from_headers, ActivityType};
+use crate::error::{codes, ApiError};
 use crate::AppState;
+
+type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
 /// Maximum playbook content size (1 MB).
 const MAX_PLAYBOOK_SIZE: usize = 1024 * 1024;
@@ -124,18 +127,17 @@ fn extract_script_block(body: &str) -> Result<String, String> {
     Err("No ```sh or ```bash code block found".into())
 }
 
-fn validate_playbook_name(name: &str) -> Result<(), (StatusCode, Json<Value>)> {
+fn validate_playbook_name(name: &str) -> Result<(), (StatusCode, Json<ApiError>)> {
     if name.is_empty()
         || !name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(
-                json!({"error": "Invalid playbook name: only alphanumeric, hyphens, and underscores allowed"}),
-            ),
-        ));
+        return Err(ApiError::new(
+            codes::INVALID_REQUEST,
+            "Invalid playbook name: only alphanumeric, hyphens, and underscores allowed",
+        )
+        .into_response_with(StatusCode::BAD_REQUEST));
     }
     Ok(())
 }
@@ -143,10 +145,7 @@ fn validate_playbook_name(name: &str) -> Result<(), (StatusCode, Json<Value>)> {
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
 /// `GET /api/playbooks` -- list all playbooks with summary info.
-pub async fn list_playbooks(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn list_playbooks(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
     let dir = &state.config.server.playbooks_dir;
     let source = source_from_headers(&headers);
     let req_id = request_id_from_headers(&headers);
@@ -167,10 +166,11 @@ pub async fn list_playbooks(
             return Ok(Json(json!({"playbooks": []})));
         }
         Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to read playbooks dir: {e}")})),
-            ));
+            return Err(ApiError::new(
+                codes::IO_ERROR,
+                format!("Failed to read playbooks dir: {e}"),
+            )
+            .into_response_with(StatusCode::INTERNAL_SERVER_ERROR));
         }
     };
 
@@ -215,7 +215,7 @@ pub async fn get_playbook(
     State(state): State<AppState>,
     Path(name): Path<String>,
     headers: HeaderMap,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     validate_playbook_name(&name)?;
     let source = source_from_headers(&headers);
     let req_id = request_id_from_headers(&headers);
@@ -223,23 +223,17 @@ pub async fn get_playbook(
 
     let content = tokio::fs::read_to_string(&file_path).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": format!("Playbook '{name}' not found")})),
-            )
+            ApiError::new(codes::NOT_FOUND, format!("Playbook '{name}' not found"))
+                .into_response_with(StatusCode::NOT_FOUND)
         } else {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to read playbook: {e}")})),
-            )
+            ApiError::new(codes::IO_ERROR, format!("Failed to read playbook: {e}"))
+                .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
         }
     })?;
 
     let (fm, script) = parse_playbook(&content).map_err(|e| {
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"error": format!("Invalid playbook: {e}")})),
-        )
+        ApiError::new(codes::INVALID_CONTENT, format!("Invalid playbook: {e}"))
+            .into_response_with(StatusCode::UNPROCESSABLE_ENTITY)
     })?;
 
     let params: HashMap<String, ParamDetail> = fm
@@ -284,43 +278,42 @@ pub async fn put_playbook(
     Path(name): Path<String>,
     headers: HeaderMap,
     body: String,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     validate_playbook_name(&name)?;
     let source = source_from_headers(&headers);
     let req_id = request_id_from_headers(&headers);
 
     if body.len() > MAX_PLAYBOOK_SIZE {
-        return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(
-                json!({"error": format!("Playbook content exceeds maximum size of {} bytes", MAX_PLAYBOOK_SIZE)}),
-            ),
-        ));
+        return Err(ApiError::new(
+            codes::FILE_TOO_LARGE,
+            format!("Playbook content exceeds maximum size of {MAX_PLAYBOOK_SIZE} bytes"),
+        )
+        .into_response_with(StatusCode::PAYLOAD_TOO_LARGE));
     }
 
     // Validate the content parses correctly
     let (_fm, _script) = parse_playbook(&body).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("Invalid playbook content: {e}")})),
+        ApiError::new(
+            codes::INVALID_CONTENT,
+            format!("Invalid playbook content: {e}"),
         )
+        .into_response_with(StatusCode::BAD_REQUEST)
     })?;
 
     let dir = &state.config.server.playbooks_dir;
     // Create dir if needed
     if let Err(e) = tokio::fs::create_dir_all(dir).await {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Failed to create playbooks dir: {e}")})),
-        ));
+        return Err(ApiError::new(
+            codes::IO_ERROR,
+            format!("Failed to create playbooks dir: {e}"),
+        )
+        .into_response_with(StatusCode::INTERNAL_SERVER_ERROR));
     }
 
     let file_path = format!("{dir}/{name}.md");
     tokio::fs::write(&file_path, &body).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Failed to write playbook: {e}")})),
-        )
+        ApiError::new(codes::IO_ERROR, format!("Failed to write playbook: {e}"))
+            .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
     })?;
 
     state
@@ -342,7 +335,7 @@ pub async fn delete_playbook(
     State(state): State<AppState>,
     Path(name): Path<String>,
     headers: HeaderMap,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     validate_playbook_name(&name)?;
     let source = source_from_headers(&headers);
     let req_id = request_id_from_headers(&headers);
@@ -350,15 +343,11 @@ pub async fn delete_playbook(
 
     tokio::fs::remove_file(&file_path).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": format!("Playbook '{name}' not found")})),
-            )
+            ApiError::new(codes::NOT_FOUND, format!("Playbook '{name}' not found"))
+                .into_response_with(StatusCode::NOT_FOUND)
         } else {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to delete playbook: {e}")})),
-            )
+            ApiError::new(codes::IO_ERROR, format!("Failed to delete playbook: {e}"))
+                .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
         }
     })?;
 

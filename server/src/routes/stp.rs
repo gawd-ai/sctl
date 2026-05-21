@@ -12,14 +12,17 @@ use axum::{
 };
 use serde_json::{json, Value};
 
+use crate::error::{codes, ApiError};
 use crate::gawdxfer::types::{InitDownload, InitUpload, TransferError};
 use crate::AppState;
+
+type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
 /// `POST /api/stp/download` — init a chunked download.
 pub async fn init_download(
     State(state): State<AppState>,
     Json(req): Json<InitDownload>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let result = state
         .transfer_manager
         .init_download(&req.path, req.chunk_size)
@@ -32,7 +35,7 @@ pub async fn init_download(
 pub async fn init_upload(
     State(state): State<AppState>,
     Json(req): Json<InitUpload>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let result = state
         .transfer_manager
         .init_upload(req)
@@ -45,7 +48,7 @@ pub async fn init_upload(
 pub async fn get_chunk(
     State(state): State<AppState>,
     AxumPath((xfer, idx)): AxumPath<(String, u32)>,
-) -> Result<Response, (StatusCode, Json<Value>)> {
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
     let (header, data) = state
         .transfer_manager
         .serve_chunk(&xfer, idx)
@@ -68,7 +71,7 @@ pub async fn post_chunk(
     AxumPath((xfer, idx)): AxumPath<(String, u32)>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let chunk_hash = headers
         .get("X-Gx-Chunk-Hash")
         .and_then(|v| v.to_str().ok())
@@ -76,10 +79,10 @@ pub async fn post_chunk(
         .to_string();
 
     if chunk_hash.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Missing X-Gx-Chunk-Hash header", "code": "INVALID_REQUEST"})),
-        ));
+        return Err(
+            ApiError::new(codes::INVALID_REQUEST, "Missing X-Gx-Chunk-Hash header")
+                .into_response_with(StatusCode::BAD_REQUEST),
+        );
     }
 
     let ack = state
@@ -94,7 +97,7 @@ pub async fn post_chunk(
 pub async fn resume_transfer(
     State(state): State<AppState>,
     AxumPath(xfer): AxumPath<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let result = state
         .transfer_manager
         .resume(&xfer)
@@ -107,7 +110,7 @@ pub async fn resume_transfer(
 pub async fn transfer_status(
     State(state): State<AppState>,
     AxumPath(xfer): AxumPath<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let result = state
         .transfer_manager
         .status(&xfer)
@@ -117,9 +120,7 @@ pub async fn transfer_status(
 }
 
 /// `GET /api/stp/transfers` — list all transfers.
-pub async fn list_transfers(
-    State(state): State<AppState>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn list_transfers(State(state): State<AppState>) -> ApiResult<Value> {
     let result = state.transfer_manager.list().await;
     Ok(Json(serde_json::to_value(&result).unwrap()))
 }
@@ -128,7 +129,7 @@ pub async fn list_transfers(
 pub async fn abort_transfer(
     State(state): State<AppState>,
     AxumPath(xfer): AxumPath<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     state
         .transfer_manager
         .abort(&xfer, "client abort")
@@ -138,8 +139,12 @@ pub async fn abort_transfer(
 }
 
 /// Convert a gawdxfer `TransferError` to an HTTP error response.
+///
+/// Transfer-specific detail (transfer_id, recoverable flag) lands in
+/// `ApiError.detail` so the wire format stays unified with the rest of
+/// the REST surface while keeping the gawdxfer-specific context.
 #[allow(clippy::needless_pass_by_value)]
-fn transfer_error_to_http(e: TransferError) -> (StatusCode, Json<Value>) {
+fn transfer_error_to_http(e: TransferError) -> (StatusCode, Json<ApiError>) {
     let status = match e.code.as_str() {
         "FILE_NOT_FOUND" | "TRANSFER_NOT_FOUND" => StatusCode::NOT_FOUND,
         "PERMISSION_DENIED" => StatusCode::FORBIDDEN,
@@ -149,13 +154,10 @@ fn transfer_error_to_http(e: TransferError) -> (StatusCode, Json<Value>) {
         "MAX_TRANSFERS" => StatusCode::TOO_MANY_REQUESTS,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    (
-        status,
-        Json(json!({
-            "error": e.message,
-            "code": e.code,
+    ApiError::new(e.code, e.message)
+        .with_detail(json!({
             "transfer_id": e.transfer_id,
             "recoverable": e.recoverable,
-        })),
-    )
+        }))
+        .into_response_with(status)
 }

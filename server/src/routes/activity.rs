@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::activity::{ActivitySource, ActivityType};
+use crate::error::{codes, ApiError};
 use crate::AppState;
 
 /// Query parameters for `GET /api/activity`.
@@ -68,15 +69,12 @@ pub async fn get_activity(
 pub async fn get_exec_result(
     State(state): State<AppState>,
     Path(id): Path<u64>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     match state.exec_results_cache.get(id).await {
         Some(result) => Ok(Json(json!(result))),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": "Exec result not found or evicted",
-                "code": "NOT_FOUND",
-            })),
-        )),
+        None => Err(
+            ApiError::new(codes::NOT_FOUND, "Exec result not found or evicted")
+                .into_response_with(StatusCode::NOT_FOUND),
+        ),
     }
 }

@@ -40,6 +40,7 @@ pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ".", env!("SCTL_BUI
 pub mod activity;
 pub mod auth;
 pub mod config;
+pub mod error;
 pub mod gawdxfer;
 pub mod gps;
 pub mod infra;

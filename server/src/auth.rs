@@ -9,9 +9,9 @@ use axum::{
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
 };
-use serde_json::json;
+
+use crate::error::{codes, ApiError};
 
 /// Axum middleware that rejects requests without a valid `Authorization: Bearer`
 /// header. The expected key is injected via the [`ApiKey`] extension.
@@ -25,10 +25,8 @@ pub async fn require_api_key(request: Request, next: Next) -> Response {
     let api_key = match request.extensions().get::<ApiKey>() {
         Some(key) => key.0.clone(),
         None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "Server configuration error"})),
-            )
+            return ApiError::new("SERVER_CONFIG_ERROR", "Server configuration error")
+                .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
                 .into_response();
         }
     };
@@ -41,19 +39,18 @@ pub async fn require_api_key(request: Request, next: Next) -> Response {
     let provided = match auth_header {
         Some(h) if h.starts_with("Bearer ") => &h[7..],
         _ => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "Missing or invalid Authorization header"})),
+            return ApiError::new(
+                codes::AUTH_MISSING_TOKEN,
+                "Missing or invalid Authorization header",
             )
-                .into_response();
+            .into_response_with(StatusCode::UNAUTHORIZED)
+            .into_response();
         }
     };
 
     if !constant_time_eq(api_key.as_bytes(), provided.as_bytes()) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({"error": "Invalid API key"})),
-        )
+        return ApiError::new(codes::AUTH_INVALID_TOKEN, "Invalid API key")
+            .into_response_with(StatusCode::FORBIDDEN)
             .into_response();
     }
 

@@ -14,7 +14,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::activity::{self, request_id_from_headers, ActivityType};
+use crate::error::{codes, ApiError};
 use crate::AppState;
+
+type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
 /// `GET /api/sessions` — list all active sessions (same shape as WS `session.listed`).
 pub async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
@@ -69,7 +72,7 @@ pub async fn signal_session(
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(payload): Json<SignalRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let source = activity::source_from_headers(&headers);
     let req_id = request_id_from_headers(&headers);
 
@@ -78,10 +81,7 @@ pub async fn signal_session(
         .signal_session(&id, payload.signal)
         .await
         .map_err(|e| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": e, "code": "SESSION_NOT_FOUND"})),
-            )
+            ApiError::new(codes::SESSION_NOT_FOUND, e).into_response_with(StatusCode::NOT_FOUND)
         })?;
 
     state
@@ -109,16 +109,16 @@ pub async fn kill_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let source = activity::source_from_headers(&headers);
     let req_id = request_id_from_headers(&headers);
 
     let found = state.session_manager.kill_session(&id).await;
     if !found {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("Session {id} not found"), "code": "SESSION_NOT_FOUND"})),
-        ));
+        return Err(
+            ApiError::new(codes::SESSION_NOT_FOUND, format!("Session {id} not found"))
+                .into_response_with(StatusCode::NOT_FOUND),
+        );
     }
 
     let _ = state.session_events.send(json!({
@@ -160,7 +160,7 @@ pub async fn patch_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(patch): Json<SessionPatch>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     // Rename
     if let Some(ref name) = patch.name {
         state
@@ -168,10 +168,7 @@ pub async fn patch_session(
             .rename_session(&id, name)
             .await
             .map_err(|e| {
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({"error": e, "code": "SESSION_NOT_FOUND"})),
-                )
+                ApiError::new(codes::SESSION_NOT_FOUND, e).into_response_with(StatusCode::NOT_FOUND)
             })?;
         let _ = state.session_events.send(json!({
             "type": "session.renamed",
@@ -187,10 +184,7 @@ pub async fn patch_session(
             .set_user_allows_ai(&id, allowed)
             .await
             .map_err(|e| {
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({"error": e, "code": "SESSION_NOT_FOUND"})),
-                )
+                ApiError::new(codes::SESSION_NOT_FOUND, e).into_response_with(StatusCode::NOT_FOUND)
             })?;
         let _ = state.session_events.send(json!({
             "type": "session.ai_permission_changed",
@@ -218,10 +212,7 @@ pub async fn patch_session(
             )
             .await
             .map_err(|e| {
-                (
-                    StatusCode::CONFLICT,
-                    Json(json!({"error": e, "code": "AI_NOT_ALLOWED"})),
-                )
+                ApiError::new(codes::AI_NOT_ALLOWED, e).into_response_with(StatusCode::CONFLICT)
             })?;
         let mut broadcast = json!({
             "type": "session.ai_status_changed",
