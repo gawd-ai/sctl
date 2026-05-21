@@ -4,3 +4,16 @@
 # back to "0.4.0.0".
 [build.env]
 passthrough = ["SCTL_BUILD_NUMBER"]
+
+# Pin newer images so the container's glibc matches host rustc (1.95+).
+# cross 0.2.5's stock :main images are Debian 11 (glibc 2.31) and reject
+# host-compiled build scripts that need 2.32+. The :edge tag tracks the
+# main branch and bumps to current-base images on every push.
+[target.riscv64gc-unknown-linux-musl]
+image = "ghcr.io/cross-rs/riscv64gc-unknown-linux-musl:edge"
+
+[target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:edge"
+
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:edge"
