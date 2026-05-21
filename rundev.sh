@@ -590,6 +590,13 @@ do_build() {
     (cd "$SCTL_DIR" && cargo build --release -v 2>&1)
     ok "sctl built: $SCTL_BIN"
 
+    # Regenerate TypeScript bindings from Rust types so the web client cannot
+    # silently drift on wire shapes. Drives `#[cfg_attr(test, derive(ts_rs::TS))]`
+    # exporters; one .ts file per #[ts(export)] type into web/src/lib/types/generated/.
+    log "Regenerating TypeScript bindings (ts-rs)..."
+    (cd "$SCTL_DIR" && cargo test --quiet export_bindings 2>&1)
+    ok "TS bindings regenerated → web/src/lib/types/generated/"
+
     log "Building mcp-sctl (release)..."
     (cd "$MCP_DIR" && cargo build --release -v 2>&1)
     ok "mcp-sctl built: $MCP_BIN"

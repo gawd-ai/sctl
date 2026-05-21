@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 
 /// Transfer direction from the device's perspective.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export))]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
     Upload,
@@ -59,13 +61,17 @@ pub struct TransferProgress {
 // ─── Protocol Request/Response Messages ──────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export))]
 pub struct InitDownload {
     pub path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_size: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export))]
 pub struct InitDownloadResult {
     pub transfer_id: String,
     pub file_size: u64,
@@ -76,6 +82,8 @@ pub struct InitDownloadResult {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export))]
 pub struct InitUpload {
     pub path: String,
     pub filename: String,
@@ -85,11 +93,13 @@ pub struct InitUpload {
     pub file_hash: String,
     pub chunk_size: u32,
     pub total_chunks: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export))]
 pub struct InitUploadResult {
     pub transfer_id: String,
     pub chunk_size: u32,
@@ -97,6 +107,8 @@ pub struct InitUploadResult {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export))]
 pub struct ChunkHeader {
     pub transfer_id: String,
     pub chunk_index: u32,
@@ -104,15 +116,19 @@ pub struct ChunkHeader {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export))]
 pub struct ChunkAck {
     pub transfer_id: String,
     pub chunk_index: u32,
     pub ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export))]
 pub struct Progress {
     pub transfer_id: String,
     pub direction: Direction,
@@ -127,6 +143,8 @@ pub struct Progress {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export))]
 pub struct Complete {
     pub transfer_id: String,
     pub direction: Direction,
@@ -138,6 +156,8 @@ pub struct Complete {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export))]
 pub struct TransferError {
     pub transfer_id: String,
     pub code: String,
@@ -146,6 +166,8 @@ pub struct TransferError {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export))]
 #[allow(dead_code)]
 pub struct Abort {
     pub transfer_id: String,
@@ -153,12 +175,16 @@ pub struct Abort {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export))]
 #[allow(dead_code)]
 pub struct Resume {
     pub transfer_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export))]
 pub struct ResumeResult {
     pub transfer_id: String,
     pub direction: Direction,
@@ -170,6 +196,8 @@ pub struct ResumeResult {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export))]
 pub struct StatusResult {
     pub transfer_id: String,
     pub direction: Direction,
@@ -184,6 +212,8 @@ pub struct StatusResult {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export))]
 pub struct TransferSummary {
     pub transfer_id: String,
     pub direction: Direction,
@@ -196,6 +226,8 @@ pub struct TransferSummary {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export))]
 pub struct ListResult {
     pub transfers: Vec<TransferSummary>,
 }
