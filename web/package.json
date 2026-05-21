@@ -68,7 +68,7 @@
     "@testing-library/svelte": "^5.3.1",
     "flowbite-svelte": "^0.47.0",
     "flowbite-svelte-icons": "^2.0.0",
-    "gawdux": "github:gawd-ai/gawdux",
+    "gawdux": "github:gawd-ai/gawdux#56ef7fa",
     "jsdom": "^28.1.0",
     "publint": "^0.2.0",
     "svelte": "^5.0.0",
