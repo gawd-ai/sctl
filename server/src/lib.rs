@@ -1,6 +1,11 @@
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
+// Pedantic guard against any owned-return going unused. ~50 candidates
+// triggered when re-enabled; almost none represent real bug-bait
+// (every internal caller uses the return), so the annotation pressure
+// outweighs the diagnostic value. Re-enable when a real "ignored result"
+// bug shows up.
 #![allow(clippy::must_use_candidate)]
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
@@ -8,8 +13,12 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::unused_async)]
+// Suggests adding `S: BuildHasher` generics to functions taking HashMap
+// params. The four hits live in axum extractor signatures + shell helpers
+// where the public API is keyed on `HashMap<String, String>`; generalizing
+// would propagate the parameter through callers without any practical
+// benefit (no consumer uses an alternative hasher).
 #![allow(clippy::implicit_hasher)]
-#![allow(clippy::redundant_closure_for_method_calls)]
 
 //! sctl library — exposes core modules for use by downstream crates (e.g. netage-server).
 //!

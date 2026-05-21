@@ -259,7 +259,8 @@ pub async fn set_bands(
                 &config.enabled_bands,
                 config.priority_band,
                 rsrp,
-            );
+            )
+            .await;
         }
 
         return Ok(Json(json!({

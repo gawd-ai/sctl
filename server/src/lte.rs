@@ -228,9 +228,9 @@ impl LteState {
     }
 
     /// Load safe bands from `{data_dir}/safe_bands.json`. Silent on missing file.
-    pub fn load_safe_bands(&mut self, data_dir: &str) {
+    pub async fn load_safe_bands(&mut self, data_dir: &str) {
         let path = std::path::Path::new(data_dir).join("safe_bands.json");
-        match std::fs::read_to_string(&path) {
+        match tokio::fs::read_to_string(&path).await {
             Ok(contents) => match serde_json::from_str::<SafeBandConfig>(&contents) {
                 Ok(config) => {
                     info!(
@@ -238,7 +238,7 @@ impl LteState {
                         config
                             .bands
                             .iter()
-                            .map(|b| b.to_string())
+                            .map(ToString::to_string)
                             .collect::<Vec<_>>()
                             .join(",B"),
                         std::time::SystemTime::now()
@@ -257,7 +257,7 @@ impl LteState {
     }
 
     /// Persist current safe bands to `{data_dir}/safe_bands.json` (atomic: tmp + rename).
-    pub fn save_safe_bands(&self, data_dir: &str) {
+    pub async fn save_safe_bands(&self, data_dir: &str) {
         let Some(ref config) = self.safe_bands else {
             return;
         };
@@ -267,19 +267,19 @@ impl LteState {
             warn!("Failed to serialize safe bands");
             return;
         };
-        if let Err(e) = std::fs::write(&tmp, &json) {
+        if let Err(e) = tokio::fs::write(&tmp, &json).await {
             warn!("Failed to write safe_bands.json.tmp: {e}");
             return;
         }
-        if let Err(e) = std::fs::rename(&tmp, &path) {
+        if let Err(e) = tokio::fs::rename(&tmp, &path).await {
             warn!("Failed to rename safe_bands.json.tmp: {e}");
         }
     }
 
     /// Load persisted LTE data (scan results, band history) from `{data_dir}/lte_data.json`.
-    pub fn load_lte_data(&mut self, data_dir: &str) {
+    pub async fn load_lte_data(&mut self, data_dir: &str) {
         let path = std::path::Path::new(data_dir).join("lte_data.json");
-        match std::fs::read_to_string(&path) {
+        match tokio::fs::read_to_string(&path).await {
             Ok(contents) => match serde_json::from_str::<PersistedLteData>(&contents) {
                 Ok(data) => {
                     if let Some(scan) = data.scan_status {
@@ -305,7 +305,7 @@ impl LteState {
     }
 
     /// Persist scan results and band history to `{data_dir}/lte_data.json` (atomic: tmp + rename).
-    pub fn save_lte_data(&self, data_dir: &str) {
+    pub async fn save_lte_data(&self, data_dir: &str) {
         let data = PersistedLteData {
             scan_status: self.scan_status.clone(),
             band_history: self.band_history.values().cloned().collect(),
@@ -316,11 +316,11 @@ impl LteState {
             warn!("Failed to serialize LTE data");
             return;
         };
-        if let Err(e) = std::fs::write(&tmp, &json) {
+        if let Err(e) = tokio::fs::write(&tmp, &json).await {
             warn!("Failed to write lte_data.json.tmp: {e}");
             return;
         }
-        if let Err(e) = std::fs::rename(&tmp, &path) {
+        if let Err(e) = tokio::fs::rename(&tmp, &path).await {
             warn!("Failed to rename lte_data.json.tmp: {e}");
         }
     }
@@ -329,7 +329,7 @@ impl LteState {
     ///
     /// Signal quality gate: configs with RSRP below -110 dBm are "marginal" and
     /// won't overwrite an existing safe config that has better signal quality.
-    pub fn promote_safe_bands(
+    pub async fn promote_safe_bands(
         &mut self,
         data_dir: &str,
         bands: &[u16],
@@ -379,7 +379,7 @@ impl LteState {
             confirmed_at: now,
             signal_rsrp: rsrp,
         });
-        self.save_safe_bands(data_dir);
+        self.save_safe_bands(data_dir).await;
     }
 
     /// Record a band change. Only `User` source saves `pre_change_bands` and
@@ -408,12 +408,12 @@ impl LteState {
                 "Recorded user band change: B{} → B{}",
                 current_bands
                     .iter()
-                    .map(|b| b.to_string())
+                    .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(",B"),
                 new_bands
                     .iter()
-                    .map(|b| b.to_string())
+                    .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(",B"),
             );
@@ -440,9 +440,9 @@ pub struct SimState {
 }
 
 /// Load SIM state from `{data_dir}/sim_state.json`. Returns `None` on missing file.
-fn load_sim_state(data_dir: &str) -> Option<SimState> {
+async fn load_sim_state(data_dir: &str) -> Option<SimState> {
     let path = std::path::Path::new(data_dir).join("sim_state.json");
-    match std::fs::read_to_string(&path) {
+    match tokio::fs::read_to_string(&path).await {
         Ok(contents) => match serde_json::from_str::<SimState>(&contents) {
             Ok(state) => Some(state),
             Err(e) => {
@@ -459,31 +459,30 @@ fn load_sim_state(data_dir: &str) -> Option<SimState> {
 }
 
 /// Persist SIM state to `{data_dir}/sim_state.json` (atomic: tmp + rename).
-fn save_sim_state(data_dir: &str, state: &SimState) {
+async fn save_sim_state(data_dir: &str, state: &SimState) {
     let path = std::path::Path::new(data_dir).join("sim_state.json");
     let tmp = path.with_extension("json.tmp");
     let Ok(json) = serde_json::to_string_pretty(state) else {
         warn!("Failed to serialize SIM state");
         return;
     };
-    if let Err(e) = std::fs::write(&tmp, &json) {
+    if let Err(e) = tokio::fs::write(&tmp, &json).await {
         warn!("Failed to write sim_state.json.tmp: {e}");
         return;
     }
-    if let Err(e) = std::fs::rename(&tmp, &path) {
+    if let Err(e) = tokio::fs::rename(&tmp, &path).await {
         warn!("Failed to rename sim_state.json.tmp: {e}");
     }
 }
 
 /// Delete SIM-specific persisted data on SIM change.
-fn clear_sim_data(data_dir: &str) {
+async fn clear_sim_data(data_dir: &str) {
     for name in ["safe_bands.json", "lte_data.json"] {
         let path = std::path::Path::new(data_dir).join(name);
-        if path.exists() {
-            match std::fs::remove_file(&path) {
-                Ok(()) => info!("SIM change: removed {name}"),
-                Err(e) => warn!("SIM change: failed to remove {name}: {e}"),
-            }
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => info!("SIM change: removed {name}"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("SIM change: failed to remove {name}: {e}"),
         }
     }
 }
@@ -703,7 +702,7 @@ pub async fn detect_sim_change(
         .unwrap_or_default()
         .as_secs();
 
-    let previous = load_sim_state(data_dir);
+    let previous = load_sim_state(data_dir).await;
     let sim_changed = matches!(&previous, Some(prev) if prev.iccid != iccid);
 
     if sim_changed {
@@ -714,7 +713,7 @@ pub async fn detect_sim_change(
         );
 
         // 1. Clear persisted SIM-specific data
-        clear_sim_data(data_dir);
+        clear_sim_data(data_dir).await;
 
         // 2. Clear in-memory state
         {
@@ -793,7 +792,7 @@ pub async fn detect_sim_change(
             .map_or(now, |p| if sim_changed { now } else { p.first_seen }),
         last_seen: now,
     };
-    save_sim_state(data_dir, &new_state);
+    save_sim_state(data_dir, &new_state).await;
 
     sim_changed
 }
@@ -1609,7 +1608,7 @@ pub fn spawn_band_scan(
                 scan.current_band = None;
                 scan.results = results;
             }
-            state.save_lte_data(&data_dir);
+            state.save_lte_data(&data_dir).await;
         }
 
         info!("Band scan finished");
@@ -2201,16 +2200,15 @@ impl AtPollingHealth {
 }
 
 /// Append one structured modem-state line to `modem-state.log`. Reuses the
-/// `watchdog_history.jsonl` rolling-file pattern (rotate at 5 MB → `.1`,
-/// best-effort, log on error). Hooks into the poller's existing modem reads
-/// — no new AT polling (see `feedback_no_modem_polling_on_bpi`).
+/// shared `util::append_rotating` helper (5 MB → `.log.1`, async tokio::fs,
+/// best-effort logging on error). Hooks into the poller's existing modem
+/// reads — no new AT polling (see `feedback_no_modem_polling_on_bpi`).
 ///
 /// On OpenWrt: writes to `/root/log/modem-state.log` so it survives reboots
 /// alongside the rotated system log. Elsewhere: writes inside `data_dir`.
 ///
 /// Format: `<ts_unix> <iso8601> | rsrp=… sinr=… rssi=… band=… op=… conn=… tech=… tunnel=…`
-fn append_modem_state_line(data_dir: &str, signal: &LteSignal, tunnel_connected: bool) {
-    use std::io::Write;
+async fn append_modem_state_line(data_dir: &str, signal: &LteSignal, tunnel_connected: bool) {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let unix_secs = SystemTime::now()
@@ -2223,16 +2221,6 @@ fn append_modem_state_line(data_dir: &str, signal: &LteSignal, tunnel_connected:
     } else {
         std::path::Path::new(data_dir).join("modem-state.log")
     };
-
-    // Rotate at 5 MB — matches watchdog_history.jsonl.
-    let mut rotated = false;
-    if let Ok(meta) = std::fs::metadata(&path) {
-        if meta.len() > 5 * 1024 * 1024 {
-            let rotated_path = path.with_extension("log.1");
-            let _ = std::fs::rename(&path, &rotated_path);
-            rotated = true;
-        }
-    }
 
     let line = format!(
         "{unix_secs} {iso} | rsrp={rsrp} sinr={sinr} rssi={rssi} band={band} op={op} conn={conn} tech={tech} tunnel={tunnel}\n",
@@ -2247,20 +2235,10 @@ fn append_modem_state_line(data_dir: &str, signal: &LteSignal, tunnel_connected:
         tunnel = tunnel_connected,
     );
 
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        Ok(mut f) => {
-            if let Err(e) = f.write_all(line.as_bytes()) {
-                warn!("modem-state.log append failed: {e}");
-            }
-        }
-        Err(e) => warn!("modem-state.log open ({}) failed: {e}", path.display()),
-    }
-    if rotated {
-        info!("modem-state.log rotated (>5MB) → .log.1");
+    match crate::util::append_rotating(&path, &line, 5 * 1024 * 1024).await {
+        Ok(true) => info!("modem-state.log rotated (>5MB) → .log.1"),
+        Ok(false) => {}
+        Err(e) => warn!("modem-state.log append ({}) failed: {e}", path.display()),
     }
 }
 
@@ -2708,7 +2686,8 @@ pub fn spawn_lte_poller(
                 &data_dir,
                 &signal,
                 tunnel_stats.connected.load(Ordering::Relaxed),
-            );
+            )
+            .await;
 
             let _ = session_events.send(serde_json::json!({
                 "type": "lte.signal",
@@ -2741,7 +2720,7 @@ pub fn spawn_lte_poller(
                 polls_since_save += 1;
                 if polls_since_save >= 10 {
                     polls_since_save = 0;
-                    state.save_lte_data(&data_dir);
+                    state.save_lte_data(&data_dir).await;
                 }
             }
 

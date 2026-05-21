@@ -322,16 +322,18 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     });
 
     // LTE state (only when [lte] config is present)
-    let lte_state = config.lte.as_ref().map(|lc| {
+    let lte_state = if let Some(lc) = config.lte.as_ref() {
         info!(
             "LTE monitoring enabled (poll: {}s, hint: {:?})",
             lc.poll_interval_secs, lc.device
         );
         let mut ls = lte::LteState::new();
-        ls.load_safe_bands(&data_dir);
-        ls.load_lte_data(&data_dir);
-        Arc::new(tokio::sync::Mutex::new(ls))
-    });
+        ls.load_safe_bands(&data_dir).await;
+        ls.load_lte_data(&data_dir).await;
+        Some(Arc::new(tokio::sync::Mutex::new(ls)))
+    } else {
+        None
+    };
 
     // Tunnel event persistence: load previous events from disk
     let events_path = std::path::Path::new(&data_dir).join("tunnel_events.json");

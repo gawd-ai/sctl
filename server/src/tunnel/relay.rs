@@ -764,7 +764,11 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
     let (device_tx, mut device_rx) = mpsc::channel::<TunnelMessage>(256);
     // Priority channel for ping/pong — bypasses the main device_tx queue so
     // control messages aren't delayed behind request bursts from sctlin/MCP.
-    let (priority_tx, mut priority_rx) = mpsc::channel::<TunnelMessage>(8);
+    // Sized to comfortably hold a burst of control frames during high-traffic
+    // moments without dropping; we warn at 75% fill so any future regression
+    // in upstream cadence surfaces in logs instead of silently dropping pings.
+    let priority_capacity: usize = 32;
+    let (priority_tx, mut priority_rx) = mpsc::channel::<TunnelMessage>(priority_capacity);
 
     // Wait for the registration message which contains the api_key
     let Some(Ok(axum::extract::ws::Message::Text(text))) = ws_stream.next().await else {
@@ -966,6 +970,14 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                         }
                     }
 
+                    let depth = priority_capacity - ping_tx.capacity();
+                    if depth * 4 >= priority_capacity * 3 {
+                        warn!(
+                            serial = %ping_serial,
+                            depth, capacity = priority_capacity,
+                            "Relay priority queue ≥75% full — control frames at risk"
+                        );
+                    }
                     if ping_tx.send(TunnelMessage::Text(json!({"type": "tunnel.ping"}))).await.is_err() {
                         info!(serial = %ping_serial, "Relay ping: device_tx closed, exiting");
                         break;
@@ -1082,6 +1094,14 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                         pong_count.fetch_add(1, Ordering::Relaxed);
                         // Send pong via priority channel — bypasses request queue
                         // so device receives it promptly.
+                        let depth = priority_capacity - priority_tx.capacity();
+                        if depth * 4 >= priority_capacity * 3 {
+                            warn!(
+                                serial = %serial,
+                                depth, capacity = priority_capacity,
+                                "Relay priority queue ≥75% full — control frames at risk"
+                            );
+                        }
                         match priority_tx
                             .try_send(TunnelMessage::Text(json!({"type": "tunnel.pong"})))
                         {

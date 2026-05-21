@@ -799,7 +799,8 @@ pub fn spawn_lte_watchdog(
                                         current_bands,
                                         priority,
                                         rsrp,
-                                    );
+                                    )
+                                    .await;
                                 }
                             }
                             lte.band_stable_since = None;
@@ -1518,7 +1519,6 @@ async fn record_history_and_detect_regression(
     detail: &str,
     session_events: &broadcast::Sender<Value>,
 ) {
-    use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let ts = SystemTime::now()
@@ -1534,35 +1534,18 @@ async fn record_history_and_detect_regression(
         "detail": detail,
     });
 
-    // Append + rotate at 5 MB.
+    // Append + rotate at 5 MB via the shared async helper.
     let line = format!("{entry}\n");
-    let mut rotated = false;
-    if let Ok(meta) = std::fs::metadata(&path) {
-        if meta.len() > 5 * 1024 * 1024 {
-            let rotated_path = path.with_extension("jsonl.1");
-            let _ = std::fs::rename(&path, &rotated_path);
-            rotated = true;
-        }
-    }
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        Ok(mut f) => {
-            if let Err(e) = f.write_all(line.as_bytes()) {
-                warn!("watchdog_history append failed: {e}");
-            }
-        }
-        Err(e) => warn!("watchdog_history open failed: {e}"),
-    }
-    if rotated {
-        info!("watchdog_history.jsonl rotated (>5MB) → .jsonl.1");
+    match crate::util::append_rotating(&path, &line, 5 * 1024 * 1024).await {
+        Ok(true) => info!("watchdog_history.jsonl rotated (>5MB) → .jsonl.1"),
+        Ok(false) => {}
+        Err(e) => warn!("watchdog_history append failed: {e}"),
     }
 
     // Regression detection — scan recent entries (cheap; file is bounded).
     let one_hour_ago = ts.saturating_sub(3600);
-    let count = std::fs::read_to_string(&path)
+    let count = tokio::fs::read_to_string(&path)
+        .await
         .unwrap_or_default()
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())

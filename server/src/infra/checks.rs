@@ -490,7 +490,7 @@ fn parse_ping_rtt(stdout: &str) -> Option<u64> {
 
 /// Get the first non-empty line of a string.
 fn first_line(s: &str) -> Option<&str> {
-    s.lines().find(|l| !l.trim().is_empty()).map(|l| l.trim())
+    s.lines().find(|l| !l.trim().is_empty()).map(str::trim)
 }
 
 /// Truncate a string to max chars (UTF-8 safe), appending "..." if truncated.
