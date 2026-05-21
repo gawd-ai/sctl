@@ -1,4 +1,6 @@
 @import 'tailwindcss';
+@import 'gawdux/styles/tokens.css';
+@import './lib/styles/theme.css';
 
 @font-face {
 	font-family: 'MesloLGS NF';

@@ -1,0 +1,58 @@
+/* sctlin "hacker terminal" theme — overrides gawdux CSS variables to match
+   sctlin's existing dark/neutral palette so gawdux primitives (FormField,
+   ListPageScaffold, PageFeedback, TableContainer, etc.) render with the
+   same terminal aesthetic as sctlin's native components.
+
+   sctlin runs in permanent dark mode (`<html class="dark">`), so the
+   `:root` and `.dark` blocks are intentionally identical — there's no
+   light/dark toggle to swap between. Variables are sourced from sctlin's
+   inline Tailwind palette catalog:
+     - panels:   neutral-800 (#262626)
+     - inputs:   neutral-700 (#404040)
+     - subtle:   neutral-900 (#171717)
+     - borders:  neutral-700 / neutral-600
+     - text:     neutral-200 (primary), -400 (muted), -500 (very muted)
+     - accents:  amber-400 (warn), cyan-400 (info), green-400 (ok),
+                 red-400 (error)
+
+   Import order in app.css matters: this file must come AFTER
+   gawdux/styles/tokens.css so its variable definitions cascade-replace
+   the gawdux defaults.
+
+   To preserve sctlin's vibe when adopting a new gawdux primitive, just
+   import the primitive — the CSS variable overrides do the rest. If a
+   primitive uses a hardcoded color (not yet variableized in gawdux), add
+   the missing variable to gawdux's tokens.css and reference it here. */
+
+:root,
+.dark {
+	/* Surfaces — sctlin's "carved-into-the-terminal" panels. */
+	--gawdux-surface: theme(colors.neutral.900);
+	--gawdux-surface-card: theme(colors.neutral.800);
+	--gawdux-surface-card-header: theme(colors.neutral.900);
+	--gawdux-surface-input: theme(colors.neutral.700);
+	--gawdux-surface-subtle: theme(colors.neutral.900);
+
+	/* Text — bright phosphor on dark surfaces. */
+	--gawdux-text-primary: theme(colors.neutral.200);
+	--gawdux-text-secondary: theme(colors.neutral.400);
+	--gawdux-text-muted: theme(colors.neutral.500);
+	--gawdux-text-heading: theme(colors.neutral.100);
+
+	/* Accents — amber for warn, cyan for info, green for ok, red for error. */
+	--gawdux-text-error: theme(colors.red.400);
+	--gawdux-text-success: theme(colors.green.400);
+	--gawdux-text-accent: theme(colors.cyan.400);
+
+	/* Borders — sctlin's panel separators (700 strong, 800 subtle with alpha). */
+	--gawdux-border: theme(colors.neutral.800);
+	--gawdux-border-input: theme(colors.neutral.700);
+	--gawdux-border-strong: theme(colors.neutral.600);
+
+	/* Focus ring — cyan keeps the terminal feel and shows clearly on dark. */
+	--gawdux-focus-ring: theme(colors.cyan.500);
+
+	/* Hover shadow — neutral-700 RGB so the existing
+	   `0 0 0 rgb(var(--gawdux-hover-shadow-rgb) / 0.X)` patterns still work. */
+	--gawdux-hover-shadow-rgb: 64 64 64;
+}
