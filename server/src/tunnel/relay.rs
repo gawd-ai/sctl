@@ -333,7 +333,7 @@ pub struct ConnectedDevice {
     /// Pending REST-over-WS requests awaiting responses, keyed by `request_id`.
     pub pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<TunnelResponse>>>>,
     /// Connected WS clients, keyed by `client_id`.
-    pub clients: Arc<RwLock<HashMap<String, mpsc::Sender<Value>>>>,
+    pub clients: Arc<RwLock<HashMap<String, mpsc::Sender<Arc<Value>>>>>,
     /// Session subscriptions: `session_id` -> set of `client_ids` watching output.
     pub session_subscriptions: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     /// Last heartbeat timestamp as ms since relay epoch (lock-free).
@@ -374,11 +374,11 @@ async fn drain_device(device: &ConnectedDevice, reason: &str) {
     // Notify all connected WS clients
     let clients = device.clients.read().await;
     if !clients.is_empty() {
-        let disconnect_msg = json!({
+        let disconnect_msg = Arc::new(json!({
             "type": "tunnel.device_disconnected",
             "serial": device.serial,
             "reason": reason,
-        });
+        }));
         for (_, client_tx) in clients.iter() {
             let _ = client_tx.try_send(disconnect_msg.clone());
         }
@@ -1035,10 +1035,10 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                             let clients_read = clients.read().await;
                             let count = client_ids.len();
                             if count == 1 {
-                                // Single-subscriber fast path: move instead of clone
+                                // Single-subscriber fast path: move into Arc instead of fanout-cloning
                                 if let Some(cid) = client_ids.iter().next() {
                                     if let Some(client_tx) = clients_read.get(cid) {
-                                        if client_tx.try_send(parsed).is_err() {
+                                        if client_tx.try_send(Arc::new(parsed)).is_err() {
                                             dropped_messages.fetch_add(1, Ordering::Relaxed);
                                             warn!(
                                                 serial = %serial,
@@ -1047,18 +1047,20 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                                                 "Dropped session output (backpressure)"
                                             );
                                             // Notify client about the gap so it can re-attach
-                                            let _ = client_tx.try_send(json!({
+                                            let _ = client_tx.try_send(Arc::new(json!({
                                                 "type": "session.gap",
                                                 "session_id": session_id_owned,
                                                 "reason": "backpressure",
-                                            }));
+                                            })));
                                         }
                                     }
                                 }
                             } else {
+                                // Multi-subscriber path: build the Arc once, fanout-clone the Arc
+                                let payload = Arc::new(parsed);
                                 for cid in client_ids {
                                     if let Some(client_tx) = clients_read.get(cid) {
-                                        if client_tx.try_send(parsed.clone()).is_err() {
+                                        if client_tx.try_send(payload.clone()).is_err() {
                                             dropped_messages.fetch_add(1, Ordering::Relaxed);
                                             warn!(
                                                 serial = %serial,
@@ -1066,11 +1068,11 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                                                 client_id = %cid,
                                                 "Dropped session output (backpressure)"
                                             );
-                                            let _ = client_tx.try_send(json!({
+                                            let _ = client_tx.try_send(Arc::new(json!({
                                                 "type": "session.gap",
                                                 "session_id": session_id_owned,
                                                 "reason": "backpressure",
-                                            }));
+                                            })));
                                         }
                                     }
                                 }
@@ -1146,7 +1148,7 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                                 if let Some(client_tx) = clients_read.get(client_id) {
                                     let mut response = parsed.clone();
                                     response["request_id"] = json!(original_rid);
-                                    let _ = client_tx.send(response).await;
+                                    let _ = client_tx.send(Arc::new(response)).await;
                                 }
                             } else {
                                 // REST proxy request — resolve the oneshot
@@ -1228,7 +1230,7 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                                 if let Some(client_tx) = clients_read.get(client_id) {
                                     let mut msg = parsed.clone();
                                     msg["request_id"] = json!(original_rid);
-                                    let _ = client_tx.send(msg).await;
+                                    let _ = client_tx.send(Arc::new(msg)).await;
                                 }
                                 continue;
                             }
@@ -1236,8 +1238,9 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
 
                         // No client tag — broadcast to all clients (backpressure-aware)
                         let clients_read = clients.read().await;
+                        let payload = Arc::new(parsed);
                         for (cid, client_tx) in clients_read.iter() {
-                            if client_tx.try_send(parsed.clone()).is_err() {
+                            if client_tx.try_send(payload.clone()).is_err() {
                                 dropped_messages.fetch_add(1, Ordering::Relaxed);
                                 warn!(
                                     serial = %serial,
@@ -1257,8 +1260,9 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                         // Update persistent snapshot
                         state.update_snapshot(&serial, msg_type, &parsed).await;
                         let clients_read = clients.read().await;
+                        let payload = Arc::new(parsed);
                         for (_, client_tx) in clients_read.iter() {
-                            if client_tx.try_send(parsed.clone()).is_err() {
+                            if client_tx.try_send(payload.clone()).is_err() {
                                 dropped_messages.fetch_add(1, Ordering::Relaxed);
                             }
                         }
@@ -2920,12 +2924,12 @@ async fn handle_client_ws(
     _state: RelayState,
     serial: String,
     device_tx: mpsc::Sender<TunnelMessage>,
-    clients: Arc<RwLock<HashMap<String, mpsc::Sender<Value>>>>,
+    clients: Arc<RwLock<HashMap<String, mpsc::Sender<Arc<Value>>>>>,
     session_subs: Arc<RwLock<HashMap<String, HashSet<String>>>>,
 ) {
     let (mut ws_sink, mut ws_stream) = socket.split();
     let client_id = uuid::Uuid::new_v4().to_string();
-    let (client_tx, mut client_rx) = mpsc::channel::<Value>(256);
+    let (client_tx, mut client_rx) = mpsc::channel::<Arc<Value>>(256);
 
     // Register this client
     clients.write().await.insert(client_id.clone(), client_tx);
@@ -2935,7 +2939,7 @@ async fn handle_client_ws(
     // Forward client_rx messages to WS sink
     let send_task = tokio::spawn(async move {
         while let Some(msg) = client_rx.recv().await {
-            let text = match serde_json::to_string(&msg) {
+            let text = match serde_json::to_string(msg.as_ref()) {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!("Client WS serialize failed: {e}");
