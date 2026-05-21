@@ -457,7 +457,9 @@ sctl can monitor GPS location and LTE signal quality from Quectel modems (tested
 
 ```toml
 [gps]
-device = "/dev/ttyUSB2"       # Serial device for AT commands
+# device is optional; sctl auto-detects the Quectel AT port via sysfs.
+# Override only if autodetect fails (non-Quectel modem).
+# device = "/dev/ttyUSB2"
 poll_interval_secs = 30       # Seconds between GPS polls
 history_size = 100             # Maximum fix history entries
 auto_enable = true             # Auto-enable GNSS engine on startup
@@ -479,7 +481,9 @@ MCP tool: `device_gps` returns the same data.
 
 ```toml
 [lte]
-device = "/dev/ttyUSB2"       # Serial device for AT commands
+# device is optional; sctl auto-detects the Quectel AT port via sysfs.
+# Override only if autodetect fails (non-Quectel modem).
+# device = "/dev/ttyUSB2"
 poll_interval_secs = 60       # Seconds between signal polls
 watchdog = true                # Auto-recovery when signal or tunnel drops
 interface = "wwan0"            # Network interface for IP checks

@@ -95,14 +95,18 @@ tunnel_proxy_timeout_secs = 60      # Relay mode: proxy request timeout
 
 # Optional — GPS location tracking via Quectel modem GNSS
 [gps]
-device = "/dev/ttyUSB2"             # Serial device for AT commands
+# device is optional; sctl auto-detects the Quectel AT port via sysfs.
+# Override only if autodetect fails (non-Quectel modem).
+# device = "/dev/ttyUSB2"
 poll_interval_secs = 30             # Seconds between GPS polls
 history_size = 100                  # Maximum fix history entries
 auto_enable = true                  # Auto-enable GNSS engine on startup
 
 # Optional — LTE signal monitoring via Quectel modem AT commands
 [lte]
-device = "/dev/ttyUSB2"             # Serial device for AT commands
+# device is optional; sctl auto-detects the Quectel AT port via sysfs.
+# Override only if autodetect fails (non-Quectel modem).
+# device = "/dev/ttyUSB2"
 poll_interval_secs = 60             # Seconds between signal polls
 ```
 

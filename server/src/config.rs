@@ -268,7 +268,7 @@ pub struct GpsConfig {
 ///
 /// ```toml
 /// [lte]
-/// device = "/dev/ttyUSB2"
+/// # device is optional. sctl auto-detects the Quectel AT port via sysfs.
 /// poll_interval_secs = 60
 /// watchdog = true
 /// interface = "wwan0"
