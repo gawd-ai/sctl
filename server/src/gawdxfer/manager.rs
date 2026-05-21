@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{info, warn};
@@ -447,10 +447,12 @@ impl TransferManager {
                         file_hash: t.spec.file_hash.clone(),
                         elapsed_ms,
                     };
-                    let _ = self.progress_tx.send(json!({
-                        "type": "gx.complete",
-                        "data": serde_json::to_value(&complete).unwrap_or_default(),
-                    }));
+                    let _ = self.progress_tx.send(
+                        crate::ws::messages::WsServerMsg::GxComplete {
+                            data: complete.clone(),
+                        }
+                        .to_value(),
+                    );
                     info!(
                         transfer_id = %transfer_id,
                         filename = %t.spec.filename,
@@ -713,10 +715,12 @@ impl TransferManager {
                 file_hash: t.spec.file_hash.clone(),
                 elapsed_ms,
             };
-            let _ = self.progress_tx.send(json!({
-                "type": "gx.complete",
-                "data": serde_json::to_value(&complete).unwrap_or_default(),
-            }));
+            let _ = self.progress_tx.send(
+                crate::ws::messages::WsServerMsg::GxComplete {
+                    data: complete.clone(),
+                }
+                .to_value(),
+            );
             info!(
                 transfer_id = %transfer_id,
                 filename = %t.spec.filename,
@@ -940,10 +944,9 @@ impl TransferManager {
     /// Emit a progress event through the broadcast channel.
     fn emit_progress(&self, transfer: &Transfer) {
         let progress = Self::progress_snapshot(transfer);
-        let _ = self.progress_tx.send(json!({
-            "type": "gx.progress",
-            "data": serde_json::to_value(&progress).unwrap_or_default(),
-        }));
+        let _ = self
+            .progress_tx
+            .send(crate::ws::messages::WsServerMsg::GxProgress { data: progress }.to_value());
     }
 }
 

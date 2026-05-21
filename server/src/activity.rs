@@ -19,11 +19,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::sync::{broadcast, RwLock};
 
 /// Types of activities tracked by the journal.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export))]
 #[serde(rename_all = "snake_case")]
 pub enum ActivityType {
     Exec,
@@ -47,6 +49,8 @@ pub enum ActivityType {
 
 /// Where the request originated.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export))]
 #[serde(rename_all = "snake_case")]
 pub enum ActivitySource {
     Mcp,
@@ -58,15 +62,18 @@ pub enum ActivitySource {
 
 /// A single activity journal entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export))]
 pub struct ActivityEntry {
     pub id: u64,
     pub timestamp: u64,
     pub activity_type: ActivityType,
     pub source: ActivitySource,
     pub summary: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(type = "unknown"))]
     pub detail: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
 }
 
@@ -156,10 +163,12 @@ impl ActivityLog {
         };
 
         // Broadcast before acquiring the write lock (non-blocking for readers)
-        let _ = self.broadcast_tx.send(json!({
-            "type": "activity.new",
-            "entry": &entry,
-        }));
+        let _ = self.broadcast_tx.send(
+            crate::ws::messages::WsServerMsg::ActivityNew {
+                entry: entry.clone(),
+            }
+            .to_value(),
+        );
 
         let mut entries = self.entries.write().await;
         if entries.len() >= self.max_entries {

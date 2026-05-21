@@ -44,4 +44,4 @@ strip = true
 panic = "abort"
 
 [dev-dependencies]
-ts-rs = "^12"
+ts-rs = { version = "^12", features = ["serde-json-impl"] }

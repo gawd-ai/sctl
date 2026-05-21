@@ -46,6 +46,8 @@
 //! | `shell.listed`       | `shells[]`, `default_shell`           |
 //! | `error`              | `code`, `message`, `session_id?`      |
 
+pub mod messages;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -58,6 +60,8 @@ use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
+
+use messages::WsServerMsg;
 use tracing::{error, info};
 
 use crate::activity::{ActivitySource, ActivityType};
@@ -91,17 +95,27 @@ pub async fn ws_upgrade(
 
 /// Convert an [`OutputEntry`] to a WebSocket JSON message.
 fn entry_to_ws_message(session_id: &str, entry: &OutputEntry) -> Value {
-    match entry.stream {
-        OutputStream::Stdout | OutputStream::Stderr | OutputStream::System => {
-            json!({
-                "type": format!("session.{}", entry.stream.as_str()),
-                "session_id": session_id,
-                "data": entry.data,
-                "seq": entry.seq,
-                "timestamp_ms": entry.timestamp_ms,
-            })
-        }
-    }
+    let msg = match entry.stream {
+        OutputStream::Stdout => WsServerMsg::SessionStdout {
+            session_id: session_id.to_string(),
+            data: entry.data.clone(),
+            seq: entry.seq,
+            timestamp_ms: entry.timestamp_ms,
+        },
+        OutputStream::Stderr => WsServerMsg::SessionStderr {
+            session_id: session_id.to_string(),
+            data: entry.data.clone(),
+            seq: entry.seq,
+            timestamp_ms: entry.timestamp_ms,
+        },
+        OutputStream::System => WsServerMsg::SessionSystem {
+            session_id: session_id.to_string(),
+            data: entry.data.clone(),
+            seq: entry.seq,
+            timestamp_ms: entry.timestamp_ms,
+        },
+    };
+    msg.to_value()
 }
 
 /// Background task that reads from a session's [`OutputBuffer`] and forwards
@@ -202,11 +216,12 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                     axum::extract::ws::Message::Text(text) => {
                         let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
                             let _ = tx
-                                .send(json!({
-                                    "type": "error",
-                                    "code": "INVALID_JSON",
-                                    "message": "Failed to parse JSON message"
-                                }))
+                                .send(WsServerMsg::Error {
+                                    code: "INVALID_JSON".into(),
+                                    message: "Failed to parse JSON message".into(),
+                                    session_id: None,
+                                    request_id: None,
+                                }.to_value())
                                 .await;
                             continue;
                         };
@@ -216,11 +231,9 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
 
                         match msg_type {
                             "ping" => {
-                                let mut resp = json!({"type": "pong"});
-                                if let Some(ref rid) = request_id {
-                                    resp["request_id"] = json!(rid);
-                                }
-                                let _ = tx.send(resp).await;
+                                let _ = tx.send(WsServerMsg::Pong {
+                                    request_id: request_id.clone(),
+                                }.to_value()).await;
                             }
                             "session.start" => {
                                 let working_dir = parsed["working_dir"].as_str().map(ToString::to_string);
@@ -280,15 +293,12 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                                 let session_id = parsed["session_id"].as_str().unwrap_or("");
                                 let command = parsed["command"].as_str().unwrap_or("");
                                 if session_id.is_empty() || command.is_empty() {
-                                    let mut resp = json!({
-                                        "type": "error",
-                                        "code": "MISSING_FIELD",
-                                        "message": "session_id and command are required"
-                                    });
-                                    if let Some(ref rid) = request_id {
-                                        resp["request_id"] = json!(rid);
-                                    }
-                                    let _ = tx.send(resp).await;
+                                    let _ = tx.send(WsServerMsg::Error {
+                                        code: "MISSING_FIELD".into(),
+                                        message: "session_id and command are required".into(),
+                                        session_id: None,
+                                        request_id: request_id.clone(),
+                                    }.to_value()).await;
                                     continue;
                                 }
                                 state.session_manager.touch_ai_activity(session_id).await;
@@ -315,11 +325,10 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                                     handle_session_kill(&state, &tx, session_id, request_id.as_deref())
                                         .await;
                                     // Broadcast session.destroyed to all clients
-                                    let _ = state.session_events.send(json!({
-                                        "type": "session.destroyed",
-                                        "session_id": session_id,
-                                        "reason": "killed",
-                                    }));
+                                    let _ = state.session_events.send(WsServerMsg::SessionDestroyed {
+                                        session_id: session_id.to_string(),
+                                        reason: "killed".into(),
+                                    }.to_value());
                                     connection_sessions.retain(|id| id != session_id);
                                     // Abort the subscriber task
                                     if let Some(task) = subscriber_tasks.remove(session_id) {
@@ -331,15 +340,12 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                                 let session_id = parsed["session_id"].as_str().unwrap_or("");
                                 let signal = parsed["signal"].as_i64().unwrap_or(0);
                                 if session_id.is_empty() || signal == 0 {
-                                    let mut resp = json!({
-                                        "type": "error",
-                                        "code": "MISSING_FIELD",
-                                        "message": "session_id and signal are required"
-                                    });
-                                    if let Some(ref rid) = request_id {
-                                        resp["request_id"] = json!(rid);
-                                    }
-                                    let _ = tx.send(resp).await;
+                                    let _ = tx.send(WsServerMsg::Error {
+                                        code: "MISSING_FIELD".into(),
+                                        message: "session_id and signal are required".into(),
+                                        session_id: None,
+                                        request_id: request_id.clone(),
+                                    }.to_value()).await;
                                     continue;
                                 }
                                 #[allow(clippy::cast_possible_truncation)]
@@ -357,15 +363,12 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                                 let session_id = parsed["session_id"].as_str().unwrap_or("");
                                 let since = parsed["since"].as_u64().unwrap_or(0);
                                 if session_id.is_empty() {
-                                    let mut resp = json!({
-                                        "type": "error",
-                                        "code": "MISSING_FIELD",
-                                        "message": "session_id is required"
-                                    });
-                                    if let Some(ref rid) = request_id {
-                                        resp["request_id"] = json!(rid);
-                                    }
-                                    let _ = tx.send(resp).await;
+                                    let _ = tx.send(WsServerMsg::Error {
+                                        code: "MISSING_FIELD".into(),
+                                        message: "session_id is required".into(),
+                                        session_id: None,
+                                        request_id: request_id.clone(),
+                                    }.to_value()).await;
                                     continue;
                                 }
                                 handle_session_attach(
@@ -412,14 +415,10 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                                         obj
                                     })
                                     .collect();
-                                let mut resp = json!({
-                                    "type": "session.listed",
-                                    "sessions": sessions_json,
-                                });
-                                if let Some(ref rid) = request_id {
-                                    resp["request_id"] = json!(rid);
-                                }
-                                let _ = tx.send(resp).await;
+                                let _ = tx.send(WsServerMsg::SessionListed {
+                                    sessions: sessions_json,
+                                    request_id: request_id.clone(),
+                                }.to_value()).await;
                             }
                             "session.resize" => {
                                 let session_id = parsed["session_id"].as_str().unwrap_or("");
@@ -428,15 +427,12 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                                 #[allow(clippy::cast_possible_truncation)]
                                 let cols = parsed["cols"].as_u64().unwrap_or(0) as u16;
                                 if session_id.is_empty() || rows == 0 || cols == 0 {
-                                    let mut resp = json!({
-                                        "type": "error",
-                                        "code": "MISSING_FIELD",
-                                        "message": "session_id, rows, and cols are required"
-                                    });
-                                    if let Some(ref rid) = request_id {
-                                        resp["request_id"] = json!(rid);
-                                    }
-                                    let _ = tx.send(resp).await;
+                                    let _ = tx.send(WsServerMsg::Error {
+                                        code: "MISSING_FIELD".into(),
+                                        message: "session_id, rows, and cols are required".into(),
+                                        session_id: None,
+                                        request_id: request_id.clone(),
+                                    }.to_value()).await;
                                     continue;
                                 }
                                 handle_session_resize(
@@ -453,55 +449,44 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                                 let session_id = parsed["session_id"].as_str().unwrap_or("");
                                 let allowed = parsed["allowed"].as_bool();
                                 if session_id.is_empty() || allowed.is_none() {
-                                    let mut resp = json!({
-                                        "type": "error",
-                                        "code": "MISSING_FIELD",
-                                        "message": "session_id and allowed (bool) are required"
-                                    });
-                                    if let Some(ref rid) = request_id {
-                                        resp["request_id"] = json!(rid);
-                                    }
-                                    let _ = tx.send(resp).await;
+                                    let _ = tx.send(WsServerMsg::Error {
+                                        code: "MISSING_FIELD".into(),
+                                        message: "session_id and allowed (bool) are required".into(),
+                                        session_id: None,
+                                        request_id: request_id.clone(),
+                                    }.to_value()).await;
                                     continue;
                                 }
                                 let allowed = allowed.unwrap();
                                 match state.session_manager.set_user_allows_ai(session_id, allowed).await {
                                     Ok(ai_cleared) => {
-                                        let mut resp = json!({
-                                            "type": "session.allow_ai.ack",
-                                            "session_id": session_id,
-                                            "allowed": allowed,
-                                        });
-                                        if let Some(ref rid) = request_id {
-                                            resp["request_id"] = json!(rid);
-                                        }
-                                        let _ = tx.send(resp).await;
+                                        let _ = tx.send(WsServerMsg::SessionAllowAiAck {
+                                            session_id: session_id.to_string(),
+                                            allowed,
+                                            request_id: request_id.clone(),
+                                        }.to_value()).await;
                                         // Broadcast permission change
-                                        let _ = state.session_events.send(json!({
-                                            "type": "session.ai_permission_changed",
-                                            "session_id": session_id,
-                                            "allowed": allowed,
-                                        }));
+                                        let _ = state.session_events.send(WsServerMsg::SessionAiPermissionChanged {
+                                            session_id: session_id.to_string(),
+                                            allowed,
+                                        }.to_value());
                                         // If AI state was cleared, also broadcast status change
                                         if ai_cleared {
-                                            let _ = state.session_events.send(json!({
-                                                "type": "session.ai_status_changed",
-                                                "session_id": session_id,
-                                                "working": false,
-                                            }));
+                                            let _ = state.session_events.send(WsServerMsg::SessionAiStatusChanged {
+                                                session_id: session_id.to_string(),
+                                                working: false,
+                                                activity: None,
+                                                message: None,
+                                            }.to_value());
                                         }
                                     }
                                     Err(e) => {
-                                        let mut resp = json!({
-                                            "type": "error",
-                                            "code": "SESSION_NOT_FOUND",
-                                            "session_id": session_id,
-                                            "message": e,
-                                        });
-                                        if let Some(ref rid) = request_id {
-                                            resp["request_id"] = json!(rid);
-                                        }
-                                        let _ = tx.send(resp).await;
+                                        let _ = tx.send(WsServerMsg::Error {
+                                            code: "SESSION_NOT_FOUND".into(),
+                                            message: e,
+                                            session_id: Some(session_id.to_string()),
+                                            request_id: request_id.clone(),
+                                        }.to_value()).await;
                                     }
                                 }
                             }
@@ -509,15 +494,12 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                                 let session_id = parsed["session_id"].as_str().unwrap_or("");
                                 let working = parsed["working"].as_bool();
                                 if session_id.is_empty() || working.is_none() {
-                                    let mut resp = json!({
-                                        "type": "error",
-                                        "code": "MISSING_FIELD",
-                                        "message": "session_id and working (bool) are required"
-                                    });
-                                    if let Some(ref rid) = request_id {
-                                        resp["request_id"] = json!(rid);
-                                    }
-                                    let _ = tx.send(resp).await;
+                                    let _ = tx.send(WsServerMsg::Error {
+                                        code: "MISSING_FIELD".into(),
+                                        message: "session_id and working (bool) are required".into(),
+                                        session_id: None,
+                                        request_id: request_id.clone(),
+                                    }.to_value()).await;
                                     continue;
                                 }
                                 let working = working.unwrap();
@@ -525,46 +507,30 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                                 let message = parsed["message"].as_str();
                                 match state.session_manager.set_ai_status(session_id, working, activity, message).await {
                                     Ok(()) => {
-                                        let mut resp = json!({
-                                            "type": "session.ai_status.ack",
-                                            "session_id": session_id,
-                                            "working": working,
-                                        });
-                                        if let Some(a) = activity {
-                                            resp["activity"] = json!(a);
-                                        }
-                                        if let Some(m) = message {
-                                            resp["message"] = json!(m);
-                                        }
-                                        if let Some(ref rid) = request_id {
-                                            resp["request_id"] = json!(rid);
-                                        }
-                                        let _ = tx.send(resp).await;
+                                        let activity_s = activity.map(String::from);
+                                        let message_s = message.map(String::from);
+                                        let _ = tx.send(WsServerMsg::SessionAiStatusAck {
+                                            session_id: session_id.to_string(),
+                                            working,
+                                            activity: activity_s.clone(),
+                                            message: message_s.clone(),
+                                            request_id: request_id.clone(),
+                                        }.to_value()).await;
                                         // Broadcast status change
-                                        let mut broadcast = json!({
-                                            "type": "session.ai_status_changed",
-                                            "session_id": session_id,
-                                            "working": working,
-                                        });
-                                        if let Some(a) = activity {
-                                            broadcast["activity"] = json!(a);
-                                        }
-                                        if let Some(m) = message {
-                                            broadcast["message"] = json!(m);
-                                        }
-                                        let _ = state.session_events.send(broadcast);
+                                        let _ = state.session_events.send(WsServerMsg::SessionAiStatusChanged {
+                                            session_id: session_id.to_string(),
+                                            working,
+                                            activity: activity_s,
+                                            message: message_s,
+                                        }.to_value());
                                     }
                                     Err(e) => {
-                                        let mut resp = json!({
-                                            "type": "error",
-                                            "code": "AI_NOT_ALLOWED",
-                                            "session_id": session_id,
-                                            "message": e,
-                                        });
-                                        if let Some(ref rid) = request_id {
-                                            resp["request_id"] = json!(rid);
-                                        }
-                                        let _ = tx.send(resp).await;
+                                        let _ = tx.send(WsServerMsg::Error {
+                                            code: "AI_NOT_ALLOWED".into(),
+                                            message: e,
+                                            session_id: Some(session_id.to_string()),
+                                            request_id: request_id.clone(),
+                                        }.to_value()).await;
                                     }
                                 }
                             }
@@ -572,71 +538,56 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                                 let session_id = parsed["session_id"].as_str().unwrap_or("");
                                 let name = parsed["name"].as_str().unwrap_or("");
                                 if session_id.is_empty() || name.is_empty() {
-                                    let mut resp = json!({
-                                        "type": "error",
-                                        "code": "MISSING_FIELD",
-                                        "message": "session_id and name are required"
-                                    });
-                                    if let Some(ref rid) = request_id {
-                                        resp["request_id"] = json!(rid);
-                                    }
-                                    let _ = tx.send(resp).await;
+                                    let _ = tx.send(WsServerMsg::Error {
+                                        code: "MISSING_FIELD".into(),
+                                        message: "session_id and name are required".into(),
+                                        session_id: None,
+                                        request_id: request_id.clone(),
+                                    }.to_value()).await;
                                     continue;
                                 }
                                 match state.session_manager.rename_session(session_id, name).await {
                                     Ok(()) => {
-                                        let mut resp = json!({
-                                            "type": "session.rename.ack",
-                                            "session_id": session_id,
-                                            "name": name,
-                                        });
-                                        if let Some(ref rid) = request_id {
-                                            resp["request_id"] = json!(rid);
-                                        }
-                                        let _ = tx.send(resp).await;
+                                        let _ = tx.send(WsServerMsg::SessionRenameAck {
+                                            session_id: session_id.to_string(),
+                                            name: name.to_string(),
+                                            request_id: request_id.clone(),
+                                        }.to_value()).await;
                                         // Broadcast to all clients
-                                        let _ = state.session_events.send(json!({
-                                            "type": "session.renamed",
-                                            "session_id": session_id,
-                                            "name": name,
-                                        }));
+                                        let _ = state.session_events.send(WsServerMsg::SessionRenamed {
+                                            session_id: session_id.to_string(),
+                                            name: name.to_string(),
+                                        }.to_value());
                                     }
                                     Err(e) => {
-                                        let mut resp = json!({
-                                            "type": "error",
-                                            "code": "SESSION_NOT_FOUND",
-                                            "session_id": session_id,
-                                            "message": e,
-                                        });
-                                        if let Some(ref rid) = request_id {
-                                            resp["request_id"] = json!(rid);
-                                        }
-                                        let _ = tx.send(resp).await;
+                                        let _ = tx.send(WsServerMsg::Error {
+                                            code: "SESSION_NOT_FOUND".into(),
+                                            message: e,
+                                            session_id: Some(session_id.to_string()),
+                                            request_id: request_id.clone(),
+                                        }.to_value()).await;
                                     }
                                 }
                             }
                             "shell.list" => {
                                 let shells = crate::shell::detect_shells();
-                                let mut resp = json!({
-                                    "type": "shell.listed",
-                                    "shells": shells,
-                                    "default_shell": &state.config.shell.default_shell,
-                                });
-                                if let Some(ref rid) = request_id {
-                                    resp["request_id"] = json!(rid);
-                                }
-                                let _ = tx.send(resp).await;
+                                let shells_json: Vec<Value> = shells
+                                    .into_iter()
+                                    .map(|s| serde_json::to_value(&s).unwrap_or_default())
+                                    .collect();
+                                let _ = tx.send(WsServerMsg::ShellListed {
+                                    shells: shells_json,
+                                    default_shell: state.config.shell.default_shell.clone(),
+                                    request_id: request_id.clone(),
+                                }.to_value()).await;
                             }
                             _ => {
-                                let mut resp = json!({
-                                    "type": "error",
-                                    "code": "UNKNOWN_TYPE",
-                                    "message": format!("Unknown message type: {msg_type}")
-                                });
-                                if let Some(ref rid) = request_id {
-                                    resp["request_id"] = json!(rid);
-                                }
-                                let _ = tx.send(resp).await;
+                                let _ = tx.send(WsServerMsg::Error {
+                                    code: "UNKNOWN_TYPE".into(),
+                                    message: format!("Unknown message type: {msg_type}"),
+                                    session_id: None,
+                                    request_id: request_id.clone(),
+                                }.to_value()).await;
                             }
                         }
                     }
@@ -760,22 +711,22 @@ async fn handle_session_start(
                     .await;
             }
 
-            let mut resp = json!({
-                "type": "session.started",
-                "session_id": session_id,
-                "pid": pid,
-                "persistent": persistent,
-                "pty": use_pty,
-                "user_allows_ai": allows_ai,
-                "created_at": crate::sessions::journal::now_ms(),
-            });
-            if let Some(n) = name {
-                resp["name"] = json!(n);
-            }
-            if let Some(rid) = request_id {
-                resp["request_id"] = json!(rid);
-            }
-            let queued = tx.send(resp).await.is_ok();
+            let queued = tx
+                .send(
+                    WsServerMsg::SessionStarted {
+                        session_id: session_id.clone(),
+                        pid,
+                        persistent,
+                        pty: use_pty,
+                        user_allows_ai: allows_ai,
+                        created_at: crate::sessions::journal::now_ms(),
+                        name: name.map(String::from),
+                        request_id: request_id.map(String::from),
+                    }
+                    .to_value(),
+                )
+                .await
+                .is_ok();
             tracing::info!(
                 request_id = request_id.unwrap_or(""),
                 session_id = %session_id,
@@ -784,18 +735,17 @@ async fn handle_session_start(
             );
 
             // Broadcast session.created to all connected clients
-            let mut broadcast = json!({
-                "type": "session.created",
-                "session_id": session_id,
-                "pid": pid,
-                "pty": use_pty,
-                "persistent": persistent,
-                "user_allows_ai": allows_ai,
-            });
-            if let Some(n) = name {
-                broadcast["name"] = json!(n);
-            }
-            let _ = state.session_events.send(broadcast);
+            let _ = state.session_events.send(
+                WsServerMsg::SessionCreated {
+                    session_id: session_id.clone(),
+                    pid,
+                    pty: use_pty,
+                    persistent,
+                    user_allows_ai: allows_ai,
+                    name: name.map(String::from),
+                }
+                .to_value(),
+            );
 
             state
                 .activity_log
@@ -822,15 +772,17 @@ async fn handle_session_start(
                 error = %e,
                 "WS: session.start PTY spawn failed"
             );
-            let mut resp = json!({
-                "type": "error",
-                "code": "SESSION_LIMIT",
-                "message": e,
-            });
-            if let Some(rid) = request_id {
-                resp["request_id"] = json!(rid);
-            }
-            let _ = tx.send(resp).await;
+            let _ = tx
+                .send(
+                    WsServerMsg::Error {
+                        code: "SESSION_LIMIT".into(),
+                        message: e,
+                        session_id: None,
+                        request_id: request_id.map(String::from),
+                    }
+                    .to_value(),
+                )
+                .await;
             None
         }
     }
@@ -849,26 +801,28 @@ async fn handle_session_exec(
         .exec_command(session_id, command)
         .await
     {
-        let mut resp = json!({
-            "type": "error",
-            "code": "SESSION_ERROR",
-            "session_id": session_id,
-            "message": e,
-        });
-        if let Some(rid) = request_id {
-            resp["request_id"] = json!(rid);
-        }
-        let _ = tx.send(resp).await;
+        let _ = tx
+            .send(
+                WsServerMsg::Error {
+                    code: "SESSION_ERROR".into(),
+                    message: e,
+                    session_id: Some(session_id.to_string()),
+                    request_id: request_id.map(String::from),
+                }
+                .to_value(),
+            )
+            .await;
     } else {
-        let mut resp = json!({
-            "type": "session.exec.ack",
-            "session_id": session_id,
-            "command": command,
-        });
-        if let Some(rid) = request_id {
-            resp["request_id"] = json!(rid);
-        }
-        let _ = tx.send(resp).await;
+        let _ = tx
+            .send(
+                WsServerMsg::SessionExecAck {
+                    session_id: session_id.to_string(),
+                    command: command.to_string(),
+                    request_id: request_id.map(String::from),
+                }
+                .to_value(),
+            )
+            .await;
 
         state
             .activity_log
@@ -896,12 +850,15 @@ async fn handle_session_stdin(
         .await
     {
         let _ = tx
-            .send(json!({
-                "type": "error",
-                "code": "SESSION_ERROR",
-                "session_id": session_id,
-                "message": e,
-            }))
+            .send(
+                WsServerMsg::Error {
+                    code: "SESSION_ERROR".into(),
+                    message: e,
+                    session_id: Some(session_id.to_string()),
+                    request_id: None,
+                }
+                .to_value(),
+            )
             .await;
     }
 }
@@ -914,15 +871,16 @@ async fn handle_session_kill(
     request_id: Option<&str>,
 ) {
     if state.session_manager.kill_session(session_id).await {
-        let mut resp = json!({
-            "type": "session.closed",
-            "session_id": session_id,
-            "reason": "killed",
-        });
-        if let Some(rid) = request_id {
-            resp["request_id"] = json!(rid);
-        }
-        let _ = tx.send(resp).await;
+        let _ = tx
+            .send(
+                WsServerMsg::SessionClosed {
+                    session_id: session_id.to_string(),
+                    reason: "killed".into(),
+                    request_id: request_id.map(String::from),
+                }
+                .to_value(),
+            )
+            .await;
 
         state
             .activity_log
@@ -935,16 +893,17 @@ async fn handle_session_kill(
             )
             .await;
     } else {
-        let mut resp = json!({
-            "type": "error",
-            "code": "SESSION_NOT_FOUND",
-            "session_id": session_id,
-            "message": format!("Session {session_id} not found"),
-        });
-        if let Some(rid) = request_id {
-            resp["request_id"] = json!(rid);
-        }
-        let _ = tx.send(resp).await;
+        let _ = tx
+            .send(
+                WsServerMsg::Error {
+                    code: "SESSION_NOT_FOUND".into(),
+                    message: format!("Session {session_id} not found"),
+                    session_id: Some(session_id.to_string()),
+                    request_id: request_id.map(String::from),
+                }
+                .to_value(),
+            )
+            .await;
     }
 }
 
@@ -962,15 +921,16 @@ async fn handle_session_signal(
         .await
     {
         Ok(()) => {
-            let mut resp = json!({
-                "type": "session.signal.ack",
-                "session_id": session_id,
-                "signal": signal,
-            });
-            if let Some(rid) = request_id {
-                resp["request_id"] = json!(rid);
-            }
-            let _ = tx.send(resp).await;
+            let _ = tx
+                .send(
+                    WsServerMsg::SessionSignalAck {
+                        session_id: session_id.to_string(),
+                        signal,
+                        request_id: request_id.map(String::from),
+                    }
+                    .to_value(),
+                )
+                .await;
 
             state
                 .activity_log
@@ -988,16 +948,17 @@ async fn handle_session_signal(
                 .await;
         }
         Err(e) => {
-            let mut resp = json!({
-                "type": "error",
-                "code": "SESSION_ERROR",
-                "session_id": session_id,
-                "message": e,
-            });
-            if let Some(rid) = request_id {
-                resp["request_id"] = json!(rid);
-            }
-            let _ = tx.send(resp).await;
+            let _ = tx
+                .send(
+                    WsServerMsg::Error {
+                        code: "SESSION_ERROR".into(),
+                        message: e,
+                        session_id: Some(session_id.to_string()),
+                        request_id: request_id.map(String::from),
+                    }
+                    .to_value(),
+                )
+                .await;
         }
     }
 }
@@ -1017,28 +978,30 @@ async fn handle_session_resize(
         .await
     {
         Ok(()) => {
-            let mut resp = json!({
-                "type": "session.resize.ack",
-                "session_id": session_id,
-                "rows": rows,
-                "cols": cols,
-            });
-            if let Some(rid) = request_id {
-                resp["request_id"] = json!(rid);
-            }
-            let _ = tx.send(resp).await;
+            let _ = tx
+                .send(
+                    WsServerMsg::SessionResizeAck {
+                        session_id: session_id.to_string(),
+                        rows,
+                        cols,
+                        request_id: request_id.map(String::from),
+                    }
+                    .to_value(),
+                )
+                .await;
         }
         Err(e) => {
-            let mut resp = json!({
-                "type": "error",
-                "code": "SESSION_ERROR",
-                "session_id": session_id,
-                "message": e,
-            });
-            if let Some(rid) = request_id {
-                resp["request_id"] = json!(rid);
-            }
-            let _ = tx.send(resp).await;
+            let _ = tx
+                .send(
+                    WsServerMsg::Error {
+                        code: "SESSION_ERROR".into(),
+                        message: e,
+                        session_id: Some(session_id.to_string()),
+                        request_id: request_id.map(String::from),
+                    }
+                    .to_value(),
+                )
+                .await;
         }
     }
 }
@@ -1073,16 +1036,17 @@ async fn handle_session_attach(
 
         let last_seq = entries.last().map_or(since, |e| e.seq);
 
-        let mut resp = json!({
-            "type": "session.attached",
-            "session_id": session_id,
-            "entries": entries_json,
-            "dropped": dropped,
-        });
-        if let Some(rid) = request_id {
-            resp["request_id"] = json!(rid);
-        }
-        let _ = tx.send(resp).await;
+        let _ = tx
+            .send(
+                WsServerMsg::SessionAttached {
+                    session_id: session_id.to_string(),
+                    entries: entries_json,
+                    dropped,
+                    request_id: request_id.map(String::from),
+                }
+                .to_value(),
+            )
+            .await;
 
         // Start a new subscriber from the last replayed seq
         let task = tokio::spawn(subscriber_task(
@@ -1098,15 +1062,16 @@ async fn handle_session_attach(
             connection_sessions.push(session_id.to_string());
         }
     } else {
-        let mut resp = json!({
-            "type": "error",
-            "code": "SESSION_NOT_FOUND",
-            "session_id": session_id,
-            "message": format!("Session {session_id} not found"),
-        });
-        if let Some(rid) = request_id {
-            resp["request_id"] = json!(rid);
-        }
-        let _ = tx.send(resp).await;
+        let _ = tx
+            .send(
+                WsServerMsg::Error {
+                    code: "SESSION_NOT_FOUND".into(),
+                    message: format!("Session {session_id} not found"),
+                    session_id: Some(session_id.to_string()),
+                    request_id: request_id.map(String::from),
+                }
+                .to_value(),
+            )
+            .await;
     }
 }
