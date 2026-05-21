@@ -2200,6 +2200,118 @@ impl AtPollingHealth {
     }
 }
 
+/// Append one structured modem-state line to `modem-state.log`. Reuses the
+/// `watchdog_history.jsonl` rolling-file pattern (rotate at 5 MB → `.1`,
+/// best-effort, log on error). Hooks into the poller's existing modem reads
+/// — no new AT polling (see `feedback_no_modem_polling_on_bpi`).
+///
+/// On OpenWrt: writes to `/root/log/modem-state.log` so it survives reboots
+/// alongside the rotated system log. Elsewhere: writes inside `data_dir`.
+///
+/// Format: `<ts_unix> <iso8601> | rsrp=… sinr=… rssi=… band=… op=… conn=… tech=… tunnel=…`
+fn append_modem_state_line(data_dir: &str, signal: &LteSignal, tunnel_connected: bool) {
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let path = if crate::lte_watchdog::is_openwrt() {
+        std::path::PathBuf::from("/root/log/modem-state.log")
+    } else {
+        std::path::Path::new(data_dir).join("modem-state.log")
+    };
+
+    // Rotate at 5 MB — matches watchdog_history.jsonl.
+    let mut rotated = false;
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 5 * 1024 * 1024 {
+            let rotated_path = path.with_extension("log.1");
+            let _ = std::fs::rename(&path, &rotated_path);
+            rotated = true;
+        }
+    }
+
+    let line = format!(
+        "{unix_secs} {iso} | rsrp={rsrp} sinr={sinr} rssi={rssi} band={band} op={op} conn={conn} tech={tech} tunnel={tunnel}\n",
+        iso = format_iso8601_utc(unix_secs),
+        rsrp = signal.rsrp.map_or("-".into(), |v| v.to_string()),
+        sinr = signal.sinr.map_or("-".into(), |v| format!("{v:.1}")),
+        rssi = signal.rssi_dbm,
+        band = signal.band.as_deref().unwrap_or("-"),
+        op = signal.operator.as_deref().unwrap_or("-"),
+        conn = signal.connection_state.as_deref().unwrap_or("-"),
+        tech = signal.technology.as_deref().unwrap_or("-"),
+        tunnel = tunnel_connected,
+    );
+
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                warn!("modem-state.log append failed: {e}");
+            }
+        }
+        Err(e) => warn!("modem-state.log open ({}) failed: {e}", path.display()),
+    }
+    if rotated {
+        info!("modem-state.log rotated (>5MB) → .log.1");
+    }
+}
+
+/// Format a UTC unix timestamp as `YYYY-MM-DDTHH:MM:SSZ` without pulling in
+/// `chrono`. Uses Howard Hinnant's `civil_from_days` algorithm — exact for
+/// any valid `time_t`, no leap-second handling required (matches kernel clock).
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+fn format_iso8601_utc(unix_secs: u64) -> String {
+    let secs_of_day = unix_secs % 86_400;
+    let hour = secs_of_day / 3600;
+    let minute = (secs_of_day / 60) % 60;
+    let second = secs_of_day % 60;
+
+    // Days since 1970-01-01 → (year, month, day) via civil_from_days.
+    let z: i64 = (unix_secs / 86_400) as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 {
+        y += 1;
+    }
+    format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+#[cfg(test)]
+mod modem_state_log_tests {
+    use super::format_iso8601_utc;
+
+    #[test]
+    fn iso8601_epoch() {
+        assert_eq!(format_iso8601_utc(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn iso8601_known_timestamp() {
+        // 2026-05-20T13:07:50 UTC (LiveBarn first wedge symptom onset)
+        assert_eq!(format_iso8601_utc(1_779_282_470), "2026-05-20T13:07:50Z");
+    }
+
+    #[test]
+    fn iso8601_leap_year_boundary() {
+        // 2024-02-29 12:00:00 UTC
+        assert_eq!(format_iso8601_utc(1_709_208_000), "2024-02-29T12:00:00Z");
+    }
+}
+
 /// Spawn the background LTE signal poller. Returns a `JoinHandle` for abort on shutdown.
 ///
 /// The poller uses data-path-aware polling modes instead of binary tunnel suppression:
@@ -2590,6 +2702,12 @@ pub fn spawn_lte_poller(
                 signal.operator,
                 signal.pci,
                 signal.earfcn,
+            );
+
+            append_modem_state_line(
+                &data_dir,
+                &signal,
+                tunnel_stats.connected.load(Ordering::Relaxed),
             );
 
             let _ = session_events.send(serde_json::json!({

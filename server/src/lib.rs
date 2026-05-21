@@ -37,6 +37,7 @@ pub mod infra;
 pub mod lte;
 pub mod lte_watchdog;
 pub mod modem;
+pub mod platform;
 pub mod routes;
 pub mod sessions;
 pub mod shell;

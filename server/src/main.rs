@@ -246,6 +246,9 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     info!("Device serial: {}", config.device.serial);
     info!("Listening on {}", config.server.listen);
 
+    // Best-effort: self-heal persistent log capture on OpenWrt. No-op elsewhere.
+    sctl::platform::openwrt::ensure_persistent_logs().await;
+
     if let Some(tc) = &config.tunnel {
         if !tc.relay && tc.heartbeat_interval_secs > 15 {
             warn!(
