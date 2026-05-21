@@ -11,43 +11,17 @@ export interface SidePanelTabDef {
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'reconnecting' | 'device_offline';
 
 // ── Activity feed ───────────────────────────────────────────────────
+// Canonical definitions live in ./generated/ (driven by ts-rs from the
+// Rust server crate). Re-exported here so existing imports continue to
+// resolve without churn.
 
-export type ActivityType =
-	| 'exec'
-	| 'file_read'
-	| 'file_write'
-	| 'file_list'
-	| 'session_start'
-	| 'session_exec'
-	| 'session_kill'
-	| 'session_signal'
-	| 'playbook_list'
-	| 'playbook_read'
-	| 'playbook_write'
-	| 'playbook_delete';
+import type { ActivityType } from './generated/ActivityType';
+import type { ActivitySource } from './generated/ActivitySource';
+import type { ActivityEntry } from './generated/ActivityEntry';
+export type { ActivityType, ActivitySource, ActivityEntry };
 
-export type ActivitySource = 'mcp' | 'ws' | 'rest' | 'unknown';
-
-/** A single entry in the device activity log. */
-export interface ActivityEntry {
-	/** Monotonic server-assigned ID (increases with each operation). */
-	id: number;
-	/** Unix epoch seconds when the activity occurred. */
-	timestamp: number;
-	/** The type of operation (exec, file_read, session_start, etc.). */
-	activity_type: ActivityType;
-	/** Which client interface triggered this activity. */
-	source: ActivitySource;
-	/** Human-readable one-line description of the activity. */
-	summary: string;
-	/** Additional structured data (command args, file paths, exit codes, etc.). */
-	detail?: Record<string, unknown>;
-}
-
-export interface WsActivityNewMsg {
-	type: 'activity.new';
-	entry: ActivityEntry;
-}
+import type { WsServerMsg as GeneratedWsServerMsg } from './generated/WsServerMsg';
+export type WsActivityNewMsg = Extract<GeneratedWsServerMsg, { type: 'activity.new' }>;
 
 // ── Theme ───────────────────────────────────────────────────────────
 
@@ -317,96 +291,62 @@ export type WsClientMsg =
 
 // ── Wire protocol: server → client ─────────────────────────────────
 
-export interface WsPongMsg {
-	type: 'pong';
-	request_id?: string;
-}
+// All server → client message variants are derived from the generated
+// `WsServerMsg` discriminated union (canonical source: Rust enum
+// `crate::ws::messages::WsServerMsg`). Adding/removing a variant on the
+// server propagates here on the next `cargo test export_bindings`.
 
-export interface WsSessionStartedMsg {
-	type: 'session.started';
-	request_id?: string;
-	session_id: string;
-	pid: number;
-	pty: boolean;
-}
+export type WsPongMsg = Extract<GeneratedWsServerMsg, { type: 'pong' }>;
+export type WsSessionStartedMsg = Extract<GeneratedWsServerMsg, { type: 'session.started' }>;
+export type WsSessionExecAckMsg = Extract<GeneratedWsServerMsg, { type: 'session.exec.ack' }>;
+export type WsSessionOutputMsg = Extract<
+	GeneratedWsServerMsg,
+	{ type: 'session.stdout' | 'session.stderr' | 'session.system' }
+>;
 
-export interface WsSessionExecAckMsg {
-	type: 'session.exec.ack';
-	request_id?: string;
-	session_id: string;
-}
-
-export interface WsSessionOutputMsg {
-	type: 'session.stdout' | 'session.stderr' | 'session.system';
-	session_id: string;
-	data: string;
-	seq: number;
-	timestamp_ms?: number;
-}
-
+/** Synthetic — not currently emitted by the server, kept for forward compatibility. */
 export interface WsSessionGapMsg {
 	type: 'session.gap';
 	session_id: string;
 	reason: string;
 }
 
+/** Synthetic — not currently emitted by the server, kept for forward compatibility. */
 export interface WsSessionExitedMsg {
 	type: 'session.exited';
 	session_id: string;
 	exit_code: number;
 }
 
-export interface WsSessionClosedMsg {
-	type: 'session.closed';
-	request_id?: string;
-	session_id: string;
-	reason: string;
-}
+export type WsSessionClosedMsg = Extract<GeneratedWsServerMsg, { type: 'session.closed' }>;
+export type WsSessionSignalAckMsg = Extract<GeneratedWsServerMsg, { type: 'session.signal.ack' }>;
 
-export interface WsSessionSignalAckMsg {
-	type: 'session.signal.ack';
-	request_id?: string;
-	session_id: string;
-}
+/**
+ * A single replayed buffer entry inside a `session.attached` payload. Each
+ * entry is itself a full `session.stdout` / `session.stderr` / `session.system`
+ * server message (with `type`, `session_id`, `data`, `seq`, `timestamp_ms`).
+ */
+export type WsSessionAttachEntry = Extract<
+	GeneratedWsServerMsg,
+	{ type: 'session.stdout' | 'session.stderr' | 'session.system' }
+>;
 
-export interface WsSessionAttachEntry {
-	stream: 'stdout' | 'stderr' | 'system';
-	data: string;
-	seq: number;
-	timestamp_ms: number;
-}
+/**
+ * Refine the generated `session.attached` shape: entries are typed
+ * `session.{stdout,stderr,system}` messages, not opaque `JsonValue`s.
+ */
+export type WsSessionAttachedMsg = Omit<
+	Extract<GeneratedWsServerMsg, { type: 'session.attached' }>,
+	'entries'
+> & { entries: WsSessionAttachEntry[] };
 
-export interface WsSessionAttachedMsg {
-	type: 'session.attached';
-	request_id?: string;
-	session_id: string;
-	entries: WsSessionAttachEntry[];
-}
+export type WsSessionResizeAckMsg = Extract<GeneratedWsServerMsg, { type: 'session.resize.ack' }>;
 
-export interface WsSessionResizeAckMsg {
-	type: 'session.resize.ack';
-	request_id?: string;
-	session_id: string;
-	rows: number;
-	cols: number;
-}
-
-export interface RemoteSessionInfo {
-	session_id: string;
-	pid: number;
-	persistent: boolean;
-	pty: boolean;
-	attached: boolean;
-	name?: string;
-	user_allows_ai?: boolean;
-	ai_is_working?: boolean;
-	ai_activity?: string;
-	ai_status_message?: string;
-	status?: 'running' | 'exited';
-	idle?: boolean;
-	idle_timeout?: number;
-	exit_code?: number;
-}
+// Canonical session-list payload (server-side struct: `SessionListItem`).
+// Re-exported as `RemoteSessionInfo` to keep the historical TS name stable
+// for the rest of the codebase.
+import type { SessionListItem } from './generated/SessionListItem';
+export type RemoteSessionInfo = SessionListItem;
 
 // ── REST API types ─────────────────────────────────────────────────
 
@@ -649,195 +589,59 @@ export interface ServerConfig {
 	relayApiKey?: string;
 }
 
-export interface WsSessionListedMsg {
-	type: 'session.listed';
-	request_id?: string;
-	sessions: RemoteSessionInfo[];
-}
+export type WsSessionListedMsg = Extract<GeneratedWsServerMsg, { type: 'session.listed' }>;
+export type WsShellListedMsg = Extract<GeneratedWsServerMsg, { type: 'shell.listed' }>;
+export type WsErrorMsg = Extract<GeneratedWsServerMsg, { type: 'error' }>;
+export type WsSessionRenameAckMsg = Extract<GeneratedWsServerMsg, { type: 'session.rename.ack' }>;
+export type WsSessionCreatedBroadcast = Extract<GeneratedWsServerMsg, { type: 'session.created' }>;
+export type WsSessionDestroyedBroadcast = Extract<GeneratedWsServerMsg, { type: 'session.destroyed' }>;
+export type WsSessionRenamedBroadcast = Extract<GeneratedWsServerMsg, { type: 'session.renamed' }>;
+export type WsSessionAllowAiAckMsg = Extract<GeneratedWsServerMsg, { type: 'session.allow_ai.ack' }>;
+export type WsSessionAiPermissionChangedBroadcast = Extract<
+	GeneratedWsServerMsg,
+	{ type: 'session.ai_permission_changed' }
+>;
+export type WsSessionAiStatusChangedBroadcast = Extract<
+	GeneratedWsServerMsg,
+	{ type: 'session.ai_status_changed' }
+>;
 
-export interface WsShellListedMsg {
-	type: 'shell.listed';
-	request_id?: string;
-	shells: string[];
-	default_shell: string;
-}
-
-export interface WsErrorMsg {
-	type: 'error';
-	request_id?: string;
-	code: string;
-	message: string;
-	session_id?: string;
-}
-
-export interface WsSessionRenameAckMsg {
-	type: 'session.rename.ack';
-	request_id?: string;
-	session_id: string;
-	name: string;
-}
-
-export interface WsSessionCreatedBroadcast {
-	type: 'session.created';
-	session_id: string;
-	pid: number;
-	pty: boolean;
-	persistent: boolean;
-	name?: string;
-}
-
-export interface WsSessionDestroyedBroadcast {
-	type: 'session.destroyed';
-	session_id: string;
-	reason: string;
-}
-
-export interface WsSessionRenamedBroadcast {
-	type: 'session.renamed';
-	session_id: string;
-	name: string;
-}
-
-export interface WsSessionAllowAiAckMsg {
-	type: 'session.allow_ai.ack';
-	request_id?: string;
-	session_id: string;
-	allowed: boolean;
-}
-
-export interface WsSessionAiPermissionChangedBroadcast {
-	type: 'session.ai_permission_changed';
-	session_id: string;
-	allowed: boolean;
-}
-
-export interface WsSessionAiStatusChangedBroadcast {
-	type: 'session.ai_status_changed';
-	session_id: string;
-	working: boolean;
-	activity?: string;
-	message?: string;
-}
-
-export type WsServerMsg =
-	| WsPongMsg
-	| WsSessionStartedMsg
-	| WsSessionExecAckMsg
-	| WsSessionOutputMsg
-	| WsSessionExitedMsg
-	| WsSessionClosedMsg
-	| WsSessionGapMsg
-	| WsSessionSignalAckMsg
-	| WsSessionAttachedMsg
-	| WsSessionResizeAckMsg
-	| WsSessionRenameAckMsg
-	| WsSessionListedMsg
-	| WsShellListedMsg
-	| WsSessionCreatedBroadcast
-	| WsSessionDestroyedBroadcast
-	| WsSessionRenamedBroadcast
-	| WsSessionAllowAiAckMsg
-	| WsSessionAiPermissionChangedBroadcast
-	| WsSessionAiStatusChangedBroadcast
-	| WsActivityNewMsg
-	| GxProgressMsg
-	| GxCompleteMsg
-	| GxErrorMsg
-	| WsErrorMsg;
+// Canonical server → client union sourced from the Rust enum via ts-rs.
+// Synthetic variants (`session.gap`, `session.exited`) that don't exist on
+// the server today are unioned in so consumers can still narrow on them
+// defensively.
+export type WsServerMsg = GeneratedWsServerMsg | WsSessionGapMsg | WsSessionExitedMsg;
 
 // ── Transfer (gawdxfer / STP) types ────────────────────────────
+// Canonical definitions in ./generated/ (driven by ts-rs from the
+// Rust `gawdxfer::types` module). The Stp* aliases below match the
+// historical naming scheme that's already wired into the rest of
+// the codebase — they're 1:1 with the generated types underneath.
 
-export type TransferDirection = 'upload' | 'download';
+import type { Direction } from './generated/Direction';
+import type { InitDownloadResult as GeneratedInitDownloadResult } from './generated/InitDownloadResult';
+import type { InitUploadResult as GeneratedInitUploadResult } from './generated/InitUploadResult';
+import type { ChunkAck as GeneratedChunkAck } from './generated/ChunkAck';
+import type { ResumeResult as GeneratedResumeResult } from './generated/ResumeResult';
+import type { StatusResult as GeneratedStatusResult } from './generated/StatusResult';
+import type { TransferSummary as GeneratedTransferSummary } from './generated/TransferSummary';
+import type { ListResult as GeneratedListResult } from './generated/ListResult';
 
-export interface StpInitDownloadResult {
-	transfer_id: string;
-	file_size: number;
-	file_hash: string;
-	chunk_size: number;
-	total_chunks: number;
-	filename: string;
-}
+export type TransferDirection = Direction;
+export type StpInitDownloadResult = GeneratedInitDownloadResult;
+export type StpInitUploadResult = GeneratedInitUploadResult;
+export type StpChunkAck = GeneratedChunkAck;
+export type StpResumeResult = GeneratedResumeResult;
+export type StpStatusResult = GeneratedStatusResult;
+export type StpTransferSummary = GeneratedTransferSummary;
+export type StpListResult = GeneratedListResult;
 
-export interface StpInitUploadResult {
-	transfer_id: string;
-	chunk_size: number;
-	total_chunks: number;
-}
+export type GxProgressMsg = Extract<GeneratedWsServerMsg, { type: 'gx.progress' }>;
+export type GxCompleteMsg = Extract<GeneratedWsServerMsg, { type: 'gx.complete' }>;
 
-export interface StpChunkAck {
-	transfer_id: string;
-	chunk_index: number;
-	ok: boolean;
-	error?: string;
-}
-
-export interface StpResumeResult {
-	transfer_id: string;
-	direction: TransferDirection;
-	chunks_received: number[];
-	total_chunks: number;
-	chunk_size: number;
-	file_size: number;
-	file_hash: string;
-}
-
-export interface StpStatusResult {
-	transfer_id: string;
-	direction: TransferDirection;
-	phase: string;
-	filename: string;
-	file_size: number;
-	chunks_done: number;
-	total_chunks: number;
-	bytes_transferred: number;
-	elapsed_ms: number;
-	error_count: number;
-}
-
-export interface StpTransferSummary {
-	transfer_id: string;
-	direction: TransferDirection;
-	filename: string;
-	file_size: number;
-	phase: string;
-	chunks_done: number;
-	total_chunks: number;
-	bytes_transferred: number;
-}
-
-export interface StpListResult {
-	transfers: StpTransferSummary[];
-}
-
-export interface GxProgressMsg {
-	type: 'gx.progress';
-	data: {
-		transfer_id: string;
-		direction: TransferDirection;
-		path: string;
-		filename: string;
-		chunks_done: number;
-		total_chunks: number;
-		bytes_transferred: number;
-		file_size: number;
-		elapsed_ms: number;
-		rate_bps: number;
-	};
-}
-
-export interface GxCompleteMsg {
-	type: 'gx.complete';
-	data: {
-		transfer_id: string;
-		direction: TransferDirection;
-		path: string;
-		filename: string;
-		file_size: number;
-		file_hash: string;
-		elapsed_ms: number;
-	};
-}
-
+/** Synthetic — server emits `gx.complete` with `TransferError`-shaped data
+ *  on failures rather than a separate `gx.error` variant. Kept for clients
+ *  that wire failure handling onto a dedicated type. */
 export interface GxErrorMsg {
 	type: 'gx.error';
 	data: {

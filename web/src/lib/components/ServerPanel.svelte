@@ -250,7 +250,7 @@
 				pid: rs.pid,
 				status: 'detached' as const,
 				isActive: false,
-				sessionStatus: rs.status,
+				sessionStatus: rs.status as 'running' | 'exited',
 				idle: rs.idle,
 				exitCode: rs.exit_code,
 				idleTimeout: rs.idle_timeout

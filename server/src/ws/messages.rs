@@ -21,12 +21,13 @@ use serde_json::Value;
 
 use crate::activity::ActivityEntry;
 use crate::gawdxfer::types::{Complete, Progress};
+use crate::sessions::SessionListItem;
 
 /// Server → client message. Wire format is `{"type": "<code>", ...fields}`
 /// via serde's internally-tagged enum representation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
-#[cfg_attr(test, ts(export))]
+#[cfg_attr(test, ts(export, optional_fields))]
 #[serde(tag = "type")]
 pub enum WsServerMsg {
     // ─── Heartbeat ───────────────────────────────────────────────────────────
@@ -104,7 +105,7 @@ pub enum WsServerMsg {
     /// Response to `session.list`.
     #[serde(rename = "session.listed")]
     SessionListed {
-        sessions: Vec<Value>,
+        sessions: Vec<SessionListItem>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
     },
@@ -191,7 +192,7 @@ pub enum WsServerMsg {
     /// Response to `shell.list`.
     #[serde(rename = "shell.listed")]
     ShellListed {
-        shells: Vec<Value>,
+        shells: Vec<String>,
         default_shell: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,

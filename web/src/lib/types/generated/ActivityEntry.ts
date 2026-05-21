@@ -5,4 +5,4 @@ import type { ActivityType } from "./ActivityType";
 /**
  * A single activity journal entry.
  */
-export type ActivityEntry = { id: number, timestamp: number, activity_type: ActivityType, source: ActivitySource, summary: string, detail?: unknown, request_id?: string | null, };
+export type ActivityEntry = { id: number, timestamp: number, activity_type: ActivityType, source: ActivitySource, summary: string, detail?: unknown, request_id?: string, };

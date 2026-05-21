@@ -51,6 +51,9 @@ pub struct SessionManager {
 }
 
 /// Summary of a session returned by [`SessionManager::list_sessions`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, optional_fields))]
 #[allow(clippy::struct_excessive_bools)]
 pub struct SessionListItem {
     pub session_id: String,

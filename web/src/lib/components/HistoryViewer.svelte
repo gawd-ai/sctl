@@ -286,7 +286,7 @@
 							</div>
 						{/if}
 					{/each}
-					{#if entry.detail.has_full_output && onOpenViewer}
+					{#if (entry.detail as Record<string, unknown>).has_full_output && onOpenViewer}
 						<button
 							class="mt-1 px-2 py-0.5 rounded text-[9px] bg-blue-500/15 text-blue-400 hover:bg-blue-500/25 transition-colors disabled:opacity-50"
 							disabled={loadingResult === entry.id}

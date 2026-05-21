@@ -383,40 +383,8 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                                 .await;
                             }
                             "session.list" => {
-                                let items = state.session_manager.list_sessions().await;
-                                let sessions_json: Vec<Value> = items
-                                    .iter()
-                                    .map(|s| {
-                                        let mut obj = json!({
-                                            "session_id": s.session_id,
-                                            "pid": s.pid,
-                                            "persistent": s.persistent,
-                                            "pty": s.pty,
-                                            "attached": s.attached,
-                                            "status": s.status,
-                                            "idle": s.idle,
-                                            "idle_timeout": s.idle_timeout,
-                                            "created_at": s.created_at,
-                                            "user_allows_ai": s.user_allows_ai,
-                                            "ai_is_working": s.ai_is_working,
-                                        });
-                                        if let Some(exit_code) = s.exit_code {
-                                            obj["exit_code"] = json!(exit_code);
-                                        }
-                                        if let Some(ref name) = s.name {
-                                            obj["name"] = json!(name);
-                                        }
-                                        if let Some(ref activity) = s.ai_activity {
-                                            obj["ai_activity"] = json!(activity);
-                                        }
-                                        if let Some(ref msg) = s.ai_status_message {
-                                            obj["ai_status_message"] = json!(msg);
-                                        }
-                                        obj
-                                    })
-                                    .collect();
                                 let _ = tx.send(WsServerMsg::SessionListed {
-                                    sessions: sessions_json,
+                                    sessions: state.session_manager.list_sessions().await,
                                     request_id: request_id.clone(),
                                 }.to_value()).await;
                             }
@@ -570,13 +538,8 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                                 }
                             }
                             "shell.list" => {
-                                let shells = crate::shell::detect_shells();
-                                let shells_json: Vec<Value> = shells
-                                    .into_iter()
-                                    .map(|s| serde_json::to_value(&s).unwrap_or_default())
-                                    .collect();
                                 let _ = tx.send(WsServerMsg::ShellListed {
-                                    shells: shells_json,
+                                    shells: crate::shell::detect_shells(),
                                     default_shell: state.config.shell.default_shell.clone(),
                                     request_id: request_id.clone(),
                                 }.to_value()).await;

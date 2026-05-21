@@ -4,4 +4,4 @@ export type InitUpload = { path: string, filename: string, file_size: number,
 /**
  * Whole-file SHA-256 hash. If empty, the server computes it after all chunks are received.
  */
-file_hash: string, chunk_size: number, total_chunks: number, mode?: string | null, };
+file_hash: string, chunk_size: number, total_chunks: number, mode?: string, };

@@ -25,7 +25,7 @@ use tokio::sync::{broadcast, RwLock};
 /// Types of activities tracked by the journal.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
-#[cfg_attr(test, ts(export))]
+#[cfg_attr(test, ts(export, optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum ActivityType {
     Exec,
@@ -50,7 +50,7 @@ pub enum ActivityType {
 /// Where the request originated.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
-#[cfg_attr(test, ts(export))]
+#[cfg_attr(test, ts(export, optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum ActivitySource {
     Mcp,
@@ -63,7 +63,7 @@ pub enum ActivitySource {
 /// A single activity journal entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
-#[cfg_attr(test, ts(export))]
+#[cfg_attr(test, ts(export, optional_fields))]
 pub struct ActivityEntry {
     pub id: u64,
     pub timestamp: u64,
