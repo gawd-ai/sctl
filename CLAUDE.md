@@ -53,7 +53,7 @@ are picked up on the next tool call. No restart needed.
 # Individual components
 cd server && cargo build --release
 cd mcp && cargo build --release
-cd web && npm run dev          # vite dev server at localhost:5173/sctlin
+cd web && npm run dev          # vite dev server at localhost:5170/sctlin
 
 # Cross-compile server for embedded targets
 cd server && cross build --release --target <target>

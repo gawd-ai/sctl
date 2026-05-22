@@ -62,7 +62,7 @@ PLAYBOOKS_DIR="$DATA_DIR/playbooks"
 PID_FILE="$DATA_DIR/sctl.pid"
 WEB_PID_FILE="$DATA_DIR/web.pid"
 MCP_NAME="sctl"
-WEB_PORT=5173
+WEB_PORT=5170
 
 # Persistent MCP devices config — survives reboots.
 # Uses a dev-specific filename so rundev never pollutes a prod/stage config.
@@ -104,6 +104,35 @@ warn() { echo -e "\033[1;33m==>\033[0m $*" >&2; }
 # Returns 0 if alive — callers should skip killing/re-registering MCP.
 is_mcp_alive() {
     pgrep -f "mcp-sctl.*--supervisor" &>/dev/null
+}
+
+# Detect a healthy sctl already listening on $LISTEN. Returns 0 if reachable,
+# prints the running version to stdout. Used to support side-by-side dev with
+# netage-fleet/rundev.sh — whichever rundev starts first owns the agent.
+# Reads version from /api/health (unauthenticated) so we never depend on the
+# foreign stack's API key.
+detect_existing_sctl() {
+    local body v
+    body=$(curl -sf --max-time 1 "http://${LISTEN}/api/health" 2>/dev/null) || return 1
+    v=$(printf '%s' "$body" | grep -o '"version":"[^"]*"' | head -1 | sed 's/.*:"\(.*\)"/\1/')
+    [ -n "$v" ] || return 1
+    printf '%s' "$v"
+    return 0
+}
+
+# Returns 0 if the sctl on $LISTEN was started by THIS rundev (live $PID_FILE).
+sctl_is_ours() {
+    [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null
+}
+
+# Returns 0 if a foreign rundev (netage-fleet) has a live sctl in its pidfile.
+# Best-effort; if the path doesn't exist we say "no foreign owner".
+foreign_sctl_alive() {
+    local fleet_pids="$HOME/netage/netage-fleet/.rundev.pids"
+    [[ -f "$fleet_pids" ]] || return 1
+    local pid
+    pid=$(awk '$2 == "sctl" {print $1; exit}' "$fleet_pids" 2>/dev/null)
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
 }
 
 # ─── Config helpers ──────────────────────────────────────────────────
@@ -270,15 +299,18 @@ graceful_stop() {
 # ─── kill running processes ──────────────────────────────────────────
 
 do_kill() {
-    # Kill sctl server
+    # Kill sctl server — only if WE started it. The pidfile is the sole
+    # source of truth; the pkill fallback is intentionally absent so we
+    # never reach into a foreign rundev's process tree (e.g. netage-fleet's
+    # sctl-agent on the same port).
     if [[ -f "$PID_FILE" ]]; then
         pid=$(cat "$PID_FILE")
         if kill -0 "$pid" 2>/dev/null; then
             graceful_stop "$pid" "sctl"
         fi
         rm -f "$PID_FILE"
-    else
-        pkill -INT -f "sctl.*serve" 2>/dev/null && ok "Stopped sctl" || true
+    elif foreign_sctl_alive; then
+        ok "sctl on $LISTEN is owned by another rundev — leaving it alone"
     fi
 
     # Kill web dev server
@@ -342,6 +374,9 @@ do_status() {
         else
             echo "  Health: not responding"
         fi
+    elif curl -sf --max-time 1 "http://${LISTEN}/api/health" >/dev/null 2>&1; then
+        echo "  Attached (foreign process on $LISTEN — likely netage-fleet)"
+        echo "  Health: OK"
     else
         echo "  Not running"
     fi
@@ -504,21 +539,30 @@ EOF
     generate_sctlin_seed
     sync_local_playbooks
 
-    # Stop any running instances (clean slate)
-    do_kill
+    # Detect a foreign sctl (e.g. started by netage-fleet/rundev.sh) before
+    # we touch anything. If one is healthy and we don't own it, attach.
+    local attached_version=""
+    if ! sctl_is_ours && attached_version=$(detect_existing_sctl); then
+        ok "Attaching to existing sctl on $LISTEN (version $attached_version) — started by another stack"
+        rm -f "$PID_FILE"  # clear any stale pidfile so do_kill/do_stop won't touch the foreign sctl
+        sctl_pid=""
+    else
+        # Stop any running instances we own (clean slate)
+        do_kill
 
-    # Start sctl server
-    log "Starting sctl on $LISTEN..."
-    SCTL_API_KEY="$API_KEY" \
-    SCTL_LISTEN="$LISTEN" \
-    SCTL_DATA_DIR="$DATA_DIR" \
-    SCTL_PLAYBOOKS_DIR="$PLAYBOOKS_DIR" \
-    RUST_LOG=info \
-        "$SCTL_BIN" serve &>"$DATA_DIR/sctl.log" &
-    sctl_pid=$!
-    echo "$sctl_pid" > "$PID_FILE"
+        # Start sctl server
+        log "Starting sctl on $LISTEN..."
+        SCTL_API_KEY="$API_KEY" \
+        SCTL_LISTEN="$LISTEN" \
+        SCTL_DATA_DIR="$DATA_DIR" \
+        SCTL_PLAYBOOKS_DIR="$PLAYBOOKS_DIR" \
+        RUST_LOG=info \
+            "$SCTL_BIN" serve &>"$DATA_DIR/sctl.log" &
+        sctl_pid=$!
+        echo "$sctl_pid" > "$PID_FILE"
 
-    wait_for_health "http://${LISTEN}/api/health" "$sctl_pid" "sctl on $LISTEN" "$DATA_DIR/sctl.log"
+        wait_for_health "http://${LISTEN}/api/health" "$sctl_pid" "sctl on $LISTEN" "$DATA_DIR/sctl.log"
+    fi
 
     # Start web dev server
     start_web_dev_server
@@ -538,7 +582,11 @@ EOF
     echo "============================================"
     ok "Dev environment ready!"
     echo ""
-    echo "  sctl:         http://${LISTEN} (PID $sctl_pid)"
+    if [[ -n "$sctl_pid" ]]; then
+        echo "  sctl:         http://${LISTEN} (PID $sctl_pid)"
+    else
+        echo "  sctl:         http://${LISTEN} (attached, foreign process)"
+    fi
     echo "  Web UI:       http://localhost:${WEB_PORT} (PID $web_pid)"
     echo "  MCP server:   $MCP_NAME (stdio, managed by Claude Code)"
     echo "  Config:       $CONFIG_FILE"

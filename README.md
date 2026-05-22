@@ -146,6 +146,17 @@ chmod +x rundev.sh
 
 This builds the server + MCP proxy, starts sctl locally, and registers it with Claude Code. Open a new Claude Code conversation and your AI can now execute commands, manage sessions, and operate your machine.
 
+Web UI: `http://localhost:5170/sctlin` (sctl's Vite dev server).
+
+#### Running alongside other dev stacks
+
+`rundev.sh` is designed to coexist with other dev environments that also need a local sctl-agent (e.g. `netage-fleet`'s rundev). On startup it probes `http://127.0.0.1:1337/api/health` — if a healthy sctl is already there, it **attaches** to that instance instead of launching a duplicate that would fail to bind the port. On `stop` it only kills processes it started; a foreign sctl is left running.
+
+Default port allocation when both stacks run side-by-side:
+- sctl-agent (shared): `127.0.0.1:1337`
+- sctl Vite UI: `http://localhost:5170`
+- netage-fleet Vite UI: `http://localhost:5176`
+
 ### Option 2: Manual Setup
 
 **1. Start the server** on the target device:
