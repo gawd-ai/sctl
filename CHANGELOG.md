@@ -5,7 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.0] - Unreleased
+## [0.5.0] - 2026-05-21
+
+### sctl (server) v0.5.0
+
+#### Performance
+
+- **Async filesystem in polling loops** — replaced `std::fs` with `tokio::fs` across LTE poller, watchdog history, and modem-state log (28 sites). Introduced shared `util::append_rotating` helper for both `watchdog_history.jsonl` and `modem-state.log` append-and-rotate pattern. Runs on the blocking pool via `spawn_blocking` to avoid worker-thread stalls.
+- **Relay broadcast fan-out** — payloads wrapped in `Arc<serde_json::Value>` so the per-client dispatch loop clones the Arc instead of the full JSON tree. Eliminates the relay's hottest allocation under sustained tunnel traffic.
+- **Priority queue capacity** — relay control-channel `mpsc::channel` bumped from 8 to 32 with a >75%-full warn log so future backpressure surfaces instead of silently dropping.
+- **`band_scan` extracted from `lte.rs`** — band-scan orchestration and safe-bands persistence moved to `lte/band_scan.rs`. `lte.rs` is back to a reasonable size; public API preserved.
+- **Lint hygiene** — dropped unused `clippy::pedantic` allow entries, re-enabled `must_use_candidate` with annotations on public state-returning functions.
+
+#### Added
+
+- **Unified `ApiError` + `codes` catalog** — every route returns `Result<Json<T>, (StatusCode, Json<ApiError>)>` with stable SCREAMING_SNAKE error codes from `error::codes`. Replaces the prior mix of `{error, code}` and `{code, message}` shapes across exec, files, lte, auth, sessions, ws. ~115 call sites migrated.
+- **Typed `WsServerMsg` enum** — serde internally-tagged enum replaces 38 hand-built `json!()` sites. Wire format unchanged; compile-time exhaustiveness on the server side.
+- **Generated TS bindings** — `ts-rs` annotations on `WsServerMsg`, `ApiError`, transfer types, activity types. Generated `.ts` files replace hand-maintained type duplicates in the web client; bindings regenerate on `cargo test export_bindings`.
+- **Transfer event observability** — `gawdxfer` transfers now log `transfer_start` and `transfer_complete` to the activity journal with structured detail (transfer_id, direction, filename, file_size, total_chunks). Web client subscribes to `gx.progress` and `gx.complete` via new `onTransferProgress`/`onTransferComplete` hooks on `WsClient`.
+
+#### Fixed
+
+- **`util::append_rotating` CI test race** — switched from `tokio::fs` to `spawn_blocking` + `std::fs` with explicit `flush()`. The tokio async-file `Drop` schedules close on the blocking pool; readers racing the close occasionally observed an empty file on fast filesystems (caught by CI).
+
+### mcp-sctl v0.3.0
+
+#### Changed
+
+- Bumped alongside sctl 0.5.0; consumes the unified `ApiError` shape via shared types.
+
+### sctlin (web) v0.3.0
+
+#### Added
+
+- **Hacker theme** — `web/src/lib/styles/theme.css` overrides gawdux CSS variables with sctlin's terminal palette (deep neutrals, phosphor accents). Imported after `gawdux/styles/tokens.css` in `app.css`.
+- **gawdux 0.2.0 adoption** — `DarkModeToggle`, `PageFeedback`, `ListPageScaffold` + `TableContainer` + `PageActionBar` from gawdux primitives. Replaces local `ToastContainer` and refactors `ServerDashboard` onto the shared scaffold.
+- **Generated TS types** — replaces hand-maintained `WsServerMsg`/`ApiError`/`ActivityType` shapes with bindings emitted from the Rust server.
+- **`onTransferProgress` / `onTransferComplete` hooks** on `WsClient` for `gx.*` event subscription.
+
+#### Changed
+
+- **gawdux pin** — `package.json` now pins gawdux to commit `56ef7fa` (v0.2.0) instead of a floating GitHub URL; installs are deterministic.
+- **Utility dedupe** — `moduleToMenuItem`, `buildGroupItems`, and related helpers now imported from `gawdux/utils` instead of duplicated in `+page.svelte`.
+
+### gawdux v0.2.0 (consumed by sctlin)
+
+#### Added
+
+- **CSS variable theming layer** — `tokens.css` consumes `--gawdux-*` custom properties with SIMS-palette defaults (existing consumers unchanged). New `theme.css` declares the defaults and is the override surface for downstream consumers.
+- **`className` forwarding** on every primitive — consumers can override styles without specificity wars.
+
+## [0.4.0] - 2026-05-21
 
 ### sctl (server) v0.4.0
 
