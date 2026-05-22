@@ -32,6 +32,11 @@
 	--gawdux-surface-card-header: theme(colors.neutral.900);
 	--gawdux-surface-input: theme(colors.neutral.700);
 	--gawdux-surface-subtle: theme(colors.neutral.900);
+	/* Let the outer aside's bg-neutral-950 (set in +page.svelte) show
+	   through the empty bottom of the sidenav — otherwise the panel's
+	   neutral-900 surface reads as a lighter slab against the darker
+	   canvas. */
+	--gawdux-surface-sidebar: transparent;
 
 	/* Text — bright phosphor on dark surfaces. */
 	--gawdux-text-primary: theme(colors.neutral.200);
