@@ -6,9 +6,10 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{info, warn};
@@ -19,12 +20,14 @@ use super::types::{
     ListResult, Phase, Progress, ResumeResult, StatusResult, TransferConfig, TransferError,
     TransferProgress, TransferSpec, TransferSummary,
 };
+use crate::activity::{ActivityLog, ActivitySource, ActivityType};
 
 /// Owns the set of active transfers and their lifecycle.
 pub struct TransferManager {
     transfers: RwLock<HashMap<String, Transfer>>,
     config: TransferConfig,
     progress_tx: broadcast::Sender<Value>,
+    activity_log: Arc<ActivityLog>,
 }
 
 struct Transfer {
@@ -33,11 +36,16 @@ struct Transfer {
 }
 
 impl TransferManager {
-    pub fn new(config: TransferConfig, progress_tx: broadcast::Sender<Value>) -> Self {
+    pub fn new(
+        config: TransferConfig,
+        progress_tx: broadcast::Sender<Value>,
+        activity_log: Arc<ActivityLog>,
+    ) -> Self {
         Self {
             transfers: RwLock::new(HashMap::new()),
             config,
             progress_tx,
+            activity_log,
         }
     }
 
@@ -153,6 +161,22 @@ impl TransferManager {
             chunk_size,
             "Download init"
         );
+
+        self.activity_log
+            .log(
+                ActivityType::TransferStart,
+                ActivitySource::Rest,
+                format!("download {filename} ({file_size} bytes)"),
+                Some(json!({
+                    "transfer_id": transfer_id,
+                    "direction": "download",
+                    "filename": filename,
+                    "file_size": file_size,
+                    "total_chunks": total_chunks,
+                })),
+                None,
+            )
+            .await;
 
         Ok(InitDownloadResult {
             transfer_id,
@@ -314,6 +338,22 @@ impl TransferManager {
             "Upload init"
         );
 
+        self.activity_log
+            .log(
+                ActivityType::TransferStart,
+                ActivitySource::Rest,
+                format!("upload {} ({} bytes)", req.filename, req.file_size),
+                Some(json!({
+                    "transfer_id": transfer_id,
+                    "direction": "upload",
+                    "filename": req.filename,
+                    "file_size": req.file_size,
+                    "total_chunks": total_chunks,
+                })),
+                None,
+            )
+            .await;
+
         Ok(InitUploadResult {
             transfer_id,
             chunk_size,
@@ -460,6 +500,24 @@ impl TransferManager {
                         elapsed_ms,
                         "Download complete"
                     );
+                    self.activity_log
+                        .log(
+                            ActivityType::TransferComplete,
+                            ActivitySource::Rest,
+                            format!(
+                                "download {} ({} bytes, {}ms)",
+                                t.spec.filename, t.spec.file_size, elapsed_ms
+                            ),
+                            Some(json!({
+                                "transfer_id": transfer_id,
+                                "direction": "download",
+                                "filename": t.spec.filename,
+                                "file_size": t.spec.file_size,
+                                "elapsed_ms": elapsed_ms,
+                            })),
+                            None,
+                        )
+                        .await;
                 }
                 self.emit_progress(t);
             }
@@ -728,6 +786,24 @@ impl TransferManager {
                 elapsed_ms,
                 "Upload complete"
             );
+            self.activity_log
+                .log(
+                    ActivityType::TransferComplete,
+                    ActivitySource::Rest,
+                    format!(
+                        "upload {} ({} bytes, {}ms)",
+                        t.spec.filename, file_size, elapsed_ms
+                    ),
+                    Some(json!({
+                        "transfer_id": transfer_id,
+                        "direction": "upload",
+                        "filename": t.spec.filename,
+                        "file_size": file_size,
+                        "elapsed_ms": elapsed_ms,
+                    })),
+                    None,
+                )
+                .await;
         }
 
         Ok(())

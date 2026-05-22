@@ -3,4 +3,4 @@
 /**
  * Types of activities tracked by the journal.
  */
-export type ActivityType = "exec" | "file_read" | "file_write" | "file_list" | "session_start" | "session_exec" | "session_kill" | "session_signal" | "file_delete" | "playbook_list" | "playbook_read" | "playbook_write" | "playbook_delete" | "ws_connect" | "ws_disconnect" | "tunnel_connect" | "tunnel_disconnect";
+export type ActivityType = "exec" | "file_read" | "file_write" | "file_list" | "session_start" | "session_exec" | "session_kill" | "session_signal" | "file_delete" | "playbook_list" | "playbook_read" | "playbook_write" | "playbook_delete" | "ws_connect" | "ws_disconnect" | "tunnel_connect" | "tunnel_disconnect" | "transfer_start" | "transfer_complete";

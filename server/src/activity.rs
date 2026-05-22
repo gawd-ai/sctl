@@ -45,6 +45,8 @@ pub enum ActivityType {
     WsDisconnect,
     TunnelConnect,
     TunnelDisconnect,
+    TransferStart,
+    TransferComplete,
 }
 
 /// Where the request originated.
@@ -98,6 +100,8 @@ impl ActivityType {
             "ws_disconnect" => Some(Self::WsDisconnect),
             "tunnel_connect" => Some(Self::TunnelConnect),
             "tunnel_disconnect" => Some(Self::TunnelDisconnect),
+            "transfer_start" => Some(Self::TransferStart),
+            "transfer_complete" => Some(Self::TransferComplete),
             _ => None,
         }
     }

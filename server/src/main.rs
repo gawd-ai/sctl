@@ -310,6 +310,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     let transfer_manager = Arc::new(TransferManager::new(
         transfer_config,
         session_events.clone(),
+        activity_log.clone(),
     ));
 
     // GPS state (only when [gps] config is present)

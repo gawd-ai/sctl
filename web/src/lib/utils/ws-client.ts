@@ -15,7 +15,9 @@ import type {
 	WsSessionRenameAckMsg,
 	WsSessionAllowAiAckMsg,
 	WsSessionListedMsg,
-	WsShellListedMsg
+	WsShellListedMsg,
+	GxProgressMsg,
+	GxCompleteMsg
 } from '../types/terminal.types';
 import { ConnectionError, ServerError, TimeoutError } from './errors';
 import { getRelayBaseUrl, getRelaySerial } from './relay';
@@ -311,6 +313,16 @@ export class SctlWsClient {
 		return this.on('session.gap', (m) => {
 			if (m.session_id === sessionId) cb(m);
 		});
+	}
+
+	/** Subscribe to gawdxfer per-chunk progress events. */
+	onTransferProgress(cb: (msg: GxProgressMsg) => void): () => void {
+		return this.on('gx.progress', cb);
+	}
+
+	/** Subscribe to gawdxfer completion events (success path). */
+	onTransferComplete(cb: (msg: GxCompleteMsg) => void): () => void {
+		return this.on('gx.complete', cb);
 	}
 
 	// ── Send helpers ────────────────────────────────────────────────
