@@ -3,8 +3,6 @@
 use std::borrow::Cow;
 use std::path::Path;
 
-use tokio::io::AsyncWriteExt;
-
 /// Expand a leading `~` to `$HOME`.
 ///
 /// - `"~"` → `"/home/user"`
@@ -32,29 +30,41 @@ pub fn expand_tilde(path: &str) -> Cow<'_, str> {
 /// rotates to `file.1`. Matches the prior hand-rolled patterns in
 /// `watchdog_history.jsonl` and `modem-state.log`.
 ///
-/// Uses `tokio::fs` end-to-end so the call is safe inside async polling
-/// loops without blocking a worker thread on disk I/O.
+/// Runs the rotate-then-append on the blocking pool via `spawn_blocking` so
+/// the call is safe inside async polling loops without blocking a worker
+/// thread on disk I/O. We use `std::fs` inside the closure rather than
+/// `tokio::fs` because tokio's async file Drop schedules the close on the
+/// blocking pool — readers racing the close occasionally see an empty file
+/// on slower filesystems (caught by CI). `std::fs` with an explicit
+/// `flush` + drop is synchronous and avoids the race.
 pub async fn append_rotating(path: &Path, line: &str, max_bytes: u64) -> std::io::Result<bool> {
-    let mut rotated = false;
-    if let Ok(meta) = tokio::fs::metadata(path).await {
-        if meta.len() > max_bytes {
-            let rotated_path = match path.extension().and_then(|e| e.to_str()) {
-                Some(ext) => path.with_extension(format!("{ext}.1")),
-                None => path.with_extension("1"),
-            };
-            // best-effort rename; if it fails we still try to append below
-            if tokio::fs::rename(path, &rotated_path).await.is_ok() {
-                rotated = true;
+    let path = path.to_path_buf();
+    let line = line.to_string();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut rotated = false;
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > max_bytes {
+                let rotated_path = match path.extension().and_then(|e| e.to_str()) {
+                    Some(ext) => path.with_extension(format!("{ext}.1")),
+                    None => path.with_extension("1"),
+                };
+                // best-effort rename; if it fails we still try to append below
+                if std::fs::rename(&path, &rotated_path).is_ok() {
+                    rotated = true;
+                }
             }
         }
-    }
-    let mut f = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await?;
-    f.write_all(line.as_bytes()).await?;
-    Ok(rotated)
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        f.write_all(line.as_bytes())?;
+        f.flush()?;
+        Ok(rotated)
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 #[cfg(test)]
