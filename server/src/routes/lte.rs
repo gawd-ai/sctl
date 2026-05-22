@@ -7,8 +7,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::info;
 
+use crate::error::{codes, ApiError};
 use crate::lte;
 use crate::AppState;
+
+type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
 /// `GET /api/lte` — returns current LTE signal quality, modem identity, band history, and scan status.
 ///
@@ -18,12 +21,12 @@ use crate::AppState;
 pub async fn lte(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let Some(lte_state) = &state.lte_state else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "LTE not configured on this device"})),
-        ));
+        return Err(
+            ApiError::new(codes::NOT_FOUND, "LTE not configured on this device")
+                .into_response_with(StatusCode::NOT_FOUND),
+        );
     };
 
     // Only trigger on-demand poll when explicitly requested
@@ -112,19 +115,19 @@ pub struct SetBandsRequest {
 pub async fn set_bands(
     State(state): State<AppState>,
     Json(req): Json<SetBandsRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let Some(ref lte_state) = state.lte_state else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "LTE not configured on this device"})),
-        ));
+        return Err(
+            ApiError::new(codes::NOT_FOUND, "LTE not configured on this device")
+                .into_response_with(StatusCode::NOT_FOUND),
+        );
     };
 
     let Some(ref modem) = state.modem else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "modem not available"})),
-        ));
+        return Err(
+            ApiError::new(codes::MODEM_UNAVAILABLE, "modem not available")
+                .into_response_with(StatusCode::SERVICE_UNAVAILABLE),
+        );
     };
 
     // AT commands disrupt the QMI data path — block while tunnel is active (unless forced)
@@ -134,12 +137,11 @@ pub async fn set_bands(
             .connected
             .load(std::sync::atomic::Ordering::Relaxed)
     {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(
-                json!({"error": "band changes blocked while tunnel is connected (AT commands disrupt LTE data path). Use force:true to override."}),
-            ),
-        ));
+        return Err(ApiError::new(
+            codes::TUNNEL_CONNECTED,
+            "band changes blocked while tunnel is connected (AT commands disrupt LTE data path). Use force:true to override.",
+        )
+        .into_response_with(StatusCode::CONFLICT));
     }
 
     // Validate request before touching the modem
@@ -147,32 +149,34 @@ pub async fn set_bands(
         "auto" => ((1..=128).collect(), None),
         "locked" => {
             let Some(ref bands) = req.bands else {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": "bands required for locked mode"})),
-                ));
+                return Err(ApiError::new(
+                    codes::INVALID_REQUEST,
+                    "bands required for locked mode",
+                )
+                .into_response_with(StatusCode::BAD_REQUEST));
             };
             if bands.is_empty() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": "bands list cannot be empty"})),
-                ));
+                return Err(
+                    ApiError::new(codes::INVALID_REQUEST, "bands list cannot be empty")
+                        .into_response_with(StatusCode::BAD_REQUEST),
+                );
             }
             for &b in bands {
                 if !(1..=128).contains(&b) {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({"error": format!("invalid band number: {b}")})),
-                    ));
+                    return Err(ApiError::new(
+                        codes::INVALID_REQUEST,
+                        format!("invalid band number: {b}"),
+                    )
+                    .into_response_with(StatusCode::BAD_REQUEST));
                 }
             }
             (bands.clone(), req.priority_band)
         }
         _ => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "mode must be 'locked' or 'auto'"})),
-            ));
+            return Err(
+                ApiError::new(codes::INVALID_REQUEST, "mode must be 'locked' or 'auto'")
+                    .into_response_with(StatusCode::BAD_REQUEST),
+            );
         }
     };
 
@@ -212,10 +216,8 @@ pub async fn set_bands(
         let hex = lte::bands_to_hex(&new_bands);
         let cmd = format!("AT+QCFG=\"band\",260,{hex},0");
         modem.command(&cmd).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("AT band write failed: {e}")})),
-            )
+            ApiError::new(codes::MODEM_AT_FAILED, format!("AT band write failed: {e}"))
+                .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
         })?;
 
         // If user requested a different priority than the serving anchor, set it
@@ -276,7 +278,10 @@ pub async fn set_bands(
     let (config, old_bands, old_priority, did_deregister) =
         lte::apply_bands_fast(modem, &new_bands, new_priority)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
+            .map_err(|e| {
+                ApiError::new(codes::MODEM_AT_FAILED, e)
+                    .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
+            })?;
 
     let current_bands = old_bands.clone();
     let current_priority = old_priority;
@@ -409,19 +414,19 @@ pub struct StartScanRequest {
 pub async fn start_scan(
     State(state): State<AppState>,
     Json(req): Json<StartScanRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let Some(ref lte_state) = state.lte_state else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "LTE not configured on this device"})),
-        ));
+        return Err(
+            ApiError::new(codes::NOT_FOUND, "LTE not configured on this device")
+                .into_response_with(StatusCode::NOT_FOUND),
+        );
     };
 
     let Some(ref modem) = state.modem else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "modem not available"})),
-        ));
+        return Err(
+            ApiError::new(codes::MODEM_UNAVAILABLE, "modem not available")
+                .into_response_with(StatusCode::SERVICE_UNAVAILABLE),
+        );
     };
 
     // AT commands disrupt the QMI data path — block while tunnel is active (unless forced)
@@ -431,12 +436,11 @@ pub async fn start_scan(
             .connected
             .load(std::sync::atomic::Ordering::Relaxed)
     {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(
-                json!({"error": "band scan blocked while tunnel is connected (AT commands disrupt LTE data path). Use force:true to override."}),
-            ),
-        ));
+        return Err(ApiError::new(
+            codes::TUNNEL_CONNECTED,
+            "band scan blocked while tunnel is connected (AT commands disrupt LTE data path). Use force:true to override.",
+        )
+        .into_response_with(StatusCode::CONFLICT));
     }
 
     // Check if scan already running
@@ -445,10 +449,8 @@ pub async fn start_scan(
         ls.last_user_action_at = Some(std::time::Instant::now());
         if let Some(ref scan) = ls.scan_status {
             if scan.state == "running" {
-                return Err((
-                    StatusCode::CONFLICT,
-                    Json(json!({"error": "scan already running"})),
-                ));
+                return Err(ApiError::new(codes::SCAN_RUNNING, "scan already running")
+                    .into_response_with(StatusCode::CONFLICT));
             }
         }
     }
@@ -501,14 +503,10 @@ pub async fn start_scan(
 ///
 /// No AT commands needed — just measures throughput through the LTE interface.
 /// Safe to use while tunnel is connected.
-pub async fn speed_test(
-    State(state): State<AppState>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn speed_test(State(state): State<AppState>) -> ApiResult<Value> {
     let lte_config = state.config.lte.as_ref().ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "LTE not configured on this device"})),
-        )
+        ApiError::new(codes::NOT_FOUND, "LTE not configured on this device")
+            .into_response_with(StatusCode::NOT_FOUND)
     })?;
 
     let interface = lte_config.interface.clone();
@@ -516,12 +514,11 @@ pub async fn speed_test(
     let ul_url = lte_config.speed_test_upload_url.clone();
 
     if dl_url.is_none() && ul_url.is_none() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(
-                json!({"error": "no speed_test_url or speed_test_upload_url configured in [lte]"}),
-            ),
-        ));
+        return Err(ApiError::new(
+            codes::INVALID_REQUEST,
+            "no speed_test_url or speed_test_upload_url configured in [lte]",
+        )
+        .into_response_with(StatusCode::BAD_REQUEST));
     }
 
     let download_bps = if let Some(ref url) = dl_url {
@@ -549,14 +546,12 @@ pub async fn speed_test(
 /// constrain the automatic watchdog. The operator owns the call. Returns the
 /// raw action result string plus the new detected modem path (if the kernel
 /// re-bound a tty before we returned).
-pub async fn manual_usb_cycle(
-    State(state): State<AppState>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn manual_usb_cycle(State(state): State<AppState>) -> ApiResult<Value> {
     let Some(ref lte_cfg) = state.config.lte else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "LTE not configured on this device"})),
-        ));
+        return Err(
+            ApiError::new(codes::NOT_FOUND, "LTE not configured on this device")
+                .into_response_with(StatusCode::NOT_FOUND),
+        );
     };
     let device_path = lte_cfg
         .device
@@ -583,18 +578,14 @@ pub async fn manual_usb_cycle(
 /// post-mortem inspection. This endpoint streams the file as a JSON array
 /// (parsing line-delimited JSON on the way out). Returns an empty array if
 /// the file does not exist.
-pub async fn watchdog_history(
-    State(state): State<AppState>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn watchdog_history(State(state): State<AppState>) -> ApiResult<Value> {
     let path = std::path::Path::new(&state.config.server.data_dir).join("watchdog_history.jsonl");
     if !path.exists() {
         return Ok(Json(json!([])));
     }
     let contents = std::fs::read_to_string(&path).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("read watchdog_history.jsonl: {e}")})),
-        )
+        ApiError::new(codes::IO_ERROR, format!("read watchdog_history.jsonl: {e}"))
+            .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
     })?;
     let entries: Vec<Value> = contents
         .lines()

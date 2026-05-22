@@ -86,4 +86,8 @@ pub mod codes {
     pub const BATCH_TOO_LARGE: &str = "BATCH_TOO_LARGE";
     pub const MULTIPART_ERROR: &str = "MULTIPART_ERROR";
     pub const AI_NOT_ALLOWED: &str = "AI_NOT_ALLOWED";
+    pub const MODEM_UNAVAILABLE: &str = "MODEM_UNAVAILABLE";
+    pub const MODEM_AT_FAILED: &str = "MODEM_AT_FAILED";
+    pub const TUNNEL_CONNECTED: &str = "TUNNEL_CONNECTED";
+    pub const SCAN_RUNNING: &str = "SCAN_RUNNING";
 }

@@ -39,7 +39,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::activity::{self, request_id_from_headers, ActivityType};
+use crate::error::{codes, ApiError};
 use crate::AppState;
+
+type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
 /// Query parameters for `GET /api/files`.
 #[derive(Deserialize)]
@@ -147,26 +150,24 @@ pub struct FileWriteRequest {
 
 /// Validate that a user-supplied path is absolute, has no `..` traversal, and
 /// contains no null bytes.
-pub(crate) fn validate_path(path: &str) -> Result<PathBuf, (StatusCode, Json<Value>)> {
+pub(crate) fn validate_path(path: &str) -> Result<PathBuf, (StatusCode, Json<ApiError>)> {
     let p = Path::new(path);
     if !p.is_absolute() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Path must be absolute", "code": "INVALID_PATH"})),
-        ));
+        return Err(ApiError::new(codes::INVALID_PATH, "Path must be absolute")
+            .into_response_with(StatusCode::BAD_REQUEST));
     }
     if path.contains('\0') {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Path contains null bytes", "code": "INVALID_PATH"})),
-        ));
+        return Err(
+            ApiError::new(codes::INVALID_PATH, "Path contains null bytes")
+                .into_response_with(StatusCode::BAD_REQUEST),
+        );
     }
     for component in p.components() {
         if let std::path::Component::ParentDir = component {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Path traversal (..) not allowed", "code": "INVALID_PATH"})),
-            ));
+            return Err(
+                ApiError::new(codes::INVALID_PATH, "Path traversal (..) not allowed")
+                    .into_response_with(StatusCode::BAD_REQUEST),
+            );
         }
     }
     Ok(p.to_path_buf())
@@ -195,7 +196,7 @@ pub async fn get_file(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<FilesQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let source = activity::source_from_headers(&headers);
     let req_id = request_id_from_headers(&headers);
     let path = validate_path(&query.path)?;
@@ -247,34 +248,28 @@ async fn read_file(
     max_size: usize,
     offset: Option<u64>,
     limit: Option<usize>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let metadata = match tokio::fs::metadata(path).await {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "File not found", "code": "FILE_NOT_FOUND"})),
-            ));
+            return Err(ApiError::new(codes::FILE_NOT_FOUND, "File not found")
+                .into_response_with(StatusCode::NOT_FOUND));
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": "Permission denied", "code": "PERMISSION_DENIED"})),
-            ));
+            return Err(ApiError::new(codes::PERMISSION_DENIED, "Permission denied")
+                .into_response_with(StatusCode::FORBIDDEN));
         }
         Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string(), "code": "IO_ERROR"})),
-            ));
+            return Err(ApiError::new(codes::IO_ERROR, e.to_string())
+                .into_response_with(StatusCode::INTERNAL_SERVER_ERROR));
         }
     };
 
     if metadata.is_dir() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Path is a directory, use list=true", "code": "IS_DIRECTORY"})),
-        ));
+        return Err(
+            ApiError::new(codes::IS_DIRECTORY, "Path is a directory, use list=true")
+                .into_response_with(StatusCode::BAD_REQUEST),
+        );
     }
 
     let file_size = metadata.len();
@@ -284,13 +279,11 @@ async fn read_file(
     // Without range params, enforce the old behaviour: reject oversized files.
     #[allow(clippy::cast_possible_truncation)]
     if offset.is_none() && limit.is_none() && file_size as usize > max_size {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": format!("File too large ({} bytes, max {})", file_size, max_size),
-                "code": "FILE_TOO_LARGE"
-            })),
-        ));
+        return Err(ApiError::new(
+            codes::FILE_TOO_LARGE,
+            format!("File too large ({file_size} bytes, max {max_size})"),
+        )
+        .into_response_with(StatusCode::BAD_REQUEST));
     }
 
     let modified = metadata.modified().ok().and_then(format_system_time);
@@ -302,16 +295,12 @@ async fn read_file(
         let mut file = match tokio::fs::File::open(path).await {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                return Err((
-                    StatusCode::FORBIDDEN,
-                    Json(json!({"error": "Permission denied", "code": "PERMISSION_DENIED"})),
-                ));
+                return Err(ApiError::new(codes::PERMISSION_DENIED, "Permission denied")
+                    .into_response_with(StatusCode::FORBIDDEN));
             }
             Err(e) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": e.to_string(), "code": "IO_ERROR"})),
-                ));
+                return Err(ApiError::new(codes::IO_ERROR, e.to_string())
+                    .into_response_with(StatusCode::INTERNAL_SERVER_ERROR));
             }
         };
 
@@ -319,10 +308,8 @@ async fn read_file(
             file.seek(std::io::SeekFrom::Start(read_offset))
                 .await
                 .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": e.to_string(), "code": "IO_ERROR"})),
-                    )
+                    ApiError::new(codes::IO_ERROR, e.to_string())
+                        .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
                 })?;
         }
 
@@ -331,10 +318,8 @@ async fn read_file(
         let to_read = read_limit.min(remaining);
         let mut buf = vec![0u8; to_read];
         let n = file.read(&mut buf).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string(), "code": "IO_ERROR"})),
-            )
+            ApiError::new(codes::IO_ERROR, e.to_string())
+                .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
         })?;
         buf.truncate(n);
         buf
@@ -375,26 +360,20 @@ async fn read_file(
 }
 
 /// List a directory's contents, sorted by name.
-async fn list_directory(path: &Path) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn list_directory(path: &Path) -> ApiResult<Value> {
     let mut read_dir = match tokio::fs::read_dir(path).await {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "Directory not found", "code": "FILE_NOT_FOUND"})),
-            ));
+            return Err(ApiError::new(codes::FILE_NOT_FOUND, "Directory not found")
+                .into_response_with(StatusCode::NOT_FOUND));
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": "Permission denied", "code": "PERMISSION_DENIED"})),
-            ));
+            return Err(ApiError::new(codes::PERMISSION_DENIED, "Permission denied")
+                .into_response_with(StatusCode::FORBIDDEN));
         }
         Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string(), "code": "IO_ERROR"})),
-            ));
+            return Err(ApiError::new(codes::IO_ERROR, e.to_string())
+                .into_response_with(StatusCode::INTERNAL_SERVER_ERROR));
         }
     };
 
@@ -471,7 +450,7 @@ pub async fn put_file(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<FileWriteRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let source = activity::source_from_headers(&headers);
     let req_id = request_id_from_headers(&headers);
     let path = validate_path(&payload.path)?;
@@ -481,25 +460,23 @@ pub async fn put_file(
         base64::engine::general_purpose::STANDARD
             .decode(&payload.content)
             .map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(
-                        json!({"error": format!("Invalid base64: {e}"), "code": "INVALID_CONTENT"}),
-                    ),
-                )
+                ApiError::new(codes::INVALID_CONTENT, format!("Invalid base64: {e}"))
+                    .into_response_with(StatusCode::BAD_REQUEST)
             })?
     } else {
         payload.content.into_bytes()
     };
 
     if bytes.len() > state.config.server.max_file_size {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": format!("Content too large ({} bytes, max {})", bytes.len(), state.config.server.max_file_size),
-                "code": "FILE_TOO_LARGE"
-            })),
-        ));
+        return Err(ApiError::new(
+            codes::FILE_TOO_LARGE,
+            format!(
+                "Content too large ({} bytes, max {})",
+                bytes.len(),
+                state.config.server.max_file_size
+            ),
+        )
+        .into_response_with(StatusCode::BAD_REQUEST));
     }
 
     if payload.create_dirs {
@@ -507,10 +484,8 @@ pub async fn put_file(
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|e: std::io::Error| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": e.to_string(), "code": "IO_ERROR"})),
-                    )
+                    ApiError::new(codes::IO_ERROR, e.to_string())
+                        .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
                 })?;
         }
     }
@@ -524,15 +499,11 @@ pub async fn put_file(
         .await
         .map_err(|e: std::io::Error| {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
-                (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({"error": "Permission denied", "code": "PERMISSION_DENIED"})),
-                )
+                ApiError::new(codes::PERMISSION_DENIED, "Permission denied")
+                    .into_response_with(StatusCode::FORBIDDEN)
             } else {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": e.to_string(), "code": "IO_ERROR"})),
-                )
+                ApiError::new(codes::IO_ERROR, e.to_string())
+                    .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
             }
         })?;
 
@@ -544,21 +515,19 @@ pub async fn put_file(
             tokio::spawn(async move {
                 let _ = tokio::fs::remove_file(&tp).await;
             });
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": format!("Invalid octal mode: {mode_str:?}"),
-                    "code": "INVALID_MODE"
-                })),
+            ApiError::new(
+                codes::INVALID_MODE,
+                format!("Invalid octal mode: {mode_str:?}"),
             )
+            .into_response_with(StatusCode::BAD_REQUEST)
         })?;
         let perms = std::fs::Permissions::from_mode(mode);
         if let Err(e) = tokio::fs::set_permissions(&temp_path, perms).await {
             let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to set mode: {e}"), "code": "IO_ERROR"})),
-            ));
+            return Err(
+                ApiError::new(codes::IO_ERROR, format!("Failed to set mode: {e}"))
+                    .into_response_with(StatusCode::INTERNAL_SERVER_ERROR),
+            );
         }
     }
 
@@ -583,16 +552,14 @@ pub async fn put_file(
 pub(crate) async fn rename_temp_to_final(
     temp_path: &Path,
     final_path: &Path,
-) -> Result<(), (StatusCode, Json<Value>)> {
+) -> Result<(), (StatusCode, Json<ApiError>)> {
     tokio::fs::rename(temp_path, final_path).await.map_err(|e| {
         let tp = temp_path.to_path_buf();
         tokio::spawn(async move {
             let _ = tokio::fs::remove_file(&tp).await;
         });
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Failed to rename: {e}"), "code": "IO_ERROR"})),
-        )
+        ApiError::new(codes::IO_ERROR, format!("Failed to rename: {e}"))
+            .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
     })
 }
 
@@ -630,27 +597,21 @@ pub async fn delete_file(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<FileDeleteRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let source = activity::source_from_headers(&headers);
     let req_id = request_id_from_headers(&headers);
     let path = validate_path(&payload.path)?;
 
     tokio::fs::remove_file(&path).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "File not found", "code": "FILE_NOT_FOUND"})),
-            )
+            ApiError::new(codes::FILE_NOT_FOUND, "File not found")
+                .into_response_with(StatusCode::NOT_FOUND)
         } else if e.kind() == std::io::ErrorKind::PermissionDenied {
-            (
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": "Permission denied", "code": "PERMISSION_DENIED"})),
-            )
+            ApiError::new(codes::PERMISSION_DENIED, "Permission denied")
+                .into_response_with(StatusCode::FORBIDDEN)
         } else {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string(), "code": "IO_ERROR"})),
-            )
+            ApiError::new(codes::IO_ERROR, e.to_string())
+                .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
         }
     })?;
 
@@ -678,7 +639,7 @@ pub async fn download_file(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<DownloadQuery>,
-) -> Result<Response, (StatusCode, Json<Value>)> {
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
     let source = activity::source_from_headers(&headers);
     let req_id = request_id_from_headers(&headers);
     let path = validate_path(&query.path)?;
@@ -686,32 +647,24 @@ pub async fn download_file(
     let metadata = tokio::fs::metadata(&path)
         .await
         .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "File not found", "code": "FILE_NOT_FOUND"})),
-            ),
-            std::io::ErrorKind::PermissionDenied => (
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": "Permission denied", "code": "PERMISSION_DENIED"})),
-            ),
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string(), "code": "IO_ERROR"})),
-            ),
+            std::io::ErrorKind::NotFound => ApiError::new(codes::FILE_NOT_FOUND, "File not found")
+                .into_response_with(StatusCode::NOT_FOUND),
+            std::io::ErrorKind::PermissionDenied => {
+                ApiError::new(codes::PERMISSION_DENIED, "Permission denied")
+                    .into_response_with(StatusCode::FORBIDDEN)
+            }
+            _ => ApiError::new(codes::IO_ERROR, e.to_string())
+                .into_response_with(StatusCode::INTERNAL_SERVER_ERROR),
         })?;
 
     if metadata.is_dir() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Path is a directory", "code": "IS_DIRECTORY"})),
-        ));
+        return Err(ApiError::new(codes::IS_DIRECTORY, "Path is a directory")
+            .into_response_with(StatusCode::BAD_REQUEST));
     }
 
     let file = tokio::fs::File::open(&path).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string(), "code": "IO_ERROR"})),
-        )
+        ApiError::new(codes::IO_ERROR, e.to_string())
+            .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
     })?;
 
     let file_size = metadata.len();
@@ -755,7 +708,7 @@ pub async fn upload_file(
     headers: HeaderMap,
     Query(query): Query<UploadQuery>,
     mut multipart: Multipart,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let source = activity::source_from_headers(&headers);
     let req_id = request_id_from_headers(&headers);
     let dir_path = validate_path(&query.path)?;
@@ -764,35 +717,31 @@ pub async fn upload_file(
     let meta = tokio::fs::metadata(&dir_path)
         .await
         .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "Directory not found", "code": "FILE_NOT_FOUND"})),
-            ),
-            std::io::ErrorKind::PermissionDenied => (
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": "Permission denied", "code": "PERMISSION_DENIED"})),
-            ),
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string(), "code": "IO_ERROR"})),
-            ),
+            std::io::ErrorKind::NotFound => {
+                ApiError::new(codes::FILE_NOT_FOUND, "Directory not found")
+                    .into_response_with(StatusCode::NOT_FOUND)
+            }
+            std::io::ErrorKind::PermissionDenied => {
+                ApiError::new(codes::PERMISSION_DENIED, "Permission denied")
+                    .into_response_with(StatusCode::FORBIDDEN)
+            }
+            _ => ApiError::new(codes::IO_ERROR, e.to_string())
+                .into_response_with(StatusCode::INTERNAL_SERVER_ERROR),
         })?;
 
     if !meta.is_dir() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Target path is not a directory", "code": "NOT_A_DIRECTORY"})),
-        ));
+        return Err(
+            ApiError::new(codes::NOT_A_DIRECTORY, "Target path is not a directory")
+                .into_response_with(StatusCode::BAD_REQUEST),
+        );
     }
 
     let max_size = state.config.server.max_file_size;
     let mut uploaded: Vec<Value> = Vec::new();
 
     while let Some(field) = multipart.next_field().await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("Multipart error: {e}"), "code": "MULTIPART_ERROR"})),
-        )
+        ApiError::new(codes::MULTIPART_ERROR, format!("Multipart error: {e}"))
+            .into_response_with(StatusCode::BAD_REQUEST)
     })? {
         let file_name = match field.file_name() {
             Some(name) => name.to_string(),
@@ -801,29 +750,29 @@ pub async fn upload_file(
 
         // Reject path traversal in filenames
         if file_name.contains('/') || file_name.contains('\\') || file_name == ".." {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(
-                    json!({"error": format!("Invalid filename: {file_name}"), "code": "INVALID_PATH"}),
-                ),
-            ));
+            return Err(ApiError::new(
+                codes::INVALID_PATH,
+                format!("Invalid filename: {file_name}"),
+            )
+            .into_response_with(StatusCode::BAD_REQUEST));
         }
 
         let bytes = field.bytes().await.map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("Failed to read field: {e}"), "code": "MULTIPART_ERROR"})),
-            )
+            ApiError::new(codes::MULTIPART_ERROR, format!("Failed to read field: {e}"))
+                .into_response_with(StatusCode::BAD_REQUEST)
         })?;
 
         if bytes.len() > max_size {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": format!("File '{}' too large ({} bytes, max {})", file_name, bytes.len(), max_size),
-                    "code": "FILE_TOO_LARGE"
-                })),
-            ));
+            return Err(ApiError::new(
+                codes::FILE_TOO_LARGE,
+                format!(
+                    "File '{}' too large ({} bytes, max {})",
+                    file_name,
+                    bytes.len(),
+                    max_size
+                ),
+            )
+            .into_response_with(StatusCode::BAD_REQUEST));
         }
 
         let final_path = dir_path.join(&file_name);
@@ -832,15 +781,11 @@ pub async fn upload_file(
 
         tokio::fs::write(&temp_path, &bytes).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
-                (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({"error": "Permission denied", "code": "PERMISSION_DENIED"})),
-                )
+                ApiError::new(codes::PERMISSION_DENIED, "Permission denied")
+                    .into_response_with(StatusCode::FORBIDDEN)
             } else {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": e.to_string(), "code": "IO_ERROR"})),
-                )
+                ApiError::new(codes::IO_ERROR, e.to_string())
+                    .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
             }
         })?;
 

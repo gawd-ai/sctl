@@ -14,9 +14,10 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::activity::{self, request_id_from_headers, ActivityType, CachedExecResult};
+use crate::error::{codes, ApiError};
 use crate::shell::process;
 use crate::AppState;
 
@@ -66,7 +67,7 @@ pub async fn exec(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<ExecRequest>,
-) -> Result<Json<ExecResponse>, (StatusCode, Json<Value>)> {
+) -> Result<Json<ExecResponse>, (StatusCode, Json<ApiError>)> {
     let source = activity::source_from_headers(&headers);
     let req_id = request_id_from_headers(&headers);
     let timeout = payload
@@ -113,11 +114,11 @@ pub async fn exec(
                 req_id,
             )
             .await;
-            let mut err = json!({"error": "Command timed out", "code": "TIMEOUT"});
+            let mut err = ApiError::new(codes::TIMEOUT, "Command timed out");
             if let Some(ref rid) = payload.request_id {
-                err["request_id"] = json!(rid);
+                err = err.with_detail(json!({ "request_id": rid }));
             }
-            Err((StatusCode::GATEWAY_TIMEOUT, Json(err)))
+            Err(err.into_response_with(StatusCode::GATEWAY_TIMEOUT))
         }
         Err(e) => {
             let error_msg = e.to_string();
@@ -131,11 +132,11 @@ pub async fn exec(
                 req_id,
             )
             .await;
-            let mut err = json!({"error": error_msg, "code": "EXEC_FAILED"});
+            let mut err = ApiError::new(codes::EXEC_FAILED, error_msg);
             if let Some(ref rid) = payload.request_id {
-                err["request_id"] = json!(rid);
+                err = err.with_detail(json!({ "request_id": rid }));
             }
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)))
+            Err(err.into_response_with(StatusCode::INTERNAL_SERVER_ERROR))
         }
     }
 }
@@ -203,23 +204,24 @@ pub async fn batch_exec(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<BatchExecRequest>,
-) -> Result<Json<BatchExecResponse>, (StatusCode, Json<Value>)> {
+) -> Result<Json<BatchExecResponse>, (StatusCode, Json<ApiError>)> {
     let source = activity::source_from_headers(&headers);
     let req_id = request_id_from_headers(&headers);
     if payload.commands.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "commands array is empty", "code": "INVALID_REQUEST"})),
-        ));
+        return Err(
+            ApiError::new(codes::INVALID_REQUEST, "commands array is empty")
+                .into_response_with(StatusCode::BAD_REQUEST),
+        );
     }
     if payload.commands.len() > state.config.server.max_batch_size {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": format!("Too many commands (max {})", state.config.server.max_batch_size),
-                "code": "BATCH_TOO_LARGE"
-            })),
-        ));
+        return Err(ApiError::new(
+            codes::BATCH_TOO_LARGE,
+            format!(
+                "Too many commands (max {})",
+                state.config.server.max_batch_size
+            ),
+        )
+        .into_response_with(StatusCode::BAD_REQUEST));
     }
 
     let default_shell = payload
