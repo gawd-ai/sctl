@@ -95,7 +95,9 @@ for d in $LIST; do
   echo "interface=$d gateway=${g:-none} src=${src:-none} link=$link"
 
   if [ -z "$g" ]; then echo "  -> no gateway, skip"; echo "$d|none|${src:-none}|-|-|-|no-gw" >> "$RES"; continue; fi
-  if [ "$link" != "up" ]; then echo "  -> link $link, skip"; echo "$d|$g|${src:-none}|-|-|-|down" >> "$RES"; continue; fi
+  # ethernet reports operstate=up; point-to-point links (wwan0/wg0/ppp) report
+  # "unknown" even when fully up — accept both, reject only a real down state.
+  case "$link" in up|unknown) ;; *) echo "  -> link $link, skip"; echo "$d|$g|${src:-none}|-|-|-|$link" >> "$RES"; continue ;; esac
   if [ -z "$IPS" ]; then echo "  -> could not resolve $HOST"; echo "$d|$g|${src:-none}|-|-|-|dns-fail" >> "$RES"; continue; fi
 
   # pin temporary /32 routes for every server IP via this interface
