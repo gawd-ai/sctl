@@ -21,8 +21,8 @@ params:
     default: "8"
   url:
     type: string
-    description: Download endpoint. Default Cloudflare __down (script appends ?bytes=N). Upload posts to the matching /__up on the same host.
-    default: https://speed.cloudflare.com/__down
+    description: Speed-test server. Default is the Cloudflare base host; the script appends /__down?bytes=N for download and /__up for upload. A full __down URL also works.
+    default: https://speed.cloudflare.com
   verbosity:
     type: string
     description: Output detail level
@@ -60,16 +60,17 @@ HAVE_CURL=0; command -v curl >/dev/null 2>&1 && HAVE_CURL=1
 HAVE_WGET=0; command -v wget >/dev/null 2>&1 && HAVE_WGET=1
 [ "$HAVE_CURL" = 1 ] || [ "$HAVE_WGET" = 1 ] || { echo "ERROR: neither curl nor wget present"; exit 1; }
 
-# download URL: append ?bytes=N for the Cloudflare __down endpoint
-case "$URL" in
-  *\?*)    DOWN_URL="$URL" ;;
-  *__down) DOWN_URL="$URL?bytes=$BYTES_REQ" ;;
-  *)       DOWN_URL="$URL" ;;
-esac
-# scheme+host -> matching upload sink (Cloudflare __up on the same host)
+# Derive endpoints. URL may be a bare base host (default) or a full __down URL.
 SCHEME=$(echo "$URL" | sed -n 's#^\([a-zA-Z]*\)://.*#\1#p'); [ -z "$SCHEME" ] && SCHEME=https
 HOST=$(echo "$URL" | sed 's#^[a-zA-Z]*://##; s#[/?].*##; s#:.*##')
-UP_URL="$SCHEME://$HOST/__up"
+REST=${URL#*://}; case "$REST" in */*) UPATH="/${REST#*/}" ;; *) UPATH="" ;; esac
+case "$UPATH" in
+  ''|/)    DOWN_URL="$SCHEME://$HOST/__down?bytes=$BYTES_REQ" ;;  # bare base host
+  *\?*)    DOWN_URL="$URL" ;;                                     # already has a query
+  *__down) DOWN_URL="$URL?bytes=$BYTES_REQ" ;;                    # __down without a query
+  *)       DOWN_URL="$URL" ;;                                     # other explicit path
+esac
+UP_URL="$SCHEME://$HOST/__up"   # upload always posts to /__up on the same host
 
 # resolve test host to its IPv4 addresses (for /32 forcing)
 IPS=$(nslookup "$HOST" 2>/dev/null | awk '/^Name:/{n=1} n&&/^Address/{print $NF}' \
