@@ -1,14 +1,20 @@
 # sctl Guide
 
-The complete guide to deploying, configuring, and using sctl.
+Operator guide for deploying, configuring, and troubleshooting sctl as an AI remote control plane for real environments: local machines, servers, VPSes, data centers, embedded Linux hardware, communications devices, robotics/edge systems, and remote compute with unreliable links. Start with the main [README](../README.md) for a product overview; use this guide when you are ready to run targets, configure MCP, set up relays, manage playbooks, or operate GPS/LTE monitoring.
+
+Reference details live in the component docs:
+
+- [MCP README](../mcp/README.md) — MCP config and full tool catalog.
+- [Server README](../server/README.md) — HTTP API, WebSocket protocol, and TOML reference.
+- [Web README](../web/README.md) — sctlin package API and integration examples.
 
 ## How sctl Works
 
-sctl is a three-component system for remote device control:
+sctl is a three-component system for AI-assisted remote control:
 
 ```
 AI prompt
-  -> Claude Code / AI agent
+  -> MCP-compatible AI agent
     -> mcp-sctl (MCP proxy, runs on your machine)
       -> JSON-RPC 2.0 over stdio
         -> HTTP/WebSocket request
@@ -27,7 +33,38 @@ AI prompt
 2. **HTTP/WS API** (direct) -- any client can call the REST endpoints or open a WebSocket for interactive sessions.
 3. **sctlin web UI** -- Svelte 5 terminal component library. Embeddable or standalone.
 
-**Persistent sessions** are the core differentiator. When you start a session with `persistent: true`, the shell process lives on the device. Output is buffered in a ring buffer with monotonically increasing sequence numbers. If the network drops, the session keeps running. When you reconnect, `session.attach` replays everything you missed. No output is lost (unless the ring buffer wraps).
+**Persistent sessions** are the core differentiator. When you start a session with `persistent: true`, the shell process lives on the device. Output is buffered in a ring buffer with monotonically increasing sequence numbers. If the network drops, the session keeps running. When you reconnect, `session.attach` replays everything you missed. No output is lost unless the ring buffer wraps.
+
+## Operating Model
+
+sctl uses "device" broadly: any Linux target with `/bin/sh` can be a controlled system. That includes a developer workstation, a lab machine, a server, a VPS, a rack host, an OpenWrt router, an LTE gateway, an embedded board, or the compute module inside a larger product.
+
+The mission is to give AI agents a practical, inspectable way to operate systems that are not naturally inside the agent's local sandbox:
+
+- **Local and infrastructure targets** -- install sctl on your own machine first, then use the same MCP tools and APIs for servers, VPSes, and data-center hosts.
+- **Hardware and communications targets** -- run the device-side server on Linux-based boards, routers, modems, gateways, or prototypes where SSH may be awkward, unavailable, or not enough for AI/human collaboration.
+- **Remote and intermittent-link targets** -- use the relay for LTE/5G, CGNAT, firewalled, or otherwise unreachable devices; persistent sessions continue running and can replay missed output after reconnects.
+- **Robotics, drones, and edge systems** -- operate the Linux compute layer without replacing flight, autonomy, or domain-specific control software.
+- **Space-based AI compute** -- apply the same control pattern to remote compute where inbound access may be impossible and operational links may be delayed or intermittent.
+
+The control surface is intentionally simple: authenticated HTTP/WebSocket APIs, MCP tools for agents, Markdown playbooks for repeatable operations, and sctlin for human-visible terminal handoff.
+
+## Agent Client Setup
+
+`mcp-sctl` is a stdio MCP server, so any MCP-compatible client can launch it. The release scripts provide first-class setup commands for the common agent clients:
+
+```bash
+./rundev.sh agents    # detected clients plus snippets for generic/unverified clients
+./rundev.sh claude    # Claude Code
+./rundev.sh codex     # Codex CLI
+./rundev.sh hermes    # Hermes
+./rundev.sh opencode  # OpenCode config
+./rundev.sh openclaw  # OpenClaw config
+./rundev.sh grok      # Grok Build / generic MCP snippet
+./rundev.sh nanoclaw  # NanoClaw / generic MCP snippet
+```
+
+All of these point the client at the same `mcp-sctl --supervisor --config <devices.json>` process. For clients that do not expose a stable CLI registration command, the script prints the equivalent config snippet instead of inventing client-specific behavior.
 
 ## Deployment
 
@@ -145,7 +182,7 @@ make deploy-riscv HOST=192.168.1.1   # RISC-V
 
 Flash storage considerations: set `journal_enabled = false` or use a tmpfs `data_dir` to avoid flash wear from output journaling.
 
-## Multi-Device Fleet
+## Multi-Device Operations
 
 mcp-sctl supports managing multiple devices from a single MCP server.
 
@@ -392,7 +429,7 @@ mcp-sctl fetches the playbook list on first request and caches it per-device. Th
 
 ### Built-in library
 
-sctl ships with 8 playbooks covering common operations:
+sctl ships with 9 playbooks covering common operations:
 
 | Playbook | MCP Tool | Description |
 |----------|----------|-------------|
@@ -401,9 +438,10 @@ sctl ships with 8 playbooks covering common operations:
 | `linux/security-hardening` | `pb_linux-security-hardening` | SSH, firewall, users, permissions audit |
 | `openwrt/diagnostics` | `pb_openwrt-diagnostics` | OpenWrt-specific system diagnostics |
 | `openwrt/health-check` | `pb_openwrt-health-check` | OpenWrt health monitoring |
-| `openwrt/network-setup` | `pb_openwrt-network-setup` | Network interface configuration |
+| `openwrt/network-setup` | `pb_openwrt-network-setup` | Network diagnostics and controlled reset/restart actions |
 | `openwrt/security-hardening` | `pb_openwrt-security-hardening` | OpenWrt security audit and hardening |
-| `openwrt/network-mode` | `pb_network-mode` | Configure ethernet port roles (router/switch/hybrid) |
+| `openwrt/network-mode` | `pb_network-mode` | Configure multi-port ethernet roles (router/switch/hybrid) |
+| `openwrt/speedtest-multi-eth` | `pb_speedtest-multi-eth` | Per-interface throughput and latency testing |
 
 Deploy them by copying to the device's `playbooks_dir`:
 
@@ -636,7 +674,7 @@ sctlin is also a component library (`npm install sctlin`). See the [web README](
 
 ### MCP tools missing
 
-- Verify mcp-sctl is registered: `claude mcp list`
+- Verify mcp-sctl is registered in your client: `./rundev.sh status`, `claude mcp list`, `codex mcp list`, `hermes mcp list`, or the equivalent client config view.
 - Check config path: `mcp-sctl --config /path/to/devices.json`
 - Test device connectivity: `device_health` tool
 - For playbook tools (`pb_*`): verify playbooks exist in the device's `playbooks_dir`

@@ -1,6 +1,6 @@
 ---
 name: linux-security-hardening
-description: Security audit and hardening for Linux systems — SSH config, open ports, users, passwords, fail2ban, SUID files
+description: Security audit for Linux systems — SSH config, open ports, users, passwords, fail2ban, SUID files; optional safe fixes
 params:
   verbosity:
     type: string
@@ -9,7 +9,7 @@ params:
     enum: [brief, normal, verbose]
   fix_issues:
     type: string
-    description: Whether to auto-fix safe issues or just report
+    description: Whether to report findings only or apply conservative fixes
     default: report-only
     enum: [report-only, auto-fix]
 ---

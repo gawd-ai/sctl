@@ -1,19 +1,27 @@
 <script lang="ts">
-	import type { PlaybookDetail, ExecResult, ViewerTab } from '../types/terminal.types';
+	import type { PlaybookDetail, ExecResult, ViewerTab, WsSessionOutputMsg } from '../types/terminal.types';
 	import type { SctlRestClient } from '../utils/rest-client';
+	import type { SctlWsClient } from '../utils/ws-client';
 	import { renderPlaybookScript } from '../utils/playbook-parser';
 	import { uuid } from '../utils/index';
+	import { onDestroy } from 'svelte';
 
 	interface Props {
 		playbook: PlaybookDetail | null;
 		restClient: SctlRestClient | null;
+		/**
+		 * WebSocket client. When present, the playbook runs as a streaming **job**
+		 * (live output, no 30s ceiling). When absent, falls back to the legacy
+		 * blocking `restClient.exec()`.
+		 */
+		wsClient?: SctlWsClient | null;
 		onresult?: (result: ExecResult) => void;
 		onRunInTerminal?: (script: string) => void;
 		onOpenViewer?: (tab: ViewerTab) => void;
 		onclose?: () => void;
 	}
 
-	let { playbook, restClient, onresult, onRunInTerminal, onOpenViewer, onclose }: Props = $props();
+	let { playbook, restClient, wsClient = null, onresult, onRunInTerminal, onOpenViewer, onclose }: Props = $props();
 
 	// Parameter values
 	let paramValues: Record<string, string> = $state({});
@@ -21,8 +29,22 @@
 	let scriptPreviewExpanded = $state(false);
 	let confirmingExecute = $state(false);
 	let result: ExecResult | null = $state(null);
-	let resultExpanded = $state(false);
 	let error: string | null = $state(null);
+
+	// Streaming job state
+	let liveOutput = $state('');
+	let jobSessionId: string | null = $state(null);
+	let canceling = $state(false);
+	let outputEl: HTMLPreElement | null = $state(null);
+
+	// Active job subscriptions (component-scoped so we can tear them down on
+	// destroy / re-run). Not reactive.
+	let activeUnsubs: Array<() => void> = [];
+	function teardownJobSubs() {
+		for (const u of activeUnsubs) u();
+		activeUnsubs = [];
+	}
+	onDestroy(teardownJobSubs);
 
 	// Initialize param values from defaults when playbook changes
 	$effect(() => {
@@ -33,9 +55,15 @@
 			}
 			paramValues = values;
 			result = null;
-			resultExpanded = false;
 			error = null;
+			liveOutput = '';
 		}
+	});
+
+	// Auto-scroll the live output to the bottom as frames arrive.
+	$effect(() => {
+		liveOutput;
+		if (outputEl) outputEl.scrollTop = outputEl.scrollHeight;
 	});
 
 	// Live script preview
@@ -49,22 +77,112 @@
 	})());
 
 	async function execute() {
-		if (!playbook || !restClient) return;
+		if (!playbook) return;
+		const script = renderPlaybookScript(playbook.script, paramValues, playbook.params);
 
+		// ── Streaming path (preferred): run as a job, stream output live ──
+		if (wsClient) {
+			teardownJobSubs();
+			executing = true;
+			error = null;
+			result = null;
+			liveOutput = '';
+			canceling = false;
+
+			let stdoutBuf = '';
+			let stderrBuf = '';
+			const startTime = Date.now();
+			let finished = false;
+
+			const finish = (exitCode: number) => {
+				if (finished) return;
+				finished = true;
+				teardownJobSubs();
+				const res: ExecResult = {
+					exit_code: exitCode,
+					stdout: stdoutBuf,
+					stderr: stderrBuf,
+					duration_ms: Date.now() - startTime
+				};
+				result = res;
+				executing = false;
+				jobSessionId = null;
+				canceling = false;
+				onresult?.(res);
+			};
+
+			try {
+				const started = await wsClient.startJob({ command: script, name: `pb:${playbook.name}` });
+				jobSessionId = started.session_id;
+
+				activeUnsubs.push(
+					wsClient.onOutput(started.session_id, (msg: WsSessionOutputMsg) => {
+						liveOutput += msg.data;
+						if (msg.type === 'session.stdout') stdoutBuf += msg.data;
+						else if (msg.type === 'session.stderr') stderrBuf += msg.data;
+					})
+				);
+				activeUnsubs.push(
+					wsClient.onSessionEnd(started.session_id, (msg) => {
+						finish('exit_code' in msg ? msg.exit_code : -1);
+					})
+				);
+			} catch (e) {
+				teardownJobSubs();
+				error = e instanceof Error ? e.message : 'Failed to start job';
+				executing = false;
+				jobSessionId = null;
+			}
+			return;
+		}
+
+		// ── Legacy fallback (no WS client): blocking one-shot exec ──
+		if (!restClient) return;
 		executing = true;
 		error = null;
 		result = null;
-
+		liveOutput = '';
 		try {
-			const script = renderPlaybookScript(playbook.script, paramValues, playbook.params);
 			const execResult = await restClient.exec(script);
 			result = execResult;
+			liveOutput = `${execResult.stdout ?? ''}${execResult.stderr ?? ''}`;
 			onresult?.(execResult);
 		} catch (e) {
 			error = e instanceof Error ? e.message : 'Execution failed';
 		} finally {
 			executing = false;
 		}
+	}
+
+	async function cancelJob() {
+		if (!wsClient || !jobSessionId || canceling) return;
+		canceling = true;
+		try {
+			await wsClient.killSession(jobSessionId);
+		} catch {
+			// Session may have already exited — the end subscription will finalize.
+		}
+	}
+
+	function openFullOutput() {
+		if (!result || !playbook || !onOpenViewer) return;
+		const cmd = playbook.name;
+		const tab: ViewerTab = {
+			key: uuid(),
+			type: 'exec',
+			label: cmd.length > 24 ? cmd.slice(0, 24) + '...' : cmd,
+			icon: '$',
+			data: {
+				activityId: 0,
+				command: cmd,
+				exitCode: result.exit_code,
+				stdout: result.stdout,
+				stderr: result.stderr,
+				durationMs: result.duration_ms,
+				status: result.exit_code === 0 ? 'success' : 'failed'
+			}
+		};
+		onOpenViewer(tab);
 	}
 
 	let paramEntries = $derived(
@@ -135,6 +253,13 @@
 					</button>
 				{/if}
 				<div class="flex-1"></div>
+				{#if executing && jobSessionId}
+					<button
+						class="px-2 py-1 rounded text-[10px] transition-colors bg-red-900/40 text-red-400 hover:bg-red-900/60 disabled:opacity-50 disabled:cursor-wait"
+						disabled={canceling}
+						onclick={cancelJob}
+					>{canceling ? 'Stopping...' : 'Cancel'}</button>
+				{/if}
 				<button
 					class="px-2 py-1 rounded text-[10px] transition-colors
 						{executing
@@ -171,7 +296,7 @@
 				{/if}
 			</div>
 
-			<!-- Result -->
+			<!-- Error -->
 			{#if error}
 				<div>
 					<div class="text-[10px] text-red-400 uppercase tracking-wide mb-1">Error</div>
@@ -179,64 +304,37 @@
 				</div>
 			{/if}
 
-			{#if result}
+			<!-- Live output + result -->
+			{#if executing || liveOutput || result}
 				<div>
-					<div class="flex items-center gap-2">
-						<button
-							class="flex items-center gap-1 text-[10px] text-neutral-500 uppercase tracking-wide hover:text-neutral-400 transition-colors"
-							onclick={() => { resultExpanded = !resultExpanded; }}
-						>
-							<svg class="w-3 h-3 transition-transform {resultExpanded ? 'rotate-90' : ''}" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-								<path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
-							</svg>
-							Result
-						</button>
-						<span class="text-[9px] tabular-nums {result.exit_code === 0 ? 'text-green-400' : 'text-red-400'}">
-							exit {result.exit_code}
-						</span>
-						<span class="text-[9px] text-neutral-600 tabular-nums">{result.duration_ms}ms</span>
-						{#if onOpenViewer}
-							<div class="flex-1"></div>
-							<button
-								class="px-2 py-0.5 rounded text-[9px] bg-blue-500/15 text-blue-400 hover:bg-blue-500/25 transition-colors"
-								onclick={() => {
-									if (!result || !playbook) return;
-									const cmd = playbook.name;
-									const tab: ViewerTab = {
-										key: uuid(),
-										type: 'exec',
-										label: cmd.length > 24 ? cmd.slice(0, 24) + '...' : cmd,
-										icon: '$',
-										data: {
-											activityId: 0,
-											command: cmd,
-											exitCode: result.exit_code,
-											stdout: result.stdout,
-											stderr: result.stderr,
-											durationMs: result.duration_ms,
-											status: result.exit_code === 0 ? 'success' : 'failed',
-										}
-									};
-									onOpenViewer(tab);
-								}}
-							>view full output</button>
+					<div class="flex items-center gap-2 mb-1">
+						<span class="text-[10px] text-neutral-500 uppercase tracking-wide">Output</span>
+						{#if executing}
+							<span class="text-[9px] text-green-400 flex items-center gap-1">
+								<span class="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse"></span>
+								running
+							</span>
+						{/if}
+						{#if result}
+							<span class="text-[9px] tabular-nums {result.exit_code === 0 ? 'text-green-400' : 'text-red-400'}">
+								exit {result.exit_code}
+							</span>
+							<span class="text-[9px] text-neutral-600 tabular-nums">{result.duration_ms}ms</span>
+							{#if onOpenViewer}
+								<div class="flex-1"></div>
+								<button
+									class="px-2 py-0.5 rounded text-[9px] bg-blue-500/15 text-blue-400 hover:bg-blue-500/25 transition-colors"
+									onclick={openFullOutput}
+								>view full output</button>
+							{/if}
 						{/if}
 					</div>
-					{#if resultExpanded}
-						<div class="mt-1">
-							{#if result.stdout}
-								<div class="mb-1">
-									<div class="text-[9px] text-neutral-600 mb-0.5">stdout</div>
-									<pre class="p-2 bg-neutral-800/50 border border-neutral-800 rounded text-[10px] text-neutral-300 whitespace-pre-wrap break-all max-h-48 overflow-y-auto">{result.stdout}</pre>
-								</div>
-							{/if}
-							{#if result.stderr}
-								<div>
-									<div class="text-[9px] text-neutral-600 mb-0.5">stderr</div>
-									<pre class="p-2 bg-red-900/10 border border-red-900/30 rounded text-[10px] text-red-300/80 whitespace-pre-wrap break-all max-h-48 overflow-y-auto">{result.stderr}</pre>
-								</div>
-							{/if}
-						</div>
+					{#if liveOutput}
+						<pre
+							bind:this={outputEl}
+							class="p-2 bg-neutral-800/50 border border-neutral-800 rounded text-[10px] text-neutral-300 whitespace-pre-wrap break-all max-h-64 overflow-y-auto">{liveOutput}</pre>
+					{:else if executing}
+						<div class="p-2 bg-neutral-800/30 border border-neutral-800/50 rounded text-[10px] text-neutral-600">Waiting for output…</div>
 					{/if}
 				</div>
 			{/if}

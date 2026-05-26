@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.0] - 2026-05-21
+## [0.5.0] - 2026-05-26
 
 ### sctl (server) v0.5.0
 
@@ -28,13 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`util::append_rotating` CI test race** — switched from `tokio::fs` to `spawn_blocking` + `std::fs` with explicit `flush()`. The tokio async-file `Drop` schedules close on the blocking pool; readers racing the close occasionally observed an empty file on fast filesystems (caught by CI).
 
-### mcp-sctl v0.3.0
+### mcp-sctl v0.5.0
 
 #### Changed
 
-- Bumped alongside sctl 0.5.0; consumes the unified `ApiError` shape via shared types.
+- Unified package version with the sctl 0.5.0 release; consumes the unified `ApiError` shape via shared types.
 
-### sctlin (web) v0.3.0
+### sctlin (web) v0.5.0
 
 #### Added
 

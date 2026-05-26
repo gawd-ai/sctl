@@ -5,7 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-05-26
+
+### Performance
+
+- **Async filesystem in polling loops** — moved LTE poller, watchdog history, and modem-state log file work off Tokio worker threads.
+- **Relay broadcast fan-out** — reduced hot-path allocations by sharing relay payloads across client dispatch with `Arc`.
+- **Priority queue capacity** — increased relay control-channel capacity and added warning logs for backpressure visibility.
+- **LTE band scan extraction** — moved band-scan orchestration into its own module while preserving the public API.
+- **Lint hygiene** — re-enabled stricter public API annotations and removed obsolete allow entries.
+
+### Added
+
+- **Unified `ApiError` catalog** — route errors now use stable SCREAMING_SNAKE codes and a consistent response shape.
+- **Typed WebSocket server messages** — server-originated WS frames are represented by a tagged enum while preserving the wire format.
+- **Generated TypeScript bindings** — server-owned protocol and API types can be exported for the web client.
+- **Transfer event observability** — file transfers log structured start/complete events and emit progress/completion hooks for sctlin.
+
+### Fixed
+
+- **Rotating append test race** — fixed intermittent CI reads from async file close timing by flushing in a blocking section.
+
+## [0.4.0] - 2026-05-21
 
 ### Added
 

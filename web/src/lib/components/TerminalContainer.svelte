@@ -916,7 +916,10 @@
 	export async function fetchRemoteSessions(): Promise<RemoteSessionInfo[]> {
 		try {
 			const result = await client.listSessions();
-			remoteSessions = result.sessions;
+			// Jobs (one-shot streaming runs) are not interactive terminals — keep
+			// them out of the terminal tab/reconcile UI. They also never broadcast
+			// `session.created`, so the live-add path needs no filter.
+			remoteSessions = result.sessions.filter((s) => s.kind !== 'job');
 			config.callbacks?.onRemoteSessions?.(remoteSessions);
 			return remoteSessions;
 		} catch (err) {

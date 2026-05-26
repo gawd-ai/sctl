@@ -4,15 +4,15 @@
 
 # sctl
 
-Remote device control server for AI agents.
+Device-side control server for AI agents and authenticated clients.
 
-> **See also:** [Guide](../docs/guide.md) for deployment, tunnel setup, playbooks, GPS/LTE, and troubleshooting.
+Use this document as the server reference: configuration, HTTP endpoints, WebSocket protocol, and relay API. For deployment flow, MCP setup, playbooks, GPS/LTE operation, and troubleshooting, see the [Guide](../docs/guide.md).
 
 ## Overview
 
-sctl exposes HTTP and WebSocket APIs that let an AI agent (or any authenticated client) execute commands, manage interactive shell sessions with full PTY support, read/write files, and query device status on Linux devices -- all protected by a pre-shared API key.
+sctl exposes HTTP and WebSocket APIs that let an AI agent or any authenticated client execute commands, manage interactive shell sessions with full PTY support, read/write files, run playbooks, and query status on Linux targets. Those targets can be local machines, servers, VPSes, embedded boards, network devices, robotics or drone compute modules, or remote compute reached through a relay. All non-health endpoints are protected by a pre-shared API key.
 
-Works on any Linux system -- x86_64 servers, ARM single-board computers, RISC-V routers, and more.
+Works on any Linux system with `/bin/sh` -- x86_64 servers, ARM single-board computers, RISC-V routers, and more.
 
 ## Quick Start
 
@@ -31,7 +31,7 @@ sctl listens on `0.0.0.0:1337` by default. Test it:
 
 ```bash
 curl http://localhost:1337/api/health
-# {"status":"ok","uptime_secs":5,"version":"0.4.0","sessions":0,...}
+# {"status":"ok","uptime_secs":5,"version":"0.5.0","sessions":0,...}
 
 curl -H "Authorization: Bearer your-secret-key" http://localhost:1337/api/exec \
   -H "Content-Type: application/json" \
@@ -51,7 +51,7 @@ sctl loads configuration in order of precedence (highest wins):
 ```toml
 [server]
 listen = "0.0.0.0:1337"            # Bind address (env: SCTL_LISTEN)
-max_connections = 10                # (not currently enforced)
+max_connections = 10                # Maximum concurrent HTTP connections
 max_sessions = 20                   # Concurrent WebSocket shell sessions
 session_buffer_size = 1000          # Max output entries per session ring buffer
 exec_timeout_ms = 30000             # Default exec timeout in ms (30s)
@@ -111,6 +111,8 @@ poll_interval_secs = 60             # Seconds between signal polls
 ```
 
 ## API Reference
+
+This section is the protocol reference for client implementers. If you are using MCP, start with [mcp-sctl](../mcp/README.md); it wraps these endpoints as tools.
 
 All endpoints except `/api/health` require `Authorization: Bearer <key>`.
 
@@ -199,7 +201,7 @@ curl http://localhost:1337/api/health
 {
   "status": "ok",
   "uptime_secs": 42,
-  "version": "0.4.0",
+  "version": "0.5.0",
   "sessions": 3,
   "tunnel": {
     "connected": true,

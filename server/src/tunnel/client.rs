@@ -2514,6 +2514,114 @@ async fn handle_forwarded_session_message(
                 }
             }
         }
+        "job.start" => {
+            let command = msg["command"].as_str().unwrap_or("");
+            if command.is_empty() {
+                let mut resp = json!({
+                    "type": "error",
+                    "code": "MISSING_FIELD",
+                    "message": "command is required",
+                });
+                if let Some(ref rid) = request_id {
+                    resp["request_id"] = json!(rid);
+                }
+                send_response_async(ws_sink, resp).await;
+            } else {
+                let working_dir = msg["working_dir"].as_str().map(ToString::to_string);
+                let env: Option<HashMap<String, String>> = msg
+                    .get("env")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok());
+                let shell = msg["shell"].as_str().map(ToString::to_string);
+                let name = msg["name"].as_str().map(ToString::to_string);
+                let raw_dir = working_dir
+                    .as_deref()
+                    .unwrap_or(&state.config.shell.default_working_dir);
+                let expanded = crate::util::expand_tilde(raw_dir);
+                let dir = expanded.as_ref();
+                let sh = shell
+                    .as_deref()
+                    .unwrap_or(&state.config.shell.default_shell);
+
+                info!(
+                    request_id = request_id.as_deref().unwrap_or(""),
+                    shell = sh,
+                    working_dir = dir,
+                    "Tunnel: job.start received"
+                );
+
+                match state
+                    .session_manager
+                    .create_job(
+                        sh,
+                        dir,
+                        command,
+                        env.as_ref(),
+                        name.as_deref(),
+                        crate::sessions::JOB_IDLE_TIMEOUT_SECS,
+                        state.session_events.clone(),
+                    )
+                    .await
+                {
+                    Ok((session_id, pid)) => {
+                        info!(
+                            request_id = request_id.as_deref().unwrap_or(""),
+                            session_id = %session_id,
+                            pid,
+                            "Tunnel: job.start spawn succeeded"
+                        );
+                        let mut resp = json!({
+                            "type": "session.started",
+                            "session_id": session_id,
+                            "pid": pid,
+                            "persistent": true,
+                            "pty": false,
+                            "user_allows_ai": true,
+                            "created_at": crate::sessions::journal::now_ms(),
+                        });
+                        if let Some(n) = name.as_deref() {
+                            resp["name"] = json!(n);
+                        }
+                        if let Some(ref rid) = request_id {
+                            resp["request_id"] = json!(rid);
+                        }
+                        send_response_async(ws_sink, resp).await;
+
+                        // Stream job output up the tunnel via the same subscriber
+                        // terminals use. No `session.created` broadcast — jobs stay
+                        // out of the terminal/tabs UI.
+                        if let Some(buffer) = state.session_manager.get_buffer(&session_id).await {
+                            let task = tokio::spawn(tunnel_subscriber_task(
+                                state.clone(),
+                                session_id.clone(),
+                                buffer,
+                                ws_sink.clone(),
+                                0,
+                            ));
+                            subscriber_tasks
+                                .lock()
+                                .await
+                                .insert(session_id.clone(), task);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            request_id = request_id.as_deref().unwrap_or(""),
+                            error = %e,
+                            "Tunnel: job.start spawn failed"
+                        );
+                        let mut resp = json!({
+                            "type": "error",
+                            "code": "SESSION_LIMIT",
+                            "message": e,
+                        });
+                        if let Some(ref rid) = request_id {
+                            resp["request_id"] = json!(rid);
+                        }
+                        send_response_async(ws_sink, resp).await;
+                    }
+                }
+            }
+        }
         "session.exec" => {
             let session_id = msg["session_id"].as_str().unwrap_or("");
             let command = msg["command"].as_str().unwrap_or("");

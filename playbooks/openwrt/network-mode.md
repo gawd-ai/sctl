@@ -1,13 +1,13 @@
 ---
 name: network-mode
-description: Configure BPI ethernet port roles — router (stock), switch (L2 bridge), or hybrid (passthrough + routed) with LTE backup
+description: Configure multi-port OpenWrt ethernet roles — router, switch, or hybrid — with LTE backup safeguards
 params:
   apn:
     type: string
     description: Carrier APN (e.g. ltemobile.apn, fast.t-mobile.com)
   action:
     type: string
-    description: Action to perform
+    description: Action to perform; apply/revert change network configuration
     default: status
     enum: [status, apply, revert]
   mode:
@@ -21,12 +21,12 @@ params:
     default: eth4
   bridge_proto:
     type: string
-    description: "How BPI gets its management IP on the bridge: dhcp (upstream DHCP), static (fixed IP), none (LTE only)"
+    description: "How the device gets its management IP on the bridge: dhcp (upstream DHCP), static (fixed IP), none (LTE only)"
     default: dhcp
     enum: [dhcp, static, none]
   bridge_ip:
     type: string
-    description: "Static IP/mask for BPI on bridge (e.g. 10.0.0.50/24). Required when bridge_proto=static"
+    description: "Static IP/mask for the device on bridge (e.g. 10.0.0.50/24). Required when bridge_proto=static"
     default: ""
   bridge_gateway:
     type: string
@@ -38,11 +38,11 @@ params:
     default: eth0
   routed_ports:
     type: string
-    description: "Comma-separated ports where BPI serves DHCP (hybrid only)"
+    description: "Comma-separated ports where the device serves DHCP (hybrid only)"
     default: eth1,eth2,eth3,eth5
   routed_subnet:
     type: string
-    description: "BPI IP on routed segment (hybrid only)"
+    description: "Device IP on routed segment (hybrid only)"
     default: 192.168.2.1/24
   lte_backup:
     type: string

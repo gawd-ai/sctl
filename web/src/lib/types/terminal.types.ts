@@ -210,6 +210,16 @@ export interface WsSessionStartMsg {
 	name?: string;
 }
 
+export interface WsJobStartMsg {
+	type: 'job.start';
+	request_id?: string;
+	command: string;
+	shell?: string;
+	working_dir?: string;
+	env?: Record<string, string>;
+	name?: string;
+}
+
 export interface WsSessionExecMsg {
 	type: 'session.exec';
 	request_id?: string;
@@ -278,6 +288,7 @@ export interface WsSessionAllowAiMsg {
 export type WsClientMsg =
 	| WsPingMsg
 	| WsSessionStartMsg
+	| WsJobStartMsg
 	| WsSessionExecMsg
 	| WsSessionStdinMsg
 	| WsSessionKillMsg
@@ -311,7 +322,11 @@ export interface WsSessionGapMsg {
 	reason: string;
 }
 
-/** Synthetic — not currently emitted by the server, kept for forward compatibility. */
+/**
+ * Emitted by the server when a one-shot **job** process exits (see `job.start`).
+ * Not sent for interactive terminal sessions. Declared here rather than derived
+ * from the generated union because the device emits it as a raw frame.
+ */
 export interface WsSessionExitedMsg {
 	type: 'session.exited';
 	session_id: string;

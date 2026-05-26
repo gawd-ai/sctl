@@ -25,7 +25,7 @@ use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Child;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{error, info};
 
 use super::buffer::{OutputBuffer, OutputStream};
@@ -81,7 +81,12 @@ impl ManagedSession {
     /// Takes ownership of the child's stdio handles and spawns four background
     /// tasks (stdin writer, stdout reader, stderr reader, exit watcher) that
     /// route I/O through the [`OutputBuffer`].
-    pub fn spawn(session_id: String, mut child: Child, buffer_size: usize) -> Result<Self, String> {
+    pub fn spawn(
+        session_id: String,
+        mut child: Child,
+        buffer_size: usize,
+        exit_events: Option<broadcast::Sender<serde_json::Value>>,
+    ) -> Result<Self, String> {
         let process_id = child.id().unwrap_or(0);
         // pgid = pid because the shell is the process group leader via setpgid(0,0)
         let process_group_id = process_id;
@@ -150,7 +155,7 @@ impl ManagedSession {
         let status_exit = Arc::clone(&status);
         let exit_code_exit = Arc::clone(&exit_code);
         let exit_task = tokio::spawn(async move {
-            match child.wait().await {
+            let code = match child.wait().await {
                 Ok(s) => {
                     let code = s.code().unwrap_or(-1);
                     info!("Session {sid_exit} exited with code {code}");
@@ -159,6 +164,7 @@ impl ManagedSession {
                         OutputStream::System,
                         format!("Process exited with code {code}"),
                     );
+                    code
                 }
                 Err(e) => {
                     error!("Session {sid_exit} wait error: {e}");
@@ -167,9 +173,21 @@ impl ManagedSession {
                         .lock()
                         .await
                         .push(OutputStream::System, format!("Process wait error: {e}"));
+                    -1
                 }
-            }
+            };
             *status_exit.lock().await = SessionStatus::Exited;
+            // For jobs (one-shot sessions), broadcast a typed completion frame so
+            // subscribers get the exit code promptly without parsing the system
+            // line or waiting for the 30s reaper sweep. `None` for interactive
+            // terminals (unchanged behavior).
+            if let Some(tx) = &exit_events {
+                let _ = tx.send(serde_json::json!({
+                    "type": "session.exited",
+                    "session_id": sid_exit,
+                    "exit_code": code,
+                }));
+            }
         });
 
         Ok(ManagedSession {
@@ -193,6 +211,7 @@ impl ManagedSession {
         mut child: Child,
         pty_master: OwnedFd,
         buffer_size: usize,
+        exit_events: Option<broadcast::Sender<serde_json::Value>>,
     ) -> Result<Self, String> {
         let process_id = child.id().unwrap_or(0);
         // For PTY sessions the child is a session leader via setsid(), so
@@ -300,7 +319,7 @@ impl ManagedSession {
         let status_exit = Arc::clone(&status);
         let exit_code_exit = Arc::clone(&exit_code);
         let exit_task = tokio::spawn(async move {
-            match child.wait().await {
+            let code = match child.wait().await {
                 Ok(s) => {
                     let code = s.code().unwrap_or(-1);
                     info!("Session {sid_exit} exited with code {code}");
@@ -309,6 +328,7 @@ impl ManagedSession {
                         OutputStream::System,
                         format!("Process exited with code {code}"),
                     );
+                    code
                 }
                 Err(e) => {
                     error!("Session {sid_exit} wait error: {e}");
@@ -317,9 +337,21 @@ impl ManagedSession {
                         .lock()
                         .await
                         .push(OutputStream::System, format!("Process wait error: {e}"));
+                    -1
                 }
-            }
+            };
             *status_exit.lock().await = SessionStatus::Exited;
+            // For jobs (one-shot sessions), broadcast a typed completion frame so
+            // subscribers get the exit code promptly without parsing the system
+            // line or waiting for the 30s reaper sweep. `None` for interactive
+            // terminals (unchanged behavior).
+            if let Some(tx) = &exit_events {
+                let _ = tx.send(serde_json::json!({
+                    "type": "session.exited",
+                    "session_id": sid_exit,
+                    "exit_code": code,
+                }));
+            }
         });
 
         // pty_master OwnedFd stays alive for resize operations. The dup'd fds

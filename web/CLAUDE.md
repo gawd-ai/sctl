@@ -1,10 +1,10 @@
-# sctlin — AI Integration Guide
+# sctlin - AI Integration Guide
 
-This file is designed for AI agents (Claude Code, Cursor, etc.) to integrate sctlin without reading source code.
+This file is designed for AI agents and coding clients (Claude Code, Codex CLI, Hermes, OpenCode, OpenClaw, NanoClaw, Cursor, etc.) to integrate sctlin without reading source code.
 
 ## Package Overview
 
-**sctlin** is a Svelte 5 component library for connecting to [sctl](https://github.com/gawd-coder/sctl) daemons — lightweight device management agents running on Linux/OpenWrt devices. sctlin provides:
+**sctlin** is a Svelte 5 component library for connecting to [sctl](https://github.com/gawd-ai/sctl) servers -- authenticated control services for Linux machines, servers, embedded hardware, network devices, and remote compute. sctlin provides:
 
 - Terminal emulation (xterm.js) with session management, split panes, tabs
 - Device info, activity monitoring, playbook execution widgets

@@ -7,10 +7,16 @@
 #   ./rundev.sh          # build everything, start all services
 #   ./rundev.sh build    # build only (server, mcp, web) — no start/stop
 #   ./rundev.sh start    # restart all services without rebuilding
-#   ./rundev.sh stop     # stop all services and deregister MCP
+#   ./rundev.sh stop     # stop all services and deregister MCP clients
 #   ./rundev.sh status   # show what's running
-#   ./rundev.sh claude   # only register MCP in Claude Code (no build/start)
-#   ./rundev.sh codex    # only register MCP in Codex CLI (no build/start)
+#   ./rundev.sh agents   # register MCP in detected agent clients (no build/start)
+#   ./rundev.sh claude   # register MCP in Claude Code (no build/start)
+#   ./rundev.sh codex    # register MCP in Codex CLI (no build/start)
+#   ./rundev.sh hermes   # register MCP in Hermes (no build/start)
+#   ./rundev.sh opencode # register MCP in OpenCode config (no build/start)
+#   ./rundev.sh openclaw # register MCP in OpenClaw config (no build/start)
+#   ./rundev.sh grok     # show Grok Build/generic MCP config (no build/start)
+#   ./rundev.sh nanoclaw # show NanoClaw/generic MCP config (no build/start)
 #   ./rundev.sh tunnel [--cloudflared | --relay-url <url>]
 #                        # build + start tunnel dev env (relay + clients + MCP via relay)
 #
@@ -100,17 +106,25 @@ err()  { echo -e "\033[1;31m==>\033[0m $*" >&2; }
 ok()   { echo -e "\033[1;32m==>\033[0m $*"; }
 warn() { echo -e "\033[1;33m==>\033[0m $*" >&2; }
 
-# Check if mcp-sctl supervisor is running (spawned by Claude Code).
-# Returns 0 if alive — callers should skip killing/re-registering MCP.
+run_probe() {
+    if command -v timeout &>/dev/null; then
+        timeout 5 "$@"
+    else
+        "$@"
+    fi
+}
+
+# Check if an mcp-sctl supervisor is running (spawned by an MCP client).
+# Returns 0 if alive -- callers should avoid killing the shared supervisor.
 is_mcp_alive() {
     pgrep -f "mcp-sctl.*--supervisor" &>/dev/null
 }
 
 # Detect a healthy sctl already listening on $LISTEN. Returns 0 if reachable,
-# prints the running version to stdout. Used to support side-by-side dev with
-# netage-fleet/rundev.sh — whichever rundev starts first owns the agent.
+# prints the running version to stdout. Used to support side-by-side dev when
+# another stack already owns the local server port.
 # Reads version from /api/health (unauthenticated) so we never depend on the
-# foreign stack's API key.
+# external stack's API key.
 detect_existing_sctl() {
     local body v
     body=$(curl -sf --max-time 1 "http://${LISTEN}/api/health" 2>/dev/null) || return 1
@@ -123,16 +137,6 @@ detect_existing_sctl() {
 # Returns 0 if the sctl on $LISTEN was started by THIS rundev (live $PID_FILE).
 sctl_is_ours() {
     [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null
-}
-
-# Returns 0 if a foreign rundev (netage-fleet) has a live sctl in its pidfile.
-# Best-effort; if the path doesn't exist we say "no foreign owner".
-foreign_sctl_alive() {
-    local fleet_pids="$HOME/netage/netage-fleet/.rundev.pids"
-    [[ -f "$fleet_pids" ]] || return 1
-    local pid
-    pid=$(awk '$2 == "sctl" {print $1; exit}' "$fleet_pids" 2>/dev/null)
-    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
 }
 
 # ─── Config helpers ──────────────────────────────────────────────────
@@ -173,6 +177,394 @@ cfg_device_exists() {
 
 cfg_device_names() {
     jq -r '.devices | keys[]' "$CONFIG_FILE"
+}
+
+# ─── Agent MCP client helpers ────────────────────────────────────────
+
+ensure_mcp_bin() {
+    if [[ ! -x "$MCP_BIN" ]]; then
+        err "mcp-sctl binary not found: $MCP_BIN"
+        err "Run '$0 build' first."
+        exit 1
+    fi
+}
+
+prepare_local_agent_config() {
+    mkdir -p "$DATA_DIR" "$PLAYBOOKS_DIR" "$(dirname "$CONFIG_FILE")"
+
+    if [[ -f "$CONFIG_FILE" ]] && command -v jq &>/dev/null; then
+        jq --arg url "$DEVICE_URL" --arg key "$API_KEY" --arg pb "$PLAYBOOKS_DIR" \
+            '.devices.local = {url: $url, api_key: $key, playbooks_dir: $pb} | .default_device = "local" | .config_version = 2' \
+            "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+        ok "Config updated (merged dev device): $CONFIG_FILE"
+    else
+        cat > "$CONFIG_FILE" <<EOF
+{
+  "config_version": 2,
+  "devices": {
+    "local": {
+      "url": "$DEVICE_URL",
+      "api_key": "$API_KEY",
+      "playbooks_dir": "$PLAYBOOKS_DIR"
+    }
+  },
+  "default_device": "local"
+}
+EOF
+        ok "Config created: $CONFIG_FILE"
+    fi
+
+    generate_sctlin_seed
+}
+
+openclaw_mcp_json() {
+    jq -cn --arg command "$MCP_BIN" --arg config "$CONFIG_FILE" \
+        '{command: $command, args: ["--supervisor", "--config", $config]}'
+}
+
+generic_mcp_json() {
+    jq -cn --arg command "$MCP_BIN" --arg config "$CONFIG_FILE" \
+        '{mcpServers: {sctl: {command: $command, args: ["--supervisor", "--config", $config]}}}'
+}
+
+opencode_mcp_json() {
+    jq -cn --arg command "$MCP_BIN" --arg config "$CONFIG_FILE" \
+        '{mcp: {sctl: {type: "local", command: [$command, "--supervisor", "--config", $config], enabled: true}}}'
+}
+
+nanoclaw_mcp_json() {
+    jq -cn --arg command "$MCP_BIN" --arg config "$CONFIG_FILE" \
+        '{mcpServers: {sctl: {command: $command, args: ["--supervisor", "--config", $config]}}}'
+}
+
+write_mcp_wrapper() {
+    local wrapper="$SCTL_CONFIG_DIR/mcp-sctl-hermes"
+    mkdir -p "$SCTL_CONFIG_DIR"
+    cat > "$wrapper" <<EOF
+#!/usr/bin/env bash
+exec "$MCP_BIN" --supervisor --config "$CONFIG_FILE" "\$@"
+EOF
+    chmod +x "$wrapper"
+    printf '%s' "$wrapper"
+}
+
+print_client_snippet() {
+    local client="${1:-generic}"
+
+    echo ""
+    case "$client" in
+        claude)
+            echo "Claude Code manual registration:"
+            echo "  claude mcp add --transport stdio $MCP_NAME -- $MCP_BIN --supervisor --config $CONFIG_FILE"
+            ;;
+        codex)
+            echo "Codex CLI manual registration:"
+            echo "  codex mcp add $MCP_NAME -- $MCP_BIN --supervisor --config $CONFIG_FILE"
+            ;;
+        hermes)
+            echo "Hermes manual registration:"
+            echo "  wrapper=$SCTL_CONFIG_DIR/mcp-sctl-hermes"
+            echo "  cat > \"\$wrapper\" <<'EOF'"
+            echo "#!/usr/bin/env bash"
+            echo "exec \"$MCP_BIN\" --supervisor --config \"$CONFIG_FILE\" \"\\\$@\""
+            echo "EOF"
+            echo "  chmod +x \"\$wrapper\""
+            echo "  hermes mcp add $MCP_NAME --command \"\$wrapper\""
+            ;;
+        opencode|open-code)
+            echo "OpenCode config snippet for ~/.config/opencode/opencode.json:"
+            opencode_mcp_json | jq '.'
+            ;;
+        openclaw)
+            echo "OpenClaw manual registration:"
+            echo "  openclaw mcp set $MCP_NAME '$(openclaw_mcp_json)'"
+            ;;
+        nanoclaw)
+            echo "NanoClaw .mcp.json / container MCP snippet:"
+            nanoclaw_mcp_json | jq '.'
+            ;;
+        grok|grok-build)
+            echo "Grok Build / generic MCP stdio config snippet:"
+            generic_mcp_json | jq '.'
+            ;;
+        *)
+            echo "Generic MCP stdio config snippet:"
+            generic_mcp_json | jq '.'
+            ;;
+    esac
+    echo ""
+}
+
+register_claude() {
+    if ! command -v claude &>/dev/null; then
+        warn "Claude Code CLI not found"
+        print_client_snippet claude
+        return 0
+    fi
+
+    if is_mcp_alive && run_probe claude mcp get "$MCP_NAME" &>/dev/null; then
+        ok "Claude Code already has '$MCP_NAME'; live supervisor will hot-reload config"
+        return 0
+    fi
+
+    log "Registering mcp-sctl with Claude Code..."
+    claude mcp remove "$MCP_NAME" 2>/dev/null || true
+    claude mcp add --transport stdio \
+        "$MCP_NAME" -- "$MCP_BIN" --supervisor --config "$CONFIG_FILE"
+    ok "MCP server '$MCP_NAME' registered in Claude Code"
+}
+
+register_codex() {
+    if ! command -v codex &>/dev/null; then
+        warn "Codex CLI not found"
+        print_client_snippet codex
+        return 0
+    fi
+
+    log "Registering mcp-sctl with Codex CLI..."
+    codex mcp remove "$MCP_NAME" 2>/dev/null || true
+    codex mcp add "$MCP_NAME" -- "$MCP_BIN" --supervisor --config "$CONFIG_FILE"
+    ok "MCP server '$MCP_NAME' registered in Codex CLI"
+}
+
+register_hermes() {
+    if ! command -v hermes &>/dev/null; then
+        warn "Hermes CLI not found"
+        print_client_snippet hermes
+        return 0
+    fi
+
+    local wrapper
+    wrapper=$(write_mcp_wrapper)
+
+    log "Registering mcp-sctl with Hermes..."
+    hermes mcp remove "$MCP_NAME" 2>/dev/null || true
+    if command -v timeout &>/dev/null; then
+        printf 'y\n' | timeout 45 hermes mcp add "$MCP_NAME" --command "$wrapper"
+    else
+        printf 'y\n' | hermes mcp add "$MCP_NAME" --command "$wrapper"
+    fi
+    ok "MCP server '$MCP_NAME' registered in Hermes"
+}
+
+register_opencode() {
+    local cmd=""
+    if command -v opencode &>/dev/null; then
+        cmd="opencode"
+    elif command -v open-code &>/dev/null; then
+        cmd="open-code"
+    fi
+
+    local config_dir="$HOME/.config/opencode"
+    local config_file="$config_dir/opencode.json"
+    mkdir -p "$config_dir"
+
+    if [[ -f "$config_file" ]] && ! jq empty "$config_file" >/dev/null 2>&1; then
+        warn "OpenCode config exists but is not parseable as plain JSON: $config_file"
+        warn "Leaving it untouched; add this snippet manually if it is JSONC."
+        print_client_snippet opencode
+        return 0
+    fi
+
+    local input="$config_file"
+    if [[ ! -f "$config_file" ]]; then
+        input="$DATA_DIR/opencode.empty.json"
+        printf '{}\n' > "$input"
+    fi
+
+    jq --arg command "$MCP_BIN" --arg config "$CONFIG_FILE" '
+        .["$schema"] = (.["$schema"] // "https://opencode.ai/config.json")
+        | .mcp.sctl = {
+            type: "local",
+            command: [$command, "--supervisor", "--config", $config],
+            enabled: true
+        }
+    ' "$input" > "$config_file.tmp" && mv "$config_file.tmp" "$config_file"
+
+    if [[ -n "$cmd" ]]; then
+        ok "MCP server '$MCP_NAME' written to OpenCode config ($cmd): $config_file"
+    else
+        ok "MCP server '$MCP_NAME' written to OpenCode config: $config_file"
+        warn "OpenCode CLI not found; config will apply once OpenCode is installed"
+    fi
+}
+
+register_openclaw() {
+    local json
+    json=$(openclaw_mcp_json)
+
+    if ! command -v openclaw &>/dev/null; then
+        warn "OpenClaw CLI not found"
+        print_client_snippet openclaw
+        return 0
+    fi
+
+    log "Registering mcp-sctl with OpenClaw..."
+    openclaw mcp set "$MCP_NAME" "$json"
+    ok "MCP server '$MCP_NAME' registered in OpenClaw"
+}
+
+register_grok() {
+    local cmd=""
+    if command -v grok-build &>/dev/null; then
+        cmd="grok-build"
+    elif command -v grok &>/dev/null; then
+        cmd="grok"
+    fi
+
+    if [[ -n "$cmd" ]] && "$cmd" mcp --help >/dev/null 2>&1; then
+        warn "$cmd has an MCP command, but sctl does not yet have a verified Grok Build registration adapter"
+    else
+        warn "Grok Build CLI not found or MCP registration syntax is not verifiable locally"
+    fi
+    print_client_snippet grok
+}
+
+register_nanoclaw() {
+    if command -v nanoclaw &>/dev/null; then
+        warn "NanoClaw CLI found, but sctl does not yet have a verified NanoClaw registration adapter"
+    else
+        warn "NanoClaw CLI not found"
+    fi
+    print_client_snippet nanoclaw
+}
+
+register_agent_client() {
+    case "$1" in
+        claude) register_claude ;;
+        codex) register_codex ;;
+        hermes) register_hermes ;;
+        opencode|open-code) register_opencode ;;
+        openclaw) register_openclaw ;;
+        grok|grok-build) register_grok ;;
+        nanoclaw) register_nanoclaw ;;
+        *)
+            warn "Unknown agent client: $1"
+            print_client_snippet generic
+            ;;
+    esac
+}
+
+register_detected_agent_clients() {
+    local registered=0
+
+    if command -v claude &>/dev/null; then register_claude; registered=1; fi
+    if command -v codex &>/dev/null; then register_codex; registered=1; fi
+    if command -v hermes &>/dev/null; then register_hermes; registered=1; fi
+    if command -v opencode &>/dev/null || command -v open-code &>/dev/null; then register_opencode; registered=1; fi
+    if command -v openclaw &>/dev/null; then register_openclaw; registered=1; fi
+
+    if [[ "$registered" -eq 0 ]]; then
+        warn "No supported MCP client CLI found"
+        print_client_snippet generic
+    fi
+}
+
+register_all_agent_clients() {
+    local clients=(claude codex hermes)
+    for client in "${clients[@]}"; do
+        register_agent_client "$client" || warn "Registration path failed for $client"
+    done
+
+    if command -v opencode &>/dev/null || command -v open-code &>/dev/null; then
+        register_opencode || warn "Registration path failed for opencode"
+    else
+        warn "OpenCode CLI not found"
+        print_client_snippet opencode
+    fi
+
+    if command -v openclaw &>/dev/null; then
+        register_openclaw || warn "Registration path failed for openclaw"
+    else
+        warn "OpenClaw CLI not found"
+        print_client_snippet openclaw
+    fi
+
+    register_grok || warn "Registration path failed for grok"
+    register_nanoclaw || warn "Registration path failed for nanoclaw"
+}
+
+unregister_agent_clients() {
+    if command -v claude &>/dev/null && run_probe claude mcp get "$MCP_NAME" &>/dev/null; then
+        claude mcp remove "$MCP_NAME" 2>/dev/null && ok "Removed MCP server '$MCP_NAME' from Claude Code" || true
+    fi
+    if command -v codex &>/dev/null && run_probe codex mcp get "$MCP_NAME" &>/dev/null; then
+        codex mcp remove "$MCP_NAME" 2>/dev/null && ok "Removed MCP server '$MCP_NAME' from Codex CLI" || true
+    fi
+    if command -v hermes &>/dev/null && run_probe hermes mcp list 2>/dev/null | grep -q "$MCP_NAME"; then
+        hermes mcp remove "$MCP_NAME" 2>/dev/null && ok "Removed MCP server '$MCP_NAME' from Hermes" || true
+    fi
+    local opencode_config="$HOME/.config/opencode/opencode.json"
+    if [[ -f "$opencode_config" ]] && jq -e '.mcp.sctl' "$opencode_config" >/dev/null 2>&1; then
+        jq 'del(.mcp.sctl)' "$opencode_config" > "$opencode_config.tmp" \
+            && mv "$opencode_config.tmp" "$opencode_config" \
+            && ok "Removed MCP server '$MCP_NAME' from OpenCode config" || true
+    fi
+    if command -v openclaw &>/dev/null; then
+        openclaw mcp unset "$MCP_NAME" 2>/dev/null && ok "Removed MCP server '$MCP_NAME' from OpenClaw" || true
+    fi
+}
+
+print_agent_status() {
+    echo "--- MCP clients ---"
+    if command -v claude &>/dev/null; then
+        if run_probe claude mcp get "$MCP_NAME" &>/dev/null; then
+            echo "  Claude Code: registered"
+        else
+            local rc=$?
+            [[ "$rc" -eq 124 ]] && echo "  Claude Code: unknown (probe timed out)" || echo "  Claude Code: not registered"
+        fi
+    else
+        echo "  Claude Code: CLI not found"
+    fi
+
+    if command -v codex &>/dev/null; then
+        if run_probe codex mcp get "$MCP_NAME" &>/dev/null; then
+            echo "  Codex CLI: registered"
+        else
+            local rc=$?
+            [[ "$rc" -eq 124 ]] && echo "  Codex CLI: unknown (probe timed out)" || echo "  Codex CLI: not registered"
+        fi
+    else
+        echo "  Codex CLI: CLI not found"
+    fi
+
+    if command -v hermes &>/dev/null; then
+        local hermes_list=""
+        if hermes_list=$(run_probe hermes mcp list 2>/dev/null); then
+            printf '%s' "$hermes_list" | grep -q "$MCP_NAME" && echo "  Hermes: registered" || echo "  Hermes: not registered"
+        else
+            local rc=$?
+            [[ "$rc" -eq 124 ]] && echo "  Hermes: unknown (probe timed out)" || echo "  Hermes: not registered"
+        fi
+    else
+        echo "  Hermes: CLI not found"
+    fi
+
+    if [[ -f "$HOME/.config/opencode/opencode.json" ]] && jq -e '.mcp.sctl' "$HOME/.config/opencode/opencode.json" >/dev/null 2>&1; then
+        echo "  OpenCode: configured"
+    elif command -v opencode &>/dev/null || command -v open-code &>/dev/null; then
+        echo "  OpenCode: not configured"
+    else
+        echo "  OpenCode: CLI not found"
+    fi
+
+    if command -v openclaw &>/dev/null; then
+        if run_probe openclaw mcp show "$MCP_NAME" &>/dev/null; then
+            echo "  OpenClaw: registered"
+        else
+            local rc=$?
+            [[ "$rc" -eq 124 ]] && echo "  OpenClaw: unknown (probe timed out)" || echo "  OpenClaw: not registered"
+        fi
+    else
+        echo "  OpenClaw: CLI not found"
+    fi
+
+    if is_mcp_alive; then
+        echo "  mcp-sctl supervisor: running"
+    else
+        echo "  mcp-sctl supervisor: not running"
+    fi
 }
 
 # ─── Environment profile helpers ─────────────────────────────────────
@@ -301,16 +693,13 @@ graceful_stop() {
 do_kill() {
     # Kill sctl server — only if WE started it. The pidfile is the sole
     # source of truth; the pkill fallback is intentionally absent so we
-    # never reach into a foreign rundev's process tree (e.g. netage-fleet's
-    # sctl-agent on the same port).
+    # never reach into another process tree on the same port.
     if [[ -f "$PID_FILE" ]]; then
         pid=$(cat "$PID_FILE")
         if kill -0 "$pid" 2>/dev/null; then
             graceful_stop "$pid" "sctl"
         fi
         rm -f "$PID_FILE"
-    elif foreign_sctl_alive; then
-        ok "sctl on $LISTEN is owned by another rundev — leaving it alone"
     fi
 
     # Kill web dev server
@@ -340,9 +729,9 @@ do_kill() {
         rm -f "$CLOUDFLARED_PID_FILE"
     fi
 
-    # Kill mcp-sctl only if not managed by Claude Code
+    # Kill mcp-sctl only if not managed by a live MCP client.
     if is_mcp_alive; then
-        ok "mcp-sctl supervisor alive (managed by Claude Code) — leaving it running"
+        ok "mcp-sctl supervisor alive (managed by an MCP client) — leaving it running"
     else
         pkill -INT -f "mcp-sctl" 2>/dev/null && ok "Stopped mcp-sctl" || true
     fi
@@ -353,11 +742,11 @@ do_kill() {
 do_stop() {
     log "Stopping..."
 
-    # Deregister MCP only if not managed by a live Claude session
+    # Deregister MCP only if not managed by a live client session.
     if is_mcp_alive; then
-        ok "mcp-sctl managed by Claude Code — skipping deregister"
-    elif claude mcp get "$MCP_NAME" &>/dev/null; then
-        claude mcp remove "$MCP_NAME" 2>/dev/null && ok "Removed MCP server '$MCP_NAME' from Claude Code" || true
+        ok "mcp-sctl managed by a live MCP client — skipping client deregistration"
+    else
+        unregister_agent_clients
     fi
 
     do_kill
@@ -375,7 +764,7 @@ do_status() {
             echo "  Health: not responding"
         fi
     elif curl -sf --max-time 1 "http://${LISTEN}/api/health" >/dev/null 2>&1; then
-        echo "  Attached (foreign process on $LISTEN — likely netage-fleet)"
+        echo "  Attached (external process on $LISTEN)"
         echo "  Health: OK"
     else
         echo "  Not running"
@@ -414,12 +803,7 @@ do_status() {
     fi
 
     echo ""
-    echo "--- mcp-sctl ---"
-    if claude mcp get "$MCP_NAME" 2>/dev/null; then
-        echo "  Registered in Claude Code"
-    else
-        echo "  Not registered"
-    fi
+    print_agent_status
 
     echo ""
     echo "--- env profile ---"
@@ -508,43 +892,15 @@ generate_sctlin_seed() {
 # ─── launch (shared: stop existing, start all services, register MCP) ─
 
 do_launch() {
-    # Create data dir and playbooks dir
-    mkdir -p "$DATA_DIR"
-    mkdir -p "$PLAYBOOKS_DIR"
-    mkdir -p "$(dirname "$CONFIG_FILE")"
-
-    # Merge local dev device into persistent config (preserves manually-added devices)
-    if [[ -f "$CONFIG_FILE" ]] && command -v jq &>/dev/null; then
-        jq --arg url "$DEVICE_URL" --arg key "$API_KEY" --arg pb "$PLAYBOOKS_DIR" \
-            '.devices.local = {url: $url, api_key: $key, playbooks_dir: $pb} | .default_device = "local" | .config_version = 2' \
-            "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-        ok "Config updated (merged dev device): $CONFIG_FILE"
-    else
-        cat > "$CONFIG_FILE" <<EOF
-{
-  "config_version": 2,
-  "devices": {
-    "local": {
-      "url": "$DEVICE_URL",
-      "api_key": "$API_KEY",
-      "playbooks_dir": "$PLAYBOOKS_DIR"
-    }
-  },
-  "default_device": "local"
-}
-EOF
-        ok "Config created: $CONFIG_FILE"
-    fi
-
-    generate_sctlin_seed
+    prepare_local_agent_config
     sync_local_playbooks
 
-    # Detect a foreign sctl (e.g. started by netage-fleet/rundev.sh) before
-    # we touch anything. If one is healthy and we don't own it, attach.
+    # Detect an existing sctl before we touch anything. If one is healthy and
+    # we don't own it, attach.
     local attached_version=""
     if ! sctl_is_ours && attached_version=$(detect_existing_sctl); then
         ok "Attaching to existing sctl on $LISTEN (version $attached_version) — started by another stack"
-        rm -f "$PID_FILE"  # clear any stale pidfile so do_kill/do_stop won't touch the foreign sctl
+        rm -f "$PID_FILE"  # clear stale pidfile so do_kill/do_stop won't touch the existing sctl
         sctl_pid=""
     else
         # Stop any running instances we own (clean slate)
@@ -567,16 +923,7 @@ EOF
     # Start web dev server
     start_web_dev_server
 
-    # Register MCP server with Claude Code (skip if already managed)
-    if is_mcp_alive; then
-        ok "mcp-sctl already running (managed by Claude Code) — config hot-reload will pick up changes"
-    else
-        log "Registering mcp-sctl with Claude Code..."
-        claude mcp remove "$MCP_NAME" 2>/dev/null || true
-        claude mcp add --transport stdio \
-            "$MCP_NAME" -- "$MCP_BIN" --supervisor --config "$CONFIG_FILE"
-        ok "MCP server '$MCP_NAME' registered (supervisor mode)"
-    fi
+    register_detected_agent_clients
 
     echo ""
     echo "============================================"
@@ -585,17 +932,17 @@ EOF
     if [[ -n "$sctl_pid" ]]; then
         echo "  sctl:         http://${LISTEN} (PID $sctl_pid)"
     else
-        echo "  sctl:         http://${LISTEN} (attached, foreign process)"
+        echo "  sctl:         http://${LISTEN} (attached, external process)"
     fi
     echo "  Web UI:       http://localhost:${WEB_PORT} (PID $web_pid)"
-    echo "  MCP server:   $MCP_NAME (stdio, managed by Claude Code)"
+    echo "  MCP server:   $MCP_NAME (stdio, registered with detected MCP clients)"
     echo "  Config:       $CONFIG_FILE"
     echo ""
     if is_mcp_alive; then
         echo "  MCP is live — config changes picked up automatically."
     else
-        echo "  Restart Claude Code or start a new conversation"
-        echo "  to pick up the MCP server. Run /mcp to verify."
+        echo "  Restart your MCP-compatible agent client or start a new session"
+        echo "  to pick up the MCP server."
     fi
     echo ""
     echo "  Press Ctrl+C to stop all services."
@@ -657,98 +1004,32 @@ do_build() {
     ok "Web dependencies installed"
 }
 
-# ─── claude (register MCP only, no build or start) ───────────────────
+# ─── agent MCP registration (no build or start) ──────────────────────
 
-do_claude() {
-    if [[ ! -x "$MCP_BIN" ]]; then
-        err "mcp-sctl binary not found: $MCP_BIN"
-        err "Run '$0 build' first."
-        exit 1
-    fi
-
-    # Merge local dev device into persistent config (preserves manually-added devices)
-    mkdir -p "$DATA_DIR" "$PLAYBOOKS_DIR" "$(dirname "$CONFIG_FILE")"
-    if [[ -f "$CONFIG_FILE" ]] && command -v jq &>/dev/null; then
-        jq --arg url "$DEVICE_URL" --arg key "$API_KEY" --arg pb "$PLAYBOOKS_DIR" \
-            '.devices.local = {url: $url, api_key: $key, playbooks_dir: $pb} | .default_device = "local" | .config_version = 2' \
-            "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-        ok "Config updated (merged dev device): $CONFIG_FILE"
-    else
-        cat > "$CONFIG_FILE" <<EOF
-{
-  "config_version": 2,
-  "devices": {
-    "local": {
-      "url": "$DEVICE_URL",
-      "api_key": "$API_KEY",
-      "playbooks_dir": "$PLAYBOOKS_DIR"
-    }
-  },
-  "default_device": "local"
-}
-EOF
-        ok "Config created: $CONFIG_FILE"
-    fi
-
-    generate_sctlin_seed
-
-    if is_mcp_alive; then
-        ok "mcp-sctl already running (managed by Claude Code) — config hot-reload will pick up changes"
-    else
-        log "Registering mcp-sctl with Claude Code..."
-        claude mcp remove "$MCP_NAME" 2>/dev/null || true
-        claude mcp add --transport stdio \
-            "$MCP_NAME" -- "$MCP_BIN" --supervisor --config "$CONFIG_FILE"
-        ok "MCP server '$MCP_NAME' registered (supervisor mode)"
-        echo ""
-        echo "  Restart Claude Code or start a new conversation"
-        echo "  to pick up the MCP server. Run /mcp to verify."
-    fi
-}
-
-# ─── codex (register MCP in Codex CLI) ────────────────────────────────
-
-do_codex() {
-    if [[ ! -x "$MCP_BIN" ]]; then
-        err "mcp-sctl binary not found: $MCP_BIN"
-        err "Run '$0 build' first."
-        exit 1
-    fi
-
-    # Merge local dev device into persistent config (preserves manually-added devices)
-    mkdir -p "$DATA_DIR" "$PLAYBOOKS_DIR" "$(dirname "$CONFIG_FILE")"
-    if [[ -f "$CONFIG_FILE" ]] && command -v jq &>/dev/null; then
-        jq --arg url "$DEVICE_URL" --arg key "$API_KEY" --arg pb "$PLAYBOOKS_DIR" \
-            '.devices.local = {url: $url, api_key: $key, playbooks_dir: $pb} | .default_device = "local" | .config_version = 2' \
-            "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-        ok "Config updated (merged dev device): $CONFIG_FILE"
-    else
-        cat > "$CONFIG_FILE" <<EOF
-{
-  "config_version": 2,
-  "devices": {
-    "local": {
-      "url": "$DEVICE_URL",
-      "api_key": "$API_KEY",
-      "playbooks_dir": "$PLAYBOOKS_DIR"
-    }
-  },
-  "default_device": "local"
-}
-EOF
-        ok "Config created: $CONFIG_FILE"
-    fi
-
-    generate_sctlin_seed
-
-    log "Registering mcp-sctl with Codex..."
-    codex mcp remove "$MCP_NAME" 2>/dev/null || true
-    codex mcp add "$MCP_NAME" -- "$MCP_BIN" --supervisor --config "$CONFIG_FILE"
-    ok "MCP server '$MCP_NAME' registered in Codex (supervisor mode)"
+do_agent_register() {
+    local client="$1"
+    ensure_mcp_bin
+    prepare_local_agent_config
+    register_agent_client "$client"
     echo ""
-    echo "  Restart Codex or start a new session"
-    echo "  to pick up the MCP server."
+    echo "  Restart the agent client or start a new session to pick up '$MCP_NAME'."
 }
+
+do_agents() {
+    ensure_mcp_bin
+    prepare_local_agent_config
+    register_all_agent_clients
+    echo ""
+    echo "  Restart any agent clients you use, or start new sessions, to pick up '$MCP_NAME'."
+}
+
+do_claude() { do_agent_register claude; }
+do_codex() { do_agent_register codex; }
+do_hermes() { do_agent_register hermes; }
+do_opencode() { do_agent_register opencode; }
+do_openclaw() { do_agent_register openclaw; }
+do_grok() { do_agent_register grok; }
+do_nanoclaw() { do_agent_register nanoclaw; }
 
 # ─── device add ──────────────────────────────────────────────────────
 
@@ -2434,16 +2715,7 @@ REOF
     # Start web dev server
     start_web_dev_server
 
-    # Register MCP server with Claude Code (skip if already managed)
-    if is_mcp_alive; then
-        ok "mcp-sctl already running (managed by Claude Code) — config hot-reload will pick up relay routing"
-    else
-        log "Registering mcp-sctl with Claude Code (via relay)..."
-        claude mcp remove "$MCP_NAME" 2>/dev/null || true
-        claude mcp add --transport stdio \
-            "$MCP_NAME" -- "$MCP_BIN" --supervisor --config "$CONFIG_FILE"
-        ok "MCP server '$MCP_NAME' registered (supervisor mode)"
-    fi
+    register_detected_agent_clients
 
     echo ""
     echo "============================================"
@@ -2467,7 +2739,7 @@ REOF
     fi
     echo ""
     echo "  Web UI:       http://localhost:$WEB_PORT (PID $web_pid)"
-    echo "  MCP server:   $MCP_NAME (stdio, routed via tunnel relay)"
+    echo "  MCP server:   $MCP_NAME (stdio, registered with detected MCP clients)"
     echo "  Tunnel key:   $TUNNEL_KEY"
     echo ""
     echo "  Traffic flow: client -> relay -> tunnel -> sctl device"
@@ -2475,8 +2747,8 @@ REOF
     if is_mcp_alive; then
         echo "  MCP is live — config changes picked up automatically."
     else
-        echo "  Restart Claude Code or start a new conversation"
-        echo "  to pick up the MCP server. Run /mcp to verify."
+        echo "  Restart your MCP-compatible agent client or start a new session"
+        echo "  to pick up the MCP server."
     fi
     echo ""
     echo "  Press Ctrl+C to stop all services."
@@ -3228,8 +3500,14 @@ case "${1:-setup}" in
     start)  do_start ;;
     stop)   do_stop ;;
     status) do_status ;;
+    agents) do_agents ;;
     claude) do_claude ;;
     codex)  do_codex ;;
+    hermes) do_hermes ;;
+    opencode|open-code) do_opencode ;;
+    openclaw) do_openclaw ;;
+    grok|grok-build) do_grok ;;
+    nanoclaw) do_nanoclaw ;;
     tunnel) shift; do_tunnel "$@" ;;
     env)
         case "${2:-show}" in
@@ -3316,10 +3594,16 @@ case "${1:-setup}" in
         echo "  setup    build everything + start all services + register MCP (default)"
         echo "  build    build only (server, mcp, web) — no start/stop"
         echo "  start    restart all services without rebuilding"
-        echo "  stop     stop all services + deregister MCP"
+        echo "  stop     stop all services + deregister MCP clients when safe"
         echo "  status   show what's running"
-        echo "  claude   only register MCP in Claude Code (no build/start)"
-        echo "  codex    only register MCP in Codex CLI (no build/start)"
+        echo "  agents   register MCP in all supported agent clients (no build/start)"
+        echo "  claude   register MCP in Claude Code (no build/start)"
+        echo "  codex    register MCP in Codex CLI (no build/start)"
+        echo "  hermes   register MCP in Hermes (no build/start)"
+        echo "  opencode register MCP in OpenCode config (no build/start)"
+        echo "  openclaw register MCP in OpenClaw config (no build/start)"
+        echo "  grok     show Grok Build/generic MCP config (no build/start)"
+        echo "  nanoclaw show NanoClaw/generic MCP config (no build/start)"
         echo "  tunnel   build + start tunnel dev env (relay + clients via tunnel)"
         echo "             --cloudflared        use Cloudflare Quick Tunnel (double CGNAT)"
         echo "             --relay-url <url>    use an external relay URL"

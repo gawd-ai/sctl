@@ -8,7 +8,7 @@
       "host": "192.168.1.1",
       "serial": "SCTL-0001",
       "arch": "armv7l",
-      "sctl_version": "0.3.0",
+      "sctl_version": "0.5.0",
       "added_at": "2026-01-01T00:00:00Z"
     },
     "router-2": {

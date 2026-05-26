@@ -28,11 +28,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::shell::process::spawn_shell_pgroup;
+use crate::shell::process::{spawn_command_pgroup, spawn_shell_pgroup};
 use crate::shell::pty::{allocate_pty, spawn_shell_pty};
 use buffer::OutputBuffer;
 use journal::{SessionJournal, SessionMetadata};
@@ -60,6 +60,8 @@ pub struct SessionListItem {
     pub pid: u32,
     pub persistent: bool,
     pub pty: bool,
+    /// `"terminal"` or `"job"`.
+    pub kind: String,
     pub attached: bool,
     /// `"running"` or `"exited"`.
     pub status: String,
@@ -83,6 +85,33 @@ pub struct SessionListItem {
     pub ai_status_message: Option<String>,
 }
 
+/// Whether a session is an interactive terminal or a one-shot streaming "job".
+///
+/// Jobs run a single command (`<shell> -c …`) that exits on its own; their
+/// output streams over the same `session.*` WS frames as terminals, but the UI
+/// keeps them out of the terminal/tabs list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    Terminal,
+    Job,
+}
+
+impl SessionKind {
+    /// Lowercase wire string (`"terminal"` / `"job"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionKind::Terminal => "terminal",
+            SessionKind::Job => "job",
+        }
+    }
+}
+
+/// Idle timeout (seconds) applied to one-shot jobs: a job abandoned *while still
+/// running* (detached, no activity) is reaped after this long. An *exited* job is
+/// cleaned up by the next sweep regardless. Generous enough to survive a page
+/// reload → re-attach.
+pub const JOB_IDLE_TIMEOUT_SECS: u64 = 600;
+
 /// Events produced by [`SessionManager::sweep`] for callers to broadcast.
 pub enum SweepEvent {
     /// Session was destroyed (removed from pool). Contains `(session_id, reason)`.
@@ -95,6 +124,8 @@ pub enum SweepEvent {
 #[allow(clippy::struct_excessive_bools)]
 pub struct SessionEntry {
     pub session: ManagedSession,
+    /// Interactive terminal or one-shot job.
+    pub kind: SessionKind,
     /// Whether this session survives WebSocket disconnect.
     pub persistent: bool,
     /// Last time the session received input or was attached.
@@ -151,8 +182,21 @@ impl SessionManager {
         env: Option<&HashMap<String, String>>,
         persistent: bool,
     ) -> Result<(String, u32), String> {
-        self.create_session_inner(shell, working_dir, env, persistent, false, 24, 80, 0, None)
-            .await
+        self.create_session_inner(
+            shell,
+            working_dir,
+            env,
+            persistent,
+            false,
+            24,
+            80,
+            0,
+            None,
+            None,
+            SessionKind::Terminal,
+            None,
+        )
+        .await
     }
 
     /// Create a new session with optional PTY support.
@@ -179,6 +223,45 @@ impl SessionManager {
             cols,
             idle_timeout,
             name,
+            None,
+            SessionKind::Terminal,
+            None,
+        )
+        .await
+    }
+
+    /// Create a one-shot **job**: a non-PTY session whose child process *is* the
+    /// given command. Output streams over the session's pipe; the command exits
+    /// on its own, and on exit a typed `session.exited` frame is broadcast via
+    /// `exit_events`. Returns `(session_id, pid)`.
+    ///
+    /// Jobs are `persistent` so they survive a brief WS reconnect (page reload →
+    /// re-attach). `idle_timeout` reaps a job abandoned *while still running*; an
+    /// *exited* job is cleaned up by the next sweep regardless.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_job(
+        &self,
+        shell: &str,
+        working_dir: &str,
+        command: &str,
+        env: Option<&HashMap<String, String>>,
+        name: Option<&str>,
+        idle_timeout: u64,
+        exit_events: broadcast::Sender<serde_json::Value>,
+    ) -> Result<(String, u32), String> {
+        self.create_session_inner(
+            shell,
+            working_dir,
+            env,
+            true,  // persistent: survive reload → re-attach
+            false, // jobs are non-PTY (clean stdout, no echo/ANSI)
+            24,
+            80,
+            idle_timeout,
+            name,
+            Some(command),
+            SessionKind::Job,
+            Some(exit_events),
         )
         .await
     }
@@ -195,6 +278,9 @@ impl SessionManager {
         cols: u16,
         idle_timeout: u64,
         name: Option<&str>,
+        command: Option<&str>,
+        kind: SessionKind,
+        exit_events: Option<broadcast::Sender<serde_json::Value>>,
     ) -> Result<(String, u32), String> {
         let mut sessions = self.sessions.write().await;
 
@@ -218,12 +304,24 @@ impl SessionManager {
             let child = spawn_shell_pty(&pty_pair, shell, working_dir, Some(&pty_env))
                 .map_err(|e| format!("Failed to spawn PTY shell: {e}"))?;
 
-            ManagedSession::spawn_pty(session_id.clone(), child, pty_pair.master, self.buffer_size)?
+            ManagedSession::spawn_pty(
+                session_id.clone(),
+                child,
+                pty_pair.master,
+                self.buffer_size,
+                exit_events,
+            )?
+        } else if let Some(cmd) = command {
+            // Job: the child process *is* the command; it runs and exits on its
+            // own, streaming stdout/stderr over the session's pipe.
+            let child = spawn_command_pgroup(shell, working_dir, cmd, env)
+                .map_err(|e| format!("Failed to spawn command: {e}"))?;
+            ManagedSession::spawn(session_id.clone(), child, self.buffer_size, exit_events)?
         } else {
-            // Pipe-backed session
+            // Pipe-backed interactive session
             let child = spawn_shell_pgroup(shell, working_dir, env)
                 .map_err(|e| format!("Failed to spawn shell: {e}"))?;
-            ManagedSession::spawn(session_id.clone(), child, self.buffer_size)?
+            ManagedSession::spawn(session_id.clone(), child, self.buffer_size, exit_events)?
         };
 
         let pid = session.pid;
@@ -259,6 +357,7 @@ impl SessionManager {
             session_id.clone(),
             SessionEntry {
                 session,
+                kind,
                 persistent,
                 last_activity: now,
                 attached_count: 1,
@@ -585,6 +684,7 @@ impl SessionManager {
                         entry.session.pid,
                         entry.persistent,
                         entry.session.is_pty(),
+                        entry.kind,
                         entry.attached_count,
                         entry.idle_timeout,
                         entry.name.clone(),
@@ -607,6 +707,7 @@ impl SessionManager {
             pid,
             persistent,
             pty,
+            kind,
             attached_count,
             idle_timeout,
             name,
@@ -629,6 +730,7 @@ impl SessionManager {
                 pid,
                 persistent,
                 pty,
+                kind: kind.as_str().to_string(),
                 attached,
                 status: match status {
                     session::SessionStatus::Running => "running".to_string(),
@@ -697,6 +799,7 @@ impl SessionManager {
                 arch.session_id.clone(),
                 SessionEntry {
                     session,
+                    kind: SessionKind::Terminal,
                     persistent: arch.metadata.persistent,
                     last_activity: now,
                     attached_count: 0,

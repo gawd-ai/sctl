@@ -289,6 +289,52 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                                     connection_sessions.push(session_id);
                                 }
                             }
+                            "job.start" => {
+                                let command = parsed["command"].as_str().unwrap_or("");
+                                if command.is_empty() {
+                                    let _ = tx.send(WsServerMsg::Error {
+                                        code: "MISSING_FIELD".into(),
+                                        message: "command is required".into(),
+                                        session_id: None,
+                                        request_id: request_id.clone(),
+                                    }.to_value()).await;
+                                    continue;
+                                }
+                                let working_dir = parsed["working_dir"].as_str().map(ToString::to_string);
+                                let env: Option<HashMap<String, String>> = parsed
+                                    .get("env")
+                                    .and_then(|v| serde_json::from_value(v.clone()).ok());
+                                let shell = parsed["shell"].as_str().map(ToString::to_string);
+                                let name = parsed["name"].as_str().map(ToString::to_string);
+
+                                if let Some(session_id) = handle_job_start(
+                                    &state,
+                                    &tx,
+                                    request_id.as_deref(),
+                                    working_dir.as_deref(),
+                                    env.as_ref(),
+                                    shell.as_deref(),
+                                    command,
+                                    name.as_deref(),
+                                )
+                                .await
+                                {
+                                    // Stream job output over the same per-session subscriber
+                                    // path terminals use — works through the relay unchanged.
+                                    if let Some(buffer) =
+                                        state.session_manager.get_buffer(&session_id).await
+                                    {
+                                        let task = tokio::spawn(subscriber_task(
+                                            session_id.clone(),
+                                            buffer,
+                                            tx.clone(),
+                                            0,
+                                        ));
+                                        subscriber_tasks.insert(session_id.clone(), task);
+                                    }
+                                    connection_sessions.push(session_id);
+                                }
+                            }
                             "session.exec" => {
                                 let session_id = parsed["session_id"].as_str().unwrap_or("");
                                 let command = parsed["command"].as_str().unwrap_or("");
@@ -734,6 +780,112 @@ async fn handle_session_start(
                 working_dir = dir,
                 error = %e,
                 "WS: session.start PTY spawn failed"
+            );
+            let _ = tx
+                .send(
+                    WsServerMsg::Error {
+                        code: "SESSION_LIMIT".into(),
+                        message: e,
+                        session_id: None,
+                        request_id: request_id.map(String::from),
+                    }
+                    .to_value(),
+                )
+                .await;
+            None
+        }
+    }
+}
+
+/// Handle `job.start` — spawn a one-shot streaming **job** (a non-PTY session
+/// whose child *is* the command). Returns the `session_id` on success.
+///
+/// Unlike [`handle_session_start`], this does **not** broadcast `session.created`,
+/// so jobs stay out of the terminal/tabs UI. Output streams over the same
+/// `session.*` frames; completion arrives as a typed `session.exited`.
+#[allow(clippy::too_many_arguments)]
+async fn handle_job_start(
+    state: &AppState,
+    tx: &mpsc::Sender<Value>,
+    request_id: Option<&str>,
+    working_dir: Option<&str>,
+    env: Option<&HashMap<String, String>>,
+    shell: Option<&str>,
+    command: &str,
+    name: Option<&str>,
+) -> Option<String> {
+    let raw_dir = working_dir.unwrap_or(&state.config.shell.default_working_dir);
+    let expanded = crate::util::expand_tilde(raw_dir);
+    let dir = expanded.as_ref();
+    let sh = shell.unwrap_or(&state.config.shell.default_shell);
+
+    tracing::info!(
+        request_id = request_id.unwrap_or(""),
+        shell = sh,
+        working_dir = dir,
+        "WS: job.start received"
+    );
+
+    match state
+        .session_manager
+        .create_job(
+            sh,
+            dir,
+            command,
+            env,
+            name,
+            crate::sessions::JOB_IDLE_TIMEOUT_SECS,
+            state.session_events.clone(),
+        )
+        .await
+    {
+        Ok((session_id, pid)) => {
+            tracing::info!(
+                request_id = request_id.unwrap_or(""),
+                session_id = %session_id,
+                pid,
+                "WS: job.start spawn succeeded"
+            );
+            let _ = tx
+                .send(
+                    WsServerMsg::SessionStarted {
+                        session_id: session_id.clone(),
+                        pid,
+                        persistent: true,
+                        pty: false,
+                        user_allows_ai: true,
+                        created_at: crate::sessions::journal::now_ms(),
+                        name: name.map(String::from),
+                        request_id: request_id.map(String::from),
+                    }
+                    .to_value(),
+                )
+                .await;
+
+            state
+                .activity_log
+                .log(
+                    ActivityType::SessionStart,
+                    ActivitySource::Ws,
+                    format!("job {}", &session_id[..8.min(session_id.len())]),
+                    Some(json!({
+                        "session_id": session_id,
+                        "kind": "job",
+                        "command": command.chars().take(80).collect::<String>(),
+                    })),
+                    None,
+                )
+                .await;
+
+            Some(session_id)
+        }
+        Err(e) => {
+            tracing::warn!(
+                request_id = request_id.unwrap_or(""),
+                shell = sh,
+                working_dir = dir,
+                error = %e,
+                "WS: job.start spawn failed"
             );
             let _ = tx
                 .send(

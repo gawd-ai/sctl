@@ -69,6 +69,40 @@ pub fn spawn_shell_pgroup(
     cmd.spawn()
 }
 
+/// Spawn `<shell> -c "<command>"` in its own process group with piped output.
+///
+/// Like [`spawn_shell_pgroup`] but the child runs a single command and **exits
+/// on its own** when the command finishes — the basis for one-shot streaming
+/// "jobs". Stdin is `/dev/null` (the command reads no input); stdout/stderr are
+/// piped so a session can stream them live. `setpgid(0, 0)` makes the child a
+/// process-group leader so signals (e.g. SIGINT to cancel) reach the whole tree.
+pub fn spawn_command_pgroup(
+    shell: &str,
+    working_dir: &str,
+    command: &str,
+    env: Option<&HashMap<String, String>>,
+) -> std::io::Result<Child> {
+    let mut cmd = Command::new(shell);
+    cmd.arg("-c")
+        .arg(command)
+        .current_dir(working_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(vars) = env {
+        cmd.envs(vars);
+    }
+    // SAFETY: setpgid is async-signal-safe per POSIX.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+    cmd.spawn()
+}
+
 /// Execute a one-shot command via `<shell> -c "<command>"` and capture output.
 ///
 /// Stdout and stderr are read concurrently (to avoid pipe deadlock) and each

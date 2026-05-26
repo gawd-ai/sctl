@@ -5,9 +5,9 @@
 <h1 align="center">sctl</h1>
 
 <p align="center">
-  <strong>Shell Control — pronounced "scuttle" (yes, the Rustacean pun is intended).</strong><br/>
-  Give AI agents hands-on access to Linux devices — routers, servers, IoT, VMs — across any network.<br/>
-  Execute commands, manage persistent shell sessions, transfer files, run playbooks, track GPS and LTE — via <a href="https://modelcontextprotocol.io/">MCP</a>, HTTP/WebSocket API, or <a href="web/">web terminal UI</a>.
+  <strong>Shell Control, pronounced "scuttle".</strong><br/>
+  AI remote control plane for Linux devices, infrastructure, and edge compute.<br/>
+  Give agents authenticated access to commands, persistent shell sessions, files, playbooks, GPS/LTE telemetry, and web terminals through <a href="https://modelcontextprotocol.io/">MCP</a>, HTTP/WebSocket APIs, or <a href="web/">sctlin</a>.
 </p>
 
 <p align="center">
@@ -18,146 +18,141 @@
 
 ---
 
-> **WARNING: SCTL IS AN EXTREMELY POWERFUL TOOL AND WITH GREAT POWER COMES GREAT RESPONSIBILITY. THIS TOOL CAN BE DANGEROUS AND CAUSE DESTRUCTION AND TOTAL OBLITERATION IF NOT USED WITH ABSOLUTE DILIGENCE. THE AUTHORS AND GAWD BEAR NO RESPONSIBILITY FOR ANY OUTCOME WHATSOEVER.**
+> **Security warning:** sctl gives authenticated clients the ability to execute commands, write and delete files, manage shell sessions, and run playbooks on target systems. Run it only on systems you control, use strong API keys, restrict network exposure, and review commands and playbooks before granting AI access.
 
 ---
 
-## What can sctl do?
+## Why sctl?
 
-### AI troubleshoots a remote router
+sctl exists to make AI agents useful outside the chat window. The first target can be your own computer, a lab machine, a server, or a VPS. The same control model extends to racks of Linux hosts, embedded development boards, communications and network hardware, drones, robots, and remote or space-based AI compute where shell access is the operational layer.
 
-You ask Claude to check why a device is slow. The AI calls `device_exec` to check load, reads logs with `device_file_read`, spots a misconfiguration, and runs `pb_openwrt-health-check` to validate the fix — all on a device behind CGNAT, accessed through the tunnel relay.
+sctl does not provide domain-specific control logic for robots, drones, or spacecraft. It is a small, auditable control surface for Linux targets: commands, files, sessions, playbooks, telemetry, and relay access exposed in a form AI agents can use safely under operator control.
 
-```
-You:   "The router at site-3 feels sluggish. Can you check it out?"
+- **AI-native control surface** -- expose command execution, file operations, health checks, GPS, activity logs, and playbooks as MCP tools.
+- **Durable interactive sessions** -- keep shells running on the target, replay missed output after reconnects, and support full PTY workflows.
+- **Remote-first networking** -- use direct LAN URLs or the built-in relay for LTE/5G/CGNAT devices without changing client code.
+- **Human/AI shared control** -- hand sessions between a web UI and an AI agent with per-session AI permission and visible working status.
+- **Composable UI and APIs** -- use `sctlin` as a standalone app, embed it as a Svelte 5 component library, or integrate directly over HTTP/WebSocket.
 
-Claude: I'll check site-3. Let me start with system health.
-        [calls device_exec on site-3: "uptime && free -m"]
-        Load average is 4.2 on a 2-core device, and memory is at 93%.
+## Where sctl Fits
 
-        [calls device_exec: "ps aux --sort=-%mem | head -5"]
-        dnsmasq is using 180MB — that's abnormal. Let me check its config.
+- **Your own machine or lab computer** -- the base case is local: run sctl, connect an MCP-compatible agent, and let it inspect, build, test, or repair the system under your supervision.
+- **Servers, VPSes, and cloud infrastructure** -- operate Linux hosts through the same MCP tools, REST API, WebSocket sessions, and playbooks.
+- **Data centers and multi-device operations** -- manage named devices from one MCP server, keep persistent sessions alive, and use playbooks for repeatable operational checks.
+- **Hardware development benches** -- bring AI control to boards, gateways, modems, and prototypes where the useful interface is still a shell, filesystem, serial-adjacent tooling, or device telemetry.
+- **Communications and network devices** -- support OpenWrt and other Linux-based routers, LTE gateways, and remote network appliances that may sit behind CGNAT.
+- **Robots, drones, and edge systems** -- give agents a controlled way to inspect and operate Linux-based compute modules without replacing the domain-specific flight, autonomy, or control software.
+- **Space-based AI compute** -- apply the same relay, replayable session, telemetry, and playbook model to remote compute where links may be delayed, intermittent, or impossible to reach inbound.
 
-        [calls device_file_read: "/etc/config/dhcp"]
-        The DNS cache size is set to 50000 — way too high for 256MB RAM.
+## Example Workflows
 
-        [calls device_file_write: updates cachesize to 1000]
-        [calls device_exec: "/etc/init.d/dnsmasq restart"]
-        [calls pb_openwrt-health-check]
+**Inspect and repair a remote Linux host**
 
-        Fixed. dnsmasq had a 50K entry DNS cache consuming most of RAM.
-        Cache is now 1000 entries, memory usage dropped to 41%.
-```
-
-### Sessions survive network blips
-
-Start a persistent PTY session on a device. Your WiFi drops. Your laptop sleeps. Hours later, reconnect — the session is still running, and every byte of output is waiting for you.
-
-```
-# Session starts, runs a long build
--> session.start  {persistent: true, pty: true, name: "build"}
-<- session.started {session_id: "abc-123"}
--> session.exec   {command: "make -j4"}
-<- session.stdout  {data: "Compiling...", seq: 0}
-
-   ... network drops, laptop sleeps for 2 hours ...
-
-# Reconnect — replay from where you left off
--> session.attach  {session_id: "abc-123", since: 0}
-<- session.attached {entries: [seq 0..4847], dropped: 0}
-   # All 4847 output entries replayed. Build finished at seq 4201.
+```text
+Ask: "Check why site-3 is slow."
+Agent: device_exec -> device_file_read -> pb_linux-health-check
+Result: load, logs, disk state, config, and remediation steps are gathered from the host.
 ```
 
-### Fleet management across CGNAT
+**Bring up embedded hardware behind LTE**
 
-Manage devices on LAN and behind CGNAT from the same MCP config. The AI doesn't need to know which path each device uses — direct or tunneled, the API is identical.
+```text
+Device: outbound tunnel over LTE/5G to a public relay
+Agent: device_health -> device_gps -> pb_openwrt-diagnostics
+Result: the board can be inspected and recovered without inbound network access.
+```
+
+**Persistent human/AI handoff**
+
+```text
+session_start    { persistent: true, pty: true, name: "field-debug" }
+session_exec     { command: "make test" }
+session_allow_ai { allowed: false }  # human takes over in sctlin
+session_attach   { session_id: "...", since: 0 }  # agent replays missed output
+```
+
+**Same tools, direct or relayed**
 
 ```json
 {
   "devices": {
-    "office-router":  {"url": "http://192.168.1.1:1337",  "api_key": "..."},
-    "cell-tower-42":  {"url": "https://relay.example.com/d/SCTL-0042", "api_key": "..."},
-    "remote-sensor":  {"url": "https://relay.example.com/d/SCTL-0099", "api_key": "..."}
+    "office-router": { "url": "http://192.168.1.1:1337", "api_key": "..." },
+    "lte-gateway": { "url": "https://relay.example.com/d/SCTL-0042", "api_key": "..." }
   },
   "default_device": "office-router"
 }
 ```
 
-```
-You:   "Run a health check on all devices"
-
-Claude: [calls device_health on office-router]    — ok, uptime 45d
-        [calls device_health on cell-tower-42]     — ok, uptime 12d, via tunnel
-        [calls device_health on remote-sensor]     — ok, uptime 3d, via tunnel
-        [calls pb_linux-health-check on each]
-
-        All 3 devices healthy. cell-tower-42 has disk at 87% — I'll clean
-        old logs if you want.
-```
-
 ## Architecture
 
 ```
-                                                         ┌────────────────┐
-┌────────────────┐  stdio (MCP)  ┌────────────────┐      │  sctl          │
-│                │ <───────────> │                │ HTTP │  (device)      │
-│    AI Agent    │  JSON-RPC 2.0 │   mcp-sctl     │ <──> │                │
-│                │               │  Multi-device  │ +WS  │  Linux / ARM / │
-└────────────────┘               │  Local buffers │      │  RISC-V / x86  │
-                                 └────────────────┘      └────────────────┘
-                                         │
-┌────────────────┐  HTTP + WS            │           ┌────────────────┐
-│   sctlin       │ <─────────────────────┘           │  sctl          │
-│   (web UI)     │                            WS     │  (relay mode)  │
-│   Terminal,    │ <──────────────────────────────>   │  NAT traversal │
-│   files, etc.  │                                   │  for CGNAT     │
-└────────────────┘                                   └────────────────┘
+┌──────────────┐   stdio/MCP    ┌──────────────┐   HTTP/WS    ┌──────────────┐
+│  AI Agent    │ <------------> │  mcp-sctl    │ <----------> │ sctl device  │
+│ MCP client   │  JSON-RPC 2.0  │ multi-device │              │ Linux shell  │
+└──────────────┘                │ local buffer │              └──────────────┘
+                                └──────┬───────┘
+                                       │
+                         HTTP/WS       │       WS tunnel
+┌──────────────┐ <---------------------┘  ┌──────────────┐
+│   sctlin     │                           │ sctl relay   │
+│ web terminal │ <-----------------------> │ CGNAT/LTE    │
+└──────────────┘                           └──────────────┘
 ```
 
 | Component | What it does |
 |-----------|-------------|
-| **[sctl](server/)** | Lightweight server on the target device — exec, sessions, files, GPS, LTE |
-| **[mcp-sctl](mcp/)** | MCP proxy on your machine — translates AI tool calls into API requests |
-| **[sctlin](web/)** | Svelte 5 web terminal — embeddable component library or standalone app |
-| **sctl relay** | Same binary in relay mode — reverse tunnel for CGNAT/LTE devices |
+| **[sctl](server/)** | Device-side server for exec, sessions, files, activity, playbooks, GPS, and LTE |
+| **[mcp-sctl](mcp/)** | MCP proxy that maps AI tool calls to sctl HTTP/WebSocket APIs |
+| **[sctlin](web/)** | Svelte 5 web terminal and component library |
+| **sctl relay** | Reverse tunnel mode for devices that cannot accept inbound connections |
 
-## Key Capabilities
+## 0.5.0 Highlights
 
-- **Persistent sessions** — shells survive disconnects, output buffers in a ring buffer, re-attach and catch up with zero loss
-- **Full PTY support** — run vim, htop, docker — anything that needs a real terminal
-- **Multi-device fleet** — manage many devices from one MCP server with hot-reloadable config
-- **Reverse tunnel** — built-in NAT traversal for LTE/5G/CGNAT devices, with heartbeat, flap detection, and auto-reconnect
-- **Playbooks** — markdown scripts with typed parameters, auto-discovered as MCP tools
-- **GPS & LTE monitoring** — location tracking and signal metrics from Quectel modems, with autonomous watchdog recovery
-- **AI collaboration** — session-level AI/human handoff, real-time working status in web UI
-- **Security-first** — constant-time auth, path traversal prevention, process isolation, atomic writes
+- **Unified error model** — stable API error codes and generated TypeScript bindings for client consistency.
+- **Persistent PTY sessions** — replayable output buffers, resize support, process-group signals, and session journaling.
+- **Playbook API and MCP tools** — Markdown playbooks with typed parameters exposed through REST and `pb_*` MCP tools.
+- **Relay for CGNAT/LTE** — outbound device registration, proxied REST/WS sessions, heartbeat metrics, and reconnect handling.
+- **GPS/LTE telemetry** — Quectel modem polling, WebSocket broadcasts, band control, and LTE watchdog recovery.
+- **sctlin web UI** — terminal, multi-server dashboard, activity history, playbooks, file tools, and embeddable widgets.
 
 ## Quick Start
 
-### Option 1: Claude Code (recommended)
+### Agent Clients
 
 ```bash
 git clone https://github.com/gawd-ai/sctl.git && cd sctl
 
-# Build everything and start the dev stack
+# Build everything, start the dev stack, and register detected MCP clients
 chmod +x rundev.sh
 ./rundev.sh
 ```
 
-This builds the server + MCP proxy, starts sctl locally, and registers it with Claude Code. Open a new Claude Code conversation and your AI can now execute commands, manage sessions, and operate your machine.
+This is the base case: your own computer becomes the first controlled target. The script builds the server + MCP proxy, starts sctl locally, and registers `mcp-sctl` with detected MCP-compatible agent clients. Start a new agent session and it can execute commands, manage sessions, and operate the machine under your supervision.
 
-Web UI: `http://localhost:5170/sctlin` (sctl's Vite dev server).
+Supported agent setup paths:
 
-#### Running alongside other dev stacks
+| Client | Command |
+|--------|---------|
+| Auto-detect installed clients | `./rundev.sh agents` |
+| Claude Code | `./rundev.sh claude` |
+| Codex CLI | `./rundev.sh codex` |
+| Hermes | `./rundev.sh hermes` |
+| OpenCode | `./rundev.sh opencode` |
+| OpenClaw | `./rundev.sh openclaw` |
+| Grok Build / generic MCP | `./rundev.sh grok` |
+| NanoClaw / generic MCP | `./rundev.sh nanoclaw` |
 
-`rundev.sh` is designed to coexist with other dev environments that also need a local sctl-agent (e.g. `netage-fleet`'s rundev). On startup it probes `http://127.0.0.1:1337/api/health` — if a healthy sctl is already there, it **attaches** to that instance instead of launching a duplicate that would fail to bind the port. On `stop` it only kills processes it started; a foreign sctl is left running.
+Web UI: `http://localhost:5170/sctlin`.
 
-Default port allocation when both stacks run side-by-side:
-- sctl-agent (shared): `127.0.0.1:1337`
-- sctl Vite UI: `http://localhost:5170`
-- netage-fleet Vite UI: `http://localhost:5176`
+#### Local development ports
 
-### Option 2: Manual Setup
+`rundev.sh` probes `http://127.0.0.1:1337/api/health` on startup. If a healthy sctl server is already listening there, it attaches to that instance instead of launching a duplicate that would fail to bind the port. On `stop`, it only terminates processes it started.
+
+Default local ports:
+- sctl server: `127.0.0.1:1337`
+- sctlin Vite UI: `http://localhost:5170/sctlin`
+
+### Manual Setup
 
 **1. Start the server** on the target device:
 
@@ -167,62 +162,41 @@ SCTL_API_KEY=your-secret-key ./target/release/sctl
 # Listening on 0.0.0.0:1337
 ```
 
-**2. Start the MCP proxy** on your dev machine:
+**2. Register the MCP proxy** with your agent client:
 
 ```bash
 cd mcp && cargo build --release
-export SCTL_URL=http://your-device:1337
-export SCTL_API_KEY=your-secret-key
-claude mcp add sctl -- ./target/release/mcp-sctl
+
+# Example: any client that accepts a stdio MCP command can launch:
+./target/release/mcp-sctl --config ../mcp/devices.example.json
 ```
 
-**3. Use it.** Ask Claude to run commands on your device — it will use `device_exec`, `session_start`, and other tools automatically.
+**3. Use it.** Ask your agent to run commands on your device. It will use `device_exec`, `session_start`, and other tools automatically when connected through MCP.
 
-## MCP Tool Reference
+## MCP Capabilities
 
-When connected via MCP, AI agents get these tools:
+When connected through `mcp-sctl`, agents get tools for:
 
-| Tool | Description |
-|------|-------------|
-| `device_list` | List configured devices |
-| `device_health` | Check if a device is alive |
-| `device_info` | System info (hostname, CPU, memory, disk, network) |
-| `device_exec` | Execute a shell command |
-| `device_exec_batch` | Execute multiple commands sequentially |
-| `device_file_read` | Read a file or list a directory |
-| `device_file_write` | Write a file atomically |
-| `device_file_delete` | Delete a file |
-| `device_activity` | Read the activity log (exec, file I/O, sessions) |
-| `device_gps` | GPS location data (fix, history, status) |
-| `session_start` | Start a persistent interactive shell (with optional PTY) |
-| `session_exec` | Run a command in a session |
-| `session_send` | Send raw input (arrow keys, Ctrl sequences) |
-| `session_read` | Read buffered output |
-| `session_exec_wait` | Execute and wait for completion in one call |
-| `session_signal` | Send POSIX signals (SIGINT, SIGTERM, etc.) |
-| `session_kill` | Kill a session |
-| `session_list` | List active sessions |
-| `session_attach` | Re-attach to an existing persistent session |
-| `session_resize` | Resize PTY terminal dimensions |
-| `session_rename` | Rename a session |
-| `session_allow_ai` | Toggle AI input permission (human/AI handoff) |
-| `session_ai_status` | Report AI working status for UI feedback |
-| `playbook_list` | List device-stored playbooks |
-| `playbook_get` | Read a playbook |
-| `playbook_put` | Create/update/delete playbooks |
-| `pb_*` | Auto-generated tools from playbooks (e.g. `pb_linux-health-check`) |
+- Device discovery, health, info, command execution, and activity history.
+- Atomic file read/write/delete operations.
+- Persistent session lifecycle, raw terminal input, signals, resize, attach, and wait helpers.
+- AI collaboration controls such as `session_allow_ai` and `session_ai_status`.
+- Playbook CRUD and auto-generated `pb_*` tools from device-stored Markdown playbooks.
+
+See [mcp/README.md](mcp/README.md) for the complete tool catalog and config format.
 
 ## Documentation
 
 | Document | Description |
 |----------|-------------|
-| **[Guide](docs/guide.md)** | **Start here** — deployment, tunnel setup, playbooks, GPS/LTE, AI collaboration, troubleshooting |
-| [Server README](server/README.md) | Full API reference, WebSocket protocol, TOML config |
-| [MCP README](mcp/README.md) | MCP tool catalog, multi-device config, architecture |
-| [Web README](web/README.md) | Component library API, widgets, integration examples |
+| **[Guide](docs/guide.md)** | Deployment, relay setup, playbooks, GPS/LTE, AI collaboration, troubleshooting |
+| [MCP README](mcp/README.md) | MCP configuration, full tool catalog, multi-device behavior |
+| [Server README](server/README.md) | HTTP API, WebSocket protocol, TOML config, relay API |
+| [Web README](web/README.md) | sctlin package API, components, widgets, integration examples |
 | [Server config](server/sctl.toml.example) | Full TOML configuration reference |
 | [MCP config](mcp/devices.example.json) | Multi-device JSON configuration example |
-| [Security review](server/docs/REVIEW.md) | Security audit and known limitations |
+| [Security policy](SECURITY.md) | Vulnerability reporting and supported versions |
+| [Security review](server/docs/REVIEW.md) | Security design notes and known limitations |
 | [Changelog](CHANGELOG.md) | Release history |
 | [Contributing](CONTRIBUTING.md) | Development setup and guidelines |
 

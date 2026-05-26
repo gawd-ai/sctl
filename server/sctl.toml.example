@@ -2,7 +2,7 @@
 # Bind address and port (env: SCTL_LISTEN)
 listen = "0.0.0.0:1337"
 
-# Maximum concurrent HTTP connections (not currently enforced)
+# Maximum concurrent HTTP connections
 max_connections = 10
 
 # Maximum concurrent WebSocket shell sessions

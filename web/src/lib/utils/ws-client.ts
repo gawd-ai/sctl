@@ -385,6 +385,30 @@ export class SctlWsClient {
 		});
 	}
 
+	/**
+	 * Start a one-shot streaming **job**: a non-PTY session whose child process
+	 * *is* the given command. Output streams over the same `session.*` frames as
+	 * a terminal (subscribe with `onOutput`); completion arrives as
+	 * `session.exited` (subscribe with `onSessionEnd`). Jobs are kept out of the
+	 * terminal/tabs UI. Returns the started-session metadata (carries the id).
+	 */
+	async startJob(opts: {
+		command: string;
+		shell?: string;
+		workingDir?: string;
+		env?: Record<string, string>;
+		name?: string;
+	}): Promise<WsSessionStartedMsg> {
+		return this.sendWithAck<WsSessionStartedMsg>({
+			type: 'job.start',
+			command: opts.command,
+			shell: opts.shell,
+			working_dir: opts.workingDir,
+			env: opts.env,
+			name: opts.name
+		});
+	}
+
 	/** Attach to an existing session, replaying output since the given sequence number. */
 	async attachSession(sessionId: string, since?: number): Promise<WsSessionAttachedMsg> {
 		return this.sendWithAck<WsSessionAttachedMsg>({

@@ -3,7 +3,11 @@
 /**
  * Summary of a session returned by [`SessionManager::list_sessions`].
  */
-export type SessionListItem = { session_id: string, pid: number, persistent: boolean, pty: boolean, attached: boolean, 
+export type SessionListItem = { session_id: string, pid: number, persistent: boolean, pty: boolean, 
+/**
+ * `"terminal"` or `"job"`.
+ */
+kind: string, attached: boolean, 
 /**
  * `"running"` or `"exited"`.
  */

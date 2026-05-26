@@ -4,25 +4,25 @@
 
 # mcp-sctl
 
-MCP proxy that gives AI agents (Claude, GPT, local models) hands-on access to remote Linux devices via [sctl](../README.md).
+MCP proxy that gives MCP-compatible agents (Claude Code, Codex CLI, Hermes, OpenCode, OpenClaw, NanoClaw, Grok Build, GPT/local clients, and custom tools) hands-on control of Linux targets through [sctl](../README.md): local machines, servers, VPSes, embedded hardware, network devices, and remote compute reachable directly or through a relay.
 
-> **See also:** [Guide](../docs/guide.md) for deployment, fleet management, playbooks, and troubleshooting.
+Use this document when you are wiring sctl into an MCP client, configuring multiple devices, or checking the exact tool schema. For deployment, relay setup, playbooks, and troubleshooting, see the [Guide](../docs/guide.md).
 
 ## Overview
 
-mcp-sctl runs as a stdio-based MCP server, translating JSON-RPC tool calls into sctl HTTP and WebSocket requests. It supports multiple named devices, interactive streaming sessions with auto-reconnect, and local output buffering for zero-latency reads.
+mcp-sctl is the AI-facing control layer. It runs as a stdio-based MCP server, translates JSON-RPC tool calls from an AI client into sctl HTTP and WebSocket requests, supports multiple named devices, keeps local session output buffers for fast reads, and reconnects to persistent sessions after network interruptions.
 
 ```
                  stdio (JSON-RPC)              HTTP + WebSocket
 ┌──────────────┐ <---------------> ┌──────────────────┐ <---------------> ┌─────────────┐
 │  AI Agent    │                   │    mcp-sctl      │                   │    sctl     │
-│  (Claude,    │   MCP protocol    │                  │   REST + WS       │  (device)   │
-│   etc.)      │                   │  Local buffers   │   streaming       │             │
+│ MCP client   │   MCP protocol    │                  │   REST + WS       │  (device)   │
+│              │                   │  Local buffers   │   streaming       │             │
 └──────────────┘                   │  Auto-reconnect  │                   └─────────────┘
                                    └──────────────────┘
 ```
 
-**Device tools** use the REST API for one-shot operations (exec, file read/write, health checks). **Session tools** use WebSocket for persistent interactive shells with real-time output streaming.
+**Device tools** use REST for one-shot operations such as exec, file read/write, and health checks. **Session tools** use WebSocket for persistent interactive shells with real-time output streaming and replay.
 
 ## Quick Start
 
@@ -63,22 +63,53 @@ See [devices.example.json](devices.example.json) for the config format:
 
 The config file may also contain metadata fields (`host`, `serial`, `arch`, `sctl_version`, `added_at`) used by `rundev.sh device` commands. mcp-sctl ignores these unknown fields.
 
-### Claude Code integration
+### Client registration
 
-Register directly:
+Use `rundev.sh` from the repo root for the common clients:
 
 ```bash
-claude mcp add sctl -- /path/to/mcp-sctl --config /path/to/devices.json
+./rundev.sh agents    # detected clients
+./rundev.sh claude    # Claude Code
+./rundev.sh codex     # Codex CLI
+./rundev.sh hermes    # Hermes
+./rundev.sh opencode  # OpenCode config
+./rundev.sh openclaw  # OpenClaw config
+./rundev.sh grok      # Grok Build / generic MCP snippet
+./rundev.sh nanoclaw  # NanoClaw / generic MCP snippet
 ```
 
-Or add to `~/.claude/claude_code_config.json`:
+Manual stdio shape for any MCP client:
 
 ```json
 {
   "mcpServers": {
     "sctl": {
       "command": "/path/to/mcp-sctl",
-      "args": ["--config", "/path/to/devices.json"]
+      "args": ["--supervisor", "--config", "/path/to/devices.json"]
+    }
+  }
+}
+```
+
+Client-specific command examples:
+
+```bash
+claude mcp add --transport stdio sctl -- /path/to/mcp-sctl --supervisor --config /path/to/devices.json
+codex mcp add sctl -- /path/to/mcp-sctl --supervisor --config /path/to/devices.json
+openclaw mcp set sctl '{"command":"/path/to/mcp-sctl","args":["--supervisor","--config","/path/to/devices.json"]}'
+```
+
+For Hermes, use `./rundev.sh hermes`; it writes a small wrapper under `~/.config/sctl/` because Hermes parses `--args` values beginning with `--` as CLI flags.
+
+OpenCode uses its `mcp` config object:
+
+```json
+{
+  "mcp": {
+    "sctl": {
+      "type": "local",
+      "command": ["/path/to/mcp-sctl", "--supervisor", "--config", "/path/to/devices.json"],
+      "enabled": true
     }
   }
 }

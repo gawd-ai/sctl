@@ -1,8 +1,8 @@
 # sctl — Security & Code Review
 
-Review of the sctl codebase as of v0.3.0.
+Review of the sctl codebase as of v0.5.0.
 
-## Security Wins
+## Security Controls
 
 ### Constant-time auth comparison (`auth.rs`)
 
@@ -32,15 +32,23 @@ Write-to-temp-then-rename with an atomic counter for unique temp names. Readers 
 
 ## Known Limitations
 
-These are tracked for future work and are low-risk in current deployments.
+These are tracked for future work and should be considered when exposing sctl beyond trusted environments.
 
-1. **`max_connections` configured but not enforced** — the setting exists in config but no middleware limits concurrent connections. Could be enforced via Tower's `ConcurrencyLimit` layer.
+1. **Pre-shared key authentication** — sctl uses a single API key per server. There is no per-user identity, RBAC, or scoped token model.
 
-2. **Session timeout is wall-clock, not idle-based** — sessions are killed after a fixed duration from creation, regardless of activity. An idle-based timeout would be better for long-running interactive sessions.
+2. **No explicit request body size layer** — file routes enforce `max_file_size`, but the HTTP stack should also configure an explicit body limit to match the documented maximum.
 
-3. **No explicit request body size limit** — relies on Axum's default 2 MB body limit. Should be explicitly configured to match `max_file_size`.
+3. **Playbook execution is trusted automation** — playbooks execute as the sctl process user. Operators should treat them as privileged scripts and review content before enabling them on a device.
 
-## v0.4.0 Additions
+## v0.5.0 Additions
+
+### API consistency
+
+The 0.5.0 release standardizes route errors through a unified `ApiError` shape with stable error codes and replaces hand-built server WebSocket JSON with typed server-message variants. This reduces accidental wire-format drift and makes downstream clients easier to audit.
+
+### Connection limits
+
+`max_connections` is now enforced through Tower's `ConcurrencyLimitLayer`, matching the documented server configuration.
 
 ### Tunnel security
 

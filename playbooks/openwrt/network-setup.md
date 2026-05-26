@@ -1,10 +1,10 @@
 ---
 name: openwrt-network-setup
-description: OpenWrt network configuration — WiFi check/reset, DNS/DHCP status, VLAN review, interface diagnostics, firewall zones
+description: OpenWrt network diagnostics and controlled actions — WiFi check/reset, DNS/DHCP status, VLAN review, interface diagnostics, firewall zones
 params:
   action:
     type: string
-    description: Action to perform
+    description: Action to perform; reset/restart actions change live network state
     default: check
     enum: [check, reset-wifi, restart-network]
   interface:

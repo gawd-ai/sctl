@@ -493,7 +493,7 @@ fn is_lifecycle_noise(message: &str) -> bool {
             | "Notifying tunnel devices of relay shutdown..."
     ) ||
     // Prefix matches
-    message.starts_with("sctl v")          // "sctl v0.4.0 starting"
+    message.starts_with("sctl v")          // "sctl v0.5.0 starting"
         || message.starts_with("Listening on ")    // "Listening on 0.0.0.0:8443"
         || message.starts_with("Device serial: ")  // "Device serial: RELAY-001"
         || message.starts_with("Journaling enabled") // "Journaling enabled, data_dir: ..."

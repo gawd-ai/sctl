@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { SctlRestClient } from '../utils/rest-client';
+	import type { SctlWsClient } from '../utils/ws-client';
 	import type { PlaybookSummary, PlaybookDetail, ViewerTab } from '../types/terminal.types';
 	import PlaybookList from './PlaybookList.svelte';
 	import PlaybookViewer from './PlaybookViewer.svelte';
@@ -8,6 +9,7 @@
 	interface Props {
 		visible?: boolean;
 		restClient: SctlRestClient | null;
+		wsClient?: SctlWsClient | null;
 		onRunInTerminal?: (script: string) => void;
 		onOpenViewer?: (tab: ViewerTab) => void;
 	}
@@ -15,6 +17,7 @@
 	let {
 		visible = true,
 		restClient,
+		wsClient = null,
 		onRunInTerminal,
 		onOpenViewer
 	}: Props = $props();
@@ -149,6 +152,7 @@
 					<PlaybookExecutor
 						playbook={selectedPlaybook}
 						{restClient}
+						{wsClient}
 						{onRunInTerminal}
 						{onOpenViewer}
 					/>

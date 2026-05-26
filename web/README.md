@@ -1,8 +1,8 @@
 # sctlin
 
-Svelte 5 component library for [sctl](../README.md) -- embeddable terminal, device management, playbook execution, and activity monitoring.
+Svelte 5 component library for [sctl](../README.md) -- embeddable terminal, device management, playbook execution, activity monitoring, and human-visible AI handoff.
 
-> **See also:** [Guide](../docs/guide.md) for standalone deployment, relay setup, and AI collaboration features.
+Use this document when embedding sctlin in an app or integrating directly with its clients, components, widgets, and types. sctlin is the browser control surface for local machines, servers, embedded Linux hardware, network devices, and remote compute operated through sctl. For standalone deployment, relay setup, and AI collaboration features, see the [Guide](../docs/guide.md).
 
 ## Installation
 
@@ -77,6 +77,11 @@ Widgets                (self-contained: each creates its own clients internally)
 ```
 
 **Callback-driven pattern**: sctlin uses no framework-specific stores or context. All state flows through plain callbacks (`SctlinCallbacks`). Wrap these callbacks in your framework's reactivity system (Svelte `$state`, React `useState`, Vue `ref`, etc.).
+
+**Two integration levels**:
+
+- Use widgets when you want a self-contained terminal, status panel, activity feed, or playbook browser.
+- Use components and clients when your app owns connection state, layout, and session lifecycle.
 
 ## Components
 

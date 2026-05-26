@@ -1317,6 +1317,7 @@
 										<PlaybookPanel
 											visible={isFocused && (serverPanelOpen[server.id] ?? false) && panelTab === 'playbooks'}
 											restClient={manager.get(server.id)?.restClient ?? null}
+											wsClient={manager.get(server.id)?.wsClient ?? null}
 											onRunInTerminal={(script: string) => {
 												containerRefs[server.id]?.execInActiveSession(script);
 											}}
@@ -1360,6 +1361,7 @@
 									<PlaybookPanel
 										visible={isDashFocused && (serverPanelOpen[server.id] ?? false) && dashTab === 'playbooks'}
 										restClient={manager.get(server.id)?.restClient ?? null}
+										wsClient={manager.get(server.id)?.wsClient ?? null}
 										onOpenViewer={(tab) => openViewerTab(server.id, tab)}
 									/>
 								</div>

@@ -58,7 +58,7 @@ describe('SctlRestClient', () => {
 
 	describe('getHealth', () => {
 		it('returns health data', async () => {
-			const health = { status: 'ok', uptime: 1234, version: '0.4.0' };
+			const health = { status: 'ok', uptime: 1234, version: '0.5.0' };
 			mockJsonResponse(health);
 			const result = await client.getHealth();
 			expect(result).toEqual(health);

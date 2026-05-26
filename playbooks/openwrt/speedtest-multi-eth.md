@@ -1,10 +1,10 @@
 ---
 name: speedtest-multi-eth
-description: Per-interface download AND upload throughput + latency through each WAN path. Forces each test out one interface via temporary /32 host routes; the default route is never changed and all temp routes are removed on exit. Uses curl (streams large uploads, reports speed directly); falls back to wget for download only when curl is absent.
+description: Per-interface download/upload throughput and latency through each WAN path, using temporary host routes without changing the default route
 params:
   interfaces:
     type: string
-    description: Interfaces to test — auto (all ETH ports with a gateway), all (every default-route interface incl. LTE), or comma-separated list e.g. eth5,wwan0
+    description: Interfaces to test — auto (ETH ports with a gateway), all (default-route interfaces including LTE), or comma-separated list e.g. eth5,wwan0
     default: auto
   direction:
     type: string

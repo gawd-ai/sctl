@@ -1,6 +1,6 @@
 ---
 name: openwrt-security-hardening
-description: Security audit for OpenWrt — dropbear SSH, firewall zones, uhttpd, default credentials, package updates
+description: Security audit for OpenWrt — dropbear SSH, firewall zones, uhttpd, default credentials, package updates; optional safe fixes
 params:
   verbosity:
     type: string
@@ -9,7 +9,7 @@ params:
     enum: [brief, normal, verbose]
   fix_issues:
     type: string
-    description: Whether to auto-fix safe issues or just report
+    description: Whether to report findings only or apply conservative fixes
     default: report-only
     enum: [report-only, auto-fix]
 ---

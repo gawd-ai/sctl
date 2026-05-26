@@ -6,15 +6,14 @@
 //!
 //! ## Architecture
 //!
-//! Config is pushed from the fleet management server and persisted to
-//! `/etc/netage/infra-monitor.json` so monitoring survives sctl restarts.
+//! Config is pushed from an external controller and persisted under the server
+//! data directory so monitoring survives sctl restarts.
 //! A tokio interval task runs checks (ping, HTTP, TCP, SNMP) against each
 //! target and maintains a per-target state machine (UNKNOWN → UP / DEGRADED
 //! → DOWN). Recovery actions execute locally on the BPI when a target
 //! transitions to DOWN.
 //!
-//! Results are served via `GET /api/infra/results` and collected by
-//! netage-server's health poller (one read per BPI per 30s cycle).
+//! Results are served via `GET /api/infra/results` for external health polling.
 
 pub mod checks;
 pub mod discovery;
@@ -172,7 +171,7 @@ pub struct TargetState {
     pub last_check: String,
     /// Human-readable detail of the last check result.
     pub detail: String,
-    /// Target name from config (for event emission by netage-server).
+    /// Target name from config, suitable for event emission.
     #[serde(default)]
     pub name: String,
 }

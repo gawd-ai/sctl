@@ -20,7 +20,7 @@
 // benefit (no consumer uses an alternative hasher).
 #![allow(clippy::implicit_hasher)]
 
-//! sctl library — exposes core modules for use by downstream crates (e.g. netage-server).
+//! sctl library — exposes core modules for use by the server binary and integrations.
 //!
 //! This library re-exports the key building blocks:
 //! - `tunnel` — relay and client for CGNAT device connectivity
