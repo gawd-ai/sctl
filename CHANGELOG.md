@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### Fixed
 
 - **`util::append_rotating` CI test race** — switched from `tokio::fs` to `spawn_blocking` + `std::fs` with explicit `flush()`. The tokio async-file `Drop` schedules close on the blocking pool; readers racing the close occasionally observed an empty file on fast filesystems (caught by CI).
+- **LTE watchdog no longer condemns a healthy bearer on AT `NOCONN`** — on the EC25 in QMI raw-IP mode, `AT+QENG="servingcell"` reports `NOCONN` even while a live bearer carries traffic. `diagnose()` now decides the data path from kernel truth (interface IPv4 + interface-bound reachability ping) instead of the serving-cell field: no IPv4 → recoverable `RegisteredNoData`; IPv4 + relay reachable → `RelayProblem` (modem untouched); IPv4 + unreachable → `InternetUnreachable` (diagnosed, not actionable). Prevents a spurious interface-restart/USB-cycle escalation — important now that the tunnel can ride a non-LTE WAN, where a tunnel drop no longer implies an LTE fault.
+- **Truthful `connection_state`** — the LTE poller reports `CONNECT` when the interface has an IPv4 (bearer up), overriding the unreliable AT idle states (`NOCONN`/`LIMSRV`/`SEARCH`). `band`/`operator` may still read null in this deep-idle state — an AT serving-cell reporting limitation, not a connectivity problem.
 
 ### mcp-sctl v0.5.0
 

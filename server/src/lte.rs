@@ -2203,7 +2203,26 @@ impl AtPollingHealth {
 /// shared `util::append_rotating` helper (5 MB → `.log.1`, async tokio::fs,
 /// best-effort logging on error). Hooks into the poller's existing modem
 /// reads — no new AT polling (see `feedback_no_modem_polling_on_bpi`).
+/// Reconcile the AT serving-cell connection state with kernel bearer reality.
 ///
+/// On the EC25 in QMI raw-IP mode, `AT+QENG="servingcell"` reports `NOCONN`
+/// (and `QNWINFO`/`COPS` go dark, leaving band/operator null) even while a live
+/// QMI data bearer is carrying traffic. The interface holding an IPv4 address is
+/// the authoritative "data is flowing" signal, so when the bearer is up we
+/// report `CONNECT` regardless of the unreliable serving-cell field. Band and
+/// operator may still read null in this deep-idle state — that is an AT-side
+/// reporting limitation, not a connectivity problem.
+fn effective_connection_state(raw: Option<String>, data_active: bool) -> Option<String> {
+    if data_active {
+        match raw.as_deref() {
+            None | Some("NOCONN" | "LIMSRV" | "SEARCH") => Some("CONNECT".to_string()),
+            _ => raw,
+        }
+    } else {
+        raw
+    }
+}
+
 /// On OpenWrt: writes to `/root/log/modem-state.log` so it survives reboots
 /// alongside the rotated system log. Elsewhere: writes inside `data_dir`.
 ///
@@ -2662,7 +2681,7 @@ pub fn spawn_lte_poller(
                 sector: qeng.sector,
                 ul_bw_mhz: qeng.ul_bw,
                 dl_bw_mhz: qeng.dl_bw,
-                connection_state: qeng.state,
+                connection_state: effective_connection_state(qeng.state, data_active),
                 duplex: qeng.duplex,
                 neighbors,
                 band_config,
@@ -2977,6 +2996,29 @@ OK";
         assert_eq!(bands_to_hex(&[1]), "1");
         assert_eq!(bands_to_hex(&[1, 2, 3]), "7");
         assert_eq!(bands_to_hex(&[]), "0");
+    }
+
+    #[test]
+    fn test_effective_connection_state() {
+        // Bearer up: unreliable AT idle states are reported as CONNECT.
+        for raw in [None, Some("NOCONN"), Some("LIMSRV"), Some("SEARCH")] {
+            assert_eq!(
+                effective_connection_state(raw.map(str::to_string), true).as_deref(),
+                Some("CONNECT"),
+                "bearer up should override raw {raw:?}"
+            );
+        }
+        // Bearer up but the modem already reports a real connected state: keep it.
+        assert_eq!(
+            effective_connection_state(Some("CONNECT".into()), true).as_deref(),
+            Some("CONNECT")
+        );
+        // Bearer down: trust the raw serving-cell state verbatim.
+        assert_eq!(
+            effective_connection_state(Some("NOCONN".into()), false).as_deref(),
+            Some("NOCONN")
+        );
+        assert_eq!(effective_connection_state(None, false), None);
     }
 
     #[test]

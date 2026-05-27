@@ -124,7 +124,6 @@ impl Symptom {
 /// Diagnose the current problem by checking modem state, interface, and tunnel.
 async fn diagnose(
     modem: &Modem,
-    lte_state: &Mutex<LteState>,
     tunnel_stats: &TunnelStats,
     interface: &str,
     reachability_target: &str,
@@ -168,25 +167,28 @@ async fn diagnose(
                 return (Symptom::NotRegistered, Some(reg));
             }
             RegistrationStatus::RegisteredHome | RegistrationStatus::RegisteredRoam => {
-                // Registered — check data path
-                let is_noconn = {
-                    let lte = lte_state.lock().await;
-                    lte.signal
-                        .as_ref()
-                        .and_then(|s| s.connection_state.as_deref())
-                        == Some("NOCONN")
-                };
-                if is_noconn || !interface_has_ipv4(interface) {
+                // Registered — diagnose the data path from KERNEL truth, not the
+                // AT serving-cell field. On the EC25 in QMI raw-IP mode,
+                // AT+QENG="servingcell" reports NOCONN even while a live QMI data
+                // bearer carries traffic (QNWINFO/COPS go dark too), so NOCONN
+                // alone must never condemn the modem. Trusting it was a spurious
+                // recovery trigger — especially now the tunnel can ride a non-LTE
+                // WAN, where a tunnel drop no longer implies an LTE fault at all.
+                if !interface_has_ipv4(interface) {
+                    // No IPv4 on the LTE interface → the QMI bearer is genuinely
+                    // down. Recoverable.
                     return (Symptom::RegisteredNoData, Some(reg));
                 }
-                // Has registration + IP — check internet reachability
-                if check_reachability(reachability_target).await {
+                // Bearer is up (interface has an IPv4). If the relay is reachable
+                // over this interface, the data path works — a tunnel drop is then
+                // a relay/app problem, not the modem.
+                if check_reachability(interface, reachability_target).await {
                     return (Symptom::RelayProblem, Some(reg));
                 }
-                // Registered + IP but reachability target unreachable.
-                // The modem is doing its job; the wider internet (or just the
-                // target) is the problem. Diagnosed but NOT actionable — a
-                // modem cycle won't help and may make things worse.
+                // Bearer up but the relay is unreachable over it. The modem is
+                // doing its job; the wider internet (or just the target) is the
+                // problem. Diagnosed but NOT actionable — a modem cycle won't help
+                // and may make things worse.
                 return (Symptom::InternetUnreachable, Some(reg));
             }
             RegistrationStatus::Unknown => {}
@@ -1017,7 +1019,6 @@ pub fn spawn_lte_watchdog(
             // ── Diagnose the problem ──
             let (symptom, reg_status) = diagnose(
                 &modem,
-                &lte_state,
                 &tunnel_stats,
                 &interface,
                 &reachability_target,
@@ -1853,9 +1854,18 @@ fn extract_relay_host(url: &str) -> Option<String> {
 }
 
 /// Check internet reachability by pinging a target host.
-async fn check_reachability(target: &str) -> bool {
-    let result = tokio::process::Command::new("ping")
-        .args(["-c", "1", "-W", "3", target])
+/// Ping the reachability target, bound to `interface` (when non-empty) so the
+/// probe measures THIS link — e.g. wwan0/LTE — rather than whatever route the
+/// kernel happens to pick (which, once the tunnel rides a different WAN, may not
+/// be LTE at all). busybox ping supports `-I <iface>`.
+async fn check_reachability(interface: &str, target: &str) -> bool {
+    let mut cmd = tokio::process::Command::new("ping");
+    cmd.arg("-c").arg("1").arg("-W").arg("3");
+    if !interface.is_empty() {
+        cmd.arg("-I").arg(interface);
+    }
+    cmd.arg(target);
+    let result = cmd
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
