@@ -693,9 +693,13 @@ upload_comms_provider() {
     local bin_path
     bin_path=$(comms_provider_bin "$provider" "$arch")
     log "Uploading comms provider $provider to $host..."
+    # scp to a temp name in the comms dir, then same-fs rename into place. A
+    # direct scp over the target truncates it, which fails ETXTBSY if the helper
+    # is already running; rename() over a busy executable is fine (the running
+    # process keeps its now-unlinked inode, the new file is live on next spawn).
     ssh $ssh_opts "root@$host" "mkdir -p '$COMMS_REMOTE_DIR'"
-    scp $ssh_opts "$bin_path" "root@$host:$COMMS_REMOTE_DIR/$QUECTEL_DRIVER_BIN_NAME"
-    ssh $ssh_opts "root@$host" "chmod +x '$COMMS_REMOTE_DIR/$QUECTEL_DRIVER_BIN_NAME'"
+    scp $ssh_opts "$bin_path" "root@$host:$COMMS_REMOTE_DIR/.$QUECTEL_DRIVER_BIN_NAME.new"
+    ssh $ssh_opts "root@$host" "chmod +x '$COMMS_REMOTE_DIR/.$QUECTEL_DRIVER_BIN_NAME.new' && mv '$COMMS_REMOTE_DIR/.$QUECTEL_DRIVER_BIN_NAME.new' '$COMMS_REMOTE_DIR/$QUECTEL_DRIVER_BIN_NAME'"
     ok "Comms provider uploaded: $provider"
 }
 
@@ -2018,11 +2022,15 @@ upload_comms_provider_remote() {
         h_attempts=$((h_attempts + 1))
     done
 
-    # Place staged helper into the comms dir (mkdir -p + cp + chmod + cleanup)
+    # Place staged helper into the comms dir. Stage to a temp name on the comms
+    # dir's own filesystem, then rename into place: a direct `cp` over the target
+    # truncates it, which fails ETXTBSY if the helper is already running. rename()
+    # over a busy executable is fine — the running process keeps its now-unlinked
+    # inode, the new binary goes live on the next spawn (the post-upload restart).
     log "Installing comms helper at $COMMS_REMOTE_DIR/$QUECTEL_DRIVER_BIN_NAME ..."
     local place_out
     place_out=$(remote_exec_stdout_trimmed "$url" "$api_key" \
-        "sh -c 'mkdir -p $COMMS_REMOTE_DIR && cp /tmp/$QUECTEL_DRIVER_BIN_NAME $COMMS_REMOTE_DIR/$QUECTEL_DRIVER_BIN_NAME && chmod +x $COMMS_REMOTE_DIR/$QUECTEL_DRIVER_BIN_NAME && rm -f /tmp/$QUECTEL_DRIVER_BIN_NAME && echo placed'" \
+        "sh -c 'mkdir -p $COMMS_REMOTE_DIR && cp /tmp/$QUECTEL_DRIVER_BIN_NAME $COMMS_REMOTE_DIR/.$QUECTEL_DRIVER_BIN_NAME.new && chmod +x $COMMS_REMOTE_DIR/.$QUECTEL_DRIVER_BIN_NAME.new && mv $COMMS_REMOTE_DIR/.$QUECTEL_DRIVER_BIN_NAME.new $COMMS_REMOTE_DIR/$QUECTEL_DRIVER_BIN_NAME && rm -f /tmp/$QUECTEL_DRIVER_BIN_NAME && echo placed'" \
         8000 3 10) || true
     if [[ "$place_out" == *placed* ]]; then
         ok "Comms helper installed ($h_retries retries)"
