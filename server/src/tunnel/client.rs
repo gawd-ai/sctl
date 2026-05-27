@@ -1140,11 +1140,12 @@ async fn handle_relay_message(
         "gx.list" => {
             handle_gx_list(state, ws_sink, request_id.as_deref()).await;
         }
-        // Forwarded session.* and shell.* messages from clients via relay.
+        // Forwarded session.*, shell.*, and job.* messages from clients via relay.
         // GUARD: Any new WS message prefix (e.g. "foo.*") requires adding it here,
         // otherwise tunnel clients won't handle those messages and they'll fall
         // through to the "Unknown tunnel message type" warning below.
-        t if t.starts_with("session.") || t.starts_with("shell.") => {
+        // (job.* was the A′ streaming-jobs prefix that fell through here until added.)
+        t if t.starts_with("session.") || t.starts_with("shell.") || t.starts_with("job.") => {
             handle_forwarded_session_message(state, ws_sink, subscriber_tasks, &msg).await;
         }
         // Client WS keep-alive ping — ignore

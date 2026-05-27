@@ -91,7 +91,9 @@ impl ManagedSession {
         // pgid = pid because the shell is the process group leader via setpgid(0,0)
         let process_group_id = process_id;
 
-        let stdin = child.stdin.take().ok_or("Failed to take stdin pipe")?;
+        // `None` for jobs (one-shot non-PTY sessions spawned with stdin = /dev/null);
+        // `Some` for interactive pipe terminals. The stdin writer task below handles both.
+        let stdin = child.stdin.take();
         let stdout = child.stdout.take().ok_or("Failed to take stdout pipe")?;
         let stderr = child.stderr.take().ok_or("Failed to take stderr pipe")?;
 
@@ -102,14 +104,21 @@ impl ManagedSession {
         // stdin writer task
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(64);
         let stdin_task = tokio::spawn(async move {
-            let mut stdin = stdin;
-            while let Some(data) = stdin_rx.recv().await {
-                if stdin.write_all(&data).await.is_err() {
-                    break;
+            match stdin {
+                // Interactive terminal: forward stdin sends to the child.
+                Some(mut stdin) => {
+                    while let Some(data) = stdin_rx.recv().await {
+                        if stdin.write_all(&data).await.is_err() {
+                            break;
+                        }
+                        if stdin.flush().await.is_err() {
+                            break;
+                        }
+                    }
                 }
-                if stdin.flush().await.is_err() {
-                    break;
-                }
+                // Job: child stdin is /dev/null. Drain and drop any stray stdin
+                // sends so senders never block; nothing is written to the child.
+                None => while stdin_rx.recv().await.is_some() {},
             }
         });
 

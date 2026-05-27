@@ -1,9 +1,13 @@
 # Design: Streaming jobs (A′)
 
-**Status:** implemented 2026-05-26 (server + web). Builds via `rundev.sh build` (exit 0),
-ts-rs bindings regenerated, `cargo clippy --release` clean, `svelte-check` 0 errors. **Not
-yet runtime-validated end-to-end, not deployed** (device needs a riscv64 cross-build +
-deploy, which awaits authorization).
+**Status:** DEPLOYED + VALIDATED 2026-05-27 (server + web). Live on bpi-relay (riscv64) and
+the relay VPS (both 0.5.0.79). One seam was missed in the original 2026-05-26 implementation
+and only surfaced on hardware: the device's first-level tunnel dispatch (`tunnel/client.rs`,
+the `Unknown tunnel message type` match) matched `session.*`/`shell.*` but not `job.*`, so
+`job.start` over the relay was dropped before reaching the handler. Fixed by adding
+`|| t.starts_with("job.")` to that guard. The relay needed no change. Validated end-to-end
+over the relay with a raw WS client: live progressive streaming, a 35s job past the old 30s
+ceiling, and correct exit codes (0 and non-zero).
 **Decisions locked:** straight to the clean primitive (no PoC phase); a job is a distinct
 `job.start` WS message backed by a `kind: Job` session; the device emits a typed
 `session.exited` frame.

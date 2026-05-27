@@ -30,6 +30,7 @@ pub async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
                 "pid": s.pid,
                 "persistent": s.persistent,
                 "pty": s.pty,
+                "kind": s.kind,
                 "attached": s.attached,
                 "status": s.status,
                 "idle": s.idle,
