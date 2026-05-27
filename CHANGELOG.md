@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Added
 
+- **External comms provider helpers** — GPS/LTE hardware support now runs through a helper-process protocol. The main `sctl` binary no longer carries Quectel modem code; `sctl-comms-quectel` is deployed only to targets that need the current LTE/GNSS provider.
 - **Unified `ApiError` + `codes` catalog** — every route returns `Result<Json<T>, (StatusCode, Json<ApiError>)>` with stable SCREAMING_SNAKE error codes from `error::codes`. Replaces the prior mix of `{error, code}` and `{code, message}` shapes across exec, files, lte, auth, sessions, ws. ~115 call sites migrated.
 - **Typed `WsServerMsg` enum** — serde internally-tagged enum replaces 38 hand-built `json!()` sites. Wire format unchanged; compile-time exhaustiveness on the server side.
 - **Generated TS bindings** — `ts-rs` annotations on `WsServerMsg`, `ApiError`, transfer types, activity types. Generated `.ts` files replace hand-maintained type duplicates in the web client; bindings regenerate on `cargo test export_bindings`.

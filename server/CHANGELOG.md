@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **External comms provider helpers** — GPS/LTE hardware support now runs through a helper-process protocol. The main `sctl` binary no longer carries Quectel modem code; `sctl-comms-quectel` is deployed only to targets that need the current LTE/GNSS provider.
 - **Unified `ApiError` catalog** — route errors now use stable SCREAMING_SNAKE codes and a consistent response shape.
 - **Typed WebSocket server messages** — server-originated WS frames are represented by a tagged enum while preserving the wire format.
 - **Generated TypeScript bindings** — server-owned protocol and API types can be exported for the web client.

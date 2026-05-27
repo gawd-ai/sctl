@@ -34,7 +34,7 @@ use axum::{
 };
 use clap::{Parser, Subcommand};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
@@ -42,8 +42,9 @@ use tracing::{info, warn};
 use sctl::{
     activity::ActivityLog,
     auth::ApiKey,
+    comms,
     config::Config,
-    gps, infra, lte, routes, sessions,
+    infra, routes, sessions,
     sessions::SessionManager,
     state::{AppState, TunnelStats},
     tunnel, ws, ExecResultsCache,
@@ -125,32 +126,6 @@ fn install_panic_hook(data_dir: &str) {
         let _ = std::fs::write(&log_path, &payload);
         prev(info);
     }));
-}
-
-/// Persist the currently-detected modem path for observability/post-mortem.
-///
-/// This file is NOT read on next boot — startup always re-detects via sysfs.
-/// It exists so an operator inspecting a wedged box can see what sctl was
-/// last running against.
-fn persist_modem_state(data_dir: &str, detected_path: &str) {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let payload = serde_json::json!({
-        "detected_path": detected_path,
-        "at_unix": ts,
-    });
-    let path = std::path::Path::new(data_dir).join("modem_state.json");
-    let tmp = path.with_extension("json.tmp");
-    if let Err(e) = std::fs::write(&tmp, payload.to_string()) {
-        warn!("modem_state.json: write tmp failed: {e}");
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        warn!("modem_state.json: rename failed: {e}");
-    }
 }
 
 /// Acquire exclusive process lock. Returns the held file (must not be dropped).
@@ -313,28 +288,15 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         activity_log.clone(),
     ));
 
-    // GPS state (only when [gps] config is present)
-    let gps_state = config.gps.as_ref().map(|gc| {
+    if let Some(gc) = config.gps.as_ref() {
+        info!("GPS tracking enabled (poll: {}s)", gc.poll_interval_secs);
+    }
+    if let Some(lc) = config.lte.as_ref() {
         info!(
-            "GPS tracking enabled (poll: {}s, hint: {:?})",
-            gc.poll_interval_secs, gc.device
+            "LTE monitoring enabled (poll: {}s, interface: {})",
+            lc.poll_interval_secs, lc.interface
         );
-        Arc::new(tokio::sync::Mutex::new(gps::GpsState::new(gc.history_size)))
-    });
-
-    // LTE state (only when [lte] config is present)
-    let lte_state = if let Some(lc) = config.lte.as_ref() {
-        info!(
-            "LTE monitoring enabled (poll: {}s, hint: {:?})",
-            lc.poll_interval_secs, lc.device
-        );
-        let mut ls = lte::LteState::new();
-        ls.load_safe_bands(&data_dir).await;
-        ls.load_lte_data(&data_dir).await;
-        Some(Arc::new(tokio::sync::Mutex::new(ls)))
-    } else {
-        None
-    };
+    }
 
     // Tunnel event persistence: load previous events from disk
     let events_path = std::path::Path::new(&data_dir).join("tunnel_events.json");
@@ -349,8 +311,6 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         Arc::new(tokio::sync::Mutex::new(is))
     };
 
-    let modem_detected_path = Arc::new(tokio::sync::RwLock::new(None::<String>));
-
     let mut state = AppState {
         session_manager,
         config: Arc::new(config),
@@ -361,15 +321,12 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         tunnel_stats: Arc::new(tun_stats),
         transfer_manager,
         sse_connections: Arc::new(AtomicU32::new(0)),
-        gps_state,
-        lte_state,
-        modem: None,
-        modem_detected_path: modem_detected_path.clone(),
-        lte_poll_notify: None,
+        comms_client: None,
+        comms_state: None,
+        comms_poll_notify: None,
         relay_history: None,
         device_snapshots: None,
         relay_state: None,
-        watchdog_snapshot: None,
         infra_state: Some(infra_state.clone()),
     };
 
@@ -498,141 +455,51 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         }
     }
 
-    // Open the cellular modem (shared by GPS + LTE). There is at most one
-    // Quectel module per BPI; sysfs is authoritative for the actual ttyUSB
-    // path, with the configured hint as a fallback only when detection fails.
-    //
-    // `modem_tx` broadcasts handle replacements after a USB power cycle (see
-    // lte_watchdog). It is created lazily on first successful open and taken
-    // by the watchdog if one is spawned. If no watchdog is spawned, it is
-    // dropped — pollers self-recover via `detect_quectel_at_port` on
-    // channel-closed.
-    //
-    // In safe mode the modem (and everything that depends on it) is skipped
-    // entirely; the management plane comes up regardless.
-    let mut modem_handle: Option<sctl::modem::Modem> = None;
-    let mut modem_tx: Option<watch::Sender<sctl::modem::Modem>> = None;
-
-    let gps_config = state.config.gps.clone();
-    let lte_config = state.config.lte.clone();
-
-    // Either subsystem being configured is reason enough to attempt to open
-    // the modem. Hint is taken from whichever config has one (LTE first).
-    let want_modem = (gps_config.is_some() || lte_config.is_some()) && !safe_mode_active;
-    let modem_hint: Option<String> = lte_config
-        .as_ref()
-        .and_then(|c| c.device.clone())
-        .or_else(|| gps_config.as_ref().and_then(|c| c.device.clone()));
-
-    if want_modem {
-        // Detection → hint → None. Three open attempts at the resolved path.
-        let resolved = sctl::modem::detect_quectel_at_port_strict().or_else(|| modem_hint.clone());
-        match resolved {
-            Some(path) => {
-                if let Some(ref hint) = modem_hint {
-                    if hint != &path {
-                        info!("Modem: detected {path} (config hint: {hint}) — using detected path");
-                    }
-                }
-                for attempt in 0..5 {
-                    match sctl::modem::Modem::open(&path) {
-                        Ok(m) => {
-                            if attempt > 0 {
-                                info!("Modem {path}: opened on attempt {}", attempt + 1);
-                            }
-                            let (tx, _rx) = watch::channel(m.clone());
-                            modem_tx = Some(tx);
-                            modem_handle = Some(m);
-                            *modem_detected_path.write().await = Some(path.clone());
-                            // Persist for post-mortem visibility — NOT for next-boot authority.
-                            persist_modem_state(&data_dir, &path);
-                            break;
-                        }
-                        Err(e) => {
-                            if attempt < 4 {
-                                info!("Modem {path}: not ready ({e}), retrying in 2s...");
-                                std::thread::sleep(std::time::Duration::from_secs(2));
-                            } else {
-                                warn!("Failed to open modem {path} after 5 attempts: {e}");
-                            }
-                        }
-                    }
-                }
+    let mut comms_task = None;
+    if safe_mode_active {
+        info!("Comms provider skipped in safe mode");
+    } else if let Some(comms_cfg) = state.config.effective_comms_config() {
+        info!(
+            "Starting comms provider '{}' via {}",
+            comms_cfg.provider,
+            comms_cfg.effective_command()
+        );
+        match comms::start_provider(&state.config, &comms_cfg).await {
+            Ok((client, comms_snapshot)) => {
+                let comms_state = Arc::new(tokio::sync::Mutex::new(comms_snapshot));
+                let notify = Arc::new(tokio::sync::Notify::new());
+                comms_task = Some(comms::spawn_poller(
+                    client.clone(),
+                    comms_state.clone(),
+                    state.config.gps.is_some(),
+                    state
+                        .config
+                        .gps
+                        .as_ref()
+                        .map_or(30, |gc| gc.poll_interval_secs),
+                    state.config.lte.is_some(),
+                    state
+                        .config
+                        .lte
+                        .as_ref()
+                        .map_or(60, |lc| lc.poll_interval_secs),
+                    state.tunnel_stats.clone(),
+                    notify.clone(),
+                ));
+                state.comms_client = Some(client);
+                state.comms_state = Some(comms_state);
+                state.comms_poll_notify = Some(notify);
             }
-            None => {
+            Err(err) => {
                 warn!(
-                    "No Quectel modem detected and no [lte]/[gps] device hint configured — \
-                     GPS/LTE/watchdog will be disabled this boot. Management plane unaffected."
+                    "Comms provider '{}' unavailable: {err}. Management plane unaffected.",
+                    comms_cfg.provider
                 );
+                state.comms_state = Some(Arc::new(tokio::sync::Mutex::new(
+                    comms::CommsState::new(comms_cfg.provider),
+                )));
             }
         }
-    }
-
-    let gps_modem = modem_handle.clone();
-    let lte_modem = modem_handle.clone();
-    state.modem = lte_modem.clone();
-
-    if let (Some(ref modem), Some(ref ls)) = (&lte_modem, &state.lte_state) {
-        // SIM change detection — must run BEFORE safe-bands restore so stale
-        // carrier-specific bands are cleared before we try to apply them.
-        let lte_cfg = state.config.lte.as_ref().unwrap();
-        let sim_changed = lte::detect_sim_change(modem, ls, &data_dir, lte_cfg).await;
-
-        if sim_changed {
-            info!("Startup: SIM changed, skipping safe-bands restore");
-        } else {
-            let safe = ls.lock().await.safe_bands.clone();
-            if let Some(ref safe_cfg) = safe {
-                let safe_hex = lte::bands_to_hex(&safe_cfg.bands);
-                match modem.command("AT+QCFG=\"band\"").await {
-                    Ok(resp) => {
-                        let current = lte::parse_band_config(&resp);
-                        let current_hex = lte::bands_to_hex(&current);
-                        if current_hex == safe_hex {
-                            info!(bands = %current_hex, "Startup: bands match safe config");
-                        } else {
-                            info!(
-                                current = %current_hex,
-                                safe = %safe_hex,
-                                "Startup: bands differ from safe config, restoring"
-                            );
-                            match lte::verified_set_bands(modem, &safe_cfg.bands).await {
-                                Ok(actual) => {
-                                    info!("Startup: safe bands restored and verified: {actual:?}");
-                                }
-                                Err(e) => warn!("Startup: safe bands restore failed: {e}"),
-                            }
-                            if let Some(pri) = safe_cfg.priority_band {
-                                let pri_cmd = format!("AT+QCFG=\"bandpri\",{pri}");
-                                if let Err(e) = modem.command(&pri_cmd).await {
-                                    warn!("Startup: failed to set band priority: {e}");
-                                }
-                            }
-                            if let Err(e) = modem.command("AT+COPS=0").await {
-                                warn!("Startup: failed to re-register network: {e}");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Startup: failed to query current bands: {e}");
-                    }
-                }
-            } else {
-                info!("Startup: no safe bands saved, skipping restore");
-            }
-        }
-    }
-
-    // Pre-create watchdog snapshot so the router clone of state includes it.
-    // The actual watchdog task is spawned later; it receives the same Arc.
-    let will_run_watchdog = state.config.lte.as_ref().is_some_and(|lc| lc.watchdog)
-        && tunnel_config
-            .as_ref()
-            .is_some_and(|tc| tc.url.is_some() && !tc.relay);
-    if will_run_watchdog {
-        state.watchdog_snapshot = Some(Arc::new(tokio::sync::Mutex::new(
-            sctl::lte_watchdog::WatchdogSnapshot::new(),
-        )));
     }
 
     let mut app = Router::new()
@@ -697,102 +564,6 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         }
     } else {
         None
-    };
-
-    let is_tunnel_client = tunnel_config
-        .as_ref()
-        .is_some_and(|tc| tc.url.is_some() && !tc.relay);
-
-    // GPS poller (only when [gps] config is present AND the modem is open).
-    // Polls at reduced rate when LTE data path is active to avoid QMI disruption.
-    let gps_task = match (
-        gps_config,
-        state.gps_state.as_ref(),
-        gps_modem.as_ref(),
-        modem_tx.as_ref(),
-    ) {
-        (Some(gc), Some(gs), Some(modem), Some(tx)) => {
-            let modem_rx = tx.subscribe();
-            let lte_iface = state.config.lte.as_ref().map(|lc| lc.interface.clone());
-            Some(gps::spawn_gps_poller(
-                gc,
-                modem.clone(),
-                gs.clone(),
-                state.session_events.clone(),
-                modem_rx,
-                lte_iface,
-            ))
-        }
-        (Some(_), _, None, _) => {
-            warn!("GPS poller: not spawning — modem unavailable this boot");
-            None
-        }
-        _ => None,
-    };
-
-    // LTE poller (only when [lte] config is present AND the modem is open).
-    let lte_task = match (
-        lte_config,
-        state.lte_state.as_ref(),
-        lte_modem.as_ref(),
-        modem_tx.as_ref(),
-    ) {
-        (Some(lc), Some(ls), Some(modem), Some(tx)) => {
-            let modem_rx = tx.subscribe();
-            let poll_notify = Arc::new(tokio::sync::Notify::new());
-            state.lte_poll_notify = Some(poll_notify.clone());
-            Some(lte::spawn_lte_poller(
-                lc,
-                modem.clone(),
-                ls.clone(),
-                state.session_events.clone(),
-                modem_rx,
-                data_dir.clone(),
-                state.tunnel_stats.clone(),
-                poll_notify,
-            ))
-        }
-        (Some(_), _, None, _) => {
-            warn!("LTE poller: not spawning — modem unavailable this boot");
-            None
-        }
-        _ => None,
-    };
-
-    // LTE watchdog (only when [lte] watchdog=true AND tunnel client mode active
-    // AND the modem is open). Takes ownership of the watch::Sender so it can
-    // broadcast new modem handles after USB power cycle.
-    let watchdog_task = match (
-        state.config.lte.clone(),
-        state.lte_state.as_ref(),
-        lte_modem.as_ref(),
-        modem_tx.take(),
-    ) {
-        (Some(lc), Some(ls), Some(modem), Some(tx)) if lc.watchdog && is_tunnel_client => {
-            info!("LTE watchdog enabled (interface: {})", lc.interface);
-            let tunnel_url = tunnel_config.as_ref().and_then(|tc| tc.url.clone());
-            let wd_snapshot = state
-                .watchdog_snapshot
-                .clone()
-                .expect("watchdog_snapshot must be pre-created");
-            Some(sctl::lte_watchdog::spawn_lte_watchdog(
-                modem.clone(),
-                tx,
-                ls.clone(),
-                state.tunnel_stats.clone(),
-                state.session_events.clone(),
-                lc,
-                data_dir.clone(),
-                tunnel_url,
-                wd_snapshot,
-                modem_detected_path.clone(),
-            ))
-        }
-        (Some(lc), _, None, _) if lc.watchdog && is_tunnel_client => {
-            warn!("LTE watchdog: not spawning — modem unavailable this boot");
-            None
-        }
-        _ => None,
     };
 
     // Start infra monitor if config was loaded from disk (skipped in safe mode)
@@ -924,19 +695,15 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         }
     }
 
-    // GPS: abort poller and disable GNSS
-    if let Some(task) = gps_task {
-        task.abort();
+    if let Some(ref client) = state.comms_client {
+        let _ = client
+            .call(
+                sctl_comms_protocol::methods::LOCATION_DISABLE,
+                serde_json::json!({}),
+            )
+            .await;
     }
-    if let Some(ref modem) = gps_modem {
-        gps::disable_gnss(modem).await;
-    }
-
-    // LTE: abort poller and watchdog
-    if let Some(task) = lte_task {
-        task.abort();
-    }
-    if let Some(task) = watchdog_task {
+    if let Some(task) = comms_task {
         task.abort();
     }
 

@@ -1797,7 +1797,7 @@ async fn find_quectel_usb_auth() -> Option<String> {
 }
 
 /// Check if a network interface has an IPv4 address assigned.
-pub(crate) fn interface_has_ipv4(iface: &str) -> bool {
+pub fn interface_has_ipv4(iface: &str) -> bool {
     // SAFETY: getifaddrs/freeifaddrs is a well-defined POSIX API.
     // We free the list before returning and don't hold pointers past that.
     unsafe {
@@ -1864,7 +1864,7 @@ async fn check_reachability(target: &str) -> bool {
 }
 
 /// Detect if running on OpenWrt (check for /etc/openwrt_release).
-pub(crate) fn is_openwrt() -> bool {
+pub fn is_openwrt() -> bool {
     std::path::Path::new("/etc/openwrt_release").exists()
 }
 

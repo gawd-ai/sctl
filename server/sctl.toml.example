@@ -71,16 +71,22 @@ level = "info"
 # heartbeat_timeout_secs = 45      # Seconds before device is considered dead
 # tunnel_proxy_timeout_secs = 60   # Proxy request timeout
 
+# [comms]
+# External comms provider helper. Omit this section on relay/VPS/server-only installs.
+# provider = "quectel-at"
+# command = "/usr/libexec/sctl/comms/sctl-comms-quectel"
+# device = "/dev/ttyUSB2"          # Optional provider hint; autodetect is preferred when available
+# startup_timeout_secs = 15
+# request_timeout_secs = 20
+
 # [gps]
-# GPS location tracking via Quectel modem GNSS.
-# device = "/dev/ttyUSB2"
+# GPS/location tracking through the active comms provider.
 # poll_interval_secs = 30
 # history_size = 100
 # auto_enable = true
 
 # [lte]
-# LTE signal monitoring via Quectel modem AT commands.
-# device = "/dev/ttyUSB2"
+# LTE/cellular monitoring through the active comms provider.
 # poll_interval_secs = 60
 # watchdog = true                       # Auto-recovery when tunnel drops (requires [tunnel])
 # interface = "wwan0"                   # Network interface for watchdog IP checks

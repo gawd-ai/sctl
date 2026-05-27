@@ -102,6 +102,7 @@ session_attach   { session_id: "...", since: 0 }  # agent replays missed output
 | Component | What it does |
 |-----------|-------------|
 | **[sctl](server/)** | Device-side server for exec, sessions, files, activity, playbooks, GPS, and LTE |
+| **[comms providers](drivers/)** | Target-specific helper binaries for hardware links such as the current Quectel LTE/GNSS provider |
 | **[mcp-sctl](mcp/)** | MCP proxy that maps AI tool calls to sctl HTTP/WebSocket APIs |
 | **[sctlin](web/)** | Svelte 5 web terminal and component library |
 | **sctl relay** | Reverse tunnel mode for devices that cannot accept inbound connections |
@@ -112,7 +113,7 @@ session_attach   { session_id: "...", since: 0 }  # agent replays missed output
 - **Persistent PTY sessions** — replayable output buffers, resize support, process-group signals, and session journaling.
 - **Playbook API and MCP tools** — Markdown playbooks with typed parameters exposed through REST and `pb_*` MCP tools.
 - **Relay for CGNAT/LTE** — outbound device registration, proxied REST/WS sessions, heartbeat metrics, and reconnect handling.
-- **GPS/LTE telemetry** — Quectel modem polling, WebSocket broadcasts, band control, and LTE watchdog recovery.
+- **External comms providers** — GPS/LTE telemetry, band control, and link recovery run through target-specific helper binaries so relay/VPS installs do not carry modem code.
 - **sctlin web UI** — terminal, multi-server dashboard, activity history, playbooks, file tools, and embeddable widgets.
 
 ## Quick Start

@@ -481,23 +481,37 @@ curl -X DELETE -H "Authorization: Bearer $KEY" \
 
 Or via MCP: `playbook_put` with the full markdown content.
 
-## GPS & LTE Monitoring
+## Comms Providers, GPS & LTE
 
-sctl can monitor GPS location and LTE signal quality from Quectel modems (tested with EC25).
+sctl handles device communications hardware through external provider helpers. The main `sctl` server owns the HTTP/MCP/API surface; provider helpers own hardware-specific logic. This keeps relay/VPS installs free of modem code and lets new comms hardware be added by deploying a new helper binary instead of rebuilding `sctl`.
+
+The first 0.5.0 provider is `sctl-comms-quectel`, which supports Quectel AT-command LTE/GNSS devices such as EC25-class 4G modules. The same provider contract is intended for 5G modules, satellite terminals, robotics radios, and space-based compute links when those providers exist.
 
 ### Hardware requirements
 
-- Quectel modem with AT command support (EC25, RM500Q, etc.)
+- For the current provider: Quectel modem with AT command support (EC25, RM500Q, etc.)
 - Serial port access (typically `/dev/ttyUSB2` for AT commands)
 - Antennas: MAIN (LTE TX/RX), DIV (LTE RX diversity), GNSS (GPS)
+
+### Provider configuration
+
+```toml
+[comms]
+provider = "quectel-at"
+command = "/usr/libexec/sctl/comms/sctl-comms-quectel"
+device = "/dev/ttyUSB2"          # Optional hint; autodetect is preferred when available
+startup_timeout_secs = 15
+request_timeout_secs = 20
+```
+
+Comms provider helpers build separately. `rundev.sh device deploy` and `device upgrade` build and upload only the configured helper, for example `sctl-comms-quectel` for `comms_provider = "quectel-at"` in the device profile. Relay/VPS deploys do not upload comms helpers.
+
+Omit `[comms]` on relay/VPS/server-only installs. For older configs, `[gps].device` or `[lte].device` still infers the Quectel provider, but new configs should bind hardware through `[comms]`.
 
 ### GPS configuration
 
 ```toml
 [gps]
-# device is optional; sctl auto-detects the Quectel AT port via sysfs.
-# Override only if autodetect fails (non-Quectel modem).
-# device = "/dev/ttyUSB2"
 poll_interval_secs = 30       # Seconds between GPS polls
 history_size = 100             # Maximum fix history entries
 auto_enable = true             # Auto-enable GNSS engine on startup
@@ -519,9 +533,6 @@ MCP tool: `device_gps` returns the same data.
 
 ```toml
 [lte]
-# device is optional; sctl auto-detects the Quectel AT port via sysfs.
-# Override only if autodetect fails (non-Quectel modem).
-# device = "/dev/ttyUSB2"
 poll_interval_secs = 60       # Seconds between signal polls
 watchdog = true                # Auto-recovery when signal or tunnel drops
 interface = "wwan0"            # Network interface for IP checks
@@ -541,7 +552,7 @@ LTE signal updates are broadcast over WebSocket as `lte.signal` messages.
 
 ### Band control
 
-Control which LTE bands the modem uses:
+Control which LTE bands the active provider uses:
 
 ```bash
 # Set allowed bands via the API
@@ -555,11 +566,11 @@ Band scanning tests each band's throughput and selects the best configuration.
 
 ### LTE watchdog
 
-When `watchdog = true`, the LTE subsystem includes autonomous recovery:
+When `watchdog = true`, the active comms provider can run autonomous recovery:
 
 - Detects modem unresponsiveness and triggers resets
 - Restores "safe bands" configuration after recovery
-- **Tunnel-aware:** skips AT commands while the tunnel is connected to avoid disrupting the data path (Quectel modems can't handle concurrent AT commands and QMI data reliably)
+- **Tunnel-aware:** avoids disruptive hardware actions while the tunnel is connected unless an operator forces the action
 - On-demand polling via API requests when the regular polling is suppressed
 
 ## AI Collaboration

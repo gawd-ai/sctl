@@ -12,11 +12,16 @@ keywords = ["remote-shell", "ai-agent", "pty", "embedded", "iot"]
 categories = ["command-line-utilities", "network-programming"]
 rust-version = "1.82"
 
+[features]
+default = []
+quectel-driver = []
+
 [dependencies]
 axum = { version = "0.8", features = ["ws", "multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "signal", "sync", "time", "macros", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sctl-comms-protocol = { path = "../crates/sctl-comms-protocol" }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

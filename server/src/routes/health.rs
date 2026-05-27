@@ -15,7 +15,7 @@ use crate::AppState;
 /// authentication required, suitable for load-balancer health checks.
 pub async fn health(State(state): State<AppState>) -> Json<Value> {
     let start = Instant::now();
-    let has_lte = state.lte_state.is_some();
+    let has_lte = state.config.lte.is_some();
     info!(has_lte, "api.health: begin");
 
     let uptime = state.start_time.elapsed().as_secs();
@@ -92,41 +92,52 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
     };
 
     // GPS summary
-    let gps = if let Some(ref gs) = state.gps_state {
-        let gs = gs.lock().await;
-        let has_fix = gs.last_fix.is_some();
-        let fix_age_secs = gs.last_fix_at.map(|t| t.elapsed().as_secs());
-        let satellites = gs.last_fix.as_ref().map(|f| f.satellites);
-        json!({
-            "status": gs.status,
-            "has_fix": has_fix,
-            "fix_age_secs": fix_age_secs,
-            "satellites": satellites,
-        })
+    let gps = if state.config.gps.is_some() {
+        state
+            .comms_state
+            .as_ref()
+            .and_then(|cs| cs.try_lock().ok())
+            .and_then(|cs| cs.gps.clone())
+            .map_or_else(
+                || json!({"status": "searching", "has_fix": false}),
+                |gps| {
+                    let last_fix = gps.get("last_fix").cloned().unwrap_or(Value::Null);
+                    json!({
+                        "status": gps.get("status").cloned().unwrap_or_else(|| json!("unknown")),
+                        "has_fix": !last_fix.is_null(),
+                        "fix_age_secs": gps.get("fix_age_secs").cloned().unwrap_or(Value::Null),
+                        "satellites": last_fix.get("satellites").cloned().unwrap_or(Value::Null),
+                    })
+                },
+            )
     } else {
         json!(null)
     };
 
     // LTE summary
     let mut lte_lock_wait_ms = 0u64;
-    let lte = if let Some(ref ls) = state.lte_state {
-        let lock_started = Instant::now();
-        let ls = ls.lock().await;
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            lte_lock_wait_ms = lock_started.elapsed().as_millis() as u64;
-        }
-        if let Some(ref sig) = ls.signal {
-            json!({
-                "rssi_dbm": sig.rssi_dbm,
-                "rsrp": sig.rsrp,
-                "sinr": sig.sinr,
-                "signal_bars": sig.signal_bars,
-                "band": sig.band,
-                "operator": sig.operator,
-            })
+    let lte = if state.config.lte.is_some() {
+        if let Some(ref cs) = state.comms_state {
+            let lock_started = Instant::now();
+            let cs = cs.lock().await;
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                lte_lock_wait_ms = lock_started.elapsed().as_millis() as u64;
+            }
+            if let Some(sig) = cs.lte.as_ref().and_then(|v| v.get("signal")) {
+                json!({
+                    "rssi_dbm": sig.get("rssi_dbm").cloned().unwrap_or(Value::Null),
+                    "rsrp": sig.get("rsrp").cloned().unwrap_or(Value::Null),
+                    "sinr": sig.get("sinr").cloned().unwrap_or(Value::Null),
+                    "signal_bars": sig.get("signal_bars").cloned().unwrap_or(Value::Null),
+                    "band": sig.get("band").cloned().unwrap_or(Value::Null),
+                    "operator": sig.get("operator").cloned().unwrap_or(Value::Null),
+                })
+            } else {
+                json!({"status": "no_signal"})
+            }
         } else {
-            json!({"status": "no_signal"})
+            json!({"status": "provider_unavailable"})
         }
     } else {
         json!(null)

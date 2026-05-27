@@ -37,7 +37,7 @@ const ROTATION_CRON_LINE: &str =
 ///
 /// Best-effort: logs warnings and continues on any sub-step failure.
 pub async fn ensure_persistent_logs() {
-    if !crate::lte_watchdog::is_openwrt() {
+    if !is_openwrt() {
         return;
     }
     info!("platform/openwrt: ensuring persistent logs");
@@ -51,6 +51,10 @@ pub async fn ensure_persistent_logs() {
     if let Err(e) = ensure_rotation_cron().await {
         warn!("platform/openwrt: ensure_rotation_cron failed: {e}");
     }
+}
+
+fn is_openwrt() -> bool {
+    std::path::Path::new("/etc/openwrt_release").exists()
 }
 
 async fn ensure_log_dir() -> Result<(), String> {

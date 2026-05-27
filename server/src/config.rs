@@ -44,13 +44,19 @@
 //! reconnect_max_delay_secs = 30            # client mode, max backoff
 //! heartbeat_interval_secs = 5              # client mode, ping interval
 //! bind_address = "wwan0"                   # client mode, interface name or IP
+//!
+//! # Optional — external comms provider helper
+//! [comms]
+//! provider = "quectel-at"
+//! command = "/usr/libexec/sctl/comms/sctl-comms-quectel"
+//! device = "/dev/ttyUSB2"
 //! ```
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Top-level configuration, deserialized from TOML.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
@@ -66,14 +72,60 @@ pub struct Config {
     pub supervisor: SupervisorConfig,
     /// Optional tunnel configuration for relay or client mode.
     pub tunnel: Option<TunnelConfig>,
-    /// Optional GPS configuration for Quectel modem GNSS tracking.
+    /// Optional external comms provider binding.
+    pub comms: Option<CommsConfig>,
+    /// Optional GPS/location configuration.
     pub gps: Option<GpsConfig>,
-    /// Optional LTE signal monitoring for Quectel modem.
+    /// Optional LTE/cellular signal monitoring.
     pub lte: Option<LteConfig>,
 }
 
+/// External comms provider helper process.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CommsConfig {
+    /// Provider name (e.g. `quectel-at`). `none` disables external comms.
+    #[serde(default = "default_comms_provider")]
+    pub provider: String,
+    /// Helper executable path.
+    pub command: Option<String>,
+    /// Optional provider device hint (for example `/dev/ttyUSB2`).
+    pub device: Option<String>,
+    /// Seconds to wait for provider startup/open.
+    #[serde(default = "default_comms_startup_timeout")]
+    pub startup_timeout_secs: u64,
+    /// Seconds to wait for each provider request.
+    #[serde(default = "default_comms_request_timeout")]
+    pub request_timeout_secs: u64,
+}
+
+impl CommsConfig {
+    #[must_use]
+    pub fn effective_command(&self) -> String {
+        self.command.clone().unwrap_or_else(|| {
+            if self.provider == "quectel-at" {
+                "/usr/libexec/sctl/comms/sctl-comms-quectel".to_string()
+            } else {
+                format!("sctl-comms-{}", self.provider)
+            }
+        })
+    }
+
+    #[must_use]
+    pub fn effective_device(&self, config: &Config) -> Option<String> {
+        self.device
+            .clone()
+            .or_else(|| config.lte.as_ref().and_then(|c| c.device.clone()))
+            .or_else(|| config.gps.as_ref().and_then(|c| c.device.clone()))
+    }
+
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        self.provider == "none"
+    }
+}
+
 /// HTTP server and resource-limit settings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
     /// Socket address to bind (default `0.0.0.0:1337`).
     #[serde(default = "default_listen")]
@@ -143,7 +195,7 @@ pub struct ServerConfig {
 }
 
 /// Supervisor settings for `sctl supervise`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SupervisorConfig {
     /// Maximum seconds between restart attempts (default 60).
     #[serde(default = "default_supervisor_max_backoff")]
@@ -154,7 +206,7 @@ pub struct SupervisorConfig {
 }
 
 /// Authentication settings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AuthConfig {
     /// Pre-shared Bearer token. Override with `SCTL_API_KEY` env var.
     /// Defaults to `"change-me"` which triggers a startup warning.
@@ -163,7 +215,7 @@ pub struct AuthConfig {
 }
 
 /// Shell defaults used when requests don't specify overrides.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ShellConfig {
     /// Shell binary for exec and sessions (default `/bin/sh`).
     #[serde(default = "default_shell")]
@@ -174,7 +226,7 @@ pub struct ShellConfig {
 }
 
 /// Device identity, embedded in `/api/info` responses.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DeviceConfig {
     /// Unique device serial number. Override with `SCTL_DEVICE_SERIAL`.
     #[serde(default = "default_serial")]
@@ -182,7 +234,7 @@ pub struct DeviceConfig {
 }
 
 /// Logging configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LoggingConfig {
     /// tracing filter level (default `info`). Overridden by `RUST_LOG` env var.
     #[serde(default = "default_log_level")]
@@ -195,7 +247,7 @@ pub struct LoggingConfig {
 ///   Devices connect inbound, clients connect to `/d/{serial}/api/*`.
 /// - **Client mode** (`url` is set): this instance connects outbound to a relay.
 /// - If neither is set, tunnel is disabled (default behavior).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TunnelConfig {
     /// Run as a tunnel relay (default false).
     #[serde(default)]
@@ -227,10 +279,10 @@ pub struct TunnelConfig {
     pub bind_address: Option<String>,
 }
 
-/// GPS configuration for Quectel modem GNSS tracking.
+/// GPS/location configuration.
 ///
-/// When present, sctl periodically polls the modem for GPS fixes via AT commands
-/// and exposes location data through `/api/gps` and the health endpoint.
+/// When present, sctl asks the active comms provider for location fixes and
+/// exposes location data through `/api/gps` and the health endpoint.
 ///
 /// ```toml
 /// [gps]
@@ -239,15 +291,12 @@ pub struct TunnelConfig {
 /// history_size = 100
 /// auto_enable = true
 /// ```
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GpsConfig {
     /// Hint for the AT command serial device (e.g. `/dev/ttyUSB2`).
     ///
-    /// sctl auto-detects the Quectel AT port from sysfs at startup and after USB
-    /// re-enumeration. This field is consulted only as a fallback when sysfs
-    /// detection fails (non-Quectel modem). For Quectel modules (vendor 2c7c),
-    /// this field is ignored — leaving it in legacy `sctl.toml` files is
-    /// harmless.
+    /// Legacy provider hint. New configs should use `[comms].device`; this
+    /// field remains as a fallback for existing `sctl.toml` files.
     #[serde(default)]
     pub device: Option<String>,
     /// Seconds between GPS polls (default 30).
@@ -261,10 +310,10 @@ pub struct GpsConfig {
     pub auto_enable: bool,
 }
 
-/// LTE signal monitoring for Quectel modem.
+/// LTE/cellular signal monitoring.
 ///
-/// When present, sctl periodically polls the modem for signal quality via AT
-/// commands and exposes the data through `/api/info`.
+/// When present, sctl asks the active comms provider for cellular signal
+/// quality and exposes the data through `/api/info` and `/api/lte`.
 ///
 /// ```toml
 /// [lte]
@@ -273,15 +322,12 @@ pub struct GpsConfig {
 /// watchdog = true
 /// interface = "wwan0"
 /// ```
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LteConfig {
     /// Hint for the AT command serial device (e.g. `/dev/ttyUSB2`).
     ///
-    /// sctl auto-detects the Quectel AT port from sysfs at startup and after USB
-    /// re-enumeration. This field is consulted only as a fallback when sysfs
-    /// detection fails (non-Quectel modem). For Quectel modules (vendor 2c7c),
-    /// this field is ignored — leaving it in legacy `sctl.toml` files is
-    /// harmless.
+    /// Legacy provider hint. New configs should use `[comms].device`; this
+    /// field remains as a fallback for existing `sctl.toml` files.
     #[serde(default)]
     pub device: Option<String>,
     /// Seconds between LTE signal polls (default 60).
@@ -353,7 +399,7 @@ pub struct LteConfig {
 
 /// Evidence gates for the automatic USB power-cycle path. Manual
 /// `POST /api/lte/usb_cycle` ignores these.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UsbCycleEvidence {
     /// Minimum sustained seconds of the qualifying symptom before USB cycle
     /// is allowed (default 600 = 10 minutes).
@@ -376,7 +422,7 @@ impl Default for UsbCycleEvidence {
 
 /// What to do when symptom evidence is ambiguous. Defaults are both false —
 /// the watchdog logs the diagnosis and waits for clearer evidence.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct UnknownAction {
     /// Allow airplane-mode cycle on Unknown symptom (default false).
     #[serde(default)]
@@ -391,6 +437,15 @@ fn default_lte_poll_interval() -> u64 {
 }
 fn default_lte_watchdog() -> bool {
     true
+}
+fn default_comms_provider() -> String {
+    "quectel-at".to_string()
+}
+fn default_comms_startup_timeout() -> u64 {
+    15
+}
+fn default_comms_request_timeout() -> u64 {
+    20
 }
 fn default_lte_interface() -> String {
     "wwan0".to_string()
@@ -690,6 +745,7 @@ impl Config {
                 logging: LoggingConfig::default(),
                 supervisor: SupervisorConfig::default(),
                 tunnel: None,
+                comms: None,
                 gps: None,
                 lte: None,
             }
@@ -713,6 +769,34 @@ impl Config {
         }
 
         config
+    }
+
+    /// Effective external comms provider, including legacy `[gps]`/`[lte]`
+    /// configs that predate the provider helper boundary.
+    #[must_use]
+    pub fn effective_comms_config(&self) -> Option<CommsConfig> {
+        if let Some(ref comms) = self.comms {
+            if comms.is_disabled() {
+                return None;
+            }
+            return Some(comms.clone());
+        }
+
+        if self.gps.is_some() || self.lte.is_some() {
+            Some(CommsConfig {
+                provider: default_comms_provider(),
+                command: None,
+                device: self
+                    .lte
+                    .as_ref()
+                    .and_then(|c| c.device.clone())
+                    .or_else(|| self.gps.as_ref().and_then(|c| c.device.clone())),
+                startup_timeout_secs: default_comms_startup_timeout(),
+                request_timeout_secs: default_comms_request_timeout(),
+            })
+        } else {
+            None
+        }
     }
 
     /// Effective client heartbeat interval after applying safety clamps.

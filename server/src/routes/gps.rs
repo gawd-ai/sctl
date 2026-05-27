@@ -3,7 +3,7 @@
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::error::{codes, ApiError};
 use crate::AppState;
@@ -14,57 +14,26 @@ use crate::AppState;
 pub async fn gps(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    let Some(gps_state) = &state.gps_state else {
+    if state.config.gps.is_none() {
         return Err(
             ApiError::new(codes::NOT_FOUND, "GPS not configured on this device")
                 .into_response_with(StatusCode::NOT_FOUND),
         );
+    }
+
+    let Some(comms_state) = &state.comms_state else {
+        return Err(
+            ApiError::new(codes::MODEM_UNAVAILABLE, "comms provider not available")
+                .into_response_with(StatusCode::SERVICE_UNAVAILABLE),
+        );
     };
 
-    let gs = gps_state.lock().await;
+    let snapshot = comms_state
+        .lock()
+        .await
+        .gps
+        .clone()
+        .unwrap_or_else(crate::comms::starting_gps_response);
 
-    let last_fix = gs.last_fix.as_ref().map(|f| {
-        json!({
-            "latitude": f.latitude,
-            "longitude": f.longitude,
-            "altitude": f.altitude,
-            "speed_kmh": f.speed_kmh,
-            "course": f.course,
-            "hdop": f.hdop,
-            "satellites": f.satellites,
-            "utc": f.utc,
-            "date": f.date,
-            "fix_type": f.fix_type,
-            "recorded_at": f.recorded_at,
-        })
-    });
-
-    let fix_age_secs = gs.last_fix_at.map(|t| t.elapsed().as_secs());
-
-    let history: Vec<Value> = gs
-        .history
-        .iter()
-        .rev()
-        .take(50)
-        .map(|f| {
-            json!({
-                "latitude": f.latitude,
-                "longitude": f.longitude,
-                "altitude": f.altitude,
-                "speed_kmh": f.speed_kmh,
-                "satellites": f.satellites,
-                "recorded_at": f.recorded_at,
-            })
-        })
-        .collect();
-
-    Ok(Json(json!({
-        "status": gs.status,
-        "last_fix": last_fix,
-        "fix_age_secs": fix_age_secs,
-        "history": history,
-        "fixes_total": gs.fixes_total,
-        "errors_total": gs.errors_total,
-        "last_error": gs.last_error,
-    })))
+    Ok(Json(snapshot))
 }

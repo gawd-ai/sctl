@@ -8,17 +8,14 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{broadcast, Mutex, Notify, RwLock};
+use tokio::sync::{broadcast, Mutex};
 use tracing::warn;
 
 use crate::activity::{ActivityLog, ExecResultsCache};
+use crate::comms::{CommsClient, CommsState};
 use crate::config::Config;
 use crate::gawdxfer::manager::TransferManager;
-use crate::gps::GpsState;
 use crate::infra::InfraState;
-use crate::lte::LteState;
-use crate::lte_watchdog::WatchdogSnapshot;
-use crate::modem::Modem;
 use crate::sessions::SessionManager;
 use crate::tunnel::relay::{DeviceSnapshot, RelayConnectionHistory, RelayState};
 
@@ -44,26 +41,18 @@ pub struct AppState {
     pub transfer_manager: Arc<TransferManager>,
     /// Current number of SSE connections (for connection limiting).
     pub sse_connections: Arc<AtomicU32>,
-    /// GPS state (None when `[gps]` not configured).
-    pub gps_state: Option<Arc<Mutex<GpsState>>>,
-    /// LTE signal state (None when `[lte]` not configured).
-    pub lte_state: Option<Arc<Mutex<LteState>>>,
-    /// LTE modem handle (None when `[lte]` not configured or modem unreachable).
-    pub modem: Option<Modem>,
-    /// Currently-detected modem device path (e.g. `/dev/ttyUSB2`). Observable
-    /// from HTTP; updated by the watchdog after a successful USB cycle. None
-    /// when no modem is present at startup.
-    pub modem_detected_path: Arc<RwLock<Option<String>>>,
-    /// Notify to trigger an on-demand LTE signal poll (None when `[lte]` not configured).
-    pub lte_poll_notify: Option<Arc<Notify>>,
+    /// External comms provider client (None when no provider is configured or startup failed).
+    pub comms_client: Option<CommsClient>,
+    /// Cached comms provider projections for GPS/LTE-compatible APIs.
+    pub comms_state: Option<Arc<Mutex<CommsState>>>,
+    /// Notify to trigger an on-demand link poll.
+    pub comms_poll_notify: Option<Arc<tokio::sync::Notify>>,
     /// Relay connection history (None when not in relay mode).
     pub relay_history: Option<Arc<RelayConnectionHistory>>,
     /// Device snapshots (relay mode only) — last-known telemetry for offline devices.
     pub device_snapshots: Option<Arc<tokio::sync::RwLock<HashMap<String, DeviceSnapshot>>>>,
     /// Relay state (relay mode only) — used for truthful live device health.
     pub relay_state: Option<RelayState>,
-    /// LTE watchdog snapshot — updated every tick for API visibility.
-    pub watchdog_snapshot: Option<Arc<Mutex<WatchdogSnapshot>>>,
     /// Infrastructure monitoring state (always present, activates on config push).
     pub infra_state: Option<Arc<Mutex<InfraState>>>,
 }

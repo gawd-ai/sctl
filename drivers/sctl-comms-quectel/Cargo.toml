@@ -1,0 +1,26 @@
+[package]
+name = "sctl-comms-quectel"
+version = "0.5.0"
+edition = "2021"
+description = "Quectel AT comms provider helper for sctl"
+license = "GPL-3.0-only"
+repository = "https://github.com/gawd-ai/sctl"
+rust-version = "1.82"
+
+[[bin]]
+name = "sctl-comms-quectel"
+path = "src/main.rs"
+
+[dependencies]
+sctl = { path = "../../server", features = ["quectel-driver"] }
+sctl-comms-protocol = { path = "../../crates/sctl-comms-protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "io-std", "sync", "time", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Strip symbols — the helper ships to space-constrained devices (e.g. riscv64 BPI)
+# over flaky LTE via chunked STP, so a smaller binary is fewer chunks to upload.
+[profile.release]
+strip = true

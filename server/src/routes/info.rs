@@ -98,7 +98,7 @@ pub(crate) async fn info_with_groups(
 ) -> Result<Json<Value>, StatusCode> {
     let start = Instant::now();
     let req_id = uuid::Uuid::new_v4().to_string();
-    let has_lte = state.lte_state.is_some();
+    let has_lte = state.config.lte.is_some();
     info!(
         req_id,
         has_lte,
@@ -199,80 +199,50 @@ pub(crate) async fn info_with_groups(
         }
     }
 
-    if groups.gps {
-        if let Some(ref gps_state) = state.gps_state {
-            let gps_lock_started = Instant::now();
-            let gs = gps_state.lock().await;
-            #[allow(clippy::cast_possible_truncation)]
-            let gps_lock_wait_ms = gps_lock_started.elapsed().as_millis() as u64;
-            let fix_age_secs = gs.last_fix_at.map(|t| t.elapsed().as_secs());
-            if let Some(ref fix) = gs.last_fix {
-                response["gps"] = json!({
-                    "status": gs.status,
-                    "latitude": fix.latitude,
-                    "longitude": fix.longitude,
-                    "altitude": fix.altitude,
-                    "satellites": fix.satellites,
-                    "speed_kmh": fix.speed_kmh,
-                    "hdop": fix.hdop,
-                    "fix_age_secs": fix_age_secs,
+    if groups.gps && state.config.gps.is_some() {
+        let gps_lock_started = Instant::now();
+        if let Some(ref comms_state) = state.comms_state {
+            let cs = comms_state.lock().await;
+            if let Some(ref gps) = cs.gps {
+                let mut projected = json!({
+                    "status": gps.get("status").cloned().unwrap_or_else(|| json!("unknown")),
                 });
-            } else {
-                response["gps"] = json!({
-                    "status": gs.status,
-                });
+                if let Some(fix) = gps.get("last_fix").filter(|v| !v.is_null()) {
+                    projected["latitude"] = fix.get("latitude").cloned().unwrap_or(Value::Null);
+                    projected["longitude"] = fix.get("longitude").cloned().unwrap_or(Value::Null);
+                    projected["altitude"] = fix.get("altitude").cloned().unwrap_or(Value::Null);
+                    projected["satellites"] = fix.get("satellites").cloned().unwrap_or(Value::Null);
+                    projected["speed_kmh"] = fix.get("speed_kmh").cloned().unwrap_or(Value::Null);
+                    projected["hdop"] = fix.get("hdop").cloned().unwrap_or(Value::Null);
+                    projected["fix_age_secs"] =
+                        gps.get("fix_age_secs").cloned().unwrap_or(Value::Null);
+                }
+                response["gps"] = projected;
             }
-            info!(req_id, gps_lock_wait_ms, "api.info: phase gps complete");
         }
+        #[allow(clippy::cast_possible_truncation)]
+        let gps_lock_wait_ms = gps_lock_started.elapsed().as_millis() as u64;
+        info!(req_id, gps_lock_wait_ms, "api.info: phase gps complete");
     }
 
     let mut lte_lock_wait_ms = 0u64;
-    if groups.lte {
-        if let Some(ref lte_state) = state.lte_state {
+    if groups.lte && state.config.lte.is_some() {
+        if let Some(ref comms_state) = state.comms_state {
             let lock_started = Instant::now();
-            let ls = lte_state.lock().await;
+            let cs = comms_state.lock().await;
             #[allow(clippy::cast_possible_truncation)]
             {
                 lte_lock_wait_ms = lock_started.elapsed().as_millis() as u64;
             }
-            let mut lte = if let Some(ref sig) = ls.signal {
-                json!({
-                    "rssi_dbm": sig.rssi_dbm,
-                    "rsrp": sig.rsrp,
-                    "rsrq": sig.rsrq,
-                    "sinr": sig.sinr,
-                    "band": sig.band,
-                    "operator": sig.operator,
-                    "technology": sig.technology,
-                    "cell_id": sig.cell_id,
-                    "signal_bars": sig.signal_bars,
-                    "pci": sig.pci,
-                    "earfcn": sig.earfcn,
-                    "freq_band": sig.freq_band,
-                    "tac": sig.tac,
-                    "plmn": sig.plmn,
-                    "enodeb_id": sig.enodeb_id,
-                    "sector": sig.sector,
-                    "ul_bw_mhz": sig.ul_bw_mhz,
-                    "dl_bw_mhz": sig.dl_bw_mhz,
-                    "connection_state": sig.connection_state,
-                    "duplex": sig.duplex,
-                    "neighbors": sig.neighbors,
-                    "band_config": sig.band_config,
-                })
+            let mut lte = if let Some(sig) = cs.lte.as_ref().and_then(|v| v.get("signal")) {
+                sig.clone()
             } else {
                 json!({"status": "no_signal"})
             };
-            if let Some(ref modem) = ls.modem {
-                lte["modem"] = json!({
-                    "model": modem.model,
-                    "firmware": modem.firmware,
-                    "imei": modem.imei,
-                    "iccid": modem.iccid,
-                });
+            if let Some(modem) = cs.lte.as_ref().and_then(|v| v.get("modem")) {
+                lte["modem"] = modem.clone();
             }
-            let detected_path = state.modem_detected_path.read().await.clone();
-            lte["detected_path"] = json!(detected_path);
+            lte["detected_path"] = json!(cs.detected_path.clone());
             response["lte"] = lte;
             info!(req_id, lte_lock_wait_ms, "api.info: phase lte complete");
         }

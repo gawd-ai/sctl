@@ -1,0 +1,12 @@
+[package]
+name = "sctl-comms-protocol"
+version = "0.5.0"
+edition = "2021"
+description = "Helper-process protocol for sctl external comms providers"
+license = "GPL-3.0-only"
+repository = "https://github.com/gawd-ai/sctl"
+rust-version = "1.75"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

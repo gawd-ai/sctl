@@ -93,20 +93,22 @@ bind_address = "wwan0"              # Client mode: bind to interface or IP (LTE 
 heartbeat_timeout_secs = 45         # Relay mode: seconds before device eviction
 tunnel_proxy_timeout_secs = 60      # Relay mode: proxy request timeout
 
-# Optional — GPS location tracking via Quectel modem GNSS
+# Optional — external comms provider helper. Omit on relay/VPS/server-only installs.
+[comms]
+provider = "quectel-at"
+command = "/usr/libexec/sctl/comms/sctl-comms-quectel"
+device = "/dev/ttyUSB2"             # Optional hint; autodetect is preferred when available
+startup_timeout_secs = 15
+request_timeout_secs = 20
+
+# Optional — GPS/location tracking through the active comms provider
 [gps]
-# device is optional; sctl auto-detects the Quectel AT port via sysfs.
-# Override only if autodetect fails (non-Quectel modem).
-# device = "/dev/ttyUSB2"
 poll_interval_secs = 30             # Seconds between GPS polls
 history_size = 100                  # Maximum fix history entries
 auto_enable = true                  # Auto-enable GNSS engine on startup
 
-# Optional — LTE signal monitoring via Quectel modem AT commands
+# Optional — LTE/cellular monitoring through the active comms provider
 [lte]
-# device is optional; sctl auto-detects the Quectel AT port via sysfs.
-# Override only if autodetect fails (non-Quectel modem).
-# device = "/dev/ttyUSB2"
 poll_interval_secs = 60             # Seconds between signal polls
 ```
 
