@@ -119,9 +119,11 @@ pub struct LteSignal {
     pub rsrq: Option<i32>,
     /// Signal-to-Interference-plus-Noise Ratio (from AT+QENG).
     pub sinr: Option<f64>,
-    /// LTE band (e.g. "B4", from AT+QNWINFO).
+    /// LTE band (e.g. "B4", from AT+QNWINFO; falls back to the QENG serving-cell
+    /// `freq_band` when QNWINFO is dark in deep idle).
     pub band: Option<String>,
-    /// Network operator name (from AT+COPS?).
+    /// Network operator name (from AT+COPS?; falls back to the QENG serving-cell
+    /// PLMN when COPS is dark in deep idle).
     pub operator: Option<String>,
     /// Access technology (e.g. "LTE", from AT+QNWINFO).
     pub technology: Option<String>,
@@ -1979,6 +1981,26 @@ fn parse_cops(response: &str) -> Option<String> {
     }
 }
 
+/// Map a PLMN (MCC+MNC) to a human-readable operator name. Used as a fallback
+/// when `AT+COPS?` is dark in deep idle but the QENG serving cell still reports
+/// the PLMN — so the operator field is never null while camped on a cell.
+/// Unknown PLMNs return the raw code (still more useful than null, and never
+/// wrong). Covers the common Canadian carriers (the current deployment region);
+/// extend as new regions come online.
+fn operator_name_from_plmn(plmn: &str) -> String {
+    match plmn {
+        "302720" => "Rogers",
+        "302370" => "Fido",
+        "302220" | "302221" => "Telus",
+        "302610" => "Bell",
+        "302490" => "Freedom",
+        "302500" => "Videotron",
+        "302780" => "SaskTel",
+        other => other,
+    }
+    .to_string()
+}
+
 /// Parse `AT+QCFG="band"` → list of enabled LTE band numbers.
 ///
 /// Response: `+QCFG: "band",0x260,0x1808,0x0`
@@ -2210,8 +2232,8 @@ impl AtPollingHealth {
 /// QMI data bearer is carrying traffic. The interface holding an IPv4 address is
 /// the authoritative "data is flowing" signal, so when the bearer is up we
 /// report `CONNECT` regardless of the unreliable serving-cell field. Band and
-/// operator may still read null in this deep-idle state — that is an AT-side
-/// reporting limitation, not a connectivity problem.
+/// operator are recovered separately from the QENG serving cell (`freq_band` /
+/// PLMN), which stays populated while camped, so they no longer read null here.
 fn effective_connection_state(raw: Option<String>, data_active: bool) -> Option<String> {
     if data_active {
         match raw.as_deref() {
@@ -2668,8 +2690,10 @@ pub fn spawn_lte_poller(
                 rsrp: qeng.rsrp,
                 rsrq: qeng.rsrq,
                 sinr: qeng.sinr,
-                band,
-                operator,
+                // Fall back to the QENG serving cell (polled every cycle) when
+                // QNWINFO/COPS are dark in deep idle — no extra AT polling.
+                band: band.or_else(|| qeng.freq_band.map(|n| format!("B{n}"))),
+                operator: operator.or_else(|| qeng.plmn.as_deref().map(operator_name_from_plmn)),
                 technology,
                 cell_id: qeng.cell_id,
                 pci: qeng.pci,
@@ -3019,6 +3043,25 @@ OK";
             Some("NOCONN")
         );
         assert_eq!(effective_connection_state(None, false), None);
+    }
+
+    #[test]
+    fn test_operator_name_from_plmn() {
+        // Known Canadian carriers map to friendly names.
+        assert_eq!(operator_name_from_plmn("302720"), "Rogers");
+        assert_eq!(operator_name_from_plmn("302220"), "Telus");
+        assert_eq!(operator_name_from_plmn("302221"), "Telus");
+        assert_eq!(operator_name_from_plmn("302610"), "Bell");
+        // Unknown PLMN falls back to the raw code — never null, never wrong.
+        assert_eq!(operator_name_from_plmn("310410"), "310410");
+    }
+
+    #[test]
+    fn test_band_label_from_freq_band() {
+        // QENG freq_band fallback matches the QNWINFO "B{n}" format.
+        assert_eq!(Some(2u16).map(|n| format!("B{n}")).as_deref(), Some("B2"));
+        assert_eq!(Some(4u16).map(|n| format!("B{n}")).as_deref(), Some("B4"));
+        assert_eq!(None::<u16>.map(|n| format!("B{n}")), None);
     }
 
     #[test]
