@@ -53,6 +53,7 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCTL_DIR="$REPO_DIR/server"
 MCP_DIR="$REPO_DIR/mcp"
 WEB_DIR="$REPO_DIR/web"
+QUECTEL_DRIVER_DIR="$REPO_DIR/drivers/sctl-comms-quectel"
 
 # Stamp the host's git commit count into the binary. `cross build` runs
 # inside a container that can't see the host's .git dir, so build.rs
@@ -92,6 +93,8 @@ RELAY_REMOTE_CONFIG="/etc/sctl/relay.toml"
 # Binaries (release for speed, debug takes too long on PTY-heavy sessions)
 SCTL_BIN="$SCTL_DIR/target/release/sctl"
 MCP_BIN="$MCP_DIR/target/release/mcp-sctl"
+QUECTEL_DRIVER_BIN_NAME="sctl-comms-quectel"
+COMMS_REMOTE_DIR="/usr/libexec/sctl/comms"
 
 # Architecture → cross-compile target mapping
 declare -A ARCH_TARGET=(
@@ -609,6 +612,91 @@ arch_to_bin() {
     else
         echo "$SCTL_DIR/target/$target/release/sctl"
     fi
+}
+
+device_comms_provider() {
+    local name="$1"
+    local provider
+    provider=$(cfg_device_get "$name" "comms_provider")
+    if [[ -n "$provider" && "$provider" != "none" ]]; then
+        echo "$provider"
+        return 0
+    fi
+
+    # Local release-prep profiles such as sctl.toml.bpi are authoritative for
+    # hardware-backed devices, even if older device metadata says "none".
+    # If a same-name config enables GPS/LTE/comms, deploy the current Quectel helper.
+    local local_cfg="$REPO_DIR/sctl.toml.$name"
+    if [[ -f "$local_cfg" ]] && grep -Eq '^\[(comms|gps|lte)\]' "$local_cfg"; then
+        echo "quectel-at"
+        return 0
+    fi
+
+    echo "${provider:-none}"
+}
+
+comms_provider_bin() {
+    local provider="$1" arch="$2"
+    local target
+    target=$(arch_to_target "$arch")
+
+    case "$provider" in
+        none|"")
+            return 1
+            ;;
+        quectel-at)
+            if [[ "$target" == "native" ]]; then
+                echo "$QUECTEL_DRIVER_DIR/target/release/$QUECTEL_DRIVER_BIN_NAME"
+            else
+                echo "$QUECTEL_DRIVER_DIR/target/$target/release/$QUECTEL_DRIVER_BIN_NAME"
+            fi
+            ;;
+        *)
+            err "Unknown comms provider: $provider"
+            return 1
+            ;;
+    esac
+}
+
+build_comms_provider() {
+    local provider="$1" arch="$2"
+    local target
+    target=$(arch_to_target "$arch")
+
+    case "$provider" in
+        none|"")
+            return 0
+            ;;
+        quectel-at)
+            if [[ "$target" == "native" ]]; then
+                log "Building comms provider $provider for $arch (native)..."
+                cargo build --manifest-path "$QUECTEL_DRIVER_DIR/Cargo.toml" --release 2>&1
+            else
+                log "Building comms provider $provider for $arch (cross: $target)..."
+                cross build --manifest-path "$QUECTEL_DRIVER_DIR/Cargo.toml" --release --target "$target" 2>&1
+            fi
+            ;;
+        *)
+            err "Unknown comms provider: $provider"
+            return 1
+            ;;
+    esac
+}
+
+upload_comms_provider() {
+    local provider="$1" arch="$2" host="$3" ssh_opts="$4"
+    if [[ "$provider" == "none" || -z "$provider" ]]; then
+        log "No comms provider configured for this device; skipping helper upload"
+        return 0
+    fi
+
+    local bin_path
+    bin_path=$(comms_provider_bin "$provider" "$arch")
+    log "Uploading comms provider $provider to $host..."
+    ssh $ssh_opts "root@$host" "mkdir -p '$COMMS_REMOTE_DIR'"
+    scp $ssh_opts "$bin_path" "root@$host:$COMMS_REMOTE_DIR/$QUECTEL_DRIVER_BIN_NAME"
+    ssh $ssh_opts "root@$host" "chmod +x '$COMMS_REMOTE_DIR/$QUECTEL_DRIVER_BIN_NAME'"
+    ok "Comms provider uploaded: $provider"
 }
 
 # ─── Shared helpers ──────────────────────────────────────────────────
@@ -1195,6 +1283,7 @@ echo "VERSION=$VERSION"
     host: \$host,
     serial: \$serial,
     arch: \$arch,
+    comms_provider: "none",
     sctl_version: \$version,
     added_at: \$now
 }
@@ -1378,6 +1467,8 @@ do_device_deploy() {
     local target bin_path
     target=$(arch_to_target "$arch")
     bin_path=$(arch_to_bin "$arch")
+    local comms_provider
+    comms_provider=$(device_comms_provider "$name")
 
     # Cross-compile
     if [[ "$target" == "native" ]]; then
@@ -1389,12 +1480,16 @@ do_device_deploy() {
     fi
     ok "Build complete: $bin_path"
 
+    build_comms_provider "$comms_provider" "$arch"
+
     local ssh_opts="-o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new"
 
     # Upload binary
     log "Uploading sctl binary to $host..."
     scp $ssh_opts "$bin_path" "root@$host:/usr/bin/sctl"
     ok "Binary uploaded"
+
+    upload_comms_provider "$comms_provider" "$arch" "$host" "$ssh_opts"
 
     # Upload config template if missing
     log "Checking config on device..."
@@ -1454,6 +1549,8 @@ do_device_upgrade() {
     local target bin_path
     target=$(arch_to_target "$arch")
     bin_path=$(arch_to_bin "$arch")
+    local comms_provider
+    comms_provider=$(device_comms_provider "$name")
 
     # Cross-compile
     if [[ "$target" == "native" ]]; then
@@ -1465,6 +1562,8 @@ do_device_upgrade() {
     fi
     ok "Build complete: $bin_path"
 
+    build_comms_provider "$comms_provider" "$arch"
+
     local ssh_opts="-o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new"
 
     # Stop, upload, start
@@ -1473,6 +1572,7 @@ do_device_upgrade() {
 
     log "Uploading new binary..."
     scp $ssh_opts "$bin_path" "root@$host:/usr/bin/sctl"
+    upload_comms_provider "$comms_provider" "$arch" "$host" "$ssh_opts"
 
     log "Starting sctl on $host..."
     ssh $ssh_opts "root@$host" "/etc/init.d/sctl start"
@@ -1706,9 +1806,12 @@ wait_for_device() {
 
 # Init an STP upload, retrying across connection windows.
 # Sets global: xfer_id
-# Usage: resilient_stp_init <url> <api_key> <file_size> <chunk_size> <total_chunks>
+# Usage: resilient_stp_init <url> <api_key> <file_size> <chunk_size> <total_chunks> [path] [filename] [mode]
+# Defaults stage to /tmp/sctl-upgrade (0755) — the server-binary upgrade path. The
+# comms-helper path overrides filename so both can ride the same chunked STP upload.
 resilient_stp_init() {
     local url="$1" api_key="$2" file_size="$3" chunk_size="$4" total_chunks="$5"
+    local path="${6:-/tmp}" filename="${7:-sctl-upgrade}" mode="${8:-0755}"
     local max_attempts=10
     for attempt in $(seq 1 "$max_attempts"); do
         # Wait for device
@@ -1721,12 +1824,13 @@ resilient_stp_init() {
             -H "Authorization: Bearer $api_key" \
             -H "Content-Type: application/json" \
             -d "$(jq -n \
-                --arg path "/tmp" \
-                --arg filename "sctl-upgrade" \
+                --arg path "$path" \
+                --arg filename "$filename" \
                 --argjson file_size "$file_size" \
                 --argjson chunk_size "$chunk_size" \
                 --argjson total_chunks "$total_chunks" \
-                '{path: $path, filename: $filename, file_size: $file_size, chunk_size: $chunk_size, total_chunks: $total_chunks, file_hash: "", mode: "0755"}'
+                --arg mode "$mode" \
+                '{path: $path, filename: $filename, file_size: $file_size, chunk_size: $chunk_size, total_chunks: $total_chunks, file_hash: "", mode: $mode}'
             )" 2>/dev/null)
         xfer_id=$(echo "$init_resp" | jq -r '.transfer_id // empty' 2>/dev/null)
         if [[ -n "$xfer_id" && "$xfer_id" != "null" ]]; then
@@ -1793,6 +1897,140 @@ stp_resume_transfer() {
         -H "Authorization: Bearer $api_key" 2>/dev/null
 }
 
+# Resiliently upload the comms helper to a relay-only device over STP, then place it
+# at $COMMS_REMOTE_DIR/<helper> (+x). Shares resilient_stp_init with the server-binary
+# path but runs its own chunk loop. NON-FATAL: the sctl binary degrades gracefully when
+# the helper is absent (main.rs:494 — WARN, mgmt plane stays up), so any failure here
+# warns and lets the more-critical server upgrade proceed. Staged to /tmp, then moved
+# into place (the comms dir may not exist; STP can't mkdir -p arbitrary parents).
+# Usage: upload_comms_provider_remote <url> <api_key> <provider> <arch>
+upload_comms_provider_remote() {
+    local url="$1" api_key="$2" provider="$3" arch="$4"
+    if [[ "$provider" == "none" || -z "$provider" ]]; then
+        log "No comms provider for this device; skipping helper upload"
+        return 0
+    fi
+
+    local helper_bin
+    helper_bin=$(comms_provider_bin "$provider" "$arch") || {
+        warn "No helper binary path for provider '$provider'; skipping helper upload"
+        return 0
+    }
+    if [[ ! -f "$helper_bin" ]]; then
+        warn "Comms helper not built at $helper_bin; skipping helper upload"
+        return 0
+    fi
+
+    local h_size h_chunk h_total
+    h_size=$(stat -c%s "$helper_bin")
+    h_chunk=65536
+    h_total=$(( (h_size + h_chunk - 1) / h_chunk ))
+    log "Comms helper: $helper_bin ($h_size bytes, $h_total chunks @ 64KiB)"
+
+    # Init (staged to /tmp; placed into $COMMS_REMOTE_DIR after verification)
+    if ! resilient_stp_init "$url" "$api_key" "$h_size" "$h_chunk" "$h_total" "/tmp" "$QUECTEL_DRIVER_BIN_NAME" "0755"; then
+        warn "Comms helper STP init failed; continuing without helper upload"
+        return 0
+    fi
+    local h_xfer="$xfer_id"
+
+    local h_idx=0 h_retries=0
+    local h_started_at h_budget=3600
+    h_started_at=$(date +%s)
+    log "Uploading comms helper ($h_total chunks, non-fatal)..."
+    while [[ $h_idx -lt $h_total ]]; do
+        local h_off=$((h_idx * h_chunk)) h_sz=$h_chunk
+        if [[ $((h_off + h_sz)) -gt $h_size ]]; then
+            h_sz=$((h_size - h_off))
+        fi
+        local h_hash h_resp h_ok
+        h_hash=$(dd if="$helper_bin" bs=1 skip="$h_off" count="$h_sz" 2>/dev/null | sha256sum | cut -d' ' -f1)
+        h_resp=$(dd if="$helper_bin" bs=1 skip="$h_off" count="$h_sz" 2>/dev/null | \
+            curl -sf --max-time 8 -X POST "$url/api/stp/chunk/$h_xfer/$h_idx" \
+                -H "Authorization: Bearer $api_key" \
+                -H "Content-Type: application/octet-stream" \
+                -H "X-Gx-Chunk-Hash: $h_hash" \
+                --data-binary @- 2>/dev/null) || true
+        h_ok=$(echo "$h_resp" | jq -r '.ok // false' 2>/dev/null)
+        if [[ "$h_ok" == "true" ]]; then
+            printf "\r  helper chunks: %d/%d (retries: %d)  " "$((h_idx + 1))" "$h_total" "$h_retries"
+            h_idx=$((h_idx + 1))
+            continue
+        fi
+
+        h_retries=$((h_retries + 1))
+        local h_now
+        h_now=$(date +%s)
+        if [[ $((h_now - h_started_at)) -ge $h_budget ]]; then
+            echo ""
+            warn "Comms helper upload exceeded ${h_budget}s budget; continuing without helper"
+            curl -sf --max-time 5 -X DELETE "$url/api/stp/$h_xfer" -H "Authorization: Bearer $api_key" >/dev/null 2>&1 || true
+            return 0
+        fi
+
+        # Transfer lost (process restarted) → re-init from scratch
+        local h_code
+        h_code=$(curl -sf --max-time 5 -o /dev/null -w '%{http_code}' "$url/api/stp/status/$h_xfer" \
+            -H "Authorization: Bearer $api_key" 2>/dev/null) || h_code="000"
+        if [[ "$h_code" == "404" ]]; then
+            echo ""
+            warn "Comms helper transfer lost (process restarted?), re-initializing..."
+            h_idx=0
+            if ! resilient_stp_init "$url" "$api_key" "$h_size" "$h_chunk" "$h_total" "/tmp" "$QUECTEL_DRIVER_BIN_NAME" "0755"; then
+                warn "Comms helper re-init failed; continuing without helper"
+                return 0
+            fi
+            h_xfer="$xfer_id"
+            continue
+        fi
+
+        # Connection dropped — wait for next window, resume if paused, retry same chunk
+        printf "\n  helper chunk %d failed, waiting for reconnection... " "$h_idx"
+        if ! wait_for_device "$url" 360 quiet; then
+            echo ""
+            warn "Device unreachable during helper upload; continuing without helper"
+            return 0
+        fi
+        printf "reconnected\n"
+        local h_phase
+        h_phase=$(stp_status_json "$url" "$api_key" "$h_xfer" | jq -r '.phase // empty' 2>/dev/null)
+        if [[ "$h_phase" == "paused" ]]; then
+            stp_resume_transfer "$url" "$api_key" "$h_xfer" >/dev/null 2>&1 || true
+        fi
+    done
+    echo ""
+
+    # Wait for verification (best-effort)
+    local h_verify="" h_attempts=0
+    while [[ "$h_verify" != "complete" && $h_attempts -lt 10 ]]; do
+        wait_for_device "$url" 360 quiet || break
+        local _i
+        for _i in $(seq 1 15); do
+            h_verify=$(curl -sf --max-time 5 "$url/api/stp/status/$h_xfer" \
+                -H "Authorization: Bearer $api_key" 2>/dev/null | jq -r '.phase // empty' 2>/dev/null)
+            [[ "$h_verify" == "complete" ]] && break
+            if [[ "$h_verify" == "failed" ]]; then
+                warn "Comms helper transfer verification failed; continuing without helper"
+                return 0
+            fi
+            sleep 0.5
+        done
+        h_attempts=$((h_attempts + 1))
+    done
+
+    # Place staged helper into the comms dir (mkdir -p + cp + chmod + cleanup)
+    log "Installing comms helper at $COMMS_REMOTE_DIR/$QUECTEL_DRIVER_BIN_NAME ..."
+    local place_out
+    place_out=$(remote_exec_stdout_trimmed "$url" "$api_key" \
+        "sh -c 'mkdir -p $COMMS_REMOTE_DIR && cp /tmp/$QUECTEL_DRIVER_BIN_NAME $COMMS_REMOTE_DIR/$QUECTEL_DRIVER_BIN_NAME && chmod +x $COMMS_REMOTE_DIR/$QUECTEL_DRIVER_BIN_NAME && rm -f /tmp/$QUECTEL_DRIVER_BIN_NAME && echo placed'" \
+        8000 3 10) || true
+    if [[ "$place_out" == *placed* ]]; then
+        ok "Comms helper installed ($h_retries retries)"
+    else
+        warn "Comms helper staged at /tmp/$QUECTEL_DRIVER_BIN_NAME but placement unconfirmed; continuing"
+    fi
+}
+
 do_device_upgrade_remote() {
     local name="${1:-}"
     if [[ -z "$name" ]]; then
@@ -1836,6 +2074,14 @@ do_device_upgrade_remote() {
         (cd "$SCTL_DIR" && cross build --release --target "$target" 2>&1)
     fi
     ok "Build complete: $bin_path"
+
+    # Build + ship the comms helper in the same pass (relay-only path parity with the
+    # SSH deploy/upgrade paths). Non-fatal: graceful-absent on the device. Done before
+    # the server swap so the restarted sctl finds the helper already in place.
+    local comms_provider
+    comms_provider=$(device_comms_provider "$name")
+    build_comms_provider "$comms_provider" "$arch"
+    upload_comms_provider_remote "$url" "$api_key" "$comms_provider" "$arch"
 
     local file_size chunk_size total_chunks expected_hash
     file_size=$(stat -c%s "$bin_path")
