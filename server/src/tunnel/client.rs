@@ -9,17 +9,26 @@ use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use futures_util::{FutureExt, SinkExt, StreamExt};
+use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName};
+use rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch, Mutex, Semaphore};
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::TlsConnector;
 use tracing::{error, info, warn};
 
 use crate::activity::{self, ActivityType, CachedExecResult};
+use crate::atomic::AtomicU64;
 use crate::config::TunnelConfig;
 use crate::sessions::buffer::{OutputBuffer, OutputEntry};
 use crate::state::TunnelEventType;
@@ -39,6 +48,53 @@ const TUNNEL_WRITER_SEND_TIMEOUT_SECS: u64 = 20;
 /// larger ones carrying the same bytes.
 const TUNNEL_STREAM_BATCH_MAX_ENTRIES: usize = 32;
 const TUNNEL_STREAM_BATCH_MAX_BYTES: usize = 8 * 1024;
+
+enum TunnelIo {
+    Plain(TcpStream),
+    // Boxed: a `TlsStream` is ~1 KiB, dwarfing the bare `TcpStream`, so inlining
+    // it would bloat every `TunnelIo` (and its enclosing futures) to that size.
+    Tls(Box<TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for TunnelIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for TunnelIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_shutdown(cx),
+        }
+    }
+}
 
 /// Resolve a `bind_address` config value to a concrete IP address.
 ///
@@ -523,6 +579,143 @@ async fn connect_tcp_ipv4_preferred(
     Err(last_err.unwrap_or_else(|| "all addresses failed".into()))
 }
 
+fn tunnel_url_host(url: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let without_scheme = url
+        .strip_prefix("wss://")
+        .or_else(|| url.strip_prefix("ws://"))
+        .unwrap_or(url);
+    let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
+    if authority.is_empty() {
+        return Err("tunnel URL host is empty".into());
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        let end = rest
+            .find(']')
+            .ok_or("invalid bracketed IPv6 address in tunnel URL")?;
+        return Ok(rest[..end].to_string());
+    }
+    if let Some((host, port)) = authority.rsplit_once(':') {
+        if port.parse::<u16>().is_ok() {
+            return Ok(host.to_string());
+        }
+    }
+    Ok(authority.to_string())
+}
+
+fn parse_sha256_pin(pin: &str) -> Result<[u8; 32], String> {
+    let mut digits = Vec::with_capacity(64);
+    for ch in pin.chars() {
+        if ch == ':' || ch.is_ascii_whitespace() {
+            continue;
+        }
+        let digit = ch
+            .to_digit(16)
+            .ok_or_else(|| format!("invalid SHA-256 pin character '{ch}'"))?;
+        digits.push(u8::try_from(digit).expect("hex digit fits in u8"));
+    }
+    if digits.len() != 64 {
+        return Err(format!(
+            "SHA-256 pin must contain 64 hex digits, got {}",
+            digits.len()
+        ));
+    }
+    let mut out = [0u8; 32];
+    for (idx, pair) in digits.chunks_exact(2).enumerate() {
+        out[idx] = (pair[0] << 4) | pair[1];
+    }
+    Ok(out)
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+fn build_tunnel_tls_config(
+    config: &TunnelConfig,
+) -> Result<Arc<RustlsClientConfig>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut root_store = RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    if let Some(path) = config.tls_ca_file.as_deref() {
+        let certs = CertificateDer::pem_file_iter(path)
+            .map_err(|e| format!("failed to open tunnel TLS CA file {path}: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("failed to parse tunnel TLS CA file {path}: {e}"))?;
+        if certs.is_empty() {
+            return Err(format!("tunnel TLS CA file {path} contains no certificates").into());
+        }
+        let total = certs.len();
+        let (added, ignored) = root_store.add_parsable_certificates(certs);
+        if added == 0 {
+            return Err(
+                format!("tunnel TLS CA file {path} contains no usable certificates").into(),
+            );
+        }
+        if ignored > 0 {
+            warn!("Tunnel: added {added}/{total} certificates from {path} ({ignored} ignored)");
+        } else {
+            info!("Tunnel: added {added} certificate(s) from {path}");
+        }
+    }
+
+    Ok(Arc::new(
+        RustlsClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth(),
+    ))
+}
+
+fn verify_tls_server_pin(
+    stream: &TlsStream<TcpStream>,
+    expected_pin: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let expected = parse_sha256_pin(expected_pin)?;
+    let (_, session) = stream.get_ref();
+    let certs = session
+        .peer_certificates()
+        .ok_or("tunnel TLS peer did not provide certificates")?;
+    let leaf = certs
+        .first()
+        .ok_or("tunnel TLS peer certificate chain is empty")?;
+    let actual = Sha256::digest(leaf.as_ref());
+    if actual.as_slice() != expected {
+        return Err(format!(
+            "tunnel TLS server certificate pin mismatch: expected {}, got {}",
+            hex_lower(&expected),
+            hex_lower(actual.as_slice())
+        )
+        .into());
+    }
+    Ok(())
+}
+
+async fn connect_tunnel_io(
+    url: &str,
+    tcp_stream: TcpStream,
+    config: &TunnelConfig,
+) -> Result<TunnelIo, Box<dyn std::error::Error + Send + Sync>> {
+    if !url.starts_with("wss://") {
+        return Ok(TunnelIo::Plain(tcp_stream));
+    }
+
+    let host = tunnel_url_host(url)?;
+    let server_name = ServerName::try_from(host.as_str())
+        .map_err(|_| format!("invalid TLS server name in tunnel URL: {host}"))?
+        .to_owned();
+    let connector = TlsConnector::from(build_tunnel_tls_config(config)?);
+    let tls_stream = connector.connect(server_name, tcp_stream).await?;
+    if let Some(pin) = config.tls_server_cert_sha256.as_deref() {
+        verify_tls_server_pin(&tls_stream, pin)?;
+    }
+    Ok(TunnelIo::Tls(Box::new(tls_stream)))
+}
+
 /// A single connection attempt: connect, register, handle messages until disconnect.
 #[allow(clippy::too_many_lines)]
 async fn connect_and_run(
@@ -546,9 +739,16 @@ async fn connect_and_run(
 
     // TLS + WebSocket handshake with timeout (can hang on riscv64/slow networks)
     let tls_start = Instant::now();
+    let tunnel_io = tokio::time::timeout(
+        Duration::from_secs(15),
+        connect_tunnel_io(&url, tcp_stream, config),
+    )
+    .await
+    .map_err(|_| ConnectError::Transient("TLS handshake timed out (15s)".into()))?
+    .map_err(ConnectError::Transient)?;
     let (ws_stream, _response) = tokio::time::timeout(
         Duration::from_secs(15),
-        tokio_tungstenite::client_async_tls(url.as_str(), tcp_stream),
+        tokio_tungstenite::client_async(url.as_str(), tunnel_io),
     )
     .await
     .map_err(|_| ConnectError::Transient("TLS/WS handshake timed out (15s)".into()))?
@@ -3811,5 +4011,40 @@ async fn tunnel_subscriber_task(
         if let Some(n) = notify {
             n.notified().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_sha256_pin, tunnel_url_host};
+
+    #[test]
+    fn tunnel_url_host_extracts_host_without_port_or_path() {
+        assert_eq!(
+            tunnel_url_host("wss://relay.example.com:443/api/tunnel").unwrap(),
+            "relay.example.com"
+        );
+        assert_eq!(
+            tunnel_url_host("ws://192.168.1.10:1337/api/tunnel").unwrap(),
+            "192.168.1.10"
+        );
+        assert_eq!(tunnel_url_host("wss://[::1]:443/api").unwrap(), "::1");
+    }
+
+    #[test]
+    fn parse_sha256_pin_accepts_compact_and_colon_hex() {
+        let compact = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let colon =
+            "00:01:02:03:04:05:06:07:08:09:0a:0b:0c:0d:0e:0f:10:11:12:13:14:15:16:17:18:19:1a:1b:1c:1d:1e:1f";
+        assert_eq!(
+            parse_sha256_pin(compact).unwrap(),
+            parse_sha256_pin(colon).unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_sha256_pin_rejects_bad_input() {
+        assert!(parse_sha256_pin("abc").is_err());
+        assert!(parse_sha256_pin(&"g".repeat(64)).is_err());
     }
 }

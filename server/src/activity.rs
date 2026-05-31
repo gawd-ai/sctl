@@ -15,12 +15,14 @@
 //!   all broadcast messages to connected clients.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{broadcast, RwLock};
+
+use crate::atomic::AtomicU64;
 
 /// Types of activities tracked by the journal.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

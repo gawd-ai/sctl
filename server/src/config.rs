@@ -17,6 +17,9 @@
 //! include_interface_addresses_in_info = true
 //! max_batch_size = 20
 //! max_file_size = 52428800  # 50 MB
+//! journal_enabled = true
+//! openwrt_persistent_logs = false
+//! openwrt_persistent_log_size_kb = 128
 //! max_concurrent_transfers = 4
 //! transfer_chunk_size = 262144  # 256 KiB
 //! transfer_max_file_size = 1073741824  # 1 GiB
@@ -45,10 +48,10 @@
 //! heartbeat_interval_secs = 5              # client mode, ping interval
 //! bind_address = "wwan0"                   # client mode, interface name or IP
 //!
-//! # Optional — external comms provider helper
+//! # Optional — external comms plugin
 //! [comms]
 //! provider = "quectel-at"
-//! command = "/usr/libexec/sctl/comms/sctl-comms-quectel"
+//! library = "/usr/lib/sctl/comms/libsctl_comms_quectel.so"
 //! device = "/dev/ttyUSB2"
 //! ```
 
@@ -80,14 +83,19 @@ pub struct Config {
     pub lte: Option<LteConfig>,
 }
 
-/// External comms provider helper process.
+/// External comms provider plugin.
+///
+/// Unknown keys are tolerated (no `deny_unknown_fields`): units provisioned in
+/// the process-helper era carry a now-removed `[comms] command = "..."` key,
+/// and rejecting it here would panic `Config::load` and take down the entire
+/// management plane on a unit that is otherwise fine. Unknown keys are ignored.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CommsConfig {
     /// Provider name (e.g. `quectel-at`). `none` disables external comms.
     #[serde(default = "default_comms_provider")]
     pub provider: String,
-    /// Helper executable path.
-    pub command: Option<String>,
+    /// Shared library path implementing the C ABI.
+    pub library: Option<String>,
     /// Optional provider device hint (for example `/dev/ttyUSB2`).
     pub device: Option<String>,
     /// Seconds to wait for provider startup/open.
@@ -100,12 +108,15 @@ pub struct CommsConfig {
 
 impl CommsConfig {
     #[must_use]
-    pub fn effective_command(&self) -> String {
-        self.command.clone().unwrap_or_else(|| {
+    pub fn effective_library(&self) -> String {
+        self.library.clone().unwrap_or_else(|| {
             if self.provider == "quectel-at" {
-                "/usr/libexec/sctl/comms/sctl-comms-quectel".to_string()
+                "/usr/lib/sctl/comms/libsctl_comms_quectel.so".to_string()
             } else {
-                format!("sctl-comms-{}", self.provider)
+                format!(
+                    "/usr/lib/sctl/comms/libsctl_comms_{}.so",
+                    self.provider.replace('-', "_")
+                )
             }
         })
     }
@@ -159,6 +170,13 @@ pub struct ServerConfig {
     /// Enable output journaling to disk (default true).
     #[serde(default = "default_journal_enabled")]
     pub journal_enabled: bool,
+    /// On OpenWrt, configure logd to persist system logs to overlay. Default
+    /// false to avoid flash wear and storage pressure on small embedded devices.
+    #[serde(default)]
+    pub openwrt_persistent_logs: bool,
+    /// Persistent OpenWrt log size in KiB when `openwrt_persistent_logs` is true.
+    #[serde(default = "default_openwrt_persistent_log_size_kb")]
+    pub openwrt_persistent_log_size_kb: u32,
     /// Batch fsync interval in milliseconds (0 = every write). Default 5000.
     #[serde(default = "default_journal_fsync_interval_ms")]
     pub journal_fsync_interval_ms: u64,
@@ -236,7 +254,10 @@ pub struct DeviceConfig {
 /// Logging configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LoggingConfig {
-    /// tracing filter level (default `info`). Overridden by `RUST_LOG` env var.
+    /// Log level (default `info`). Overridden by `RUST_LOG` env var.
+    /// Accepts `off`, `error`, `warn`, `info`, `debug`, or `trace`.
+    /// Target-specific `RUST_LOG` directives are parsed for their most verbose
+    /// level but are not target-filtered.
     #[serde(default = "default_log_level")]
     pub level: String,
 }
@@ -265,7 +286,7 @@ pub struct TunnelConfig {
     /// Seconds between heartbeat pings (client mode, default 5).
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval_secs: u64,
-    /// Seconds before a device is considered dead if no heartbeat (relay mode, default 20).
+    /// Seconds before a device is considered dead if no heartbeat (relay mode, default 45).
     #[serde(default = "default_heartbeat_timeout")]
     pub heartbeat_timeout_secs: u64,
     /// Default proxy request timeout in seconds (relay mode, default 60).
@@ -277,6 +298,13 @@ pub struct TunnelConfig {
     /// Interface names are resolved to their current IPv4 on each connect
     /// attempt, surviving DHCP/carrier IP changes across reboots.
     pub bind_address: Option<String>,
+    /// Optional PEM file with additional root CA certificates for `wss://`
+    /// tunnel client connections. Public webpki roots remain enabled.
+    pub tls_ca_file: Option<String>,
+    /// Optional lowercase or colon-separated SHA-256 pin for the relay leaf
+    /// certificate DER. Checked after the normal rustls certificate validation
+    /// and before device registration.
+    pub tls_server_cert_sha256: Option<String>,
 }
 
 /// GPS/location configuration.
@@ -295,8 +323,7 @@ pub struct TunnelConfig {
 pub struct GpsConfig {
     /// Hint for the AT command serial device (e.g. `/dev/ttyUSB2`).
     ///
-    /// Legacy provider hint. New configs should use `[comms].device`; this
-    /// field remains as a fallback for existing `sctl.toml` files.
+    /// Provider device hint. `[comms].device` takes precedence when set.
     #[serde(default)]
     pub device: Option<String>,
     /// Seconds between GPS polls (default 30).
@@ -326,14 +353,17 @@ pub struct GpsConfig {
 pub struct LteConfig {
     /// Hint for the AT command serial device (e.g. `/dev/ttyUSB2`).
     ///
-    /// Legacy provider hint. New configs should use `[comms].device`; this
-    /// field remains as a fallback for existing `sctl.toml` files.
+    /// Provider device hint. `[comms].device` takes precedence when set.
     #[serde(default)]
     pub device: Option<String>,
     /// Seconds between LTE signal polls (default 60).
     #[serde(default = "default_lte_poll_interval")]
     pub poll_interval_secs: u64,
-    /// Enable LTE watchdog for automatic modem recovery (default true).
+    /// Enable the LTE watchdog for autonomous modem recovery (default true).
+    ///
+    /// The watchdog only acts when the tunnel is down and grace has elapsed; it
+    /// diagnoses the fault from kernel truth and picks the matching recovery.
+    /// USB power-cycle stays opt-in behind `max_escalation_level >= 4`.
     #[serde(default = "default_lte_watchdog")]
     pub watchdog: bool,
     /// Network interface name for the LTE modem (default `wwan0`).
@@ -350,40 +380,18 @@ pub struct LteConfig {
     /// Custom command to restart the LTE interface (overrides auto-detection).
     /// E.g. `"ifdown wwan && sleep 2 && ifup wwan"`.
     pub interface_restart_cmd: Option<String>,
-    /// Enable AT/QMI coexistence testing (diagnostic mode). When true and data
-    /// path is active, the poller runs graduated AT command tests to determine
-    /// what's safe. Default false.
-    #[serde(default)]
-    pub at_test_mode: bool,
-    /// Seconds between signal polls when the LTE data path is active (default 120).
-    /// In gentle mode only 2 essential commands are sent with spacing.
-    #[serde(default = "default_active_poll_interval")]
-    pub active_poll_interval_secs: u64,
-    /// Milliseconds to sleep between AT commands when data path is active (default 1000).
-    #[serde(default = "default_inter_command_delay")]
-    pub inter_command_delay_ms: u64,
-    /// APN override. When set, this APN is used on SIM change instead of auto-detection.
-    /// Auto-detection tries: modem PDP context (`AT+CGDCONT?`) → built-in IMSI database.
-    pub apn: Option<String>,
     /// Seconds the tunnel must be down before the watchdog takes any action (default 120).
     /// Higher values prevent interference during natural roaming handovers.
     #[serde(default = "default_watchdog_grace")]
     pub watchdog_grace_secs: u64,
-    /// Maximum action level the watchdog is allowed to take automatically:
-    ///
-    /// - `1` — soft (re-enable QMI, AT+COPS=0)
-    /// - `2` — airplane-mode cycle (AT+CFUN=0/1)
-    /// - `3` — interface restart (`ifdown`/`ifup`, `ubus call network reload`)
-    /// - `4` — USB power-cycle (deauthorize/reauthorize sysfs)
-    ///
-    /// Default `3` — USB cycle is OPT-IN because re-enumeration can shift the
-    /// `ttyUSB*` minor number and is not idempotent. Manual cycle is always
-    /// available via `POST /api/lte/usb_cycle`.
+    /// USB power-cycle is opt-in: the watchdog only deauthorizes/reauthorizes
+    /// the modem's USB port when this is `>= 4`. Default `3`. Re-enumeration can
+    /// shift the `ttyUSB*` minor and is not idempotent, so it stays the action
+    /// of last resort. Manual `POST /api/lte/usb_cycle` ignores this.
     #[serde(default = "default_max_escalation_level")]
     pub max_escalation_level: u8,
     /// Evidence requirements that gate an automatic USB power-cycle even when
-    /// `max_escalation_level >= 4`. Applies only to the auto path; manual
-    /// cycle bypasses this gate.
+    /// `max_escalation_level >= 4`. Applies only to the auto path.
     #[serde(default)]
     pub usb_cycle_evidence: UsbCycleEvidence,
     /// Seconds of `NotRegistered` to tolerate before treating as actionable
@@ -391,45 +399,26 @@ pub struct LteConfig {
     /// the watchdog interfering.
     #[serde(default = "default_notregistered_grace")]
     pub notregistered_grace_secs: u64,
-    /// What to do when symptom evidence is ambiguous (`Symptom::Unknown`).
-    /// Both knobs default to `false` — diagnose-and-wait rather than mutate.
-    #[serde(default)]
-    pub unknown_action: UnknownAction,
 }
 
 /// Evidence gates for the automatic USB power-cycle path. Manual
-/// `POST /api/lte/usb_cycle` ignores these.
+/// `POST /api/lte/usb_cycle` ignores these. A USB cycle additionally requires
+/// the modem to still be present in sysfs (so re-enumeration can actually
+/// help — if it has vanished the watchdog declares `ModemGone` instead).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UsbCycleEvidence {
     /// Minimum sustained seconds of the qualifying symptom before USB cycle
     /// is allowed (default 600 = 10 minutes).
     #[serde(default = "default_evidence_sustained")]
     pub min_sustained_secs: u64,
-    /// Require sysfs corroboration that the modem is absent or has been at
-    /// the same port for the full sustained window (default true).
-    #[serde(default = "default_evidence_require_sysfs")]
-    pub require_sysfs_absent: bool,
 }
 
 impl Default for UsbCycleEvidence {
     fn default() -> Self {
         Self {
             min_sustained_secs: default_evidence_sustained(),
-            require_sysfs_absent: default_evidence_require_sysfs(),
         }
     }
-}
-
-/// What to do when symptom evidence is ambiguous. Defaults are both false —
-/// the watchdog logs the diagnosis and waits for clearer evidence.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct UnknownAction {
-    /// Allow airplane-mode cycle on Unknown symptom (default false).
-    #[serde(default)]
-    pub airplane_cycle: bool,
-    /// Allow escalation past airplane-cycle on Unknown symptom (default false).
-    #[serde(default)]
-    pub escalate: bool,
 }
 
 fn default_lte_poll_interval() -> u64 {
@@ -450,12 +439,6 @@ fn default_comms_request_timeout() -> u64 {
 fn default_lte_interface() -> String {
     "wwan0".to_string()
 }
-fn default_active_poll_interval() -> u64 {
-    120
-}
-fn default_inter_command_delay() -> u64 {
-    1000
-}
 fn default_watchdog_grace() -> u64 {
     120
 }
@@ -467,9 +450,6 @@ fn default_notregistered_grace() -> u64 {
 }
 fn default_evidence_sustained() -> u64 {
     600
-}
-fn default_evidence_require_sysfs() -> bool {
-    true
 }
 
 fn default_listen() -> String {
@@ -516,6 +496,9 @@ fn default_data_dir() -> String {
 }
 fn default_journal_enabled() -> bool {
     true
+}
+fn default_openwrt_persistent_log_size_kb() -> u32 {
+    128
 }
 fn default_journal_fsync_interval_ms() -> u64 {
     5000
@@ -594,6 +577,8 @@ impl Default for ServerConfig {
             session_buffer_size: default_session_buffer_size(),
             data_dir: default_data_dir(),
             journal_enabled: default_journal_enabled(),
+            openwrt_persistent_logs: false,
+            openwrt_persistent_log_size_kb: default_openwrt_persistent_log_size_kb(),
             journal_fsync_interval_ms: default_journal_fsync_interval_ms(),
             journal_max_age_hours: default_journal_max_age_hours(),
             activity_log_max_entries: default_activity_log_max_entries(),
@@ -710,6 +695,11 @@ impl Config {
                             "tunnel.url '{url}' must start with ws:// or wss://"
                         ));
                     }
+                    if url.starts_with("ws://")
+                        && (tc.tls_ca_file.is_some() || tc.tls_server_cert_sha256.is_some())
+                    {
+                        errors.push("tunnel TLS options require a wss:// tunnel.url".to_string());
+                    }
                 }
             }
             if tc.relay && tc.tunnel_key.len() < 8 {
@@ -718,6 +708,14 @@ impl Config {
                     tc.tunnel_key.len()
                 ));
             }
+        }
+
+        if (self.gps.is_some() || self.lte.is_some())
+            && self.comms.as_ref().is_none_or(CommsConfig::is_disabled)
+        {
+            errors.push(
+                "[gps] or [lte] requires an enabled [comms] plugin configuration".to_string(),
+            );
         }
 
         errors
@@ -771,8 +769,8 @@ impl Config {
         config
     }
 
-    /// Effective external comms provider, including legacy `[gps]`/`[lte]`
-    /// configs that predate the provider helper boundary.
+    /// Effective external comms provider. Hardware-backed GPS/LTE configs must
+    /// declare `[comms]`; relay/VPS/server-only installs omit it.
     #[must_use]
     pub fn effective_comms_config(&self) -> Option<CommsConfig> {
         if let Some(ref comms) = self.comms {
@@ -781,22 +779,7 @@ impl Config {
             }
             return Some(comms.clone());
         }
-
-        if self.gps.is_some() || self.lte.is_some() {
-            Some(CommsConfig {
-                provider: default_comms_provider(),
-                command: None,
-                device: self
-                    .lte
-                    .as_ref()
-                    .and_then(|c| c.device.clone())
-                    .or_else(|| self.gps.as_ref().and_then(|c| c.device.clone())),
-                startup_timeout_secs: default_comms_startup_timeout(),
-                request_timeout_secs: default_comms_request_timeout(),
-            })
-        } else {
-            None
-        }
+        None
     }
 
     /// Effective client heartbeat interval after applying safety clamps.

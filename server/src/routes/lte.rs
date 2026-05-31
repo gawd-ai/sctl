@@ -3,7 +3,7 @@
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
-use sctl_comms_protocol::{capabilities, methods};
+use sctl_comms_abi::{capabilities, methods};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::info;
@@ -35,12 +35,21 @@ pub async fn lte(
     let Some(comms_state) = &state.comms_state else {
         return comms_unavailable();
     };
-    let snapshot = comms_state
-        .lock()
-        .await
-        .lte
-        .clone()
-        .unwrap_or_else(crate::comms::starting_lte_response);
+    let (mut snapshot, watchdog) = {
+        let guard = comms_state.lock().await;
+        (
+            guard
+                .lte
+                .clone()
+                .unwrap_or_else(crate::comms::starting_lte_response),
+            guard.watchdog.clone(),
+        )
+    };
+    // The plugin emits `"watchdog": null`; the watchdog lives server-side, so
+    // overlay its snapshot here.
+    if let (Some(obj), Some(wd)) = (snapshot.as_object_mut(), watchdog) {
+        obj.insert("watchdog".to_string(), wd);
+    }
 
     Ok(Json(snapshot))
 }

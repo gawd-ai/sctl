@@ -59,6 +59,8 @@ max_batch_size = 20                 # Max commands per batch request
 max_file_size = 52428800            # Max file read/write/delete size (50 MB)
 data_dir = "/var/lib/sctl"          # Persistent data (journals, etc)
 journal_enabled = true              # Disk-backed output journaling
+openwrt_persistent_logs = false     # Leave OpenWrt logd RAM-only by default
+openwrt_persistent_log_size_kb = 128 # Local log cap if persistence is enabled
 journal_fsync_interval_ms = 5000    # Batch fsync interval (0 = every write)
 journal_max_age_hours = 72          # Auto-delete journals older than this
 default_terminal_rows = 24          # Default PTY rows
@@ -75,7 +77,7 @@ default_working_dir = "/"           # Default working directory
 serial = "SCTL-0000-DEV-001"       # Device serial (env: SCTL_DEVICE_SERIAL)
 
 [logging]
-level = "info"                      # Log filter (env: RUST_LOG)
+level = "info"                      # Log level: off/error/warn/info/debug/trace (env: RUST_LOG)
 
 [supervisor]
 max_backoff = 60                    # Max seconds between restart attempts
@@ -90,13 +92,15 @@ reconnect_delay_secs = 2            # Client mode initial backoff
 reconnect_max_delay_secs = 30       # Client mode max backoff
 heartbeat_interval_secs = 15        # Client mode ping interval; >15s is clamped for LTE/CGNAT safety
 bind_address = "wwan0"              # Client mode: bind to interface or IP (LTE failover)
+tls_ca_file = "/etc/sctl/relay-ca.pem"  # Optional extra root CA for wss:// client mode
+tls_server_cert_sha256 = "..."          # Optional relay leaf cert SHA-256 pin
 heartbeat_timeout_secs = 45         # Relay mode: seconds before device eviction
 tunnel_proxy_timeout_secs = 60      # Relay mode: proxy request timeout
 
-# Optional — external comms provider helper. Omit on relay/VPS/server-only installs.
+# Optional — external comms provider plugin. Omit on relay/VPS/server-only installs.
 [comms]
 provider = "quectel-at"
-command = "/usr/libexec/sctl/comms/sctl-comms-quectel"
+library = "/usr/lib/sctl/comms/libsctl_comms_quectel.so"
 device = "/dev/ttyUSB2"             # Optional hint; autodetect is preferred when available
 startup_timeout_secs = 15
 request_timeout_secs = 20
@@ -669,6 +673,9 @@ tunnel_key = "shared-secret"
 [tunnel]
 tunnel_key = "shared-secret"
 url = "wss://relay.example.com/api/tunnel/register"
+# Optional for private relay PKI or certificate pinning:
+# tls_ca_file = "/etc/sctl/relay-ca.pem"
+# tls_server_cert_sha256 = "ab12..."
 ```
 
 Clients just use a different base URL. No changes to mcp-sctl or sctlin:

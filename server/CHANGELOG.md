@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Performance
 
 - **Async filesystem in polling loops** — moved LTE poller, watchdog history, and modem-state log file work off Tokio worker threads.
+- **Smaller release binary** — removed vendored OpenSSL and the duplicate websocket stack, moved tunnel TLS onto direct rustls/ring with optional CA/pin checks, trimmed unused dependency defaults, replaced the two-command Clap CLI with a tiny parser, simplified release logging, and tuned the release profile for size.
 - **Relay broadcast fan-out** — reduced hot-path allocations by sharing relay payloads across client dispatch with `Arc`.
 - **Priority queue capacity** — increased relay control-channel capacity and added warning logs for backpressure visibility.
 - **LTE band scan extraction** — moved band-scan orchestration into its own module while preserving the public API.
@@ -17,7 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **External comms provider helpers** — GPS/LTE hardware support now runs through a helper-process protocol. The main `sctl` binary no longer carries Quectel modem code; `sctl-comms-quectel` is deployed only to targets that need the current LTE/GNSS provider.
+- **External comms provider plugins** — GPS/LTE hardware support now runs through C-ABI shared libraries. The main `sctl` binary no longer carries Quectel modem code; `libsctl_comms_quectel.so` is deployed only to targets that need the current LTE/GNSS provider.
+- **Opt-in OpenWrt persistent logs** — embedded devices keep logd RAM-only by default. Operators can enable bounded local post-crash logs with `openwrt_persistent_logs = true` and `openwrt_persistent_log_size_kb`.
 - **Unified `ApiError` catalog** — route errors now use stable SCREAMING_SNAKE codes and a consistent response shape.
 - **Typed WebSocket server messages** — server-originated WS frames are represented by a tagged enum while preserving the wire format.
 - **Generated TypeScript bindings** — server-owned protocol and API types can be exported for the web client.

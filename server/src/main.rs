@@ -20,6 +20,7 @@ mod sctlin_proxy;
 mod supervisor;
 
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Instant;
@@ -32,19 +33,19 @@ use axum::{
     routing::{delete, get, post},
     Extension, Router,
 };
-use clap::{Parser, Subcommand};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn};
+use tracing::{info, warn, Level};
+use tracing_subscriber::filter::LevelFilter;
 
 use sctl::{
     activity::ActivityLog,
     auth::ApiKey,
     comms,
     config::Config,
-    infra, routes, sessions,
+    infra, lte_watchdog, routes, sessions,
     sessions::SessionManager,
     state::{AppState, TunnelStats},
     tunnel, ws, ExecResultsCache,
@@ -52,62 +53,183 @@ use sctl::{
 
 use sctl::VERSION;
 
-/// Remote shell control service for Linux devices.
-#[derive(Parser)]
-#[command(name = "sctl", version = VERSION)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Run the HTTP/WS server (default when no subcommand given).
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
     Serve {
-        /// Path to TOML config file.
-        #[arg(long)]
         config: Option<String>,
-        /// Skip the process singleton lock (used internally by supervisor).
-        #[arg(long, hide = true)]
         skip_lock: bool,
     },
-    /// Run as supervisor: starts server and restarts on crash.
     Supervise {
-        /// Path to TOML config file.
-        #[arg(long)]
         config: Option<String>,
     },
+    PrintHelp(&'static str),
+    PrintVersion,
 }
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    let command = match parse_cli(std::env::args().skip(1)) {
+        Ok(command) => command,
+        Err(message) => {
+            eprintln!("{message}\n\n{}", main_help());
+            std::process::exit(2);
+        }
+    };
 
-    match cli.command {
-        Some(Commands::Supervise { config }) => {
+    match command {
+        Command::Supervise { config } => {
             run_supervisor_mode(config.as_deref()).await;
         }
-        Some(Commands::Serve { config, skip_lock }) => {
+        Command::Serve { config, skip_lock } => {
             run_server(config.as_deref(), skip_lock).await;
         }
-        None => {
-            // Backward compat: no subcommand but --config may be passed
-            let args: Vec<String> = std::env::args().collect();
-            let config_path = args
-                .windows(2)
-                .find(|w| w[0] == "--config")
-                .map(|w| w[1].clone());
-            run_server(config_path.as_deref(), false).await;
+        Command::PrintHelp(help) => {
+            println!("{help}");
+        }
+        Command::PrintVersion => {
+            println!("sctl {VERSION}");
         }
     }
 }
 
-/// Install a panic hook that persists the panic trace to disk for post-mortem.
+fn parse_cli<I>(args: I) -> Result<Command, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args: Vec<String> = args.into_iter().collect();
+    if args.is_empty() {
+        return Ok(Command::Serve {
+            config: None,
+            skip_lock: false,
+        });
+    }
+
+    match args[0].as_str() {
+        "-h" | "--help" | "help" => {
+            if args.len() == 1 {
+                return Ok(Command::PrintHelp(main_help()));
+            }
+            match args[1].as_str() {
+                "serve" => Ok(Command::PrintHelp(serve_help())),
+                "supervise" => Ok(Command::PrintHelp(supervise_help())),
+                other => Err(format!("unknown help topic '{other}'")),
+            }
+        }
+        "-V" | "--version" => Ok(Command::PrintVersion),
+        "serve" => {
+            args.remove(0);
+            parse_serve_args(args)
+        }
+        "supervise" => {
+            args.remove(0);
+            parse_supervise_args(args)
+        }
+        _ => parse_serve_args(args),
+    }
+}
+
+fn parse_serve_args(args: Vec<String>) -> Result<Command, String> {
+    let mut config = None;
+    let mut skip_lock = false;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(Command::PrintHelp(serve_help())),
+            "--config" => config = Some(next_arg(&mut iter, "--config")?),
+            "--skip-lock" => skip_lock = true,
+            other if other.starts_with("--config=") => {
+                config = Some(other["--config=".len()..].to_string());
+            }
+            other => return Err(format!("unknown serve argument '{other}'")),
+        }
+    }
+    Ok(Command::Serve { config, skip_lock })
+}
+
+fn parse_supervise_args(args: Vec<String>) -> Result<Command, String> {
+    let mut config = None;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(Command::PrintHelp(supervise_help())),
+            "--config" => config = Some(next_arg(&mut iter, "--config")?),
+            other if other.starts_with("--config=") => {
+                config = Some(other["--config=".len()..].to_string());
+            }
+            other => return Err(format!("unknown supervise argument '{other}'")),
+        }
+    }
+    Ok(Command::Supervise { config })
+}
+
+fn next_arg<I>(iter: &mut I, flag: &str) -> Result<String, String>
+where
+    I: Iterator<Item = String>,
+{
+    iter.next()
+        .ok_or_else(|| format!("missing value for {flag}"))
+}
+
+fn main_help() -> &'static str {
+    "Remote shell control service for Linux devices\n\n\
+Usage: sctl [COMMAND] [OPTIONS]\n\n\
+Commands:\n  serve      Run the HTTP/WS server (default when no subcommand is given)\n  supervise  Start and monitor the server process\n  help       Print this message or the help for a command\n\n\
+Options:\n  -h, --help     Print help\n  -V, --version  Print version"
+}
+
+fn serve_help() -> &'static str {
+    "Run the HTTP/WS server\n\n\
+Usage: sctl serve [OPTIONS]\n       sctl [OPTIONS]\n\n\
+Options:\n      --config <PATH>  Path to TOML config file\n  -h, --help           Print help"
+}
+
+fn supervise_help() -> &'static str {
+    "Start and monitor the server process\n\n\
+Usage: sctl supervise [OPTIONS]\n\n\
+Options:\n      --config <PATH>  Path to TOML config file\n  -h, --help           Print help"
+}
+
+fn parse_log_level(value: &str) -> LevelFilter {
+    value
+        .split(',')
+        .filter_map(|directive| {
+            let level = directive
+                .rsplit_once('=')
+                .map_or(directive, |(_, level)| level)
+                .trim();
+            match level.to_ascii_lowercase().as_str() {
+                "off" => Some(LevelFilter::OFF),
+                "error" => Some(LevelFilter::ERROR),
+                "warn" | "warning" => Some(LevelFilter::WARN),
+                "info" => Some(LevelFilter::INFO),
+                "debug" => Some(LevelFilter::DEBUG),
+                "trace" => Some(LevelFilter::TRACE),
+                _ => Level::from_str(level).ok().map(LevelFilter::from_level),
+            }
+        })
+        .max_by_key(|level| match *level {
+            LevelFilter::OFF => 0,
+            LevelFilter::ERROR => 1,
+            LevelFilter::WARN => 2,
+            LevelFilter::INFO => 3,
+            LevelFilter::DEBUG => 4,
+            LevelFilter::TRACE => 5,
+        })
+        .unwrap_or(LevelFilter::INFO)
+}
+
+fn init_logging(level: &str) {
+    tracing_subscriber::fmt()
+        .with_max_level(parse_log_level(level))
+        .init();
+}
+
+/// Install a panic hook that persists a panic marker to disk for post-mortem.
 ///
-/// Writes `<data_dir>/last_panic.log` with the panic message, thread name, and
-/// backtrace. Keeps the default tracing output (so logread still shows it).
+/// Writes `<data_dir>/last_panic.log` with the timestamp, thread name, and the
+/// panic message + location (no full backtrace). Keeps the default tracing
+/// output (so logread still shows it).
 fn install_panic_hook(data_dir: &str) {
-    use std::backtrace::Backtrace;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let log_path = std::path::Path::new(data_dir).join("last_panic.log");
@@ -119,9 +241,7 @@ fn install_panic_hook(data_dir: &str) {
             .as_secs();
         let thread = std::thread::current();
         let thread_name = thread.name().unwrap_or("<unnamed>");
-        let bt = Backtrace::force_capture();
-        let payload =
-            format!("panic at unix={ts}\nthread={thread_name}\n{info}\nbacktrace:\n{bt}\n");
+        let payload = format!("panic at unix={ts}\nthread={thread_name}\n{info}\n");
         // Best-effort — never panic inside the panic hook.
         let _ = std::fs::write(&log_path, &payload);
         prev(info);
@@ -160,9 +280,8 @@ fn acquire_process_lock(data_dir: &str) -> std::fs::File {
 async fn run_supervisor_mode(config_path: Option<&str>) -> ! {
     let config = Config::load(config_path);
 
-    // Initialize tracing for supervisor
     let log_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| config.logging.level.clone());
-    tracing_subscriber::fmt().with_env_filter(log_filter).init();
+    init_logging(&log_filter);
 
     // Acquire lock at supervisor level — prevents two supervisors from running
     #[cfg(unix)]
@@ -176,13 +295,11 @@ async fn run_supervisor_mode(config_path: Option<&str>) -> ! {
 async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     let config = Config::load(config_path);
 
-    // Initialize tracing
     let log_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| config.logging.level.clone());
-    tracing_subscriber::fmt().with_env_filter(log_filter).init();
+    init_logging(&log_filter);
 
     // Install panic hook early so panics in any spawned subsystem leave a
-    // persisted trace on disk for post-mortem. Without this, the supervisor
-    // restarts blindly and the underlying cause is lost.
+    // persisted marker on disk for post-mortem.
     install_panic_hook(&config.server.data_dir);
 
     // Honor safe-mode flag if the supervisor wrote one (crash-loop). When set
@@ -221,8 +338,12 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     info!("Device serial: {}", config.device.serial);
     info!("Listening on {}", config.server.listen);
 
-    // Best-effort: self-heal persistent log capture on OpenWrt. No-op elsewhere.
-    sctl::platform::openwrt::ensure_persistent_logs().await;
+    // Best-effort OpenWrt logd setup. Disabled by default on small flash devices.
+    sctl::platform::openwrt::ensure_persistent_logs(
+        config.server.openwrt_persistent_logs,
+        config.server.openwrt_persistent_log_size_kb,
+    )
+    .await;
 
     if let Some(tc) = &config.tunnel {
         if !tc.relay && tc.heartbeat_interval_secs > 15 {
@@ -460,9 +581,9 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         info!("Comms provider skipped in safe mode");
     } else if let Some(comms_cfg) = state.config.effective_comms_config() {
         info!(
-            "Starting comms provider '{}' via {}",
+            "Starting comms provider '{}' from {}",
             comms_cfg.provider,
-            comms_cfg.effective_command()
+            comms_cfg.effective_library()
         );
         match comms::start_provider(&state.config, &comms_cfg).await {
             Ok((client, comms_snapshot)) => {
@@ -486,6 +607,20 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
                     state.tunnel_stats.clone(),
                     notify.clone(),
                 ));
+                // Autonomous LTE recovery. Shares the serial port with the
+                // poller via the same host lock; only acts when the tunnel is
+                // down and grace has elapsed.
+                if state.config.lte.as_ref().is_some_and(|l| l.watchdog) {
+                    if let Some(lte_cfg) = state.config.lte.clone() {
+                        lte_watchdog::spawn_watchdog(
+                            client.clone(),
+                            comms_state.clone(),
+                            state.tunnel_stats.clone(),
+                            lte_cfg,
+                            state.config.server.data_dir.clone(),
+                        );
+                    }
+                }
                 state.comms_client = Some(client);
                 state.comms_state = Some(comms_state);
                 state.comms_poll_notify = Some(notify);
@@ -698,7 +833,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     if let Some(ref client) = state.comms_client {
         let _ = client
             .call(
-                sctl_comms_protocol::methods::LOCATION_DISABLE,
+                sctl_comms_abi::methods::LOCATION_DISABLE,
                 serde_json::json!({}),
             )
             .await;
@@ -714,4 +849,88 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
 
     state.session_manager.kill_all().await;
     info!("Goodbye");
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{parse_cli, parse_log_level, serve_help, Command};
+    use tracing_subscriber::filter::LevelFilter;
+
+    fn parse(args: &[&str]) -> Result<Command, String> {
+        parse_cli(args.iter().map(|arg| (*arg).to_string()))
+    }
+
+    #[test]
+    fn no_args_defaults_to_serve() {
+        assert_eq!(
+            parse(&[]),
+            Ok(Command::Serve {
+                config: None,
+                skip_lock: false,
+            })
+        );
+    }
+
+    #[test]
+    fn top_level_config_defaults_to_serve() {
+        assert_eq!(
+            parse(&["--config", "/etc/sctl.toml"]),
+            Ok(Command::Serve {
+                config: Some("/etc/sctl.toml".to_string()),
+                skip_lock: false,
+            })
+        );
+    }
+
+    #[test]
+    fn serve_accepts_config_equals_and_skip_lock() {
+        assert_eq!(
+            parse(&["serve", "--config=/etc/sctl.toml", "--skip-lock"]),
+            Ok(Command::Serve {
+                config: Some("/etc/sctl.toml".to_string()),
+                skip_lock: true,
+            })
+        );
+    }
+
+    #[test]
+    fn supervise_accepts_config() {
+        assert_eq!(
+            parse(&["supervise", "--config", "/etc/sctl.toml"]),
+            Ok(Command::Supervise {
+                config: Some("/etc/sctl.toml".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn serve_help_is_available() {
+        assert_eq!(
+            parse(&["help", "serve"]),
+            Ok(Command::PrintHelp(serve_help()))
+        );
+    }
+
+    #[test]
+    fn unknown_arg_is_an_error() {
+        assert!(parse(&["serve", "--bogus"]).is_err());
+    }
+
+    #[test]
+    fn rustls_crypto_provider_is_available_for_wss() {
+        let _config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+    }
+
+    #[test]
+    fn log_level_parser_accepts_plain_and_directive_style() {
+        assert_eq!(parse_log_level("debug"), LevelFilter::DEBUG);
+        assert_eq!(
+            parse_log_level("sctl=debug,tower_http=warn"),
+            LevelFilter::DEBUG
+        );
+        assert_eq!(parse_log_level("off"), LevelFilter::OFF);
+        assert_eq!(parse_log_level("not-a-level"), LevelFilter::INFO);
+    }
 }

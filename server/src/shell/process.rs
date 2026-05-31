@@ -106,7 +106,7 @@ pub fn spawn_command_pgroup(
 /// Execute a one-shot command via `<shell> -c "<command>"` and capture output.
 ///
 /// Stdout and stderr are read concurrently (to avoid pipe deadlock) and each
-/// capped at [`MAX_EXEC_OUTPUT`] bytes. The entire operation is wrapped in a
+/// capped at `MAX_EXEC_OUTPUT` bytes. The entire operation is wrapped in a
 /// `tokio::time::timeout`.
 ///
 /// # Environment variables
@@ -218,9 +218,9 @@ async fn read_capped(reader: &mut (impl tokio::io::AsyncRead + Unpin), max_bytes
 pub struct ExecResult {
     /// Process exit code, or `-1` if the code was unavailable (e.g. killed by signal).
     pub exit_code: i32,
-    /// Captured stdout (capped at [`MAX_EXEC_OUTPUT`], lossy UTF-8 conversion).
+    /// Captured stdout (capped at `MAX_EXEC_OUTPUT`, lossy UTF-8 conversion).
     pub stdout: String,
-    /// Captured stderr (capped at [`MAX_EXEC_OUTPUT`], lossy UTF-8 conversion).
+    /// Captured stderr (capped at `MAX_EXEC_OUTPUT`, lossy UTF-8 conversion).
     pub stderr: String,
     /// Wall-clock duration of the command in milliseconds.
     pub duration_ms: u64,

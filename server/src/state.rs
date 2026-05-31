@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,6 +12,7 @@ use tokio::sync::{broadcast, Mutex};
 use tracing::warn;
 
 use crate::activity::{ActivityLog, ExecResultsCache};
+use crate::atomic::AtomicU64;
 use crate::comms::{CommsClient, CommsState};
 use crate::config::Config;
 use crate::gawdxfer::manager::TransferManager;

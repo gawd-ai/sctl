@@ -14,37 +14,41 @@ rust-version = "1.82"
 
 [features]
 default = []
-quectel-driver = []
 
 [dependencies]
 axum = { version = "0.8", features = ["ws", "multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "signal", "sync", "time", "macros", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sctl-comms-protocol = { path = "../crates/sctl-comms-protocol" }
-toml = "0.8"
+sctl-comms-abi = { path = "../crates/sctl-comms-abi" }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
-uuid = { version = "1", features = ["v4"] }
-futures = "0.3"
-base64 = "0.22"
+uuid = { version = "1", default-features = false, features = ["v4"] }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 libc = "0.2"
 nix = { version = "0.29", features = ["term", "signal", "process", "fs"] }
 sha2 = "0.10"
-clap = { version = "4", features = ["derive"] }
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"
-tokio-tungstenite = { version = "0.26", features = ["native-tls-vendored"] }
+tokio-tungstenite = "0.28"
+# The tunnel client performs the rustls handshake directly so it can add CA/pin checks.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+tokio-rustls = { version = "0.26", default-features = false }
+webpki-roots = "1"
 futures-util = "0.3"
 serde_yaml = "0.9"
 tokio-util = { version = "0.7", features = ["io"] }
+libloading = "0.8"
 
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 lto = true
+codegen-units = 1
 strip = true
 panic = "abort"
 

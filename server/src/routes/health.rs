@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use axum::{extract::State, Json};
 use serde_json::{json, Value};
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::AppState;
 
@@ -16,7 +16,7 @@ use crate::AppState;
 pub async fn health(State(state): State<AppState>) -> Json<Value> {
     let start = Instant::now();
     let has_lte = state.config.lte.is_some();
-    info!(has_lte, "api.health: begin");
+    debug!(has_lte, "api.health: begin");
 
     let uptime = state.start_time.elapsed().as_secs();
     let sessions = state.session_manager.session_count().await;
@@ -227,6 +227,6 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
             lte_lock_wait_ms, "api.health: slow LTE state lock acquisition"
         );
     }
-    info!(total_ms, lte_lock_wait_ms, "api.health: end");
+    debug!(total_ms, lte_lock_wait_ms, "api.health: end");
     Json(resp)
 }

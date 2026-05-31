@@ -38,20 +38,15 @@
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ".", env!("SCTL_BUILD_NUMBER"));
 
 pub mod activity;
+pub mod at;
+pub mod atomic;
 pub mod auth;
 pub mod comms;
 pub mod config;
 pub mod error;
 pub mod gawdxfer;
-#[cfg(feature = "quectel-driver")]
-pub mod gps;
 pub mod infra;
-#[cfg(feature = "quectel-driver")]
-pub mod lte;
-#[cfg(feature = "quectel-driver")]
 pub mod lte_watchdog;
-#[cfg(feature = "quectel-driver")]
-pub mod modem;
 pub mod platform;
 pub mod routes;
 pub mod sessions;

@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -19,11 +19,13 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use futures::{SinkExt, StreamExt};
+use futures_util::{future, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock};
 use tracing::{info, info_span, warn, Instrument};
+
+use crate::atomic::AtomicU64;
 
 use super::{decode_binary_frame, encode_binary_frame, TunnelMessage, TunnelResponse};
 
@@ -1697,7 +1699,7 @@ async fn proxy_info(
         futures.push(tunnel_request_json(&state, &serial, msg, 10));
     }
 
-    let results = futures::future::join_all(futures).await;
+    let results = future::join_all(futures).await;
     for result in results {
         let response = result?;
         let status = response["status"].as_u64().unwrap_or(200);

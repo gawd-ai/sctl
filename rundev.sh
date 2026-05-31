@@ -93,12 +93,13 @@ RELAY_REMOTE_CONFIG="/etc/sctl/relay.toml"
 # Binaries (release for speed, debug takes too long on PTY-heavy sessions)
 SCTL_BIN="$SCTL_DIR/target/release/sctl"
 MCP_BIN="$MCP_DIR/target/release/mcp-sctl"
-QUECTEL_DRIVER_BIN_NAME="sctl-comms-quectel"
-COMMS_REMOTE_DIR="/usr/libexec/sctl/comms"
+QUECTEL_DRIVER_LIB_NAME="libsctl_comms_quectel.so"
+COMMS_REMOTE_DIR="/usr/lib/sctl/comms"
 
 # Architecture → cross-compile target mapping
 declare -A ARCH_TARGET=(
     [riscv64]=riscv64gc-unknown-linux-musl
+    [mipsel]=mipsel-unknown-linux-musl
     [armv7l]=armv7-unknown-linux-musleabihf
     [aarch64]=aarch64-unknown-linux-musl
     [x86_64]=native
@@ -625,7 +626,7 @@ device_comms_provider() {
 
     # Local release-prep profiles such as sctl.toml.bpi are authoritative for
     # hardware-backed devices, even if older device metadata says "none".
-    # If a same-name config enables GPS/LTE/comms, deploy the current Quectel helper.
+    # If a same-name config enables GPS/LTE/comms, deploy the current Quectel plugin.
     local local_cfg="$REPO_DIR/sctl.toml.$name"
     if [[ -f "$local_cfg" ]] && grep -Eq '^\[(comms|gps|lte)\]' "$local_cfg"; then
         echo "quectel-at"
@@ -646,9 +647,9 @@ comms_provider_bin() {
             ;;
         quectel-at)
             if [[ "$target" == "native" ]]; then
-                echo "$QUECTEL_DRIVER_DIR/target/release/$QUECTEL_DRIVER_BIN_NAME"
+                echo "$QUECTEL_DRIVER_DIR/target/release/$QUECTEL_DRIVER_LIB_NAME"
             else
-                echo "$QUECTEL_DRIVER_DIR/target/$target/release/$QUECTEL_DRIVER_BIN_NAME"
+                echo "$QUECTEL_DRIVER_DIR/target/$target/release/$QUECTEL_DRIVER_LIB_NAME"
             fi
             ;;
         *)
@@ -686,21 +687,21 @@ build_comms_provider() {
 upload_comms_provider() {
     local provider="$1" arch="$2" host="$3" ssh_opts="$4"
     if [[ "$provider" == "none" || -z "$provider" ]]; then
-        log "No comms provider configured for this device; skipping helper upload"
+        log "No comms provider configured for this device; skipping plugin upload"
         return 0
     fi
 
     local bin_path
     bin_path=$(comms_provider_bin "$provider" "$arch")
-    log "Uploading comms provider $provider to $host..."
-    # scp to a temp name in the comms dir, then same-fs rename into place. A
-    # direct scp over the target truncates it, which fails ETXTBSY if the helper
-    # is already running; rename() over a busy executable is fine (the running
-    # process keeps its now-unlinked inode, the new file is live on next spawn).
+    log "Uploading comms plugin $provider to $host..."
+    # scp to a temp name in the comms dir, then same-fs rename into place.
+    # Renaming over a .so the server has dlopen'd is safe — the running server
+    # keeps the old inode mapped — but the NEW plugin only loads on the next
+    # server start, so a restart must follow (the upgrade paths do this).
     ssh $ssh_opts "root@$host" "mkdir -p '$COMMS_REMOTE_DIR'"
-    scp $ssh_opts "$bin_path" "root@$host:$COMMS_REMOTE_DIR/.$QUECTEL_DRIVER_BIN_NAME.new"
-    ssh $ssh_opts "root@$host" "chmod +x '$COMMS_REMOTE_DIR/.$QUECTEL_DRIVER_BIN_NAME.new' && mv '$COMMS_REMOTE_DIR/.$QUECTEL_DRIVER_BIN_NAME.new' '$COMMS_REMOTE_DIR/$QUECTEL_DRIVER_BIN_NAME'"
-    ok "Comms provider uploaded: $provider"
+    scp $ssh_opts "$bin_path" "root@$host:$COMMS_REMOTE_DIR/.$QUECTEL_DRIVER_LIB_NAME.new"
+    ssh $ssh_opts "root@$host" "chmod 0644 '$COMMS_REMOTE_DIR/.$QUECTEL_DRIVER_LIB_NAME.new' && mv '$COMMS_REMOTE_DIR/.$QUECTEL_DRIVER_LIB_NAME.new' '$COMMS_REMOTE_DIR/$QUECTEL_DRIVER_LIB_NAME'"
+    ok "Comms plugin uploaded: $provider"
 }
 
 # ─── Shared helpers ──────────────────────────────────────────────────
@@ -1812,7 +1813,7 @@ wait_for_device() {
 # Sets global: xfer_id
 # Usage: resilient_stp_init <url> <api_key> <file_size> <chunk_size> <total_chunks> [path] [filename] [mode]
 # Defaults stage to /tmp/sctl-upgrade (0755) — the server-binary upgrade path. The
-# comms-helper path overrides filename so both can ride the same chunked STP upload.
+# comms plugin path overrides filename so both can ride the same chunked STP upload.
 resilient_stp_init() {
     local url="$1" api_key="$2" file_size="$3" chunk_size="$4" total_chunks="$5"
     local path="${6:-/tmp}" filename="${7:-sctl-upgrade}" mode="${8:-0755}"
@@ -1901,39 +1902,39 @@ stp_resume_transfer() {
         -H "Authorization: Bearer $api_key" 2>/dev/null
 }
 
-# Resiliently upload the comms helper to a relay-only device over STP, then place it
-# at $COMMS_REMOTE_DIR/<helper> (+x). Shares resilient_stp_init with the server-binary
+# Resiliently upload the comms plugin to a relay-only device over STP, then place it
+# at $COMMS_REMOTE_DIR/<plugin>. Shares resilient_stp_init with the server-binary
 # path but runs its own chunk loop. NON-FATAL: the sctl binary degrades gracefully when
-# the helper is absent (main.rs:494 — WARN, mgmt plane stays up), so any failure here
+# the plugin is absent (main.rs:494 — WARN, mgmt plane stays up), so any failure here
 # warns and lets the more-critical server upgrade proceed. Staged to /tmp, then moved
 # into place (the comms dir may not exist; STP can't mkdir -p arbitrary parents).
 # Usage: upload_comms_provider_remote <url> <api_key> <provider> <arch>
 upload_comms_provider_remote() {
     local url="$1" api_key="$2" provider="$3" arch="$4"
     if [[ "$provider" == "none" || -z "$provider" ]]; then
-        log "No comms provider for this device; skipping helper upload"
+        log "No comms provider for this device; skipping plugin upload"
         return 0
     fi
 
-    local helper_bin
-    helper_bin=$(comms_provider_bin "$provider" "$arch") || {
-        warn "No helper binary path for provider '$provider'; skipping helper upload"
+    local plugin_lib
+    plugin_lib=$(comms_provider_bin "$provider" "$arch") || {
+        warn "No plugin library path for provider '$provider'; skipping plugin upload"
         return 0
     }
-    if [[ ! -f "$helper_bin" ]]; then
-        warn "Comms helper not built at $helper_bin; skipping helper upload"
+    if [[ ! -f "$plugin_lib" ]]; then
+        warn "Comms plugin not built at $plugin_lib; skipping plugin upload"
         return 0
     fi
 
     local h_size h_chunk h_total
-    h_size=$(stat -c%s "$helper_bin")
+    h_size=$(stat -c%s "$plugin_lib")
     h_chunk=65536
     h_total=$(( (h_size + h_chunk - 1) / h_chunk ))
-    log "Comms helper: $helper_bin ($h_size bytes, $h_total chunks @ 64KiB)"
+    log "Comms plugin: $plugin_lib ($h_size bytes, $h_total chunks @ 64KiB)"
 
     # Init (staged to /tmp; placed into $COMMS_REMOTE_DIR after verification)
-    if ! resilient_stp_init "$url" "$api_key" "$h_size" "$h_chunk" "$h_total" "/tmp" "$QUECTEL_DRIVER_BIN_NAME" "0755"; then
-        warn "Comms helper STP init failed; continuing without helper upload"
+    if ! resilient_stp_init "$url" "$api_key" "$h_size" "$h_chunk" "$h_total" "/tmp" "$QUECTEL_DRIVER_LIB_NAME" "0644"; then
+        warn "Comms plugin STP init failed; continuing without plugin upload"
         return 0
     fi
     local h_xfer="$xfer_id"
@@ -1941,15 +1942,15 @@ upload_comms_provider_remote() {
     local h_idx=0 h_retries=0
     local h_started_at h_budget=3600
     h_started_at=$(date +%s)
-    log "Uploading comms helper ($h_total chunks, non-fatal)..."
+    log "Uploading comms plugin ($h_total chunks, non-fatal)..."
     while [[ $h_idx -lt $h_total ]]; do
         local h_off=$((h_idx * h_chunk)) h_sz=$h_chunk
         if [[ $((h_off + h_sz)) -gt $h_size ]]; then
             h_sz=$((h_size - h_off))
         fi
         local h_hash h_resp h_ok
-        h_hash=$(dd if="$helper_bin" bs=1 skip="$h_off" count="$h_sz" 2>/dev/null | sha256sum | cut -d' ' -f1)
-        h_resp=$(dd if="$helper_bin" bs=1 skip="$h_off" count="$h_sz" 2>/dev/null | \
+        h_hash=$(dd if="$plugin_lib" bs=1 skip="$h_off" count="$h_sz" 2>/dev/null | sha256sum | cut -d' ' -f1)
+        h_resp=$(dd if="$plugin_lib" bs=1 skip="$h_off" count="$h_sz" 2>/dev/null | \
             curl -sf --max-time 8 -X POST "$url/api/stp/chunk/$h_xfer/$h_idx" \
                 -H "Authorization: Bearer $api_key" \
                 -H "Content-Type: application/octet-stream" \
@@ -1957,7 +1958,7 @@ upload_comms_provider_remote() {
                 --data-binary @- 2>/dev/null) || true
         h_ok=$(echo "$h_resp" | jq -r '.ok // false' 2>/dev/null)
         if [[ "$h_ok" == "true" ]]; then
-            printf "\r  helper chunks: %d/%d (retries: %d)  " "$((h_idx + 1))" "$h_total" "$h_retries"
+            printf "\r  plugin chunks: %d/%d (retries: %d)  " "$((h_idx + 1))" "$h_total" "$h_retries"
             h_idx=$((h_idx + 1))
             continue
         fi
@@ -1967,7 +1968,7 @@ upload_comms_provider_remote() {
         h_now=$(date +%s)
         if [[ $((h_now - h_started_at)) -ge $h_budget ]]; then
             echo ""
-            warn "Comms helper upload exceeded ${h_budget}s budget; continuing without helper"
+            warn "Comms plugin upload exceeded ${h_budget}s budget; continuing without plugin"
             curl -sf --max-time 5 -X DELETE "$url/api/stp/$h_xfer" -H "Authorization: Bearer $api_key" >/dev/null 2>&1 || true
             return 0
         fi
@@ -1978,10 +1979,10 @@ upload_comms_provider_remote() {
             -H "Authorization: Bearer $api_key" 2>/dev/null) || h_code="000"
         if [[ "$h_code" == "404" ]]; then
             echo ""
-            warn "Comms helper transfer lost (process restarted?), re-initializing..."
+            warn "Comms plugin transfer lost (process restarted?), re-initializing..."
             h_idx=0
-            if ! resilient_stp_init "$url" "$api_key" "$h_size" "$h_chunk" "$h_total" "/tmp" "$QUECTEL_DRIVER_BIN_NAME" "0755"; then
-                warn "Comms helper re-init failed; continuing without helper"
+            if ! resilient_stp_init "$url" "$api_key" "$h_size" "$h_chunk" "$h_total" "/tmp" "$QUECTEL_DRIVER_LIB_NAME" "0644"; then
+                warn "Comms plugin re-init failed; continuing without plugin"
                 return 0
             fi
             h_xfer="$xfer_id"
@@ -1989,10 +1990,10 @@ upload_comms_provider_remote() {
         fi
 
         # Connection dropped — wait for next window, resume if paused, retry same chunk
-        printf "\n  helper chunk %d failed, waiting for reconnection... " "$h_idx"
+        printf "\n  plugin chunk %d failed, waiting for reconnection... " "$h_idx"
         if ! wait_for_device "$url" 360 quiet; then
             echo ""
-            warn "Device unreachable during helper upload; continuing without helper"
+            warn "Device unreachable during plugin upload; continuing without plugin"
             return 0
         fi
         printf "reconnected\n"
@@ -2014,7 +2015,7 @@ upload_comms_provider_remote() {
                 -H "Authorization: Bearer $api_key" 2>/dev/null | jq -r '.phase // empty' 2>/dev/null)
             [[ "$h_verify" == "complete" ]] && break
             if [[ "$h_verify" == "failed" ]]; then
-                warn "Comms helper transfer verification failed; continuing without helper"
+                warn "Comms plugin transfer verification failed; continuing without plugin"
                 return 0
             fi
             sleep 0.5
@@ -2022,20 +2023,16 @@ upload_comms_provider_remote() {
         h_attempts=$((h_attempts + 1))
     done
 
-    # Place staged helper into the comms dir. Stage to a temp name on the comms
-    # dir's own filesystem, then rename into place: a direct `cp` over the target
-    # truncates it, which fails ETXTBSY if the helper is already running. rename()
-    # over a busy executable is fine — the running process keeps its now-unlinked
-    # inode, the new binary goes live on the next spawn (the post-upload restart).
-    log "Installing comms helper at $COMMS_REMOTE_DIR/$QUECTEL_DRIVER_BIN_NAME ..."
+    # Place staged plugin into the comms dir via same-filesystem rename.
+    log "Installing comms plugin at $COMMS_REMOTE_DIR/$QUECTEL_DRIVER_LIB_NAME ..."
     local place_out
     place_out=$(remote_exec_stdout_trimmed "$url" "$api_key" \
-        "sh -c 'mkdir -p $COMMS_REMOTE_DIR && cp /tmp/$QUECTEL_DRIVER_BIN_NAME $COMMS_REMOTE_DIR/.$QUECTEL_DRIVER_BIN_NAME.new && chmod +x $COMMS_REMOTE_DIR/.$QUECTEL_DRIVER_BIN_NAME.new && mv $COMMS_REMOTE_DIR/.$QUECTEL_DRIVER_BIN_NAME.new $COMMS_REMOTE_DIR/$QUECTEL_DRIVER_BIN_NAME && rm -f /tmp/$QUECTEL_DRIVER_BIN_NAME && echo placed'" \
+        "sh -c 'mkdir -p $COMMS_REMOTE_DIR && cp /tmp/$QUECTEL_DRIVER_LIB_NAME $COMMS_REMOTE_DIR/.$QUECTEL_DRIVER_LIB_NAME.new && chmod 0644 $COMMS_REMOTE_DIR/.$QUECTEL_DRIVER_LIB_NAME.new && mv $COMMS_REMOTE_DIR/.$QUECTEL_DRIVER_LIB_NAME.new $COMMS_REMOTE_DIR/$QUECTEL_DRIVER_LIB_NAME && rm -f /tmp/$QUECTEL_DRIVER_LIB_NAME && echo placed'" \
         8000 3 10) || true
     if [[ "$place_out" == *placed* ]]; then
-        ok "Comms helper installed ($h_retries retries)"
+        ok "Comms plugin installed ($h_retries retries)"
     else
-        warn "Comms helper staged at /tmp/$QUECTEL_DRIVER_BIN_NAME but placement unconfirmed; continuing"
+        warn "Comms plugin staged at /tmp/$QUECTEL_DRIVER_LIB_NAME but placement unconfirmed; continuing"
     fi
 }
 
@@ -2083,9 +2080,9 @@ do_device_upgrade_remote() {
     fi
     ok "Build complete: $bin_path"
 
-    # Build + ship the comms helper in the same pass (relay-only path parity with the
+    # Build + ship the comms plugin in the same pass (relay-only path parity with the
     # SSH deploy/upgrade paths). Non-fatal: graceful-absent on the device. Done before
-    # the server swap so the restarted sctl finds the helper already in place.
+    # the server swap so the restarted sctl finds the plugin already in place.
     local comms_provider
     comms_provider=$(device_comms_provider "$name")
     build_comms_provider "$comms_provider" "$arch"

@@ -26,6 +26,11 @@ max_file_size = 52428800
 # Enable output journaling to disk (default true)
 # journal_enabled = true
 
+# On OpenWrt, keep logd RAM-only by default to protect small overlays.
+# Set true only when local post-crash logs are worth the flash budget.
+# openwrt_persistent_logs = false
+# openwrt_persistent_log_size_kb = 128
+
 # Default terminal dimensions for PTY sessions
 # default_terminal_rows = 24
 # default_terminal_cols = 80
@@ -51,8 +56,9 @@ default_working_dir = "/"
 serial = "SCTL-0000-DEV-001"
 
 [logging]
-# Log level filter (env: RUST_LOG)
+# Log level (env: RUST_LOG)
 # Examples: "info", "debug", "sctl=debug,tower_http=info"
+# Target-specific directives are accepted for compatibility but only the most verbose level is used.
 level = "info"
 
 # [tunnel]
@@ -61,6 +67,8 @@ level = "info"
 # tunnel_key = "shared-secret-with-relay"
 # url = "wss://relay.example.com/api/tunnel/register"
 # bind_address = "wwan0"           # Bind outbound WS to interface/IP (LTE failover)
+# tls_ca_file = "/etc/sctl/relay-ca.pem"  # Optional extra root CA for wss:// client mode
+# tls_server_cert_sha256 = "..."          # Optional relay leaf cert SHA-256 pin
 # reconnect_delay_secs = 2         # Initial backoff (client mode)
 # reconnect_max_delay_secs = 30    # Max backoff (client mode)
 # heartbeat_interval_secs = 15     # Ping interval (client mode); >15s is clamped for LTE/CGNAT safety
@@ -72,9 +80,9 @@ level = "info"
 # tunnel_proxy_timeout_secs = 60   # Proxy request timeout
 
 # [comms]
-# External comms provider helper. Omit this section on relay/VPS/server-only installs.
+# External comms provider plugin. Omit this section on relay/VPS/server-only installs.
 # provider = "quectel-at"
-# command = "/usr/libexec/sctl/comms/sctl-comms-quectel"
+# library = "/usr/lib/sctl/comms/libsctl_comms_quectel.so"
 # device = "/dev/ttyUSB2"          # Optional provider hint; autodetect is preferred when available
 # startup_timeout_secs = 15
 # request_timeout_secs = 20
@@ -88,7 +96,6 @@ level = "info"
 # [lte]
 # LTE/cellular monitoring through the active comms provider.
 # poll_interval_secs = 60
-# watchdog = true                       # Auto-recovery when tunnel drops (requires [tunnel])
-# interface = "wwan0"                   # Network interface for watchdog IP checks
-# speed_test_url = "http://speedtest.tele2.net/10MB.zip"  # Download URL for band scan speed test
-# speed_test_upload_url = "http://speedtest.tele2.net/upload.php"  # Upload URL for band scan speed test
+# interface = "wwan0"                   # Network interface for IP checks and speed tests
+# speed_test_url = "http://speedtest.tele2.net/10MB.zip"  # Download speed test URL
+# speed_test_upload_url = "http://speedtest.tele2.net/upload.php"  # Upload speed test URL

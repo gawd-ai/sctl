@@ -12,7 +12,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
-use futures::stream::Stream;
+use futures_util::stream::{self, Stream};
 use std::convert::Infallible;
 use std::sync::atomic::Ordering;
 
@@ -32,7 +32,7 @@ pub async fn event_stream(State(state): State<AppState>) -> impl IntoResponse {
     let rx = state.session_events.subscribe();
     let counter = state.sse_connections.clone();
 
-    let stream = futures::stream::unfold((rx, counter), |(mut rx, counter)| async move {
+    let stream = stream::unfold((rx, counter), |(mut rx, counter)| async move {
         match rx.recv().await {
             Ok(value) => {
                 let event_type = value["type"].as_str().unwrap_or("message").to_string();

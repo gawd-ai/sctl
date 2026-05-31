@@ -91,7 +91,7 @@ Environment variables for quick setup:
 | `SCTL_LISTEN` | `0.0.0.0:1337` | Bind address |
 | `SCTL_DEVICE_SERIAL` | `SCTL-0000-DEV-001` | Device serial for identification |
 | `SCTL_DATA_DIR` | `/var/lib/sctl` | Persistent data (journals) |
-| `RUST_LOG` | `info` | Log level filter |
+| `RUST_LOG` | `info` | Log level (`off`, `error`, `warn`, `info`, `debug`, `trace`) |
 
 For full TOML configuration, see [sctl.toml.example](../server/sctl.toml.example).
 
@@ -180,7 +180,7 @@ make deploy HOST=192.168.1.1         # ARM
 make deploy-riscv HOST=192.168.1.1   # RISC-V
 ```
 
-Flash storage considerations: set `journal_enabled = false` or use a tmpfs `data_dir` to avoid flash wear from output journaling.
+Flash storage considerations: set `journal_enabled = false` or use a tmpfs `data_dir` to avoid flash wear from output journaling. OpenWrt system-log persistence is also disabled by default; enable `openwrt_persistent_logs = true` only when the device has enough overlay headroom for local post-crash logs.
 
 ## Multi-Device Operations
 
@@ -282,6 +282,9 @@ api_key = "device-specific-key"
 [tunnel]
 tunnel_key = "shared-secret-between-relay-and-devices"
 url = "wss://relay.example.com/api/tunnel/register"
+# Optional when the relay uses private PKI or a pinned certificate:
+# tls_ca_file = "/etc/sctl/relay-ca.pem"
+# tls_server_cert_sha256 = "ab12..."
 ```
 
 ### How clients connect
@@ -483,9 +486,9 @@ Or via MCP: `playbook_put` with the full markdown content.
 
 ## Comms Providers, GPS & LTE
 
-sctl handles device communications hardware through external provider helpers. The main `sctl` server owns the HTTP/MCP/API surface; provider helpers own hardware-specific logic. This keeps relay/VPS installs free of modem code and lets new comms hardware be added by deploying a new helper binary instead of rebuilding `sctl`.
+sctl handles device communications hardware through dynamically loaded comms plugins. The main `sctl` server owns the HTTP/MCP/API surface and generic AT transport; plugins own hardware-specific command semantics. This keeps relay/VPS installs free of modem code and lets new comms hardware be added by deploying a target-specific shared library instead of rebuilding `sctl`.
 
-The first 0.5.0 provider is `sctl-comms-quectel`, which supports Quectel AT-command LTE/GNSS devices such as EC25-class 4G modules. The same provider contract is intended for 5G modules, satellite terminals, robotics radios, and space-based compute links when those providers exist.
+The first 0.5.0 provider is `libsctl_comms_quectel.so`, which supports Quectel AT-command LTE/GNSS devices such as EC25-class 4G modules. The same C ABI contract is intended for 5G modules, satellite terminals, robotics radios, and space-based compute links when those providers exist.
 
 ### Hardware requirements
 
@@ -498,15 +501,15 @@ The first 0.5.0 provider is `sctl-comms-quectel`, which supports Quectel AT-comm
 ```toml
 [comms]
 provider = "quectel-at"
-command = "/usr/libexec/sctl/comms/sctl-comms-quectel"
+library = "/usr/lib/sctl/comms/libsctl_comms_quectel.so"
 device = "/dev/ttyUSB2"          # Optional hint; autodetect is preferred when available
 startup_timeout_secs = 15
 request_timeout_secs = 20
 ```
 
-Comms provider helpers build separately. `rundev.sh device deploy` and `device upgrade` build and upload only the configured helper, for example `sctl-comms-quectel` for `comms_provider = "quectel-at"` in the device profile. Relay/VPS deploys do not upload comms helpers.
+Comms plugins build separately. `rundev.sh device deploy` and `device upgrade` build and upload only the configured plugin, for example `libsctl_comms_quectel.so` for `comms_provider = "quectel-at"` in the device profile. Relay/VPS deploys do not upload comms plugins.
 
-Omit `[comms]` on relay/VPS/server-only installs. For older configs, `[gps].device` or `[lte].device` still infers the Quectel provider, but new configs should bind hardware through `[comms]`.
+Omit `[comms]` on relay/VPS/server-only installs. Hardware-backed GPS/LTE configs must include `[comms]`; `[gps].device` and `[lte].device` remain device hints only.
 
 ### GPS configuration
 
@@ -533,10 +536,39 @@ MCP tool: `device_gps` returns the same data.
 
 ```toml
 [lte]
-poll_interval_secs = 60       # Seconds between signal polls
-watchdog = true                # Auto-recovery when signal or tunnel drops
-interface = "wwan0"            # Network interface for IP checks
+poll_interval_secs = 60        # Seconds between signal polls
+interface = "wwan0"            # Network interface for IPv4 / data-path checks
+watchdog = true                # Autonomous modem recovery (default true)
+watchdog_grace_secs = 120      # Tunnel must be down this long before any action
+notregistered_grace_secs = 180 # Extra wait for NotRegistered (survives handovers)
+max_escalation_level = 3       # 4 opts in to the last-resort USB power-cycle
+# reachability_host = "8.8.8.8"        # Interface-bound ping target for diagnosis
+# interface_restart_cmd = "ifdown wwan && sleep 2 && ifup wwan"
 ```
+
+#### Watchdog behavior
+
+The watchdog only acts when the tunnel is **down**, the client is **not**
+mid-reconnect, and `watchdog_grace_secs` has elapsed — so it never disturbs a
+working link. It diagnoses the fault from kernel truth (interface IPv4 + an
+interface-bound ping), never the modem's AT serving-cell field, and picks the
+matching recovery:
+
+- **No usable signal** (storm, dead zone, antenna) → waits. Cycling the modem
+  cannot conjure RF, so it does nothing destructive.
+- **Registered but no data bearer** → interface restart → airplane-mode cycle.
+- **Searching / not registered with good signal** → re-register / airplane cycle.
+- **AT unresponsive but present in sysfs** → interface restart, then USB cycle.
+- **Modem vanished from sysfs / relay or internet unreachable** → diagnose only.
+
+The USB power-cycle is the last resort: it is opt-in (`max_escalation_level = 4`),
+requires the symptom to persist for `usb_cycle_evidence.min_sustained_secs`
+(default 600) with the modem still present in sysfs, backs off exponentially,
+and goes dormant after three failures. The airplane-mode cycle always restores
+`CFUN=1` before returning, and on startup the watchdog forces `CFUN=1` and
+re-authorizes the USB port to heal any action a crash interrupted. A manual
+`POST /api/lte/usb_cycle` bypasses every gate. Recovery actions are logged to
+`watchdog_history.jsonl` and surfaced in the `watchdog` field of `/api/lte`.
 
 ### LTE data
 
@@ -545,7 +577,6 @@ The `GET /api/info` response includes LTE metrics when configured:
 - **Signal:** RSSI, RSRP, RSRQ, SINR, signal bars (1-5)
 - **Cell:** band, operator, technology (LTE/WCDMA), cell ID
 - **Modem:** model, firmware, IMEI, ICCID
-- **Band history:** recent band transitions with timestamps
 - **Neighbor cells:** visible cells and their signal strength
 
 LTE signal updates are broadcast over WebSocket as `lte.signal` messages.
@@ -562,16 +593,7 @@ curl -X POST -H "Authorization: Bearer $KEY" \
   http://device:1337/api/lte/bands
 ```
 
-Band scanning tests each band's throughput and selects the best configuration.
-
-### LTE watchdog
-
-When `watchdog = true`, the active comms provider can run autonomous recovery:
-
-- Detects modem unresponsiveness and triggers resets
-- Restores "safe bands" configuration after recovery
-- **Tunnel-aware:** avoids disruptive hardware actions while the tunnel is connected unless an operator forces the action
-- On-demand polling via API requests when the regular polling is suppressed
+Band scans are capability-gated by the active plugin. The current Quectel plugin exposes signal telemetry, GNSS, band control, and USB-cycle recovery; future plugins can add scan capabilities behind the same API surface. The autonomous watchdog (above) runs server-side and drives whichever recovery primitives the active plugin offers.
 
 ## AI Collaboration
 

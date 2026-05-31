@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::AppState;
 
@@ -99,7 +99,7 @@ pub(crate) async fn info_with_groups(
     let start = Instant::now();
     let req_id = uuid::Uuid::new_v4().to_string();
     let has_lte = state.config.lte.is_some();
-    info!(
+    debug!(
         req_id,
         has_lte,
         groups = ?groups,
@@ -118,7 +118,7 @@ pub(crate) async fn info_with_groups(
         let cpuinfo = read_proc_file("/proc/cpuinfo");
         #[allow(clippy::cast_possible_truncation)]
         let proc_ms = proc_started.elapsed().as_millis() as u64;
-        info!(req_id, proc_ms, "api.info: phase proc complete");
+        debug!(req_id, proc_ms, "api.info: phase proc complete");
 
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let system_uptime = uptime_str
@@ -169,7 +169,7 @@ pub(crate) async fn info_with_groups(
         .await;
         #[allow(clippy::cast_possible_truncation)]
         let interfaces_ms = interfaces_started.elapsed().as_millis() as u64;
-        info!(
+        debug!(
             req_id,
             interfaces_ms,
             interface_count = interfaces.len(),
@@ -183,7 +183,7 @@ pub(crate) async fn info_with_groups(
         let disk = get_disk_usage("/");
         #[allow(clippy::cast_possible_truncation)]
         let disk_ms = disk_started.elapsed().as_millis() as u64;
-        info!(req_id, disk_ms, "api.info: phase disk complete");
+        debug!(req_id, disk_ms, "api.info: phase disk complete");
         response["disk"] = disk;
     }
 
@@ -222,7 +222,7 @@ pub(crate) async fn info_with_groups(
         }
         #[allow(clippy::cast_possible_truncation)]
         let gps_lock_wait_ms = gps_lock_started.elapsed().as_millis() as u64;
-        info!(req_id, gps_lock_wait_ms, "api.info: phase gps complete");
+        debug!(req_id, gps_lock_wait_ms, "api.info: phase gps complete");
     }
 
     let mut lte_lock_wait_ms = 0u64;
@@ -244,7 +244,7 @@ pub(crate) async fn info_with_groups(
             }
             lte["detected_path"] = json!(cs.detected_path.clone());
             response["lte"] = lte;
-            info!(req_id, lte_lock_wait_ms, "api.info: phase lte complete");
+            debug!(req_id, lte_lock_wait_ms, "api.info: phase lte complete");
         }
     }
 
@@ -252,7 +252,7 @@ pub(crate) async fn info_with_groups(
     let response_body_len = serde_json::to_string(&response).map_or(0, |s| s.len());
     #[allow(clippy::cast_possible_truncation)]
     let serialize_ms = serialize_started.elapsed().as_millis() as u64;
-    info!(
+    debug!(
         req_id,
         serialize_ms, response_body_len, "api.info: phase serialize complete"
     );
@@ -265,7 +265,7 @@ pub(crate) async fn info_with_groups(
             total_ms, lte_lock_wait_ms, "api.info: slow LTE state lock acquisition"
         );
     }
-    info!(
+    debug!(
         req_id,
         total_ms, lte_lock_wait_ms, response_body_len, "api.info: end"
     );
@@ -364,7 +364,7 @@ async fn collect_interfaces(req_id: &str, include_addresses: bool) -> Vec<Value>
         if let Some(addresses_by_name) = collect_interface_addresses(req_id) {
             #[allow(clippy::cast_possible_truncation)]
             let addr_ms = addr_started.elapsed().as_millis() as u64;
-            info!(
+            debug!(
                 req_id,
                 addr_ms,
                 address_interface_count = addresses_by_name.len(),
@@ -387,7 +387,7 @@ async fn collect_interfaces(req_id: &str, include_addresses: bool) -> Vec<Value>
             );
         }
     } else {
-        info!(
+        debug!(
             req_id,
             "api.info: interface address enumeration disabled by config"
         );
@@ -395,7 +395,7 @@ async fn collect_interfaces(req_id: &str, include_addresses: bool) -> Vec<Value>
 
     #[allow(clippy::cast_possible_truncation)]
     let total_ms = start.elapsed().as_millis() as u64;
-    info!(
+    debug!(
         req_id,
         total_ms,
         interface_count = interfaces.len(),
@@ -449,7 +449,7 @@ fn collect_interface_addresses(
     #[allow(clippy::cast_possible_truncation)]
     let total_ms = start.elapsed().as_millis() as u64;
     let address_count: usize = addresses.values().map(std::vec::Vec::len).sum();
-    info!(
+    debug!(
         req_id,
         total_ms,
         interface_count = addresses.len(),

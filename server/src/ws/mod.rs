@@ -56,7 +56,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use futures::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};

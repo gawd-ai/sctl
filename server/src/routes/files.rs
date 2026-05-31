@@ -22,8 +22,10 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
+
+use crate::atomic::AtomicU64;
 
 /// Monotonic counter to uniquify temp file names across concurrent writes.
 pub(crate) static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
