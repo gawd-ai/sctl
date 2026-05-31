@@ -1,0 +1,37 @@
+[server]
+listen = "0.0.0.0:1337"
+data_dir = "/tmp/sctl/data"
+journal_enabled = false
+openwrt_persistent_logs = false
+playbooks_dir = "/etc/sctl/playbooks"
+max_connections = 6
+max_sessions = 3
+session_buffer_size = 200
+max_file_size = 2097152
+transfer_chunk_size = 65536
+
+[auth]
+api_key = "{{API_KEY}}"
+
+[shell]
+default_shell = "/bin/sh"
+default_working_dir = "/tmp"
+
+[device]
+serial = "{{SERIAL}}"
+
+[logging]
+level = "warn"
+
+[comms]
+provider = "quectel-at"
+library = "/tmp/sctl/lib/libsctl_comms_quectel.so"
+device = "{{AT_DEVICE}}"
+startup_timeout_secs = 20
+request_timeout_secs = 25
+
+[lte]
+device = "{{AT_DEVICE}}"
+poll_interval_secs = 90
+watchdog = false
+interface = "{{LTE_INTERFACE}}"

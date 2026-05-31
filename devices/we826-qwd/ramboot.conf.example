@@ -1,0 +1,33 @@
+# Runtime payload source for /etc/sctl/ramboot.sh.
+# The installer writes /etc/sctl/ramboot.conf from environment variables.
+
+RUN_DIR='/tmp/sctl'
+CACHE_DIR='/tmp/sctl/cache'
+BIN='/tmp/sctl/sctl-server'
+PLUGIN='/tmp/sctl/lib/libsctl_comms_quectel.so'
+MUSL_LIBC='/tmp/sctl/lib/libc.so'
+LIBGCC='/tmp/sctl/lib/libgcc_s.so.1'
+SCTL_CONFIG='/etc/sctl/sctl.toml'
+
+SERVER_URL='https://example.invalid/sctl-server-mips.gz'
+SERVER_SHA256='replace-with-sha256-of-downloaded-server-payload'
+SERVER_GZIP=1
+
+PLUGIN_URL='https://example.invalid/sctl-comms-quectel-mips.so.gz'
+PLUGIN_SHA256='replace-with-sha256-of-downloaded-plugin-payload'
+PLUGIN_GZIP=1
+
+MUSL_LIBC_URL='https://example.invalid/libc.so.gz'
+MUSL_LIBC_SHA256='replace-with-sha256-of-downloaded-musl-libc-payload'
+MUSL_LIBC_GZIP=1
+
+LIBGCC_URL='https://example.invalid/libgcc_s.so.1.gz'
+LIBGCC_SHA256='replace-with-sha256-of-downloaded-libgcc-payload'
+LIBGCC_GZIP=1
+
+MIN_TMP_KB=24576
+FETCH_TIMEOUT_SECS=90
+CONNECT_TIMEOUT_SECS=10
+FETCH_ATTEMPTS=20
+FETCH_RETRY_SECS=15
+ALLOW_UNSIGNED=0
