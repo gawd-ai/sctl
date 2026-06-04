@@ -26,12 +26,14 @@ level = "warn"
 [comms]
 provider = "quectel-at"
 library = "/tmp/sctl/lib/libsctl_comms_quectel.so"
-device = "{{AT_DEVICE}}"
+# NO `device` hint — sctl DETECTS the Quectel AT port by USB interface :1.2. The
+# ttyUSB number re-enumerates after a modem cycle; a hardcoded /dev/ttyUSBn opens
+# the stale node at startup and takes the modem down. Detection self-heals.
 startup_timeout_secs = 20
 request_timeout_secs = 25
 
 [lte]
-device = "{{AT_DEVICE}}"
+# No `device` hint -> uses the detected comms port (see [comms]).
 poll_interval_secs = 90
 watchdog = false
 interface = "{{LTE_INTERFACE}}"

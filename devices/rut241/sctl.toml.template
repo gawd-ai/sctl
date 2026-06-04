@@ -23,15 +23,29 @@ serial = "{{SERIAL}}"
 [logging]
 level = "info"
 
+# Out-of-band relay tunnel ([tunnel]) is per-deployment (the relay key/endpoint
+# are environment-specific) and is intentionally NOT templated here. If this unit
+# was onboarded to a relay, RE-ADD the [tunnel] block after running install.sh —
+# install.sh overwrites /etc/sctl/sctl.toml and would otherwise drop it.
+
 [comms]
 provider = "quectel-at"
 library = "/tmp/sctl/lib/libsctl_comms_quectel.so"
-device = "{{AT_DEVICE}}"
+# NO `device` hint on purpose — sctl DETECTS the Quectel AT port by USB interface
+# :1.2 (detect_quectel_at_port). The ttyUSB number re-enumerates after a modem
+# cycle (e.g. ttyUSB2 -> ttyUSB3); a hardcoded /dev/ttyUSBn opens the now-stale
+# node at startup, fails, and takes the modem down — the failure that has bricked
+# deployed units. Detection + reopen_after_probe make it self-healing. Do not add
+# a `device` line back unless detection is genuinely unavailable.
 startup_timeout_secs = 15
 request_timeout_secs = 20
 
 [lte]
-device = "{{AT_DEVICE}}"
+# No `device` hint -> uses the detected comms port (see [comms]).
 poll_interval_secs = 60
 watchdog = false
+# qmimux0 = the QMI raw-IP data bearer holding the IPv4 /32 + default route; wwan0
+# has no IPv4. The plugin derives data_active from interface_has_ipv4(interface),
+# which maps the EC25's spurious NOCONN/LIMSRV/SEARCH serving-cell state to CONNECT
+# when the bearer is actually up. Using wwan0 here is the long-standing NOCONN bug.
 interface = "{{LTE_INTERFACE}}"

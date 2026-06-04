@@ -9,9 +9,12 @@ Usage:
 Environment:
   API_KEY        Required. Auth token written to /etc/sctl/sctl.toml.
   SERIAL         Default: RUT241
-  AT_DEVICE      Default: /dev/ttyUSB2
-  LTE_INTERFACE  Default: wwan0
+  LTE_INTERFACE  Default: qmimux0  (QMI data bearer; drives NOCONN->CONNECT)
   MIN_MARGIN_KB  Default: 768
+
+Note: the AT port is auto-detected (USB interface :1.2), never hardcoded, so a
+ttyUSB re-enumeration cannot take the modem down. A [tunnel] (OOB relay) block is
+NOT written by this installer and must be re-added after install if used.
 EOF
 }
 
@@ -33,8 +36,7 @@ ARTIFACT_DIR="$ROOT_DIR/.artifacts/rut241"
 SERVER_GZ="$ARTIFACT_DIR/sctl-server-mipsel_24kc.gz"
 PLUGIN_GZ="$ARTIFACT_DIR/sctl-comms-quectel-mipsel_24kc.so.gz"
 SERIAL=${SERIAL:-RUT241}
-AT_DEVICE=${AT_DEVICE:-/dev/ttyUSB2}
-LTE_INTERFACE=${LTE_INTERFACE:-wwan0}
+LTE_INTERFACE=${LTE_INTERFACE:-qmimux0}
 MIN_MARGIN_KB=${MIN_MARGIN_KB:-768}
 
 for file in "$SERVER_GZ" "$PLUGIN_GZ" "$DEVICE_DIR/sctl.init" "$DEVICE_DIR/sctl.toml.template"; do
@@ -55,7 +57,6 @@ sed_repl_escape() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
 sed \
     -e "s|{{API_KEY}}|$(sed_repl_escape "$API_KEY")|g" \
     -e "s|{{SERIAL}}|$(sed_repl_escape "$SERIAL")|g" \
-    -e "s|{{AT_DEVICE}}|$(sed_repl_escape "$AT_DEVICE")|g" \
     -e "s|{{LTE_INTERFACE}}|$(sed_repl_escape "$LTE_INTERFACE")|g" \
     "$DEVICE_DIR/sctl.toml.template" > "$tmpdir/sctl.toml"
 

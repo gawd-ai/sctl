@@ -22,8 +22,7 @@ Environment:
   LIBGCC_SHA256         Required unless ALLOW_UNSIGNED=1. Hash of downloaded libgcc payload.
   LIBGCC_GZIP           Default: 1
   SERIAL                Default: WE826-Q-WD
-  AT_DEVICE             Default: /dev/ttyUSB2
-  LTE_INTERFACE         Default: usb0
+  LTE_INTERFACE         Default: usb0  (AT port is auto-detected, never hardcoded)
   MIN_TMP_KB            Default: 24576
   MIN_MARGIN_KB         Default: 256
   ALLOW_UNSIGNED        Default: 0
@@ -93,7 +92,6 @@ DEVICE_DIR="$ROOT_DIR/devices/we826-qwd"
 COMMON_DIR="$ROOT_DIR/devices/common"
 
 SERIAL=${SERIAL:-WE826-Q-WD}
-AT_DEVICE=${AT_DEVICE:-/dev/ttyUSB2}
 LTE_INTERFACE=${LTE_INTERFACE:-usb0}
 SERVER_GZIP=${SERVER_GZIP:-1}
 PLUGIN_GZIP=${PLUGIN_GZIP:-1}
@@ -142,7 +140,6 @@ trap 'rm -rf "$tmpdir"' EXIT
 sed \
     -e "s|{{API_KEY}}|$(sed_repl_escape "$(toml_escape "$API_KEY")")|g" \
     -e "s|{{SERIAL}}|$(sed_repl_escape "$(toml_escape "$SERIAL")")|g" \
-    -e "s|{{AT_DEVICE}}|$(sed_repl_escape "$(toml_escape "$AT_DEVICE")")|g" \
     -e "s|{{LTE_INTERFACE}}|$(sed_repl_escape "$(toml_escape "$LTE_INTERFACE")")|g" \
     "$DEVICE_DIR/sctl.toml.template" > "$tmpdir/sctl.toml"
 

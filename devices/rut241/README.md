@@ -46,8 +46,12 @@ devices/rut241/install.sh root@ROUTER_IP
 Optional overrides:
 
 ```sh
-SERIAL=RUT241-001 AT_DEVICE=/dev/ttyUSB2 LTE_INTERFACE=wwan0 \
+SERIAL=RUT241-001 LTE_INTERFACE=qmimux0 \
 API_KEY=... devices/rut241/install.sh root@ROUTER_IP
 ```
+
+The AT port is auto-detected (USB interface :1.2) — never hardcode `/dev/ttyUSBn`,
+it re-enumerates and a stale path takes the modem down. `LTE_INTERFACE=qmimux0` is
+the QMI data bearer (holds the IPv4); using `wwan0` is the long-standing NOCONN bug.
 
 The installer refuses to proceed unless the overlay can keep a safety margin after writing the compressed payloads.
