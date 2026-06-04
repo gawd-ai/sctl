@@ -180,11 +180,23 @@ pub(crate) async fn info_with_groups(
 
     if groups.disk {
         let disk_started = Instant::now();
+        // `disk` stays the root filesystem for back-compat (existing consumers
+        // read disk.total_bytes/used_bytes). `disks` is the full picture — a
+        // device has multiple storages (e.g. an OpenWrt unit's read-only
+        // squashfs root plus a writable overlay), and reporting only `/`
+        // (always 100% on squashfs) is misleading.
         let disk = get_disk_usage("/");
+        let disks = collect_disks();
         #[allow(clippy::cast_possible_truncation)]
         let disk_ms = disk_started.elapsed().as_millis() as u64;
-        debug!(req_id, disk_ms, "api.info: phase disk complete");
+        debug!(
+            req_id,
+            disk_ms,
+            disk_count = disks.len(),
+            "api.info: phase disk complete"
+        );
         response["disk"] = disk;
+        response["disks"] = json!(disks);
     }
 
     if groups.tunnel {
@@ -541,4 +553,92 @@ pub(crate) fn get_disk_usage(path: &str) -> Value {
         "used_bytes": used,
         "available_bytes": available,
     })
+}
+
+/// Enumerate mounted filesystems and report per-mount usage for the real
+/// (non-pseudo) storage volumes.
+///
+/// Devices have more than one storage: an OpenWrt/RUTOS unit exposes a
+/// read-only squashfs root (always 100% — it's a compressed image), a writable
+/// `jffs2`/`ubifs` overlay (the storage that actually fills up), a `tmpfs`
+/// working area, and sometimes a separate log partition. Reporting only `/` was
+/// both alarming (100%) and wrong (the overlay was invisible).
+///
+/// Pseudo/kernel filesystems are skipped, `overlay`-type merge mounts are
+/// skipped (they mirror the underlying writable partition), and entries sharing
+/// a source device + size are de-duplicated (e.g. squashfs `/` and `/rom/*`).
+pub(crate) fn collect_disks() -> Vec<Value> {
+    const SKIP_FSTYPE: &[&str] = &[
+        "proc",
+        "sysfs",
+        "devtmpfs",
+        "devpts",
+        "cgroup",
+        "cgroup2",
+        "debugfs",
+        "tracefs",
+        "securityfs",
+        "pstore",
+        "bpf",
+        "mqueue",
+        "hugetlbfs",
+        "fusectl",
+        "configfs",
+        "ramfs",
+        "autofs",
+        "nsfs",
+        "rpc_pipefs",
+        "binfmt_misc",
+        "fuse.gvfsd-fuse",
+        "overlay",
+    ];
+
+    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    let mut out: Vec<Value> = Vec::new();
+    let mut seen: Vec<(String, u64)> = Vec::new();
+
+    for line in mounts.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let source = parts[0];
+        let target = parts[1];
+        let fstype = parts[2];
+        let opts = parts[3];
+
+        if SKIP_FSTYPE.contains(&fstype) {
+            continue;
+        }
+        // Kernel mountpoints that slipped past the fstype filter.
+        if target == "/dev" || target.starts_with("/proc") || target.starts_with("/sys") {
+            continue;
+        }
+
+        let usage = get_disk_usage(target);
+        let Some(total) = usage.get("total_bytes").and_then(Value::as_u64) else {
+            continue;
+        };
+        if total == 0 {
+            continue;
+        }
+        // De-dup bind/remount views of the same device+size (squashfs / vs /rom).
+        if seen.iter().any(|(s, t)| s == source && *t == total) {
+            continue;
+        }
+        seen.push((source.to_string(), total));
+
+        let read_only = opts.split(',').any(|o| o == "ro");
+        out.push(json!({
+            "mount": target,
+            "fstype": fstype,
+            "source": source,
+            "read_only": read_only,
+            "total_bytes": total,
+            "used_bytes": usage.get("used_bytes").cloned().unwrap_or(Value::Null),
+            "available_bytes": usage.get("available_bytes").cloned().unwrap_or(Value::Null),
+        }));
+    }
+
+    out
 }
