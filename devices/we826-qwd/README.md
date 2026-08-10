@@ -88,3 +88,13 @@ rm -f /etc/sctl/disabled
 - Keep payload URLs and hashes out of tracked source files.
 - Use `/etc/sctl/disabled` as the fast local kill switch.
 - Use `sysupgrade --test` only for firmware research; this deployment does not require firmware flashing.
+- **`install.sh` overwrites `/etc/sctl/sctl.toml` wholesale.** The `[tunnel]` block is
+  per-deployment and is therefore *not* in the template. To stop a re-install silently
+  un-pinning a unit that is only reachable over that tunnel, `install.sh` either writes a
+  fresh block from `TUNNEL_URL`/`TUNNEL_KEY`/`TUNNEL_BIND_ADDRESS`, or — when those are not
+  supplied — reads the existing block off the device and carries it forward verbatim. It
+  prints which path it took. Check that line on every install against an onboarded unit.
+- **`bind_address` must be an interface *name*, not an IP.** sctl only applies
+  `SO_BINDTODEVICE` when the value fails to parse as an IP address
+  (`server/src/tunnel/client.rs:474-482`). An IP literal sets only the source address, which
+  leaves tunnel egress following the default route — exactly what pinning is meant to prevent.

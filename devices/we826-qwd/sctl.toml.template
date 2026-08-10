@@ -23,6 +23,13 @@ serial = "{{SERIAL}}"
 [logging]
 level = "warn"
 
+# The out-of-band relay tunnel ([tunnel]) is per-deployment and is appended by
+# install.sh, not templated here — either from TUNNEL_URL/TUNNEL_KEY, or by
+# PRESERVING the block already on the device when those are not supplied.
+# install.sh overwrites this whole file, so that preservation is what stops a
+# re-install from silently un-pinning a unit that is only reachable over the
+# tunnel. Do not "simplify" it away.
+
 [comms]
 provider = "quectel-at"
 library = "/tmp/sctl/lib/libsctl_comms_quectel.so"
