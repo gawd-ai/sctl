@@ -1,0 +1,463 @@
+#!/bin/sh /etc/rc.common
+# netage-wanpref — prefer a healthy wired WAN uplink over the onboard cellular.
+#
+# WHY THIS EXISTS
+#   The vendor connection manager quectel-CM, launched from the dial loop at
+#   /usr/sbin/anywifi/manual_dial/quectel_ec20_ec25, installs its own
+#   `default dev $LTE_IF` at metric 0 on EVERY dial and EVERY redial. That beats
+#   UCI's network.wan.metric (3), so the cellular link always wins even when a
+#   perfectly good wired uplink is present. The vendor loop ends in `sleep 8`, so
+#   ANY one-shot fix is undone within 8 seconds. This re-asserts on a 5s tick.
+#
+#   Note what is NOT wrong: UCI already encodes the right intent (wan metric 3
+#   beats 4gwan metric 5). The only thing breaking it is that one rogue metric-0
+#   route. So the minimal correct action is to delete exactly that, and nothing else.
+#
+# SAFETY RULES — this runs on a vehicle with no physical access. Do not violate.
+#   * NEVER `/etc/init.d/network reload|restart`, NEVER `ifup`/`ifdown`. Reloading
+#     the network stack drops the cellular default route and can lock the operator
+#     out entirely.
+#   * NEVER change network.wan.metric / network.4gwan.metric in UCI. The vendor
+#     dial script re-runs its config() + `ifup wan` + `ifup 4gwan` + a fresh dial
+#     whenever those two are equal or non-numeric. Kernel FIB only.
+#   * ALWAYS add the replacement default route BEFORE deleting the old one, so
+#     "no default route" is unreachable no matter where this script is killed.
+#   * NEVER promote the wired path on link-up alone. Only a probe that actually
+#     egressed through it may promote. Every failure mode falls back to cellular.
+#
+# WHY THIS IS SAFE TO DO REMOTELY
+#   The management tunnel is pinned with bind_address = "<lte_if>" and sctl sets
+#   SO_BINDTODEVICE (server/src/tunnel/client.rs:466-548), so tunnel egress does
+#   not follow the default route. Changing the default route cannot cost us the
+#   management channel. If that pin is ever removed, this feature becomes unsafe.
+
+START=99
+STOP=10
+EXTRA_COMMANDS="loop show"
+EXTRA_HELP="	loop	Run the enforcement loop in the foreground (used by start)
+	show	Print the current state block (parsed by netage-server)"
+
+SELF=${SELF:-/etc/init.d/netage-wanpref}
+CONF=${CONF:-/etc/sctl/wanpref.conf}
+STATE=${STATE:-/tmp/wanpref.state}
+PIDFILE=${PIDFILE:-/var/run/netage-wanpref.pid}
+
+# Every external tool is indirected so the unit tests can inject fakes.
+IP=${IP:-/usr/sbin/ip}
+CURL=${CURL:-/usr/bin/curl}
+PING=${PING:-/bin/ping}
+UCI=${UCI:-/sbin/uci}
+SYSNET=${SYSNET:-/sys/class/net}
+UPTIME_FILE=${UPTIME_FILE:-/proc/uptime}
+VENDOR_PING_DIR=${VENDOR_PING_DIR:-/tmp/module_ping}
+
+# ------------------------------------------------------------------ defaults --
+ENABLED=0
+WAN_IF=eth0
+LTE_IF=usb0
+PROBE_TARGETS="174.138.114.209:8443 1.1.1.1:80"
+TICK_SECS=5
+PROBE_EVERY=3
+UP_THRESHOLD=3
+DOWN_THRESHOLD=2
+MIN_STABLE_SECS=120
+MAX_STABLE_SECS=900
+STABLE_RESET_SECS=600
+CURL_MAX_TIME=5
+LTE_FALLBACK_METRIC=100
+WAN_DEMOTED_METRIC=200
+
+load_conf() { [ -r "$CONF" ] && . "$CONF"; return 0; }
+
+is_int() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+now_secs() { awk -F. '{print $1; exit}' "$UPTIME_FILE" 2>/dev/null || echo 0; }
+
+# ------------------------------------------------------------ FIB read-only ---
+# All metrics of default routes on $1, one per line. A default route printed with
+# no `metric` token has metric 0 — which is exactly quectel-CM's rogue route.
+dev_metrics() {
+    $IP route show default 2>/dev/null | awk -v d="$1" '
+        { m = "0"; dev = ""
+          for (i = 1; i <= NF; i++) {
+              if ($i == "dev")    dev = $(i+1)
+              if ($i == "metric") m   = $(i+1)
+          }
+          if (dev == d) print m }'
+}
+
+# Gateway of the default route on $1 at metric $2 (empty if absent).
+gw_at_metric() {
+    $IP route show default 2>/dev/null | awk -v d="$1" -v want="$2" '
+        { g = ""; dev = ""; m = "0"
+          for (i = 1; i <= NF; i++) {
+              if ($i == "via")    g   = $(i+1)
+              if ($i == "dev")    dev = $(i+1)
+              if ($i == "metric") m   = $(i+1)
+          }
+          if (dev == d && m == want && g != "") { print g; exit } }'
+}
+
+# Gateway of the lowest-metric NON-SYNTHETIC default route on $1.
+#
+# Excluding our own synthetic metrics is what makes a DHCP gateway change
+# self-heal: after a renew, netifd installs a fresh low-metric route, this picks
+# it up, and gc_synthetic() then removes our stale one. If this included our own
+# routes we would happily re-assert a dead gateway forever.
+gw_of() {
+    $IP route show default 2>/dev/null | awk -v d="$1" \
+        -v s1="$WAN_DEMOTED_METRIC" -v s2="$LTE_FALLBACK_METRIC" '
+        { g = ""; dev = ""; m = "0"
+          for (i = 1; i <= NF; i++) {
+              if ($i == "via")    g   = $(i+1)
+              if ($i == "dev")    dev = $(i+1)
+              if ($i == "metric") m   = $(i+1)
+          }
+          if (dev == d && g != "" && m != s1 && m != s2) { print g; exit } }'
+}
+
+# Last-resort gateway lookup that DOES include synthetic routes, so a restore can
+# still find something to work with when netifd's route is momentarily absent.
+gw_any() {
+    $IP route show default 2>/dev/null | awk -v d="$1" '
+        { g = ""; dev = ""
+          for (i = 1; i <= NF; i++) {
+              if ($i == "via") g   = $(i+1)
+              if ($i == "dev") dev = $(i+1)
+          }
+          if (dev == d && g != "") { print g; exit } }'
+}
+
+lowest_metric() { dev_metrics "$1" | sort -n | head -1; }
+active_dev() {
+    $IP route show default 2>/dev/null |
+        awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i+1); exit } }'
+}
+
+# ------------------------------------------------------------ FIB mutations ---
+# Drop a synthetic route whose gateway no longer matches reality (DHCP renew).
+# Compares the gateway at our synthetic metric against the current real one.
+gc_synthetic() {
+    _rgw=$(gw_of "$WAN_IF")
+    _sgw=$(gw_at_metric "$WAN_IF" "$WAN_DEMOTED_METRIC")
+    if [ -n "$_sgw" ] && [ -n "$_rgw" ] && [ "$_sgw" != "$_rgw" ]; then
+        $IP route del default via "$_sgw" dev "$WAN_IF" metric "$WAN_DEMOTED_METRIC" 2>/dev/null
+    fi
+
+    _rgw=$(gw_of "$LTE_IF")
+    _sgw=$(gw_at_metric "$LTE_IF" "$LTE_FALLBACK_METRIC")
+    if [ -n "$_sgw" ] && [ -n "$_rgw" ] && [ "$_sgw" != "$_rgw" ]; then
+        $IP route del default via "$_sgw" dev "$LTE_IF" metric "$LTE_FALLBACK_METRIC" 2>/dev/null
+    fi
+    return 0
+}
+
+# Make the wired path win: delete every cellular default that beats it — but only
+# after guaranteeing a surviving cellular default at a HIGHER metric. That
+# ordering is the whole safety argument: at no instant is there no default route.
+assert_wired() {
+    _wm=$(lowest_metric "$WAN_IF")
+    is_int "$_wm" || return 1
+    _lgw=$(gw_of "$LTE_IF")
+    [ -n "$_lgw" ] || return 0          # no cellular gateway: nothing to demote
+
+    # Is there already a cellular default that loses to the wired one?
+    _keep=$(dev_metrics "$LTE_IF" | awk -v w="$_wm" '$1 + 0 > w + 0 { print; exit }')
+    if [ -z "$_keep" ]; then
+        $IP route replace default via "$_lgw" dev "$LTE_IF" \
+            metric "$LTE_FALLBACK_METRIC" 2>/dev/null
+    fi
+
+    for _m in $(dev_metrics "$LTE_IF"); do
+        is_int "$_m" || continue
+        [ "$_m" -lt "$_wm" ] || continue
+        $IP route del default via "$_lgw" dev "$LTE_IF" metric "$_m" 2>/dev/null ||
+            $IP route del default dev "$LTE_IF" metric "$_m" 2>/dev/null
+    done
+    return 0
+}
+
+# Push the wired default BELOW the cellular one. Mandatory for fallback to work:
+# eth0's metric 3 beats usb0's metric 5, so a link-up-but-dead wired uplink would
+# blackhole all traffic unless we actively demote it.
+demote_wan() {
+    _wgw=$(gw_of "$WAN_IF")
+    [ -n "$_wgw" ] || return 0
+    $IP route replace default via "$_wgw" dev "$WAN_IF" \
+        metric "$WAN_DEMOTED_METRIC" 2>/dev/null
+    for _m in $(dev_metrics "$WAN_IF"); do
+        is_int "$_m" || continue
+        [ "$_m" -lt "$WAN_DEMOTED_METRIC" ] || continue
+        $IP route del default via "$_wgw" dev "$WAN_IF" metric "$_m" 2>/dev/null
+    done
+    return 0
+}
+
+# Give the wired route its UCI metric back. netifd re-asserts this on the next
+# DHCP renew anyway; doing it here makes recovery immediate rather than eventual.
+restore_wan() {
+    _wgw=$(gw_of "$WAN_IF")
+    [ -n "$_wgw" ] || _wgw=$(gw_any "$WAN_IF")
+    [ -n "$_wgw" ] || return 0
+    _um=$($UCI -q get network.wan.metric 2>/dev/null)
+    is_int "$_um" || _um=3
+    $IP route replace default via "$_wgw" dev "$WAN_IF" metric "$_um" 2>/dev/null
+    $IP route del default via "$_wgw" dev "$WAN_IF" \
+        metric "$WAN_DEMOTED_METRIC" 2>/dev/null
+    return 0
+}
+
+# Put back the exact route quectel-CM would install, so disable() is a clean,
+# deterministic revert rather than "wait up to 8s for the vendor to notice".
+restore_vendor_lte_route() {
+    _lgw=$(gw_of "$LTE_IF")
+    [ -n "$_lgw" ] || _lgw=$(gw_any "$LTE_IF")
+    [ -n "$_lgw" ] || return 0
+    $IP route replace default via "$_lgw" dev "$LTE_IF" metric 0 2>/dev/null
+    return 0
+}
+
+drop_synthetic_lte() {
+    _lgw=$(gw_at_metric "$LTE_IF" "$LTE_FALLBACK_METRIC")
+    [ -n "$_lgw" ] || return 0
+    $IP route del default via "$_lgw" dev "$LTE_IF" \
+        metric "$LTE_FALLBACK_METRIC" 2>/dev/null
+    return 0
+}
+
+# Make cellular win, but LEAVE THE WIRED METRIC ALONE. This is what the demote
+# path needs: eth0 must stay at WAN_DEMOTED_METRIC, because the whole point of
+# demoting was that the wired path is link-up-but-dead.
+assert_lte_routes() { restore_vendor_lte_route; drop_synthetic_lte; return 0; }
+
+# Full revert to the pre-feature table, including giving eth0 its UCI metric
+# back. Correct for stop() and for ENABLED=0 — and WRONG for the demote path,
+# where restore_wan would immediately undo demote_wan and re-blackhole traffic
+# out the dead wired link. See the regression test `demote_then_assert_lte`.
+assert_lte() { restore_wan; assert_lte_routes; return 0; }
+
+# ------------------------------------------------------------------ probing ---
+# One HTTP probe forced out $WAN_IF. Echoes the HTTP status ("000" = failure).
+#
+# Preferred mechanism is `curl --interface`, which uses SO_BINDTODEVICE as root —
+# the same mechanism sctl's tunnel uses — and mutates NOTHING.
+#
+# Fallback is the temporary /32 host route from
+# playbooks/openwrt/speedtest-multi-eth.md, with one extra guard that playbook
+# does not need: REFUSE any target that already has a host route. The WireGuard
+# runbook pins the relay to the cellular interface with a persistent /32
+# (db/migrations/010_v0.06_vpn.sql), and replace+del would destroy that pin,
+# breaking out-of-band management.
+probe_one() {
+    _a=$1; _p=$2; _gw=$3
+    if [ "$HAVE_CURL_IFACE" = "1" ]; then
+        $CURL -s -k -o /dev/null --interface "$WAN_IF" \
+            --connect-timeout "$CURL_MAX_TIME" --max-time "$CURL_MAX_TIME" \
+            -w '%{http_code}' "http://$_a:$_p/" 2>/dev/null
+        return 0
+    fi
+    if $IP route show "$_a/32" 2>/dev/null | grep -q .; then echo 000; return 0; fi
+    [ -n "$_gw" ] || { echo 000; return 0; }
+    $IP route replace "$_a/32" via "$_gw" dev "$WAN_IF" 2>/dev/null
+    _c=$($CURL -s -k -o /dev/null --connect-timeout "$CURL_MAX_TIME" \
+        --max-time "$CURL_MAX_TIME" -w '%{http_code}' "http://$_a:$_p/" 2>/dev/null)
+    $IP route del "$_a/32" via "$_gw" dev "$WAN_IF" 2>/dev/null
+    echo "${_c:-000}"
+    return 0
+}
+
+# Layered gates, cheapest first. Stages 1-2 are free and unambiguous, so they are
+# hard gates with no hysteresis. Stage 3 is advisory only: old busybox `ping -I
+# <name>` semantics are not worth gating on. Stage 4 is the real test.
+probe_wan() {
+    PROBE_TARGET=""; PROBE_CODE=000
+    [ "$(cat "$SYSNET/$WAN_IF/carrier" 2>/dev/null)" = "1" ] || return 1
+    case "$(cat "$SYSNET/$WAN_IF/operstate" 2>/dev/null)" in
+        up|unknown) ;;
+        *) return 1 ;;
+    esac
+    $IP -4 -o addr show "$WAN_IF" 2>/dev/null | grep -q "inet " || return 1
+    # gw_of ignores our synthetic metrics so a DHCP gateway change self-heals.
+    # But after demote_wan the ONLY wired default IS synthetic (metric 200), so
+    # gw_of returns empty and this probe could never succeed again — the demote
+    # would LATCH, stranding the device on metered cellular until the next DHCP
+    # renew happened to reinstate netifd's route. Fall back to gw_any so we stay
+    # able to test, and therefore recover, the wired path.
+    _wgw=$(gw_of "$WAN_IF")
+    [ -n "$_wgw" ] || _wgw=$(gw_any "$WAN_IF")
+    [ -n "$_wgw" ] || return 1
+
+    if $PING -I "$WAN_IF" -c 1 -W 2 "$_wgw" >/dev/null 2>&1; then
+        PROBE_GW=ok
+    else
+        PROBE_GW=fail
+    fi
+
+    for _t in $PROBE_TARGETS; do
+        _a=${_t%%:*}; _p=${_t##*:}
+        [ "$_a" = "$_p" ] && _p=80
+        _c=$(probe_one "$_a" "$_p" "$_wgw")
+        case "$_c" in
+            ''|000) : ;;
+            *) PROBE_TARGET="$_a:$_p"; PROBE_CODE="$_c"; BIND_FAILS=0; return 0 ;;
+        esac
+    done
+
+    # Self-healing degrade: if every probe fails while the first hop answers, the
+    # curl --interface binding is probably not doing what we think it is. Switch
+    # to the host-route method rather than sitting on cellular forever.
+    if [ "$HAVE_CURL_IFACE" = "1" ] && [ "$PROBE_GW" = "ok" ]; then
+        BIND_FAILS=$((BIND_FAILS + 1))
+        if [ "$BIND_FAILS" -ge 5 ]; then HAVE_CURL_IFACE=0; BIND_FAILS=0; fi
+    fi
+    return 1
+}
+
+# ------------------------------------------------------------- observability --
+write_state() {
+    if [ "$HAVE_CURL_IFACE" = "1" ]; then _pm=bind; else _pm=hostroute; fi
+    cat > "$STATE.new" <<EOF
+enabled=$ENABLED
+state=$st
+wan_if=$WAN_IF
+lte_if=$LTE_IF
+up=$up
+down=$down
+flaps=$flaps
+cooldown=$cooldown
+probe_mode=$_pm
+probe_gw=$PROBE_GW
+probe_target=$PROBE_TARGET
+probe_code=$PROBE_CODE
+active_dev=$(active_dev)
+uptime=$nowt
+last_change=$last_change
+lte_vendor_ping=$(awk '{print $NF; exit}' "$VENDOR_PING_DIR/$LTE_IF.txt" 2>/dev/null)
+EOF
+    mv -f "$STATE.new" "$STATE"
+}
+
+# 120 -> 240 -> 480, capped at MAX_STABLE_SECS. Mirrors usb_backoff() in
+# server/src/lte_watchdog.rs so the escalation feels the same across the agent.
+backoff() {
+    _n=$1
+    [ "$_n" -gt 3 ] && _n=3
+    _v=$MIN_STABLE_SECS; _i=1
+    while [ "$_i" -lt "$_n" ]; do _v=$((_v * 2)); _i=$((_i + 1)); done
+    [ "$_v" -gt "$MAX_STABLE_SECS" ] && _v=$MAX_STABLE_SECS
+    echo "$_v"
+}
+
+# -------------------------------------------------------------------- the loop -
+# No `set -e` anywhere in here: a single failing command must never end the loop.
+loop() {
+    load_conf
+    HAVE_CURL_IFACE=0
+    BIND_FAILS=0
+    # curl >= 7.73 splits help into categories: plain `--help` no longer lists
+    # --interface, only `--help all` does. Probing only `--help` false-negatives
+    # on modern curl and silently drops us into the riskier host-route probe
+    # mode, which mutates the FIB on every probe. Ask for both.
+    { $CURL --help all 2>&1; $CURL --help 2>&1; } |
+        grep -q -- '--interface' && HAVE_CURL_IFACE=1
+    st=lte; up=0; down=0; flaps=0; tickno=0
+    cooldown=$MIN_STABLE_SECS
+    last_change=$(now_secs)
+    PROBE_GW=; PROBE_TARGET=; PROBE_CODE=000
+
+    while : ; do
+        load_conf
+        nowt=$(now_secs)
+        gc_synthetic
+
+        if [ "${ENABLED:-0}" != "1" ]; then
+            if [ "$st" = "wired" ]; then
+                assert_lte; st=lte; last_change=$nowt
+            fi
+            write_state
+            sleep "${TICK_SECS:-5}"
+            continue
+        fi
+
+        # Hard gate every tick; the expensive probe every PROBE_EVERY ticks.
+        if [ "$(cat "$SYSNET/$WAN_IF/carrier" 2>/dev/null)" != "1" ]; then
+            up=0; down=$DOWN_THRESHOLD
+        elif [ $((tickno % PROBE_EVERY)) -eq 0 ]; then
+            if probe_wan; then
+                up=$((up + 1)); down=0
+            else
+                down=$((down + 1)); up=0
+            fi
+        fi
+
+        if [ "$st" = "wired" ]; then
+            if [ "$down" -ge "$DOWN_THRESHOLD" ]; then
+                # NOT assert_lte — that would restore_wan and undo the demote.
+                demote_wan; assert_lte_routes
+                st=lte; last_change=$nowt
+                flaps=$((flaps + 1)); cooldown=$(backoff "$flaps")
+            else
+                assert_wired      # re-assert every tick — beats the vendor's 8s redial
+            fi
+        else
+            if [ "$up" -ge "$UP_THRESHOLD" ] &&
+               [ $((nowt - last_change)) -ge "$cooldown" ]; then
+                restore_wan; assert_wired
+                st=wired; last_change=$nowt
+            fi
+        fi
+
+        if [ $((nowt - last_change)) -ge "$STABLE_RESET_SECS" ]; then
+            flaps=0; cooldown=$MIN_STABLE_SECS
+        fi
+
+        write_state
+        tickno=$((tickno + 1))
+        sleep "${TICK_SECS:-5}"
+    done
+}
+
+# ------------------------------------------------------------------ rc verbs --
+start() {
+    load_conf
+    if [ -r "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        echo "netage-wanpref: already running"
+        return 0
+    fi
+    rm -f "$PIDFILE"
+    # -b forks, setsids, and redirects all three std fds to /dev/null. Both parts
+    # matter: sctl's /api/exec reads stdout/stderr to EOF, so an inherited pipe
+    # would hang the exec request until its timeout and then kill this process.
+    if [ -x /sbin/start-stop-daemon ]; then
+        /sbin/start-stop-daemon -S -b -m -p "$PIDFILE" -x "$SELF" -- loop
+    else
+        "$SELF" loop >/dev/null 2>&1 </dev/null &
+        echo $! > "$PIDFILE"
+    fi
+    return 0
+}
+
+stop() {
+    if [ -r "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
+    fi
+    rm -f "$PIDFILE"
+    sleep 1
+    load_conf
+    assert_lte      # restore the pre-change routing table deterministically
+    return 0
+}
+
+show() {
+    if [ -x "$SELF" ]; then echo "installed=1"; else echo "installed=0"; fi
+    [ -r "$CONF" ] && cat "$CONF"
+    echo "---"
+    if [ -r "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        echo "running=1"
+    else
+        echo "running=0"
+    fi
+    echo "---"
+    [ -r "$STATE" ] && cat "$STATE"
+    echo "---"
+    $IP route show default 2>/dev/null
+}

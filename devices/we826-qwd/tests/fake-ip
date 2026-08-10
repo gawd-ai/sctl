@@ -1,0 +1,103 @@
+#!/bin/sh
+# Fake `ip` for netage-wanpref unit tests.
+#
+# Maintains a routing table in $FAKE_TABLE (one route per line, exactly as
+# `ip route show` would print it) and appends every MUTATING invocation to
+# $FAKE_LOG. Read-only invocations are not logged.
+#
+# A default route printed without a `metric` token has metric 0 — that is how the
+# real kernel prints quectel-CM's rogue route, and the script under test depends
+# on parsing it that way, so the fake must reproduce it faithfully.
+#
+# $FAKE_IPV4 is a space-separated list of interfaces that "have" an IPv4 address.
+
+FAKE_TABLE=${FAKE_TABLE:?FAKE_TABLE must be set}
+FAKE_LOG=${FAKE_LOG:?FAKE_LOG must be set}
+FAKE_IPV4=${FAKE_IPV4:-}
+
+# Normalise a route spec to a match key: "<dev>|<metric>"
+key_of() {
+    _dev=""; _m="0"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            dev)    _dev=$2; shift ;;
+            metric) _m=$2;   shift ;;
+        esac
+        shift
+    done
+    printf '%s|%s' "$_dev" "$_m"
+}
+
+case "$1" in
+    -4)
+        # `ip -4 -o addr show <dev>`
+        shift
+        while [ "$1" = "-o" ] || [ "$1" = "addr" ] || [ "$1" = "show" ]; do shift; done
+        for i in $FAKE_IPV4; do
+            if [ "$i" = "$1" ]; then
+                printf '2: %s    inet 192.0.2.10/24 scope global %s\n' "$1" "$1"
+                exit 0
+            fi
+        done
+        exit 0
+        ;;
+    route) : ;;
+    *) exit 0 ;;
+esac
+
+shift
+action=$1
+shift
+
+case "$action" in
+    show)
+        if [ "$1" = "default" ]; then
+            grep '^default' "$FAKE_TABLE" 2>/dev/null
+        else
+            # host-route lookup, e.g. `ip route show 1.1.1.1/32`
+            grep "^$1 " "$FAKE_TABLE" 2>/dev/null
+        fi
+        exit 0
+        ;;
+
+    replace|add)
+        printf 'route %s %s\n' "$action" "$*" >> "$FAKE_LOG"
+        if [ "$1" = "default" ]; then
+            k=$(key_of "$@")
+            awk -v k="$k" '
+                { dev=""; m="0"
+                  for (i=1;i<=NF;i++) { if($i=="dev")dev=$(i+1); if($i=="metric")m=$(i+1) }
+                  if ($1 != "default" || dev "|" m != k) print }
+            ' "$FAKE_TABLE" > "$FAKE_TABLE.tmp"
+            mv -f "$FAKE_TABLE.tmp" "$FAKE_TABLE"
+        else
+            grep -v "^$1 " "$FAKE_TABLE" > "$FAKE_TABLE.tmp" 2>/dev/null
+            mv -f "$FAKE_TABLE.tmp" "$FAKE_TABLE"
+        fi
+        printf '%s\n' "$*" >> "$FAKE_TABLE"
+        exit 0
+        ;;
+
+    del)
+        printf 'route del %s\n' "$*" >> "$FAKE_LOG"
+        if [ "$1" = "default" ]; then
+            k=$(key_of "$@")
+            before=$(wc -l < "$FAKE_TABLE")
+            awk -v k="$k" '
+                { dev=""; m="0"
+                  for (i=1;i<=NF;i++) { if($i=="dev")dev=$(i+1); if($i=="metric")m=$(i+1) }
+                  if ($1 != "default" || dev "|" m != k) print }
+            ' "$FAKE_TABLE" > "$FAKE_TABLE.tmp"
+            mv -f "$FAKE_TABLE.tmp" "$FAKE_TABLE"
+            after=$(wc -l < "$FAKE_TABLE")
+            # Real `ip route del` exits non-zero on ENOENT; the script relies on
+            # that to fall through to its `||` alternative.
+            [ "$before" -ne "$after" ] || exit 2
+        else
+            grep -v "^$1 " "$FAKE_TABLE" > "$FAKE_TABLE.tmp" 2>/dev/null
+            mv -f "$FAKE_TABLE.tmp" "$FAKE_TABLE"
+        fi
+        exit 0
+        ;;
+esac
+exit 0

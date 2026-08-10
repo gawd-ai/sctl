@@ -1,0 +1,12 @@
+#!/bin/sh
+# Fake `curl` for netage-wanpref unit tests.
+#   FAKE_CURL_CODE  — HTTP status to emit (default 000 = failure)
+#   --help          — advertise --interface so HAVE_CURL_IFACE detection passes
+for a in "$@"; do
+    if [ "$a" = "--help" ]; then
+        printf -- '--interface <name> Use network INTERFACE (or address)\n'
+        exit 0
+    fi
+done
+printf '%s' "${FAKE_CURL_CODE:-000}"
+exit 0

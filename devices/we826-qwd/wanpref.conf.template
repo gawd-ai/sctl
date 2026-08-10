@@ -1,0 +1,14 @@
+# netage-wanpref — see /etc/init.d/netage-wanpref.
+#
+# Rewritten atomically by netage-server (write .new, then mv) and re-read by the
+# loop on EVERY tick, so ENABLED=0 takes effect within TICK_SECS. Safe to hand-edit;
+# that is the intended local kill switch.
+ENABLED={{WANPREF}}
+WAN_IF='{{WANPREF_WAN_IF}}'
+LTE_IF='{{WANPREF_LTE_IF}}'
+PROBE_TARGETS='{{WANPREF_TARGETS}}'
+TICK_SECS=5
+PROBE_EVERY=3
+UP_THRESHOLD=3
+DOWN_THRESHOLD=2
+MIN_STABLE_SECS=120

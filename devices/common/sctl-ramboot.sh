@@ -186,6 +186,15 @@ if [ -n "${LIBGCC_URL:-}" ]; then
     chmod 0644 "$LIBGCC"
 fi
 
+# Self-heal the wired-WAN preference agent, if this device has one installed.
+# It is a separate, unsupervised process (there is no procd on these units), so
+# nothing else would revive it if it died. Piggy-backing on the sctl start path
+# means any sctl start or restart also resurrects it, at the cost of zero extra
+# files. `start` is idempotent — it no-ops when the pidfile is live.
+if [ -x /etc/init.d/netage-wanpref ]; then
+    /etc/init.d/netage-wanpref start >/dev/null 2>&1 || true
+fi
+
 log "starting sctl from RAM"
 if [ -n "${LOADER:-}" ]; then
     exec "$LOADER" --library-path "$RUN_DIR/lib" "$BIN" serve --config "$SCTL_CONFIG"
