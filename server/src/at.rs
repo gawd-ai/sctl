@@ -3,8 +3,8 @@
 //! Comms plugins know vendor command semantics, but `sctl` owns the serial file
 //! descriptor, termios setup, command serialization, and timeout handling.
 
-use std::os::fd::BorrowedFd;
-use std::os::unix::io::RawFd;
+use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -32,12 +32,28 @@ pub struct AtPort {
 impl AtPort {
     /// Open a serial AT device path and spawn the blocking I/O owner thread.
     pub fn open(device: &str) -> Result<Self, String> {
-        let fd = fcntl::open(
+        // Take ownership of the descriptor the instant it exists.
+        //
+        // Every step between here and the thread spawn can fail, and each one
+        // used to `?`-return without closing the fd. That leaked one descriptor
+        // per failed open — and the common failure IS this path: when the modem
+        // re-enumerates (the vendor's AT+CFUN=1,1 loop), the old node lingers
+        // long enough to open but `tcflush` below then fails EIO. On a unit with
+        // no supervisor and no procd, accumulating those to fd exhaustion takes
+        // down the tunnel and the HTTP listener with nothing left to restart them.
+        //
+        // O_CLOEXEC is hygiene, not part of that fix: it keeps the port out of
+        // exec'd children (long-lived PTY sessions especially), and cannot affect
+        // sctl's own fd table.
+        let raw = fcntl::open(
             device,
-            OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_NONBLOCK,
+            OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
             Mode::empty(),
         )
         .map_err(|e| format!("open {device}: {e}"))?;
+        // SAFETY: `raw` was just returned by open(2) and is owned by nobody else.
+        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+        let fd = owned.as_raw_fd();
 
         let flags =
             fcntl::fcntl(fd, fcntl::FcntlArg::F_GETFL).map_err(|e| format!("F_GETFL: {e}"))?;
@@ -56,7 +72,12 @@ impl AtPort {
         let dev_name = device.to_string();
         std::thread::Builder::new()
             .name(format!("sctl-at-{dev_name}"))
-            .spawn(move || at_thread(fd, rx, &dev_name))
+            .spawn(move || {
+                at_thread(owned.as_raw_fd(), rx, &dev_name);
+                // Closes exactly once, here. If the spawn itself fails, the
+                // closure is dropped instead and this still runs.
+                drop(owned);
+            })
             .map_err(|e| format!("spawn AT thread: {e}"))?;
 
         info!("AT port {device}: opened (115200 8N1)");
@@ -119,10 +140,15 @@ fn at_thread(fd: RawFd, rx: mpsc::Receiver<AtRequest>, device: &str) {
     while let Ok(req) = rx.recv() {
         let result = execute_at(fd, &req.command, req.timeout);
         match &result {
+            // Slice on a CHAR boundary, not a byte index. A modem can return
+            // non-ASCII (operator names, or line noise on a flaky link), and
+            // `&resp[..80]` panics if byte 80 lands mid-codepoint. That panic
+            // kills this thread, so the fd never reaches the close below and
+            // every later command fails with "I/O thread gone".
             Ok(resp) => debug!(
                 "AT {device} {}: {:?}",
                 req.command,
-                if resp.len() > 80 { &resp[..80] } else { resp }
+                truncate_on_char_boundary(resp, 80)
             ),
             Err(e) => warn!("AT {device} {} failed: {e}", req.command),
         }
@@ -130,7 +156,21 @@ fn at_thread(fd: RawFd, rx: mpsc::Receiver<AtRequest>, device: &str) {
     }
 
     debug!("AT port {device}: I/O thread exiting");
-    let _ = unistd::close(fd);
+    // No close here: the OwnedFd moved into this thread by `AtPort::open` drops
+    // when the closure returns. Closing again would be a double close, which on
+    // a busy process shuts an unrelated descriptor.
+}
+
+/// Longest prefix of `s` that is at most `max` bytes and ends on a char boundary.
+fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 fn at_init(fd: RawFd) -> Result<(), String> {
@@ -261,5 +301,60 @@ mod tests {
         assert!(!stripped.contains('\0'));
         assert!(!stripped.contains("AT+CSQ"));
         assert!(stripped.contains("+CSQ: 15,99"));
+    }
+
+    /// Count fds in THIS process that point at `target`. Counting entries
+    /// outright would be flaky — cargo runs tests as parallel threads in one
+    /// process, so other tests open and close fds concurrently.
+    fn fds_pointing_at(target: &str) -> usize {
+        let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter(|e| std::fs::read_link(e.path()).is_ok_and(|l| l.to_string_lossy() == target))
+            .count()
+    }
+
+    /// Regression: every early return between `open(2)` and the thread spawn used
+    /// to leak the descriptor. The field case was a modem re-enumeration leaving
+    /// a node that opens but fails `tcflush` with EIO — one leaked fd per retry,
+    /// unbounded, on a unit with no supervisor to restart anything.
+    ///
+    /// A regular file reproduces the shape: `open` succeeds, termios setup fails
+    /// because it is not a tty.
+    #[test]
+    fn open_does_not_leak_a_descriptor_when_setup_fails() {
+        let path = std::env::temp_dir().join(format!("sctl-at-leak-{}", std::process::id()));
+        std::fs::write(&path, b"not a tty").expect("write temp file");
+        let dev = path.to_str().expect("utf8 temp path");
+
+        let before = fds_pointing_at(dev);
+        for _ in 0..16 {
+            assert!(
+                AtPort::open(dev).is_err(),
+                "a regular file must not open as an AT port"
+            );
+        }
+        let after = fds_pointing_at(dev);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            after,
+            before,
+            "AtPort::open leaked {} descriptor(s) over 16 failed opens",
+            after.saturating_sub(before)
+        );
+    }
+
+    #[test]
+    fn truncation_never_splits_a_codepoint() {
+        // 'é' is two bytes, so a byte-index slice at 80 would land mid-codepoint.
+        let s = format!("{}é{}", "a".repeat(79), "b".repeat(40));
+        let out = truncate_on_char_boundary(&s, 80);
+        assert_eq!(out.len(), 79, "must back off to the char boundary");
+        assert!(s.starts_with(out));
+        // Short strings pass through untouched.
+        assert_eq!(truncate_on_char_boundary("short", 80), "short");
     }
 }
