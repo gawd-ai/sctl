@@ -381,7 +381,7 @@ async fn drain_device(device: &ConnectedDevice, reason: &str) {
             "serial": device.serial,
             "reason": reason,
         }));
-        for (_, client_tx) in clients.iter() {
+        for client_tx in clients.values() {
             let _ = client_tx.try_send(disconnect_msg.clone());
         }
     }
@@ -1263,7 +1263,7 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
                         state.update_snapshot(&serial, msg_type, &parsed).await;
                         let clients_read = clients.read().await;
                         let payload = Arc::new(parsed);
-                        for (_, client_tx) in clients_read.iter() {
+                        for client_tx in clients_read.values() {
                             if client_tx.try_send(payload.clone()).is_err() {
                                 dropped_messages.fetch_add(1, Ordering::Relaxed);
                             }
@@ -3047,7 +3047,7 @@ async fn handle_client_ws(
             .filter(|(_, ids)| ids.contains(&client_id))
             .map(|(sid, _)| sid.clone())
             .collect();
-        for (_, client_ids) in subs.iter_mut() {
+        for client_ids in subs.values_mut() {
             client_ids.remove(&client_id);
         }
         // Remove empty subscription sets

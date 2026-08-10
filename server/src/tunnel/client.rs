@@ -1166,7 +1166,7 @@ async fn connect_and_run(
     let attached_sessions: Vec<String> = {
         let tasks = subscriber_tasks.lock().await;
         let ids = tasks.keys().cloned().collect();
-        for (_, task) in tasks.iter() {
+        for task in tasks.values() {
             task.abort();
         }
         ids
