@@ -573,7 +573,23 @@ pub(crate) fn get_disk_usage(path: &str) -> Value {
 /// Pseudo/kernel filesystems are skipped, `overlay`-type merge mounts are
 /// skipped (they mirror the underlying writable partition), and entries sharing
 /// a source device + size are de-duplicated (e.g. squashfs `/` and `/rom/*`).
+///
+/// One mount point yields at most one entry, last one wins. The kernel lets a
+/// later mount shadow an earlier one at the same path, so `/proc/mounts`
+/// legitimately lists a target twice — an OpenWrt root shows `rootfs on /`
+/// followed by `overlayfs:/overlay on /`. Those share neither source nor a
+/// skipped fstype, so the two filters above both let them through, and a
+/// consumer keying on the mount point has no way to tell which one is real.
+/// Last wins because that is the filesystem actually mounted there.
 pub(crate) fn collect_disks() -> Vec<Value> {
+    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    disks_from_mounts(&mounts, &get_disk_usage)
+}
+
+/// The rules above, applied to a `/proc/mounts` body with usage supplied by the
+/// caller — so the selection can be tested against a real device's mount table
+/// without that device, or a filesystem, being present.
+fn disks_from_mounts(mounts: &str, usage_of: &dyn Fn(&str) -> Value) -> Vec<Value> {
     const SKIP_FSTYPE: &[&str] = &[
         "proc",
         "sysfs",
@@ -597,9 +613,11 @@ pub(crate) fn collect_disks() -> Vec<Value> {
         "binfmt_misc",
         "fuse.gvfsd-fuse",
         "overlay",
+        // Same merge mount, older kernels' name for it. Without this the skip
+        // above misses every OpenWrt build before the rename.
+        "overlayfs",
     ];
 
-    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
     let mut out: Vec<Value> = Vec::new();
     let mut seen: Vec<(String, u64)> = Vec::new();
 
@@ -621,7 +639,7 @@ pub(crate) fn collect_disks() -> Vec<Value> {
             continue;
         }
 
-        let usage = get_disk_usage(target);
+        let usage = usage_of(target);
         let Some(total) = usage.get("total_bytes").and_then(Value::as_u64) else {
             continue;
         };
@@ -635,7 +653,7 @@ pub(crate) fn collect_disks() -> Vec<Value> {
         seen.push((source.to_string(), total));
 
         let read_only = opts.split(',').any(|o| o == "ro");
-        out.push(json!({
+        let entry = json!({
             "mount": target,
             "fstype": fstype,
             "source": source,
@@ -643,8 +661,97 @@ pub(crate) fn collect_disks() -> Vec<Value> {
             "total_bytes": total,
             "used_bytes": usage.get("used_bytes").cloned().unwrap_or(Value::Null),
             "available_bytes": usage.get("available_bytes").cloned().unwrap_or(Value::Null),
-        }));
+        });
+        // One row per mount point: replace in place rather than appending, so a
+        // shadowed target keeps its position in the list and the surviving row
+        // is the mount that is actually live there.
+        match out
+            .iter()
+            .position(|e| e.get("mount").and_then(Value::as_str) == Some(target))
+        {
+            Some(i) => out[i] = entry,
+            None => out.push(entry),
+        }
     }
 
     out
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::disks_from_mounts;
+    use serde_json::{json, Value};
+
+    /// Real `/proc/mounts` from WE826-F85E3CD01310, the device whose duplicate
+    /// `/` took a fleet page down. Read off the unit, not composed by hand.
+    const WE826_MOUNTS: &str = "\
+rootfs / rootfs rw 0 0
+/dev/root /rom squashfs ro,relatime,errors=continue 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+tmpfs /tmp tmpfs rw,nosuid,nodev,noatime 0 0
+/dev/mtdblock3 /overlay jffs2 rw,noatime 0 0
+overlayfs:/overlay / overlayfs rw,noatime,lowerdir=/,upperdir=/overlay/upper 0 0
+tmpfs /dev tmpfs rw,nosuid,noexec,noatime,size=512k,mode=755 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,noatime,mode=600 0 0
+";
+
+    fn sized(total: u64) -> Value {
+        json!({ "total_bytes": total, "used_bytes": total / 3, "available_bytes": total / 2 })
+    }
+
+    /// Distinct sizes per target, so the (source, size) de-dup cannot be the
+    /// thing that happens to collapse the duplicate — only the mount rule can.
+    fn usage(target: &str) -> Value {
+        match target {
+            "/" | "/overlay" => sized(851_968),
+            "/rom" => sized(14_155_776),
+            "/tmp" => sized(64_507_904),
+            _ => sized(0),
+        }
+    }
+
+    fn mounts_of(disks: &[Value]) -> Vec<&str> {
+        disks
+            .iter()
+            .filter_map(|d| d.get("mount").and_then(Value::as_str))
+            .collect()
+    }
+
+    #[test]
+    fn a_target_reported_twice_yields_one_row() {
+        let disks = disks_from_mounts(WE826_MOUNTS, &usage);
+        assert_eq!(mounts_of(&disks), vec!["/", "/rom", "/tmp", "/overlay"]);
+    }
+
+    #[test]
+    fn merge_mounts_are_skipped_under_either_kernel_name() {
+        for fstype in ["overlay", "overlayfs"] {
+            let table = format!("merged:/x /merged {fstype} rw 0 0\n");
+            assert!(
+                disks_from_mounts(&table, &|_| sized(1_000)).is_empty(),
+                "{fstype} merge mount should not be reported"
+            );
+        }
+    }
+
+    #[test]
+    fn the_live_mount_wins_when_one_shadows_another() {
+        let table = "\
+rootfs / rootfs rw 0 0
+/dev/sda1 / ext4 rw 0 0
+";
+        let disks = disks_from_mounts(table, &|_| sized(4_096));
+        assert_eq!(disks.len(), 1);
+        assert_eq!(disks[0]["fstype"], "ext4");
+        assert_eq!(disks[0]["source"], "/dev/sda1");
+    }
+
+    #[test]
+    fn pseudo_filesystems_and_zero_sized_volumes_are_left_out() {
+        let disks = disks_from_mounts(WE826_MOUNTS, &usage);
+        for skipped in ["/proc", "/sys", "/dev", "/dev/pts"] {
+            assert!(!mounts_of(&disks).contains(&skipped), "{skipped} leaked in");
+        }
+    }
 }
