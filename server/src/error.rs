@@ -90,4 +90,12 @@ pub mod codes {
     pub const MODEM_AT_FAILED: &str = "MODEM_AT_FAILED";
     pub const TUNNEL_CONNECTED: &str = "TUNNEL_CONNECTED";
     pub const SCAN_RUNNING: &str = "SCAN_RUNNING";
+    pub const INVALID_URL: &str = "INVALID_URL";
+    pub const FETCH_FAILED: &str = "FETCH_FAILED";
+    /// The peer presented a certificate that does not match its recorded pin.
+    /// Never retry through this — it is the one signal that distinguishes an
+    /// interception from an ordinary connection failure.
+    pub const CERT_PIN_MISMATCH: &str = "CERT_PIN_MISMATCH";
+    /// No CA path, no pin, and TOFU was not requested.
+    pub const CERT_UNTRUSTED: &str = "CERT_UNTRUSTED";
 }

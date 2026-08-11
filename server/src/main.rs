@@ -463,6 +463,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         .route("/api/diagnostics", get(routes::diagnostics::diagnostics))
         .route("/api/exec", post(routes::exec::exec))
         .route("/api/exec/batch", post(routes::exec::batch_exec))
+        .route("/api/fetch", post(routes::fetch::fetch))
         .route(
             "/api/files",
             get(routes::files::get_file)

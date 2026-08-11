@@ -8,6 +8,7 @@ pub mod activity;
 pub mod diagnostics;
 pub mod events;
 pub mod exec;
+pub mod fetch;
 pub mod files;
 pub mod gps;
 pub mod health;
