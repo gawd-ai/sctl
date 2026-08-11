@@ -225,6 +225,12 @@ pub(crate) async fn info_with_groups(
                     projected["altitude"] = fix.get("altitude").cloned().unwrap_or(Value::Null);
                     projected["satellites"] = fix.get("satellites").cloned().unwrap_or(Value::Null);
                     projected["speed_kmh"] = fix.get("speed_kmh").cloned().unwrap_or(Value::Null);
+                    // Course over ground. The driver has parsed this since the
+                    // GPS support landed (parts[6] of the +QGPSLOC reply) and
+                    // serialises it into the fix, but the projection dropped it,
+                    // so no consumer has ever been able to see heading. On a
+                    // vehicle that is the difference between a dot and a track.
+                    projected["course"] = fix.get("course").cloned().unwrap_or(Value::Null);
                     projected["hdop"] = fix.get("hdop").cloned().unwrap_or(Value::Null);
                     projected["fix_age_secs"] =
                         gps.get("fix_age_secs").cloned().unwrap_or(Value::Null);
