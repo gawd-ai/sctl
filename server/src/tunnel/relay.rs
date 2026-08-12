@@ -295,6 +295,8 @@ pub struct LiveDeviceStatus {
     pub dropped_messages: u64,
     pub last_gps_fix: Option<Value>,
     pub last_lte_signal: Option<Value>,
+    /// Public address this tunnel arrived from — see `ConnectedDevice::egress_ip`.
+    pub egress_ip: Option<String>,
 }
 
 /// Maximum age of a snapshot before it gets pruned (7 days).
@@ -350,6 +352,18 @@ pub struct ConnectedDevice {
     pub last_gps_fix: Arc<RwLock<Option<Value>>>,
     /// Latest LTE signal broadcast from device.
     pub last_lte_signal: Arc<RwLock<Option<Value>>>,
+    /// Public address the device connected FROM, if the front proxy reported one.
+    ///
+    /// For a device behind someone else's router this is that router's egress
+    /// address, which makes it a witness of WHICH UPSTREAM PATH carried the
+    /// tunnel — a vehicle whose AP fails from satellite to cellular reconnects
+    /// from a visibly different address. Independent of anything the device or
+    /// its AP says about itself, so it still holds when they say nothing.
+    ///
+    /// `None` when no forwarding header was present. Absence is unknown, never
+    /// an error: a direct connection or an unconfigured proxy is a deployment
+    /// choice, not a fault.
+    pub egress_ip: Option<String>,
 }
 
 /// Drain all pending requests for a device, sending error responses on each oneshot.
@@ -587,6 +601,7 @@ impl RelayState {
                 dropped_messages: device.dropped_messages.load(Ordering::Relaxed),
                 last_gps_fix,
                 last_lte_signal,
+                egress_ip: device.egress_ip.clone(),
             });
         }
 
@@ -736,10 +751,35 @@ fn is_valid_serial(s: &str) -> bool {
 /// Maximum concurrent WS clients per device.
 const MAX_CLIENTS_PER_DEVICE: usize = 32;
 
+/// The address a proxied client connected from, per the front proxy.
+///
+/// Read from headers rather than `ConnectInfo` for two reasons: the server is
+/// started with a plain `axum::serve`, so `ConnectInfo` is not available to any
+/// handler; and the relay is deployed behind a TLS-terminating reverse proxy,
+/// which makes the socket peer address `127.0.0.1` and therefore useless.
+///
+/// `X-Forwarded-For` accumulates a comma-separated chain as it crosses proxies
+/// and the ORIGINAL client is the leftmost entry. Nothing here is trusted for
+/// authorization — it is telemetry about which path a tunnel arrived over, and
+/// a device that spoofed it would only mislabel its own route.
+fn forwarded_client_ip(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers
+        .get("x-forwarded-for")
+        .or_else(|| headers.get("x-real-ip"))?
+        .to_str()
+        .ok()?;
+    let first = raw.split(',').next()?.trim();
+    if first.is_empty() || first.len() > 64 {
+        return None;
+    }
+    Some(first.to_string())
+}
+
 /// `GET /api/tunnel/register?token=<tunnel_key>&serial=<serial>` — device WS registration.
 async fn device_register_ws(
     State(state): State<RelayState>,
     Query(query): Query<RegisterQuery>,
+    headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
     if !crate::auth::constant_time_eq(state.tunnel_key.as_bytes(), query.token.as_bytes()) {
@@ -751,17 +791,23 @@ async fn device_register_ws(
     }
 
     let serial = query.serial.clone();
-    info!(serial = %serial, "Device connecting...");
+    let egress_ip = forwarded_client_ip(&headers);
+    info!(serial = %serial, egress_ip = ?egress_ip, "Device connecting...");
 
     ws.on_upgrade(move |socket| {
-        handle_device_ws(socket, state, serial.clone())
+        handle_device_ws(socket, state, serial.clone(), egress_ip)
             .instrument(info_span!("tunnel_device", serial = %serial))
     })
 }
 
 /// Handle a registered device's WebSocket connection.
 #[allow(clippy::too_many_lines)]
-async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayState, serial: String) {
+async fn handle_device_ws(
+    socket: axum::extract::ws::WebSocket,
+    state: RelayState,
+    serial: String,
+    egress_ip: Option<String>,
+) {
     let (mut ws_sink, mut ws_stream) = socket.split();
     let (device_tx, mut device_rx) = mpsc::channel::<TunnelMessage>(256);
     // Priority channel for ping/pong — bypasses the main device_tx queue so
@@ -842,6 +888,7 @@ async fn handle_device_ws(socket: axum::extract::ws::WebSocket, state: RelayStat
         shutdown_tx,
         last_gps_fix: shared_gps,
         last_lte_signal: shared_lte,
+        egress_ip: egress_ip.clone(),
     };
 
     let pending_requests = device.pending_requests.clone();
@@ -1394,6 +1441,7 @@ async fn list_devices(
             "dropped_messages": d.dropped_messages.load(Ordering::Relaxed),
             "last_gps_fix": *d.last_gps_fix.read().await,
             "last_lte_signal": *d.last_lte_signal.read().await,
+            "egress_ip": d.egress_ip,
         }));
     }
 
@@ -3428,4 +3476,79 @@ async fn proxy_stp_abort(
     let response =
         tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
     proxy_response_to_http(&response)
+}
+
+#[cfg(test)]
+mod egress_ip_tests {
+    use super::forwarded_client_ip;
+    use axum::http::{HeaderMap, HeaderName};
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn takes_the_original_client_from_a_proxy_chain() {
+        // XFF grows rightward as it crosses proxies, so the device is leftmost.
+        // Taking the last entry would record our own front proxy on every row.
+        let h = headers(&[("x-forwarded-for", "203.0.113.7, 10.0.0.1, 172.16.0.9")]);
+        assert_eq!(forwarded_client_ip(&h).as_deref(), Some("203.0.113.7"));
+    }
+
+    #[test]
+    fn handles_a_single_entry_and_trims() {
+        let h = headers(&[("x-forwarded-for", "  198.51.100.4  ")]);
+        assert_eq!(forwarded_client_ip(&h).as_deref(), Some("198.51.100.4"));
+    }
+
+    #[test]
+    fn falls_back_to_x_real_ip() {
+        let h = headers(&[("x-real-ip", "198.51.100.20")]);
+        assert_eq!(forwarded_client_ip(&h).as_deref(), Some("198.51.100.20"));
+    }
+
+    #[test]
+    fn prefers_forwarded_for_when_both_are_present() {
+        let h = headers(&[
+            ("x-forwarded-for", "203.0.113.7"),
+            ("x-real-ip", "10.0.0.1"),
+        ]);
+        assert_eq!(forwarded_client_ip(&h).as_deref(), Some("203.0.113.7"));
+    }
+
+    #[test]
+    fn absent_is_none_not_an_error() {
+        // A direct connection or an unconfigured proxy is a deployment choice.
+        assert_eq!(forwarded_client_ip(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn rejects_empty_and_absurdly_long_values() {
+        assert_eq!(
+            forwarded_client_ip(&headers(&[("x-forwarded-for", "")])),
+            None
+        );
+        assert_eq!(
+            forwarded_client_ip(&headers(&[("x-forwarded-for", ",")])),
+            None
+        );
+        let long = "a".repeat(200);
+        assert_eq!(
+            forwarded_client_ip(&headers(&[("x-forwarded-for", &long)])),
+            None
+        );
+    }
+
+    #[test]
+    fn ipv6_survives_intact() {
+        let h = headers(&[("x-forwarded-for", "2001:db8::1, 10.0.0.1")]);
+        assert_eq!(forwarded_client_ip(&h).as_deref(), Some("2001:db8::1"));
+    }
 }
