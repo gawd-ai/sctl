@@ -46,14 +46,18 @@ implicit_hasher = "allow"
 # Workspaces ignore non-root [profile.*] sections, so this is the only copy
 # that can exist.
 #
-# panic = "abort" is scheduled to flip to "unwind" in 0.6.0 Phase 1: the
-# in-process recovery machinery (catch_unwind in the tunnel client, the
-# JoinError-restart in main) is dead code under abort, and nothing respawns
-# a crashed daemon on the RAM-boot units. The flip ships with the device
-# resilience payload, not with this mechanical conversion.
+# panic is left at the default ("unwind") on purpose. Under abort, the
+# in-process recovery machinery — catch_unwind around every tunnel message
+# handler, the JoinError-restart supervisor in main — was dead code: one
+# panic took the whole daemon down. Measured cost on the WE826 MIPS payload
+# (opt-level z, lto, strip): server 2,531,300 -> 3,142,074 gzipped, +24%.
+# That exceeds the 10% revisit threshold from the 2026-08-16 owner decision,
+# so this line is explicitly still open: the fallback position is abort +
+# the ramboot supervisor respawn (which now exists and turns a panic into a
+# process restart instead of a brick, at the cost of dropped sessions and a
+# tunnel blip). Do not publish payload #1 before the owner picks one.
 [profile.release]
 opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
-panic = "abort"

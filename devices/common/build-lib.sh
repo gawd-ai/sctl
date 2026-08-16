@@ -86,7 +86,10 @@ setup_openwrt_target_env() {
 build_cargo_release_build_std() {
     local manifest=$1
     echo "building $(dirname "$manifest") for $RUST_TARGET"
-    cargo +nightly build -Z build-std=std,panic_abort \
+    # panic_unwind must match the workspace profile's panic strategy
+    # (default "unwind"); listing panic_abort here with an unwind profile
+    # fails to link std's unwinder.
+    cargo +nightly build -Z build-std=std,panic_unwind \
         --manifest-path "$manifest" \
         --release \
         --target "$RUST_TARGET"
