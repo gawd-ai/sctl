@@ -25,9 +25,12 @@ ensure_rust_build_std() {
         echo "install with: rustup toolchain install nightly" >&2
         exit 1
     fi
-    if ! rustup component list --installed | grep -q '^rust-src'; then
+    # Query the nightly toolchain explicitly: the repo's rust-toolchain.toml
+    # pins the default resolution to a stable release, which never carries
+    # rust-src, so an unqualified query would always fail here.
+    if ! rustup component list --installed --toolchain nightly | grep -q '^rust-src'; then
         echo "rust-src component is required for -Z build-std" >&2
-        echo "install with: rustup component add rust-src" >&2
+        echo "install with: rustup component add rust-src --toolchain nightly" >&2
         exit 1
     fi
 }
