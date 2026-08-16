@@ -31,7 +31,9 @@ pub async fn push_config(
     let Some(ref infra) = state.infra_state else {
         return Err((
             StatusCode::NOT_FOUND,
-            Json(json!({"error": "Infra monitoring not available"})),
+            Json(
+                json!({"error": "Infra monitoring not available", "code": "INFRA_UNAVAILABLE", "message": "Infra monitoring not available"}),
+            ),
         ));
     };
 
@@ -87,7 +89,9 @@ pub async fn check_target(
     let Some(ref infra) = state.infra_state else {
         return Err((
             StatusCode::NOT_FOUND,
-            Json(json!({"error": "Infra monitoring not available"})),
+            Json(
+                json!({"error": "Infra monitoring not available", "code": "INFRA_UNAVAILABLE", "message": "Infra monitoring not available"}),
+            ),
         ));
     };
 
@@ -95,7 +99,9 @@ pub async fn check_target(
     let Some(ref config) = guard.config else {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "No config loaded"})),
+            Json(
+                json!({"error": "No config loaded", "code": "NOT_FOUND", "message": "No config loaded"}),
+            ),
         ));
     };
 
@@ -103,7 +109,9 @@ pub async fn check_target(
     let Some(target) = target else {
         return Err((
             StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("Target {target_id} not found")})),
+            Json(
+                json!({"error": format!("Target {target_id} not found"), "code": "NOT_FOUND", "message": format!("Target {target_id} not found")}),
+            ),
         ));
     };
 
@@ -139,7 +147,9 @@ pub async fn discover_subnets() -> Result<Json<Value>, (StatusCode, Json<Value>)
         Ok(subnets) => Ok(Json(json!({ "subnets": subnets }))),
         Err(e) => Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": e, "reason": "ip_command_failed" })),
+            Json(
+                json!({ "error": e, "reason": "ip_command_failed", "code": "EXEC_FAILED", "message": e }),
+            ),
         )),
     }
 }
@@ -151,7 +161,9 @@ pub async fn delete_config(
     let Some(ref infra) = state.infra_state else {
         return Err((
             StatusCode::NOT_FOUND,
-            Json(json!({"error": "Infra monitoring not available"})),
+            Json(
+                json!({"error": "Infra monitoring not available", "code": "INFRA_UNAVAILABLE", "message": "Infra monitoring not available"}),
+            ),
         ));
     };
 

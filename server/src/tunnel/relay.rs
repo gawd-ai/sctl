@@ -143,7 +143,7 @@ async fn drain_device(device: &ConnectedDevice, reason: &str) {
         let _ = sender.send(TunnelResponse::Json(json!({
             "type": "error",
             "status": 502,
-            "body": {"error": reason, "code": "DEVICE_DISCONNECTED", "retryable": true},
+            "body": {"error": reason, "code": "DEVICE_DISCONNECTED", "message": reason, "retryable": true},
         })));
     }
     if count > 0 {
@@ -548,6 +548,7 @@ async fn proxy_passthrough(
             StatusCode::NOT_FOUND,
             Json(json!({
                 "error": format!("/api/{rest} is a streaming endpoint and cannot be proxied generically"),
+                "message": format!("/api/{rest} is a streaming endpoint and cannot be proxied generically"),
                 "code": "ROUTE_NOT_PROXIED",
             })),
         ));
@@ -571,6 +572,7 @@ async fn proxy_passthrough(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 Json(json!({
                     "error": "request body exceeds the 8 MiB tunnel cap",
+                    "message": "request body exceeds the 8 MiB tunnel cap",
                     "code": "PAYLOAD_TOO_LARGE",
                 })),
             )
@@ -598,7 +600,7 @@ async fn proxy_passthrough(
         // large, streaming endpoint, old payload answering strangely).
         return Err((
             status,
-            Json(json!({ "error": err, "code": "DEVICE_DISPATCH_ERROR" })),
+            Json(json!({ "error": err, "code": "DEVICE_DISPATCH_ERROR", "message": err })),
         ));
     }
 
@@ -611,6 +613,7 @@ async fn proxy_passthrough(
                 StatusCode::BAD_GATEWAY,
                 Json(json!({
                     "error": "device returned invalid body_b64",
+                    "message": "device returned invalid body_b64",
                     "code": "DEVICE_RESPONSE_INVALID",
                 })),
             )
@@ -635,6 +638,7 @@ async fn proxy_passthrough(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
                 "error": format!("response build failed: {e}"),
+                "message": format!("response build failed: {e}"),
                 "code": "INTERNAL",
             })),
         )
@@ -836,7 +840,7 @@ async fn handle_device_ws(
                 let _ = sender.send(TunnelResponse::Json(json!({
                     "type": "error",
                     "status": 502,
-                    "body": {"error": "device reconnecting", "code": "DEVICE_RECONNECTING", "retryable": true},
+                    "body": {"error": "device reconnecting", "code": "DEVICE_RECONNECTING", "message": "device reconnecting", "retryable": true},
                 })));
             }
             if count > 0 {
@@ -1378,7 +1382,7 @@ pub async fn tunnel_request(
     let device = devices.get(serial).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("Device '{serial}' not connected"), "code": "DEVICE_NOT_FOUND"})),
+            Json(json!({"error": format!("Device '{serial}' not connected"), "code": "DEVICE_NOT_FOUND", "message": format!("Device '{serial}' not connected")})),
         )
     })?;
 
@@ -1393,7 +1397,7 @@ pub async fn tunnel_request(
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(
-                    json!({"error": "Device has too many pending requests", "code": "OVERLOADED"}),
+                    json!({"error": "Device has too many pending requests", "code": "OVERLOADED", "message": "Device has too many pending requests"}),
                 ),
             ));
         }
@@ -1411,7 +1415,9 @@ pub async fn tunnel_request(
             pending.lock().await.remove(&request_id);
             return Err((
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error": "Failed to send to device", "code": "DEVICE_SEND_FAILED"})),
+                Json(
+                    json!({"error": "Failed to send to device", "code": "DEVICE_SEND_FAILED", "message": "Failed to send to device"}),
+                ),
             ));
         }
         Err(_) => {
@@ -1420,6 +1426,7 @@ pub async fn tunnel_request(
                 StatusCode::BAD_GATEWAY,
                 Json(json!({
                     "error": "Device request queue stalled",
+                    "message": "Device request queue stalled",
                     "code": "DEVICE_QUEUE_STALLED"
                 })),
             ));
@@ -1433,7 +1440,9 @@ pub async fn tunnel_request(
         Ok(Ok(response)) => Ok(response),
         Ok(Err(_)) => Err((
             StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "Device connection lost", "code": "DEVICE_DISCONNECTED"})),
+            Json(
+                json!({"error": "Device connection lost", "code": "DEVICE_DISCONNECTED", "message": "Device connection lost"}),
+            ),
         )),
         Err(_) => {
             // Timeout — clean up unconditionally via stored Arc
@@ -1441,7 +1450,7 @@ pub async fn tunnel_request(
             Err((
                 StatusCode::GATEWAY_TIMEOUT,
                 Json(
-                    json!({"error": "Device did not respond in time", "code": "TIMEOUT", "retryable": true}),
+                    json!({"error": "Device did not respond in time", "code": "TIMEOUT", "message": "Device did not respond in time", "retryable": true}),
                 ),
             ))
         }
@@ -1461,7 +1470,7 @@ pub async fn tunnel_request_json(
         TunnelResponse::Binary { .. } => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(
-                json!({"error": "Expected JSON response, got binary", "code": "UNEXPECTED_BINARY"}),
+                json!({"error": "Expected JSON response, got binary", "code": "UNEXPECTED_BINARY", "message": "Expected JSON response, got binary"}),
             ),
         )),
     }
@@ -1479,7 +1488,7 @@ pub async fn tunnel_request_binary(
     let device = devices.get(serial).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("Device '{serial}' not connected"), "code": "DEVICE_NOT_FOUND"})),
+            Json(json!({"error": format!("Device '{serial}' not connected"), "code": "DEVICE_NOT_FOUND", "message": format!("Device '{serial}' not connected")})),
         )
     })?;
 
@@ -1490,7 +1499,7 @@ pub async fn tunnel_request_binary(
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(
-                    json!({"error": "Device has too many pending requests", "code": "OVERLOADED"}),
+                    json!({"error": "Device has too many pending requests", "code": "OVERLOADED", "message": "Device has too many pending requests"}),
                 ),
             ));
         }
@@ -1508,7 +1517,9 @@ pub async fn tunnel_request_binary(
             device.pending_requests.lock().await.remove(request_id);
             return Err((
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error": "Failed to send to device", "code": "DEVICE_SEND_FAILED"})),
+                Json(
+                    json!({"error": "Failed to send to device", "code": "DEVICE_SEND_FAILED", "message": "Failed to send to device"}),
+                ),
             ));
         }
         Err(_) => {
@@ -1517,6 +1528,7 @@ pub async fn tunnel_request_binary(
                 StatusCode::BAD_GATEWAY,
                 Json(json!({
                     "error": "Device request queue stalled",
+                    "message": "Device request queue stalled",
                     "code": "DEVICE_QUEUE_STALLED"
                 })),
             ));
@@ -1529,7 +1541,9 @@ pub async fn tunnel_request_binary(
         Ok(Ok(response)) => Ok(response),
         Ok(Err(_)) => Err((
             StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "Device connection lost", "code": "DEVICE_DISCONNECTED"})),
+            Json(
+                json!({"error": "Device connection lost", "code": "DEVICE_DISCONNECTED", "message": "Device connection lost"}),
+            ),
         )),
         Err(_) => {
             if let Some(device) = state.devices.read().await.get(serial) {
@@ -1538,7 +1552,7 @@ pub async fn tunnel_request_binary(
             Err((
                 StatusCode::GATEWAY_TIMEOUT,
                 Json(
-                    json!({"error": "Device did not respond in time", "code": "TIMEOUT", "retryable": true}),
+                    json!({"error": "Device did not respond in time", "code": "TIMEOUT", "message": "Device did not respond in time", "retryable": true}),
                 ),
             ))
         }
@@ -1554,7 +1568,7 @@ fn validate_device_auth<'a>(
     let device = devices.get(serial).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("Device '{serial}' not connected"), "code": "DEVICE_NOT_FOUND"})),
+            Json(json!({"error": format!("Device '{serial}' not connected"), "code": "DEVICE_NOT_FOUND", "message": format!("Device '{serial}' not connected")})),
         )
     })?;
 
@@ -1563,7 +1577,9 @@ fn validate_device_auth<'a>(
         _ => {
             return Err((
                 StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "Missing or invalid Authorization header"})),
+                Json(
+                    json!({"error": "Missing or invalid Authorization header", "code": "AUTH_MISSING_TOKEN", "message": "Missing or invalid Authorization header"}),
+                ),
             ));
         }
     };
@@ -1571,7 +1587,9 @@ fn validate_device_auth<'a>(
     if !crate::auth::constant_time_eq(device.api_key.as_bytes(), provided_key.as_bytes()) {
         return Err((
             StatusCode::FORBIDDEN,
-            Json(json!({"error": "Invalid API key"})),
+            Json(
+                json!({"error": "Invalid API key", "code": "AUTH_INVALID_TOKEN", "message": "Invalid API key"}),
+            ),
         ));
     }
 
@@ -1698,7 +1716,7 @@ async fn proxy_info(
         let body_obj = body.as_object().ok_or_else(|| {
             (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error": "Invalid device info response", "code": "INVALID_DEVICE_RESPONSE"})),
+                Json(json!({"error": "Invalid device info response", "code": "INVALID_DEVICE_RESPONSE", "message": "Invalid device info response"})),
             )
         })?;
         for (key, value) in body_obj {
@@ -1773,14 +1791,14 @@ async fn proxy_exec(
         .map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Failed to read request body"})),
+                Json(json!({"error": "Failed to read request body", "code": "INVALID_REQUEST", "message": "Failed to read request body"})),
             )
         })?;
 
     let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Invalid JSON"})),
+            Json(json!({"error": "Invalid JSON", "code": "INVALID_REQUEST", "message": "Invalid JSON"})),
         )
     })?;
 
@@ -1827,14 +1845,14 @@ async fn proxy_exec_batch(
         .map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Failed to read request body"})),
+                Json(json!({"error": "Failed to read request body", "code": "INVALID_REQUEST", "message": "Failed to read request body"})),
             )
         })?;
 
     let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Invalid JSON"})),
+            Json(json!({"error": "Invalid JSON", "code": "INVALID_REQUEST", "message": "Invalid JSON"})),
         )
     })?;
 
@@ -1934,14 +1952,14 @@ async fn proxy_file_write(
         .map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Failed to read request body"})),
+                Json(json!({"error": "Failed to read request body", "code": "INVALID_REQUEST", "message": "Failed to read request body"})),
             )
         })?;
 
     let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Invalid JSON"})),
+            Json(json!({"error": "Invalid JSON", "code": "INVALID_REQUEST", "message": "Invalid JSON"})),
         )
     })?;
 
@@ -1985,14 +2003,14 @@ async fn proxy_file_delete(
         .map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Failed to read request body"})),
+                Json(json!({"error": "Failed to read request body", "code": "INVALID_REQUEST", "message": "Failed to read request body"})),
             )
         })?;
 
     let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Invalid JSON"})),
+            Json(json!({"error": "Invalid JSON", "code": "INVALID_REQUEST", "message": "Invalid JSON"})),
         )
     })?;
 
@@ -2179,14 +2197,14 @@ async fn proxy_session_signal(
         .map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Failed to read request body"})),
+                Json(json!({"error": "Failed to read request body", "code": "INVALID_REQUEST", "message": "Failed to read request body"})),
             )
         })?;
 
     let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Invalid JSON"})),
+            Json(json!({"error": "Invalid JSON", "code": "INVALID_REQUEST", "message": "Invalid JSON"})),
         )
     })?;
 
@@ -2254,14 +2272,14 @@ async fn proxy_session_patch(
         .map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Failed to read request body"})),
+                Json(json!({"error": "Failed to read request body", "code": "INVALID_REQUEST", "message": "Failed to read request body"})),
             )
         })?;
 
     let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Invalid JSON"})),
+            Json(json!({"error": "Invalid JSON", "code": "INVALID_REQUEST", "message": "Invalid JSON"})),
         )
     })?;
 
@@ -2378,14 +2396,14 @@ async fn proxy_playbook_put(
         .map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Failed to read request body"})),
+                Json(json!({"error": "Failed to read request body", "code": "INVALID_REQUEST", "message": "Failed to read request body"})),
             )
         })?;
 
     let content = String::from_utf8(body_bytes.to_vec()).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Invalid UTF-8"})),
+            Json(json!({"error": "Invalid UTF-8", "code": "INVALID_CONTENT", "message": "Invalid UTF-8"})),
         )
     })?;
 
@@ -2528,14 +2546,14 @@ async fn proxy_lte_bands(
         .map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Failed to read request body"})),
+                Json(json!({"error": "Failed to read request body", "code": "INVALID_REQUEST", "message": "Failed to read request body"})),
             )
         })?;
 
     let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Invalid JSON"})),
+            Json(json!({"error": "Invalid JSON", "code": "INVALID_REQUEST", "message": "Invalid JSON"})),
         )
     })?;
 
@@ -2571,14 +2589,14 @@ async fn proxy_lte_scan(
         .map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Failed to read request body"})),
+                Json(json!({"error": "Failed to read request body", "code": "INVALID_REQUEST", "message": "Failed to read request body"})),
             )
         })?;
 
     let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Invalid JSON"})),
+            Json(json!({"error": "Invalid JSON", "code": "INVALID_REQUEST", "message": "Invalid JSON"})),
         )
     })?;
 
@@ -2740,14 +2758,14 @@ async fn proxy_infra_discover(
         .map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Failed to read request body"})),
+                Json(json!({"error": "Failed to read request body", "code": "INVALID_REQUEST", "message": "Failed to read request body"})),
             )
         })?;
 
     let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Invalid JSON"})),
+            Json(json!({"error": "Invalid JSON", "code": "INVALID_REQUEST", "message": "Invalid JSON"})),
         )
     })?;
 
@@ -2783,14 +2801,14 @@ async fn proxy_infra_config_push(
         .map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Failed to read request body"})),
+                Json(json!({"error": "Failed to read request body", "code": "INVALID_REQUEST", "message": "Failed to read request body"})),
             )
         })?;
 
     let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Invalid JSON"})),
+            Json(json!({"error": "Invalid JSON", "code": "INVALID_REQUEST", "message": "Invalid JSON"})),
         )
     })?;
 
@@ -3101,14 +3119,14 @@ async fn proxy_stp_download_init(
         .map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Failed to read request body"})),
+                Json(json!({"error": "Failed to read request body", "code": "INVALID_REQUEST", "message": "Failed to read request body"})),
             )
         })?;
 
     let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Invalid JSON"})),
+            Json(json!({"error": "Invalid JSON", "code": "INVALID_REQUEST", "message": "Invalid JSON"})),
         )
     })?;
 
@@ -3146,14 +3164,14 @@ async fn proxy_stp_upload_init(
         .map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Failed to read request body"})),
+                Json(json!({"error": "Failed to read request body", "code": "INVALID_REQUEST", "message": "Failed to read request body"})),
             )
         })?;
 
     let payload: Value = serde_json::from_slice(&body_bytes).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Invalid JSON"})),
+            Json(json!({"error": "Invalid JSON", "code": "INVALID_REQUEST", "message": "Invalid JSON"})),
         )
     })?;
 
@@ -3218,6 +3236,7 @@ async fn proxy_stp_download_chunk(
                     StatusCode::BAD_GATEWAY,
                     Json(json!({
                         "error": "Device returned header-unsafe transfer metadata",
+                        "message": "Device returned header-unsafe transfer metadata",
                         "code": "DEVICE_RESPONSE_INVALID",
                     })),
                 ));
@@ -3235,6 +3254,7 @@ async fn proxy_stp_download_chunk(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(json!({
                             "error": format!("response build failed: {e}"),
+                            "message": format!("response build failed: {e}"),
                             "code": "INTERNAL",
                         })),
                     )
@@ -3277,7 +3297,9 @@ async fn proxy_stp_upload_chunk(
     if chunk_hash.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Missing X-Gx-Chunk-Hash header", "code": "INVALID_REQUEST"})),
+            Json(
+                json!({"error": "Missing X-Gx-Chunk-Hash header", "code": "INVALID_REQUEST", "message": "Missing X-Gx-Chunk-Hash header"}),
+            ),
         ));
     }
 
@@ -3316,7 +3338,9 @@ async fn proxy_stp_upload_chunk(
         }
         TunnelResponse::Binary { .. } => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "Unexpected binary response for chunk upload"})),
+            Json(
+                json!({"error": "Unexpected binary response for chunk upload", "code": "DEVICE_RESPONSE_INVALID", "message": "Unexpected binary response for chunk upload"}),
+            ),
         )),
     }
 }

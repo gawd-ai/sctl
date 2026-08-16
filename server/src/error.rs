@@ -98,4 +98,10 @@ pub mod codes {
     pub const CERT_PIN_MISMATCH: &str = "CERT_PIN_MISMATCH";
     /// No CA path, no pin, and TOFU was not requested.
     pub const CERT_UNTRUSTED: &str = "CERT_UNTRUSTED";
+    /// The server's own configuration is broken (e.g. no API key set).
+    pub const SERVER_CONFIG_ERROR: &str = "SERVER_CONFIG_ERROR";
+    /// Connection-count limit reached (SSE, sessions).
+    pub const TOO_MANY_CONNECTIONS: &str = "TOO_MANY_CONNECTIONS";
+    /// The infra monitoring subsystem is not available on this device.
+    pub const INFRA_UNAVAILABLE: &str = "INFRA_UNAVAILABLE";
 }

@@ -25,7 +25,12 @@ const MAX_SSE_CONNECTIONS: u32 = 64;
 pub async fn event_stream(State(state): State<AppState>) -> impl IntoResponse {
     let current = state.sse_connections.load(Ordering::Relaxed);
     if current >= MAX_SSE_CONNECTIONS {
-        return Err((StatusCode::TOO_MANY_REQUESTS, "Too many SSE connections"));
+        // The one plain-text error in the whole API surface, until 0.6.0.
+        return Err(crate::error::ApiError::new(
+            crate::error::codes::TOO_MANY_CONNECTIONS,
+            "Too many SSE connections",
+        )
+        .into_response_with(StatusCode::TOO_MANY_REQUESTS));
     }
     state.sse_connections.fetch_add(1, Ordering::Relaxed);
 

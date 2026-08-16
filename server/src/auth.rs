@@ -25,9 +25,12 @@ pub async fn require_api_key(request: Request, next: Next) -> Response {
     let api_key = match request.extensions().get::<ApiKey>() {
         Some(key) => key.0.clone(),
         None => {
-            return ApiError::new("SERVER_CONFIG_ERROR", "Server configuration error")
-                .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
-                .into_response();
+            return ApiError::new(
+                crate::error::codes::SERVER_CONFIG_ERROR,
+                "Server configuration error",
+            )
+            .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
+            .into_response();
         }
     };
 
