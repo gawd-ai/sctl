@@ -8,7 +8,9 @@ WRAPPER=/etc/sctl/ramboot.sh
 CONFIG=/etc/sctl/ramboot.conf
 DISABLED=/etc/sctl/disabled
 PID_FILE=/var/run/sctl.pid
+SUP_PID_FILE=/var/run/sctl-supervisor.pid
 LOG_FILE=/tmp/sctl/ramboot.log
+RESPAWN_SECS=10
 EXTRA_COMMANDS="status"
 
 validate_ramboot() {
@@ -38,25 +40,65 @@ start_service() {
     procd_close_instance
 }
 
+supervise_legacy() {
+    # There is no procd on the RAM-boot underlay, so before this loop nothing
+    # ever respawned a crashed daemon: one crash meant an unreachable vehicle
+    # until its next ignition cycle. The wrapper execs sctl, so the pid
+    # recorded each pass IS the daemon. The loop ends when `stop` kills the
+    # supervisor, or on its own when $DISABLED exists at respawn time.
+    local pid rc
+    while :; do
+        "$WRAPPER" >>"$LOG_FILE" 2>&1 &
+        pid=$!
+        echo "$pid" > "$PID_FILE"
+        wait "$pid"
+        rc=$?
+        rm -f "$PID_FILE"
+        if [ -e "$DISABLED" ]; then
+            echo "sctl: disabled, supervisor exiting" >>"$LOG_FILE"
+            break
+        fi
+        echo "sctl: daemon exited (rc=$rc), respawning in ${RESPAWN_SECS}s" >>"$LOG_FILE"
+        sleep "$RESPAWN_SECS"
+    done
+    rm -f "$SUP_PID_FILE"
+}
+
 start_legacy() {
     local pid
     validate_ramboot || return $?
 
+    if [ -r "$SUP_PID_FILE" ]; then
+        pid=$(cat "$SUP_PID_FILE" 2>/dev/null || true)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "sctl: supervisor already running as pid $pid"
+            return 0
+        fi
+    fi
+    # A pre-supervisor install may have left a bare daemon behind.
     if [ -r "$PID_FILE" ]; then
         pid=$(cat "$PID_FILE" 2>/dev/null || true)
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            echo "sctl: already running as pid $pid"
+            echo "sctl: already running as pid $pid (unsupervised)"
             return 0
         fi
     fi
 
     mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$LOG_FILE")"
-    "$WRAPPER" >>"$LOG_FILE" 2>&1 &
-    echo "$!" > "$PID_FILE"
+    supervise_legacy &
+    echo "$!" > "$SUP_PID_FILE"
 }
 
 stop_legacy() {
     local pid
+    # Supervisor first, so killing the daemon below cannot race a respawn.
+    if [ -r "$SUP_PID_FILE" ]; then
+        pid=$(cat "$SUP_PID_FILE" 2>/dev/null || true)
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null || true
+        fi
+        rm -f "$SUP_PID_FILE"
+    fi
     [ -r "$PID_FILE" ] || return 0
     pid=$(cat "$PID_FILE" 2>/dev/null || true)
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
