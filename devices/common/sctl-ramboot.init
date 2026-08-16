@@ -46,8 +46,16 @@ supervise_legacy() {
     # until its next ignition cycle. The wrapper execs sctl, so the pid
     # recorded each pass IS the daemon. The loop ends when `stop` kills the
     # supervisor, or on its own when $DISABLED exists at respawn time.
-    local pid rc
+    local pid rc log_bytes
     while :; do
+        # A crash loop appends wrapper output every RESPAWN_SECS with no rotation;
+        # days of that exhausts the shared /tmp tmpfs — cap at 256 KiB + one .old.
+        if [ -f "$LOG_FILE" ]; then
+            log_bytes=$(wc -c <"$LOG_FILE")
+            if [ "$((${log_bytes:-0} + 0))" -gt 262144 ]; then
+                mv -f "$LOG_FILE" "$LOG_FILE.old"
+            fi
+        fi
         "$WRAPPER" >>"$LOG_FILE" 2>&1 &
         pid=$!
         echo "$pid" > "$PID_FILE"

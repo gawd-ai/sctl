@@ -117,6 +117,20 @@ verify_file() {
     [ "$actual" = "$expected" ] || die "$label SHA-256 mismatch: expected $expected got $actual"
 }
 
+cache_is_valid() {
+    # Mirror of fetch_payload's cache-hit test, with no side effects: true
+    # only when this artifact would be served from cache without a download.
+    local expected=$1
+    local cache=$2
+
+    [ -r "$cache" ] || return 1
+    if [ -z "$expected" ]; then
+        [ "$ALLOW_UNSIGNED" = "1" ] || return 1
+        return 0
+    fi
+    check_file_sha256 "$expected" "$cache"
+}
+
 fetch_payload() {
     local url=$1
     local expected=$2
@@ -160,29 +174,49 @@ install_payload() {
     mv -f "$dst.tmp" "$dst"
 }
 
-check_tmp_space
+SERVER_CACHE=$CACHE_DIR/sctl-server.payload
+PLUGIN_CACHE=$CACHE_DIR/sctl-comms.payload
+MUSL_LIBC_CACHE=$CACHE_DIR/musl-libc.payload
+LIBGCC_CACHE=$CACHE_DIR/libgcc.payload
+
+# Only an actual download needs MIN_TMP_KB of headroom. A warm restart with
+# every payload already cached-and-valid writes ~no new bytes, and dying on
+# unrelated /tmp pressure (captures, vendor log spam) would keep the unit
+# down for the rest of the power-on. So gate the space check on whether any
+# artifact really needs fetching; if even one does, the full check runs.
+NEED_FETCH=0
+cache_is_valid "${SERVER_SHA256:-}" "$SERVER_CACHE" || NEED_FETCH=1
+[ -z "${PLUGIN_URL:-}" ] || cache_is_valid "${PLUGIN_SHA256:-}" "$PLUGIN_CACHE" || NEED_FETCH=1
+[ -z "${MUSL_LIBC_URL:-}" ] || cache_is_valid "${MUSL_LIBC_SHA256:-}" "$MUSL_LIBC_CACHE" || NEED_FETCH=1
+[ -z "${LIBGCC_URL:-}" ] || cache_is_valid "${LIBGCC_SHA256:-}" "$LIBGCC_CACHE" || NEED_FETCH=1
+
+if [ "$NEED_FETCH" = "1" ]; then
+    check_tmp_space
+else
+    log "all payloads cached and valid; skipping /tmp space check"
+fi
 mkdir -p "$RUN_DIR/lib" "$RUN_DIR/data" "$CACHE_DIR"
 
-fetch_payload "$SERVER_URL" "${SERVER_SHA256:-}" "$CACHE_DIR/sctl-server.payload" "server"
-install_payload "$CACHE_DIR/sctl-server.payload" "$BIN" "$SERVER_GZIP" "server"
+fetch_payload "$SERVER_URL" "${SERVER_SHA256:-}" "$SERVER_CACHE" "server"
+install_payload "$SERVER_CACHE" "$BIN" "$SERVER_GZIP" "server"
 chmod 0755 "$BIN"
 
 if [ -n "${PLUGIN_URL:-}" ]; then
-    fetch_payload "$PLUGIN_URL" "${PLUGIN_SHA256:-}" "$CACHE_DIR/sctl-comms.payload" "comms plugin"
-    install_payload "$CACHE_DIR/sctl-comms.payload" "$PLUGIN" "$PLUGIN_GZIP" "comms plugin"
+    fetch_payload "$PLUGIN_URL" "${PLUGIN_SHA256:-}" "$PLUGIN_CACHE" "comms plugin"
+    install_payload "$PLUGIN_CACHE" "$PLUGIN" "$PLUGIN_GZIP" "comms plugin"
     chmod 0644 "$PLUGIN"
 fi
 
 if [ -n "${MUSL_LIBC_URL:-}" ]; then
-    fetch_payload "$MUSL_LIBC_URL" "${MUSL_LIBC_SHA256:-}" "$CACHE_DIR/musl-libc.payload" "musl libc"
-    install_payload "$CACHE_DIR/musl-libc.payload" "$MUSL_LIBC" "$MUSL_LIBC_GZIP" "musl libc"
+    fetch_payload "$MUSL_LIBC_URL" "${MUSL_LIBC_SHA256:-}" "$MUSL_LIBC_CACHE" "musl libc"
+    install_payload "$MUSL_LIBC_CACHE" "$MUSL_LIBC" "$MUSL_LIBC_GZIP" "musl libc"
     chmod 0755 "$MUSL_LIBC"
     LOADER=${LOADER:-$MUSL_LIBC}
 fi
 
 if [ -n "${LIBGCC_URL:-}" ]; then
-    fetch_payload "$LIBGCC_URL" "${LIBGCC_SHA256:-}" "$CACHE_DIR/libgcc.payload" "libgcc"
-    install_payload "$CACHE_DIR/libgcc.payload" "$LIBGCC" "$LIBGCC_GZIP" "libgcc"
+    fetch_payload "$LIBGCC_URL" "${LIBGCC_SHA256:-}" "$LIBGCC_CACHE" "libgcc"
+    install_payload "$LIBGCC_CACHE" "$LIBGCC" "$LIBGCC_GZIP" "libgcc"
     chmod 0644 "$LIBGCC"
 fi
 
