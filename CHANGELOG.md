@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+This root file is the only changelog; per-component history is recorded here
+under per-component headings. `server/CHANGELOG.md` is frozen.
+
+## [Unreleased] — 0.6.0 cycle
+
+### sctl (server)
+
+#### Resilience payload
+
+- **Supervision on procd-less units** — the RAM-boot init's legacy branch now runs a respawn loop instead of launching the daemon once and walking away; a crash no longer strands a unit until its next ignition cycle.
+- **`panic = unwind`** — most panics become recoverable in-process instead of aborting the daemon (size delta flagged against the revisit clause).
+- **Jittered tunnel reconnects; a rejected tunnel key is never fatal** — the client retries on a slow cadence instead of stopping (a tunnel-only device that stops retrying is unreachable until someone drives to it).
+- **Panic-proof request paths** — no filename can panic a file download, no request can panic the sctlin proxy.
+- **AT serial fd leak fixed** — the AT layer owns its serial fd; a failed open no longer leaks one per attempt.
+- **PTY slaves leave canonical mode** — session PTYs no longer run under the cooked-mode line discipline.
+- **WE826 payload hardening** — AT-port detection baked in (no hardcoded `ttyUSB*`, survives re-install); `install.sh` no longer silently un-pins the tunnel on re-install; new `netage-wanpref` wired-WAN preference agent.
+
+#### Relay history
+
+- **Connection history survives relay restarts** — persisted under `data_dir`; rings are per-device; sessions close by identity, not by slot.
+- **Transport-path recording** — the relay records which path a device's tunnel arrived over.
+- History extracted into its own `tunnel/history.rs` unit.
+
+#### Transport contract
+
+- **Generic `http.request` passthrough** — the relay forwards any `/d/{serial}/api/*` request as a frame the device dispatches into its own router; the hand-written per-endpoint proxy wrappers are deleted. New device endpoints (including remote safe-mode clearing on CGNAT units) are reachable the moment the device ships them, with no relay change.
+- **One error dialect** — every error body carries `code` + `message` (legacy `error` duplicate kept until 0.7.0); relay transport-loss errors carry `retryable: true` (`DEVICE_DISCONNECTED` / `DEVICE_RECONNECTING` / `TIMEOUT`).
+- **Tunnel key moves to the Authorization header** — logs never see it; the query-param fallback remains for pre-0.6.0 payloads and goes away in 0.7.0. A rotated key now rejects at the WS upgrade, not in-band.
+- **Relay hardening** — device-health oracle closed, device-supplied headers sanitized, JSON on every miss.
+- **`session.exited` joins the typed `WsServerMsg` enum**; `session.gap` documentation corrected.
+
+#### Features
+
+- **`POST /api/fetch`** — device-side HTTP(S) fetch, making sctl's TLS stack (extra CAs, cert pinning) usable by the whole device.
+- **`/api/info` storage and GPS** — all storage volumes reported via `disks[]` (one mount point, one row); GPS course projected from data the driver already parsed.
+
+#### Workspace & CI
+
+- **One cargo workspace, one lockfile** — CI compiles every crate, including the comms ABI and the Quectel driver (1.6k lines of unsafe FFI that previously never met CI).
+- **One lint policy** for all workspace members; toolchain pinned (1.97.1) with a floating-stable canary job that warns instead of breaking main.
+
+#### Docs
+
+- Hand-written HTTP API reference (`docs/http-api.md`) with a CI drift gate against the registered routes.
+- Error-model reference (`docs/errors.md`): unified shape, `retryable` semantics, complete code catalog.
+- Config reference (`docs/config.md`) + fully-keyed `sctl.toml.example`, with their own CI drift gate.
+- Safe-mode operator runbook (`docs/safe-mode.md`) and build/deploy/release reference (`docs/releasing.md`).
+- `docs/README.md` reading-path index; `guide.md` stops promising tunnel-internal `gps.fix` / `lte.signal` frames to WS clients.
+
 ## [0.5.0] - 2026-05-26
 
 ### sctl (server) v0.5.0

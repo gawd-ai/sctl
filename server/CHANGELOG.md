@@ -1,5 +1,7 @@
 # Changelog
 
+**Frozen at 0.5.0 — the changelog now lives in the root [`CHANGELOG.md`](../CHANGELOG.md), under per-component headings.**
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
