@@ -1309,6 +1309,9 @@ async fn handle_relay_message(
         "tunnel.health" => {
             handle_tunnel_health(state, ws_sink, request_id.as_deref()).await;
         }
+        "http.request" => {
+            handle_tunnel_http_request(state, ws_sink, &msg, request_id.as_deref()).await;
+        }
         "tunnel.diagnostics" => {
             handle_tunnel_diagnostics(state, ws_sink, &msg, request_id.as_deref()).await;
         }
@@ -1882,6 +1885,123 @@ async fn handle_tunnel_health(state: &AppState, ws_sink: &WsSink, request_id: Op
         }),
     )
     .await;
+}
+
+/// Handle a generic `http.request` frame by dispatching it into the device's
+/// own axum router — the same routing table, extractors, and auth middleware
+/// that serve the LAN port. This is what frees the relay from hand-wrapping a
+/// named tunnel message per endpoint (and what lets a crash-looping CGNAT
+/// device have its safe-mode flag cleared remotely).
+async fn handle_tunnel_http_request(
+    state: &AppState,
+    ws_sink: &WsSink,
+    msg: &Value,
+    request_id: Option<&str>,
+) {
+    let mut out = match run_tunnel_http_request(state, msg).await {
+        Ok(v) => v,
+        Err((status, error)) => json!({ "status": status, "error": error }),
+    };
+    out["type"] = json!("http.result");
+    out["request_id"] = json!(request_id);
+    send_response_async(ws_sink, out).await;
+}
+
+/// The dispatch core of [`handle_tunnel_http_request`]; errors become
+/// `(status, message)` pairs the relay surfaces as catalog-shaped JSON.
+async fn run_tunnel_http_request(state: &AppState, msg: &Value) -> Result<Value, (u16, String)> {
+    use base64::Engine as _;
+    use tower::ServiceExt as _;
+
+    /// Response bodies ride a single tunnel text frame; cap them well below
+    /// anything that could wedge the WS writer.
+    const MAX_TUNNEL_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+    let path = msg["path"].as_str().unwrap_or_default();
+    if !path.starts_with("/api/") {
+        return Err((400, "path must start with /api/".to_string()));
+    }
+    // Streaming endpoints cannot ride a request/response frame: their
+    // responses never end. The tunnel's named session/WS machinery is the
+    // transport for those.
+    if ["/api/ws", "/api/events"].iter().any(|p| {
+        path == *p || path.starts_with(&format!("{p}?")) || path.starts_with(&format!("{p}/"))
+    }) {
+        return Err((
+            400,
+            "streaming endpoints are not tunnelable via http.request".to_string(),
+        ));
+    }
+    let Some(router) = state.api_router.get() else {
+        return Err((503, "router not initialized yet".to_string()));
+    };
+
+    let method = axum::http::Method::from_bytes(msg["method"].as_str().unwrap_or("GET").as_bytes())
+        .map_err(|_| (400, "invalid method".to_string()))?;
+    let uri: axum::http::Uri = path
+        .parse()
+        .map_err(|_| (400, "invalid path".to_string()))?;
+    let body = match msg["body_b64"].as_str() {
+        Some(b64) => base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|_| (400, "invalid body_b64".to_string()))?,
+        None => Vec::new(),
+    };
+
+    let mut req = axum::http::Request::new(axum::body::Body::from(body));
+    *req.method_mut() = method;
+    *req.uri_mut() = uri;
+    if let Some(headers) = msg["headers"].as_object() {
+        for (k, v) in headers {
+            if let (Ok(name), Some(Ok(value))) = (
+                axum::http::HeaderName::from_bytes(k.as_bytes()),
+                v.as_str().map(axum::http::HeaderValue::from_str),
+            ) {
+                req.headers_mut().insert(name, value);
+            }
+        }
+    }
+
+    let resp = router
+        .clone()
+        .oneshot(req)
+        .await
+        .map_err(|_| (500, "router dispatch failed".to_string()))?;
+
+    let status = resp.status().as_u16();
+    let content_type = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+    let content_disposition = resp
+        .headers()
+        .get(axum::http::header::CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    let body = match tokio::time::timeout(
+        Duration::from_secs(55),
+        axum::body::to_bytes(resp.into_body(), MAX_TUNNEL_BODY_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => {
+            return Err((
+                502,
+                format!("response body exceeds the {MAX_TUNNEL_BODY_BYTES}-byte tunnel cap"),
+            ));
+        }
+        Err(_) => return Err((504, "response body collection timed out".to_string())),
+    };
+
+    Ok(json!({
+        "status": status,
+        "content_type": content_type,
+        "content_disposition": content_disposition,
+        "body_b64": base64::engine::general_purpose::STANDARD.encode(&body),
+    }))
 }
 
 /// Handle tunnel.diagnostics — server diagnostics snapshot

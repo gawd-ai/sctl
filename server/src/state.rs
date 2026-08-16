@@ -57,6 +57,12 @@ pub struct AppState {
     pub relay_state: Option<RelayState>,
     /// Infrastructure monitoring state (always present, activates on config push).
     pub infra_state: Option<Arc<Mutex<InfraState>>>,
+    /// The device's own HTTP router, set once at startup after the router is
+    /// built (it needs the completed AppState to exist first). The tunnel
+    /// client dispatches generic `http.request` frames into a clone of it —
+    /// same routing table, same auth middleware, same handlers as the LAN
+    /// port, with no per-endpoint tunnel plumbing.
+    pub api_router: Arc<std::sync::OnceLock<axum::Router>>,
 }
 
 /// Tunnel connection event types.

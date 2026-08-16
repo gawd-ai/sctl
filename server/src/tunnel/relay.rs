@@ -499,28 +499,142 @@ pub fn relay_router(relay_state: RelayState) -> Router {
             post(proxy_infra_check),
         )
         .route("/d/{serial}/api/ws", get(proxy_ws))
-        // Anything else under /d/{serial}/api/ answers a machine-readable
-        // 404 here. Without this, unmatched device API paths fell through
-        // to the web UI reverse proxy, which handed API clients an HTML
-        // 404 (or 502) instead of an error they could parse.
-        .route("/d/{serial}/api/{*rest}", any(proxy_unrouted));
+        // Anything else under /d/{serial}/api/ forwards generically as an
+        // http.request tunnel frame dispatched into the device's own router.
+        // Before this, unmatched device API paths fell through to the web UI
+        // reverse proxy and handed API clients HTML; and every NEW device
+        // endpoint cost a hand-written wrapper here plus a fleet-stampeding
+        // relay redeploy.
+        .route("/d/{serial}/api/{*rest}", any(proxy_passthrough));
 
     tunnel_admin.merge(device_proxy).with_state(relay_state)
 }
 
-/// Fallback for `/d/{serial}/api/*` paths with no named proxy route. The
-/// named-route allowlist is what Phase 3's generic passthrough replaces;
-/// until then this makes the gap honest instead of HTML-shaped.
-async fn proxy_unrouted(
+/// Generic passthrough for `/d/{serial}/api/*` paths with no named proxy
+/// route: authenticate exactly like the named routes, then forward the
+/// request as an `http.request` tunnel frame that the device dispatches into
+/// its own router. New device endpoints become reachable through the relay
+/// the moment the device ships them — no wrapper, no relay redeploy.
+///
+/// Devices on payloads that predate `http.request` never answer, so the
+/// pending request times out into the standard DEVICE_TIMEOUT shape. The
+/// Phase 4 deploy gate (whole fleet on payload #1 first) makes that window
+/// empty in practice.
+async fn proxy_passthrough(
+    State(state): State<RelayState>,
     AxumPath((serial, rest)): AxumPath<(String, String)>,
-) -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({
-            "error": format!("No relay proxy route for /api/{rest} on device '{serial}'"),
-            "code": "ROUTE_NOT_PROXIED",
-        })),
-    )
+    request: Request<Body>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    use base64::Engine as _;
+
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
+    // Streaming endpoints cannot ride a request/response frame; the named
+    // /d/{serial}/api/ws route is the transport for interactive streams.
+    if rest == "ws" || rest == "events" || rest.starts_with("ws/") || rest.starts_with("events/") {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": format!("/api/{rest} is a streaming endpoint and cannot be proxied generically"),
+                "code": "ROUTE_NOT_PROXIED",
+            })),
+        ));
+    }
+
+    let method = request.method().as_str().to_string();
+    let path = match request.uri().query() {
+        Some(q) => format!("/api/{rest}?{q}"),
+        None => format!("/api/{rest}"),
+    };
+    let mut fwd_headers = serde_json::Map::new();
+    for name in ["authorization", "content-type", "accept"] {
+        if let Some(v) = request.headers().get(name).and_then(|v| v.to_str().ok()) {
+            fwd_headers.insert(name.to_string(), json!(v));
+        }
+    }
+    let body_bytes = axum::body::to_bytes(request.into_body(), 8 * 1024 * 1024)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({
+                    "error": "request body exceeds the 8 MiB tunnel cap",
+                    "code": "PAYLOAD_TOO_LARGE",
+                })),
+            )
+        })?;
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let mut msg = json!({
+        "type": "http.request",
+        "request_id": request_id,
+        "method": method,
+        "path": path,
+        "headers": fwd_headers,
+    });
+    if !body_bytes.is_empty() {
+        msg["body_b64"] = json!(base64::engine::general_purpose::STANDARD.encode(&body_bytes));
+    }
+
+    let response =
+        tunnel_request_json(&state, &serial, msg, state.tunnel_proxy_timeout_secs).await?;
+
+    let status = u16::try_from(response["status"].as_u64().unwrap_or(502)).unwrap_or(502);
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+    if let Some(err) = response["error"].as_str() {
+        // The device's dispatch layer refused the frame (bad path, body too
+        // large, streaming endpoint, old payload answering strangely).
+        return Err((
+            status,
+            Json(json!({ "error": err, "code": "DEVICE_DISPATCH_ERROR" })),
+        ));
+    }
+
+    let body = response["body_b64"]
+        .as_str()
+        .map(|b64| base64::engine::general_purpose::STANDARD.decode(b64))
+        .transpose()
+        .map_err(|_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "error": "device returned invalid body_b64",
+                    "code": "DEVICE_RESPONSE_INVALID",
+                })),
+            )
+        })?
+        .unwrap_or_default();
+
+    let mut builder = Response::builder().status(status);
+    for (header, key) in [
+        ("Content-Type", "content_type"),
+        ("Content-Disposition", "content_disposition"),
+    ] {
+        if let Some(v) = response[key].as_str() {
+            // Device-supplied string entering an HTTP header: validate, never
+            // panic (same rule as the STP chunk proxy).
+            if let Ok(hv) = axum::http::HeaderValue::from_str(v) {
+                builder = builder.header(header, hv);
+            }
+        }
+    }
+    builder.body(Body::from(body)).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": format!("response build failed: {e}"),
+                "code": "INTERNAL",
+            })),
+        )
+    })
 }
 
 // ─── Device Registration ─────────────────────────────────────────────────────

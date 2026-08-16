@@ -444,6 +444,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         device_snapshots: None,
         relay_state: None,
         infra_state: Some(infra_state.clone()),
+        api_router: Arc::new(std::sync::OnceLock::new()),
     };
 
     // Build router
@@ -637,6 +638,12 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         .merge(ws_route)
         .layer(Extension(ApiKey(state.config.auth.api_key.clone())))
         .with_state(state.clone());
+
+    // Expose the finished API surface to the tunnel client for generic
+    // http.request dispatch. Captured BEFORE the relay routes, the web-UI
+    // fallback, and the CORS/trace/concurrency layers: a tunnel request
+    // should behave exactly like a local API call, nothing more.
+    let _ = state.api_router.set(app.clone());
 
     // Tunnel: add relay routes if configured (before global layers so CORS/tracing apply)
     if let Some(ref relay_state) = relay_state_opt {
