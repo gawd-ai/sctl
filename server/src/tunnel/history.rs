@@ -82,7 +82,18 @@ struct Inner {
     /// Append handle for the JSONL log. `None` in memory-only mode (tests,
     /// or a relay with no data dir).
     log: Option<File>,
+    /// Path of the JSONL log, kept for runtime compaction rewrites.
+    path: Option<PathBuf>,
+    /// Bytes appended since the last compaction. The rings bound what a
+    /// rewrite retains, so file size is bounded by (compacted size +
+    /// `COMPACT_APPEND_BYTES`) — without this, a flapping device grows the
+    /// log for the whole relay uptime (18-day uptimes are normal) on a
+    /// nearly-full disk.
+    appended_bytes: u64,
 }
+
+/// Appended bytes that trigger an in-place compaction rewrite.
+const COMPACT_APPEND_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Per-device rings of connection sessions, with optional JSONL persistence.
 pub struct RelayConnectionHistory {
@@ -97,6 +108,8 @@ impl RelayConnectionHistory {
             inner: tokio::sync::Mutex::new(Inner {
                 rings: HashMap::new(),
                 log: None,
+                path: None,
+                appended_bytes: 0,
             }),
         }
     }
@@ -131,27 +144,15 @@ impl RelayConnectionHistory {
         }
 
         // Compact: rewrite the file to exactly the events the rings retain.
-        // This is the log's only garbage collection, and restarts are the
-        // only time it is needed — appends during one process lifetime are
-        // a few hundred bytes per connection event.
-        let compacted = reconstruct_events(&rings);
-        let tmp = path.with_extension("jsonl.tmp");
-        let write_result = (|| -> std::io::Result<()> {
-            let mut f = File::create(&tmp)?;
-            for event in &compacted {
-                writeln!(f, "{}", serde_json::to_string(event).unwrap_or_default())?;
+        // The same rewrite runs again at runtime once appends since the last
+        // compaction pass `COMPACT_APPEND_BYTES`.
+        let log = match rewrite_compacted(path, &rings) {
+            Ok(file) => Some(file),
+            Err(e) => {
+                warn!("Connection history: compaction write failed: {e}");
+                None
             }
-            f.sync_all()?;
-            std::fs::rename(&tmp, path)
-        })();
-        if let Err(e) = write_result {
-            warn!("Connection history: compaction write failed: {e}");
-        }
-
-        let log = OpenOptions::new().append(true).create(true).open(path);
-        if let Err(ref e) = log {
-            warn!("Connection history: cannot open log for append: {e}");
-        }
+        };
         if replayed > 0 {
             info!(
                 "Connection history: replayed {replayed} event(s) into {} serial ring(s)",
@@ -162,7 +163,9 @@ impl RelayConnectionHistory {
         Self {
             inner: tokio::sync::Mutex::new(Inner {
                 rings,
-                log: log.ok(),
+                log,
+                path: Some(path.clone()),
+                appended_bytes: 0,
             }),
         }
     }
@@ -180,7 +183,9 @@ impl RelayConnectionHistory {
         };
         let mut inner = self.inner.lock().await;
         apply(&mut inner.rings, &event);
-        append(&mut inner.log, &event);
+        let appended = append(&mut inner.log, &event);
+        inner.appended_bytes += appended;
+        maybe_compact(&mut inner);
     }
 
     /// Record a device disconnection for exactly the session identified by
@@ -203,7 +208,9 @@ impl RelayConnectionHistory {
         };
         let mut inner = self.inner.lock().await;
         apply(&mut inner.rings, &event);
-        append(&mut inner.log, &event);
+        let appended = append(&mut inner.log, &event);
+        inner.appended_bytes += appended;
+        maybe_compact(&mut inner);
     }
 
     /// Snapshot all sessions for the health endpoint, chronological by
@@ -351,12 +358,54 @@ fn reconstruct_events(rings: &HashMap<String, VecDeque<ConnectionSession>>) -> V
     events.into_iter().map(|(_, e)| e).collect()
 }
 
-fn append(log: &mut Option<File>, event: &HistoryEvent) {
+fn append(log: &mut Option<File>, event: &HistoryEvent) -> u64 {
     if let Some(file) = log {
         let line = serde_json::to_string(event).unwrap_or_default();
         if writeln!(file, "{line}").is_err() {
             warn!("Connection history: append failed, dropping persistence");
             *log = None;
+            return 0;
+        }
+        return line.len() as u64 + 1;
+    }
+    0
+}
+
+/// Write the ring-retained events to `path` atomically (tmp + rename) and
+/// return a fresh append handle. Used at load and for runtime compaction.
+fn rewrite_compacted(
+    path: &PathBuf,
+    rings: &HashMap<String, VecDeque<ConnectionSession>>,
+) -> std::io::Result<File> {
+    let compacted = reconstruct_events(rings);
+    let tmp = path.with_extension("jsonl.tmp");
+    let mut f = File::create(&tmp)?;
+    for event in &compacted {
+        writeln!(f, "{}", serde_json::to_string(event).unwrap_or_default())?;
+    }
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    OpenOptions::new().append(true).create(true).open(path)
+}
+
+/// After an append, compact in place once enough new bytes accumulated.
+/// On failure the log falls back to memory-only — appending onward to a
+/// file we can no longer garbage-collect would defeat the size bound.
+fn maybe_compact(inner: &mut Inner) {
+    if inner.log.is_none() || inner.appended_bytes < COMPACT_APPEND_BYTES {
+        return;
+    }
+    let Some(path) = inner.path.clone() else {
+        return;
+    };
+    match rewrite_compacted(&path, &inner.rings) {
+        Ok(file) => {
+            inner.log = Some(file);
+            inner.appended_bytes = 0;
+        }
+        Err(e) => {
+            warn!("Connection history: runtime compaction failed, dropping persistence: {e}");
+            inner.log = None;
         }
     }
 }
@@ -486,6 +535,36 @@ mod tests {
             .lines()
             .all(|l| l.trim().is_empty() || serde_json::from_str::<HistoryEvent>(l).is_ok()));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Runtime compaction: hammering one flapping serial must not grow the
+    /// file for the life of the process — once appends pass the threshold
+    /// the log is rewritten to the ring-retained events.
+    #[tokio::test]
+    async fn runtime_compaction_bounds_the_file() {
+        let dir = std::env::temp_dir().join(format!("sctl-hist-compact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("connection_history.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        let h = RelayConnectionHistory::with_persistence(&path);
+        // Each round appends ~250 bytes; push well past the threshold so the
+        // rewrite provably fires at least once.
+        let rounds = COMPACT_APPEND_BYTES / 100;
+        for i in 0..rounds {
+            h.record_connect("flapper", i, Some("1.2.3.4")).await;
+            h.record_disconnect("flapper", i, "pong_timeout", Some(31_000))
+                .await;
+        }
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            size < COMPACT_APPEND_BYTES + 64 * 1024,
+            "file stayed bounded, got {size}"
+        );
+        // The compacted file still replays into a valid ring.
+        let h2 = RelayConnectionHistory::with_persistence(&path);
+        let snap = h2.snapshot().await;
+        assert!(!snap.is_empty() && snap.len() <= PER_SERIAL_CAP);
     }
 
     /// Driven through `apply` directly so each serial gets a distinct
