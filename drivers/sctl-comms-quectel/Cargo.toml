@@ -5,7 +5,7 @@ edition = "2021"
 description = "Quectel AT comms plugin for sctl"
 license = "GPL-3.0-only"
 repository = "https://github.com/gawd-ai/sctl"
-rust-version = "1.82"
+rust-version = "1.97"
 
 [lib]
 name = "sctl_comms_quectel"

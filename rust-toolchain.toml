@@ -1,0 +1,13 @@
+# Pinned so CI, contributors, and release builds agree on one compiler.
+#
+# A floating `stable` already broke CI once: 43b7130 exists solely because
+# clippy 1.97 added `for_kv_map` findings mid-flight. The pin makes lint and
+# rustc behavior a property of the repo, not of the day the job ran. The
+# `canary-floating` CI job still builds against latest stable so the next
+# toolchain surprise arrives as a warning instead of a red main.
+#
+# Device cross-builds (devices/build.sh) use their own explicitly-selected
+# nightly for -Z build-std and are unaffected by this pin.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
