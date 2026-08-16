@@ -136,10 +136,14 @@ async fn drain_device(device: &ConnectedDevice, reason: &str) {
     let mut pending = device.pending_requests.lock().await;
     let count = pending.len();
     for (_, sender) in pending.drain() {
+        // retryable: the request was lost in transit, not rejected. For exec
+        // specifically the device caches completed results, so the caller's
+        // first retry should be GET /api/activity/{id}/result (reachable via
+        // the generic passthrough) before re-running anything side-effectful.
         let _ = sender.send(TunnelResponse::Json(json!({
             "type": "error",
             "status": 502,
-            "body": {"error": reason, "code": "DEVICE_DISCONNECTED"},
+            "body": {"error": reason, "code": "DEVICE_DISCONNECTED", "retryable": true},
         })));
     }
     if count > 0 {
@@ -832,7 +836,7 @@ async fn handle_device_ws(
                 let _ = sender.send(TunnelResponse::Json(json!({
                     "type": "error",
                     "status": 502,
-                    "body": {"error": "device reconnecting", "code": "DEVICE_RECONNECTING"},
+                    "body": {"error": "device reconnecting", "code": "DEVICE_RECONNECTING", "retryable": true},
                 })));
             }
             if count > 0 {
@@ -1436,7 +1440,9 @@ pub async fn tunnel_request(
             pending.lock().await.remove(&request_id);
             Err((
                 StatusCode::GATEWAY_TIMEOUT,
-                Json(json!({"error": "Device did not respond in time", "code": "TIMEOUT"})),
+                Json(
+                    json!({"error": "Device did not respond in time", "code": "TIMEOUT", "retryable": true}),
+                ),
             ))
         }
     }
@@ -1531,7 +1537,9 @@ pub async fn tunnel_request_binary(
             }
             Err((
                 StatusCode::GATEWAY_TIMEOUT,
-                Json(json!({"error": "Device did not respond in time", "code": "TIMEOUT"})),
+                Json(
+                    json!({"error": "Device did not respond in time", "code": "TIMEOUT", "retryable": true}),
+                ),
             ))
         }
     }
