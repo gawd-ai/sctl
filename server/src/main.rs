@@ -15,6 +15,7 @@
 mod sctlin_proxy;
 mod supervisor;
 
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::AtomicU32;
@@ -29,6 +30,7 @@ use axum::{
     routing::{delete, get, post},
     Extension, Router,
 };
+use futures_util::FutureExt;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
@@ -271,6 +273,60 @@ fn acquire_process_lock(data_dir: &str) -> std::fs::File {
     }
     eprintln!("Another sctl instance is already running (lock: {lock_path})");
     std::process::exit(99);
+}
+
+/// How long a panicked background loop waits before it is rebuilt.
+const SUPERVISED_RESTART_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Spawn a background loop that survives panics: a panic is logged and the
+/// loop is rebuilt after `restart_delay`. Under `panic=abort` these panics
+/// took the whole daemon down and the external supervisor restarted
+/// everything; under unwind the task would otherwise die silently and
+/// permanently. A loop that returns normally (shutdown) is not respawned, and
+/// aborting the returned handle remains the shutdown mechanism.
+fn spawn_supervised<F, Fut>(
+    name: &'static str,
+    restart_delay: std::time::Duration,
+    mut mk: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            if AssertUnwindSafe(mk()).catch_unwind().await.is_ok() {
+                // Normal completion (shutdown) — do not respawn.
+                break;
+            }
+            tracing::error!(
+                task = name,
+                "background task panicked; restarting in {restart_delay:?}"
+            );
+            tokio::time::sleep(restart_delay).await;
+        }
+    })
+}
+
+/// Bridge a loop the library spawns itself (comms poller, infra monitor) into
+/// `spawn_supervised`: a panic in the inner task is re-raised here so the
+/// supervisor rebuilds it, and dropping this future (the supervisor handle's
+/// `.abort()` on shutdown or config change) aborts the inner task, keeping
+/// the handle semantics identical to a directly spawned loop.
+async fn supervise_spawned(inner: tokio::task::JoinHandle<()>) {
+    struct AbortOnDrop(tokio::task::JoinHandle<()>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let mut inner = AbortOnDrop(inner);
+    if let Err(e) = (&mut inner.0).await {
+        if e.is_panic() {
+            std::panic::resume_unwind(e.into_panic());
+        }
+        // Cancelled externally — treat as shutdown.
+    }
 }
 
 async fn run_supervisor_mode(config_path: Option<&str>) -> ! {
@@ -584,23 +640,37 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
             Ok((client, comms_snapshot)) => {
                 let comms_state = Arc::new(tokio::sync::Mutex::new(comms_snapshot));
                 let notify = Arc::new(tokio::sync::Notify::new());
-                comms_task = Some(comms::spawn_poller(
-                    client.clone(),
-                    comms_state.clone(),
-                    state.config.gps.is_some(),
-                    state
-                        .config
-                        .gps
-                        .as_ref()
-                        .map_or(30, |gc| gc.poll_interval_secs),
-                    state.config.lte.is_some(),
-                    state
-                        .config
-                        .lte
-                        .as_ref()
-                        .map_or(60, |lc| lc.poll_interval_secs),
-                    state.tunnel_stats.clone(),
-                    notify.clone(),
+                let poller_client = client.clone();
+                let poller_state = comms_state.clone();
+                let gps_enabled = state.config.gps.is_some();
+                let gps_interval_secs = state
+                    .config
+                    .gps
+                    .as_ref()
+                    .map_or(30, |gc| gc.poll_interval_secs);
+                let lte_enabled = state.config.lte.is_some();
+                let lte_interval_secs = state
+                    .config
+                    .lte
+                    .as_ref()
+                    .map_or(60, |lc| lc.poll_interval_secs);
+                let poller_tunnel_stats = state.tunnel_stats.clone();
+                let poller_notify = notify.clone();
+                comms_task = Some(spawn_supervised(
+                    "comms_poller",
+                    SUPERVISED_RESTART_DELAY,
+                    move || {
+                        supervise_spawned(comms::spawn_poller(
+                            poller_client.clone(),
+                            poller_state.clone(),
+                            gps_enabled,
+                            gps_interval_secs,
+                            lte_enabled,
+                            lte_interval_secs,
+                            poller_tunnel_stats.clone(),
+                            poller_notify.clone(),
+                        ))
+                    },
                 ));
                 // Autonomous LTE recovery. Shares the serial port with the
                 // poller via the same host lock; only acts when the tunnel is
@@ -728,7 +798,14 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
                 cfg.targets.len(),
                 cfg.version
             );
-            let handle = infra::monitor::spawn_monitor(infra_state.clone(), cfg.clone());
+            let monitor_state = infra_state.clone();
+            let monitor_cfg = cfg.clone();
+            let handle = spawn_supervised("infra_monitor", SUPERVISED_RESTART_DELAY, move || {
+                supervise_spawned(infra::monitor::spawn_monitor(
+                    monitor_state.clone(),
+                    monitor_cfg.clone(),
+                ))
+            });
             guard.monitor_handle = Some(handle);
         }
     }
@@ -737,64 +814,86 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     let mgr = state.session_manager.clone();
     let sweep_tx = state.session_events.clone();
     let sweep_transfers = state.transfer_manager.clone();
-    let sweep_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            let events = mgr.sweep().await;
-            for event in events {
-                match event {
-                    sessions::SweepEvent::Destroyed(session_id, reason) => {
-                        let _ = sweep_tx.send(serde_json::json!({
-                            "type": "session.destroyed",
-                            "session_id": session_id,
-                            "reason": reason,
-                        }));
-                    }
-                    sessions::SweepEvent::AiAutoCleared(session_id) => {
-                        let _ = sweep_tx.send(serde_json::json!({
-                            "type": "session.ai_status_changed",
-                            "session_id": session_id,
-                            "working": false,
-                        }));
+    let sweep_task = spawn_supervised("session_sweep", SUPERVISED_RESTART_DELAY, move || {
+        let mgr = mgr.clone();
+        let sweep_tx = sweep_tx.clone();
+        let sweep_transfers = sweep_transfers.clone();
+        async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let events = mgr.sweep().await;
+                for event in events {
+                    match event {
+                        sessions::SweepEvent::Destroyed(session_id, reason) => {
+                            let _ = sweep_tx.send(serde_json::json!({
+                                "type": "session.destroyed",
+                                "session_id": session_id,
+                                "reason": reason,
+                            }));
+                        }
+                        sessions::SweepEvent::AiAutoCleared(session_id) => {
+                            let _ = sweep_tx.send(serde_json::json!({
+                                "type": "session.ai_status_changed",
+                                "session_id": session_id,
+                                "working": false,
+                            }));
+                        }
                     }
                 }
+                // Sweep stale gawdxfer transfers
+                sweep_transfers.sweep_stale().await;
             }
-            // Sweep stale gawdxfer transfers
-            sweep_transfers.sweep_stale().await;
         }
     });
 
     // Tunnel relay: periodic sweep to evict dead devices
     let relay_sweep_task = relay_state_opt.clone().map(|rs| {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
-            loop {
-                interval.tick().await;
-                rs.sweep_dead_devices().await;
-            }
-        })
+        spawn_supervised(
+            "relay_dead_device_sweep",
+            SUPERVISED_RESTART_DELAY,
+            move || {
+                let rs = rs.clone();
+                async move {
+                    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
+                    loop {
+                        interval.tick().await;
+                        rs.sweep_dead_devices().await;
+                    }
+                }
+            },
+        )
     });
 
     // Tunnel relay: periodic snapshot persistence (60s, debounced via dirty flag)
     let relay_snapshot_task = relay_state_opt.clone().map(|rs| {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_mins(1));
-            loop {
-                interval.tick().await;
-                rs.save_snapshots().await;
-            }
-        })
+        spawn_supervised(
+            "relay_snapshot_persist",
+            SUPERVISED_RESTART_DELAY,
+            move || {
+                let rs = rs.clone();
+                async move {
+                    let mut interval = tokio::time::interval(tokio::time::Duration::from_mins(1));
+                    loop {
+                        interval.tick().await;
+                        rs.save_snapshots().await;
+                    }
+                }
+            },
+        )
     });
 
     // Tunnel events: periodic persistence (60s, debounced via dirty flag)
     let tunnel_events_flush_task = {
         let flush_stats = state.tunnel_stats.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_mins(1));
-            loop {
-                interval.tick().await;
-                flush_stats.save_events().await;
+        spawn_supervised("tunnel_events_flush", SUPERVISED_RESTART_DELAY, move || {
+            let flush_stats = flush_stats.clone();
+            async move {
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_mins(1));
+                loop {
+                    interval.tick().await;
+                    flush_stats.save_events().await;
+                }
             }
         })
     };
@@ -950,5 +1049,33 @@ mod cli_tests {
         );
         assert_eq!(parse_log_level("off"), LevelFilter::OFF);
         assert_eq!(parse_log_level("not-a-level"), LevelFilter::INFO);
+    }
+}
+
+#[cfg(test)]
+mod supervision_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn supervised_loop_restarts_after_panics_then_stops_on_completion() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let handle = super::spawn_supervised(
+            "test_task",
+            std::time::Duration::from_millis(10),
+            move || {
+                let counter = counter.clone();
+                async move {
+                    // Panics on the first two invocations, completes on the third.
+                    assert!(
+                        counter.fetch_add(1, Ordering::SeqCst) >= 2,
+                        "induced test panic"
+                    );
+                }
+            },
+        );
+        handle.await.expect("supervisor task must not panic");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 }

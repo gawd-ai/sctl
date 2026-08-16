@@ -28,14 +28,16 @@
 //! happens only when the modem reports usable signal yet stays stuck.
 
 use std::collections::VecDeque;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use futures_util::FutureExt;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::comms::{CommsClient, CommsState};
 use crate::config::LteConfig;
@@ -407,6 +409,10 @@ fn choose_action(
 }
 
 /// Spawn the watchdog task. Returns immediately; the loop runs until shutdown.
+///
+/// The loop is panic-supervised (same pattern as `spawn_supervised` in
+/// main.rs, which this library module cannot reach): under unwind a panic
+/// here would otherwise kill the watchdog silently and permanently.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_watchdog(
     client: CommsClient,
@@ -416,89 +422,114 @@ pub fn spawn_watchdog(
     data_dir: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // Idempotent startup recovery: heal a CFUN=0 / deauthorized USB left by
-        // an action a prior crash or power-loss interrupted. Always safe to run.
-        startup_recovery(&client).await;
-
-        let mut st = WatchdogState::default();
-        let mut tunnel_down_since: Option<Instant> = None;
-        let mut tunnel_up_since: Option<Instant> = None;
-
         loop {
-            let now = Instant::now();
-            let connected = tunnel_stats.connected.load(Ordering::Relaxed);
-
-            if connected {
-                tunnel_down_since = None;
-                let up = *tunnel_up_since.get_or_insert(now);
-                let up_secs = now.duration_since(up);
-                if up_secs >= STABLE_HEAVY_RESET {
-                    st.heavy_reset();
-                } else if up_secs >= STABLE_LIGHT_RESET {
-                    st.light_reset();
-                }
-                st.state_label = "connected";
-                publish(&comms_state, &st, 0).await;
-                tokio::time::sleep(TICK).await;
-                continue;
+            let fut = watchdog_loop(
+                client.clone(),
+                comms_state.clone(),
+                tunnel_stats.clone(),
+                cfg.clone(),
+                data_dir.clone(),
+            );
+            if AssertUnwindSafe(fut).catch_unwind().await.is_ok() {
+                // Normal completion — do not respawn.
+                break;
             }
-
-            tunnel_up_since = None;
-            let down = *tunnel_down_since.get_or_insert(now);
-            let down_secs = now.duration_since(down).as_secs();
-
-            // Don't fight an in-progress reconnect that already has a bearer.
-            if tunnel_stats.reconnecting.load(Ordering::Relaxed)
-                && interface_has_ipv4(&cfg.interface)
-            {
-                st.state_label = "reconnecting";
-                publish(&comms_state, &st, down_secs).await;
-                tokio::time::sleep(TICK).await;
-                continue;
-            }
-
-            if down_secs < cfg.watchdog_grace_secs {
-                st.state_label = "grace";
-                publish(&comms_state, &st, down_secs).await;
-                tokio::time::sleep(TICK).await;
-                continue;
-            }
-
-            // Diagnose, then act (the act fn enforces every gate).
-            let probe = probe(&client, &tunnel_stats, &cfg).await;
-            let symptom = classify(probe);
-            st.track_symptom(symptom, now);
-            st.last_symptom = Some(symptom);
-
-            act(
-                &client,
-                &cfg,
-                &mut st,
-                symptom,
-                probe,
-                down_secs,
-                now,
-                &data_dir,
-                &tunnel_stats,
-            )
-            .await;
-
-            publish(&comms_state, &st, down_secs).await;
-
-            // Cadence: dormant hardware is checked rarely; a non-actionable
-            // diagnosis (often a live bearer with a relay/upstream problem) is
-            // re-probed calmly so we don't run AT every 30s on a working bearer;
-            // an active fault is watched closely.
-            let interval = if st.dormant {
-                DORMANT_TICK
-            } else if symptom.actionable() {
-                TICK
-            } else {
-                CALM_TICK
-            };
-            tokio::time::sleep(interval).await;
+            error!("LTE watchdog panicked; restarting in 5s");
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     })
+}
+
+/// The watchdog loop proper. Runs until the task is aborted; rebuilt from
+/// scratch by `spawn_watchdog` after a panic (counters reset, which matches
+/// the fresh process the old `panic=abort` profile produced).
+async fn watchdog_loop(
+    client: CommsClient,
+    comms_state: Arc<Mutex<CommsState>>,
+    tunnel_stats: Arc<TunnelStats>,
+    cfg: LteConfig,
+    data_dir: String,
+) {
+    // Idempotent startup recovery: heal a CFUN=0 / deauthorized USB left by
+    // an action a prior crash or power-loss interrupted. Always safe to run.
+    startup_recovery(&client).await;
+
+    let mut st = WatchdogState::default();
+    let mut tunnel_down_since: Option<Instant> = None;
+    let mut tunnel_up_since: Option<Instant> = None;
+
+    loop {
+        let now = Instant::now();
+        let connected = tunnel_stats.connected.load(Ordering::Relaxed);
+
+        if connected {
+            tunnel_down_since = None;
+            let up = *tunnel_up_since.get_or_insert(now);
+            let up_secs = now.duration_since(up);
+            if up_secs >= STABLE_HEAVY_RESET {
+                st.heavy_reset();
+            } else if up_secs >= STABLE_LIGHT_RESET {
+                st.light_reset();
+            }
+            st.state_label = "connected";
+            publish(&comms_state, &st, 0).await;
+            tokio::time::sleep(TICK).await;
+            continue;
+        }
+
+        tunnel_up_since = None;
+        let down = *tunnel_down_since.get_or_insert(now);
+        let down_secs = now.duration_since(down).as_secs();
+
+        // Don't fight an in-progress reconnect that already has a bearer.
+        if tunnel_stats.reconnecting.load(Ordering::Relaxed) && interface_has_ipv4(&cfg.interface) {
+            st.state_label = "reconnecting";
+            publish(&comms_state, &st, down_secs).await;
+            tokio::time::sleep(TICK).await;
+            continue;
+        }
+
+        if down_secs < cfg.watchdog_grace_secs {
+            st.state_label = "grace";
+            publish(&comms_state, &st, down_secs).await;
+            tokio::time::sleep(TICK).await;
+            continue;
+        }
+
+        // Diagnose, then act (the act fn enforces every gate).
+        let probe = probe(&client, &tunnel_stats, &cfg).await;
+        let symptom = classify(probe);
+        st.track_symptom(symptom, now);
+        st.last_symptom = Some(symptom);
+
+        act(
+            &client,
+            &cfg,
+            &mut st,
+            symptom,
+            probe,
+            down_secs,
+            now,
+            &data_dir,
+            &tunnel_stats,
+        )
+        .await;
+
+        publish(&comms_state, &st, down_secs).await;
+
+        // Cadence: dormant hardware is checked rarely; a non-actionable
+        // diagnosis (often a live bearer with a relay/upstream problem) is
+        // re-probed calmly so we don't run AT every 30s on a working bearer;
+        // an active fault is watched closely.
+        let interval = if st.dormant {
+            DORMANT_TICK
+        } else if symptom.actionable() {
+            TICK
+        } else {
+            CALM_TICK
+        };
+        tokio::time::sleep(interval).await;
+    }
 }
 
 /// Gather the diagnosis inputs with the fewest possible AT commands (AT, CSQ,
