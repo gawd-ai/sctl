@@ -16,7 +16,7 @@ use axum::{
     extract::{Path as AxumPath, Query, State, WebSocketUpgrade},
     http::{Request, StatusCode},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{any, delete, get, post},
     Json, Router,
 };
 use futures_util::{future, SinkExt, StreamExt};
@@ -498,9 +498,29 @@ pub fn relay_router(relay_state: RelayState) -> Router {
             "/d/{serial}/api/infra/check/{target_id}",
             post(proxy_infra_check),
         )
-        .route("/d/{serial}/api/ws", get(proxy_ws));
+        .route("/d/{serial}/api/ws", get(proxy_ws))
+        // Anything else under /d/{serial}/api/ answers a machine-readable
+        // 404 here. Without this, unmatched device API paths fell through
+        // to the web UI reverse proxy, which handed API clients an HTML
+        // 404 (or 502) instead of an error they could parse.
+        .route("/d/{serial}/api/{*rest}", any(proxy_unrouted));
 
     tunnel_admin.merge(device_proxy).with_state(relay_state)
+}
+
+/// Fallback for `/d/{serial}/api/*` paths with no named proxy route. The
+/// named-route allowlist is what Phase 3's generic passthrough replaces;
+/// until then this makes the gap honest instead of HTML-shaped.
+async fn proxy_unrouted(
+    AxumPath((serial, rest)): AxumPath<(String, String)>,
+) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": format!("No relay proxy route for /api/{rest} on device '{serial}'"),
+            "code": "ROUTE_NOT_PROXIED",
+        })),
+    )
 }
 
 // ─── Device Registration ─────────────────────────────────────────────────────
@@ -1427,11 +1447,28 @@ fn validate_device_auth<'a>(
 
 // ─── REST Proxy Endpoints ────────────────────────────────────────────────────
 
-/// `GET /d/{serial}/api/health` — proxied health check (no auth).
+/// `GET /d/{serial}/api/health` — proxied health check.
+///
+/// Authenticated like every other device proxy route. It was the one
+/// unauthenticated exception, which made it a serial-enumeration oracle:
+/// anyone could sweep serials and learn which devices exist and are online.
+/// The fleet server sends `Authorization: Bearer` on all device calls, so
+/// nothing legitimate relied on the exception.
 async fn proxy_health(
     State(state): State<RelayState>,
     AxumPath(serial): AxumPath<String>,
+    request: Request<Body>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+    {
+        let devices = state.devices.read().await;
+        validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+    }
+
     let request_id = uuid::Uuid::new_v4().to_string();
     let msg = json!({
         "type": "tunnel.health",
@@ -3034,14 +3071,41 @@ async fn proxy_stp_download_chunk(
             let chunk_index = header["chunk_index"].as_u64().unwrap_or(0) as u32;
             let transfer_id = header["transfer_id"].as_str().unwrap_or("");
 
-            Ok(Response::builder()
+            // These strings arrive FROM the device and enter HTTP headers
+            // here. An invalid byte (CR/LF, non-ASCII) made the builder
+            // error and the unwrap panic — one misbehaving device could
+            // crash the fleet's only aggregation point. Validate and answer
+            // 502 instead: a device putting newlines in a hex hash is
+            // broken, not something to forward.
+            let (Ok(chunk_hash), Ok(transfer_id)) = (
+                axum::http::HeaderValue::from_str(chunk_hash),
+                axum::http::HeaderValue::from_str(transfer_id),
+            ) else {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": "Device returned header-unsafe transfer metadata",
+                        "code": "DEVICE_RESPONSE_INVALID",
+                    })),
+                ));
+            };
+
+            Response::builder()
                 .header("Content-Type", "application/octet-stream")
                 .header("X-Gx-Chunk-Hash", chunk_hash)
                 .header("X-Gx-Chunk-Index", chunk_index.to_string())
                 .header("X-Gx-Transfer-Id", transfer_id)
                 .header("Content-Length", data.len())
                 .body(Body::from(data))
-                .unwrap())
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "error": format!("response build failed: {e}"),
+                            "code": "INTERNAL",
+                        })),
+                    )
+                })
         }
         TunnelResponse::Json(v) => {
             let status = v["status"].as_u64().unwrap_or(500);
