@@ -171,6 +171,7 @@ these on `/d/{serial}/api/*` routes, never from a directly-addressed device:
 | `DEVICE_RESPONSE_INVALID` | 502 | Device's response frame was malformed (bad `body_b64`, unexpected shape) |
 | `DEVICE_DISPATCH_ERROR` | device's status | The device's dispatch layer refused the `http.request` frame (bad path, body too large, streaming endpoint); the relay forwards the device's own status |
 | `ROUTE_NOT_PROXIED` | 404 | `/api/ws` and `/api/events` are streaming endpoints and cannot ride the generic request/response passthrough — use `GET /d/{serial}/api/ws` |
+| `DEVICE_PAYLOAD_OUTDATED` | 502 | The device's payload predates the generic passthrough (it registered with the legacy `?token=` auth, so it cannot answer `http.request`). Not retryable — the device answers again after it activates a 0.6.0+ payload |
 | `PAYLOAD_TOO_LARGE` | 413 | Request body exceeds the 8 MiB tunnel cap |
 | `AUTH_MISSING_TOKEN` | 401 | `Authorization` header missing on a proxy route |
 | `AUTH_INVALID_TOKEN` | 403 | Key does not match the target device's registered key |

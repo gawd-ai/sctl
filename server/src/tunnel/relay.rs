@@ -95,6 +95,12 @@ pub struct ConnectedDevice {
     pub connection_id: u64,
     pub serial: String,
     pub api_key: String,
+    /// Whether the device authenticated the register upgrade with
+    /// `Authorization: Bearer`. Only 0.6.0+ payloads send the header, so this
+    /// doubles as "the device understands `http.request`" — the passthrough
+    /// refuses legacy devices instantly instead of holding the request for
+    /// the full proxy timeout. Retire with the `?token=` fallback in 0.7.0.
+    pub supports_passthrough: bool,
     /// Send messages to the device over the tunnel WS.
     pub device_tx: mpsc::Sender<TunnelMessage>,
     /// Pending REST-over-WS requests awaiting responses, keyed by `request_id`.
@@ -458,10 +464,11 @@ pub fn relay_router(relay_state: RelayState) -> Router {
 /// its own router. New device endpoints become reachable through the relay
 /// the moment the device ships them — no wrapper, no relay redeploy.
 ///
-/// Devices on payloads that predate `http.request` never answer, so the
-/// pending request times out into the standard DEVICE_TIMEOUT shape. The
-/// Phase 4 deploy gate (whole fleet on payload #1 first) makes that window
-/// empty in practice.
+/// Devices on payloads that predate `http.request` never answer, so instead
+/// of holding the request for the full proxy timeout the relay refuses them
+/// immediately with `DEVICE_PAYLOAD_OUTDATED` (detected via Bearer-vs-query
+/// auth at register). The Phase 4 deploy gate (whole fleet on payload #1
+/// first) makes that window empty in practice.
 async fn proxy_passthrough(
     State(state): State<RelayState>,
     AxumPath((serial, rest)): AxumPath<(String, String)>,
@@ -477,6 +484,22 @@ async fn proxy_passthrough(
     {
         let devices = state.devices.read().await;
         validate_device_auth(&devices, &serial, auth_header.as_deref())?;
+        if devices
+            .get(&serial)
+            .is_some_and(|d| !d.supports_passthrough)
+        {
+            let reason =
+                "device payload predates generic proxying; it answers after activating 0.6.0+";
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "error": reason,
+                    "message": reason,
+                    "code": crate::error::codes::DEVICE_PAYLOAD_OUTDATED,
+                    "retryable": false,
+                })),
+            ));
+        }
     }
 
     // Streaming endpoints cannot ride a request/response frame; the named
@@ -655,10 +678,11 @@ async fn device_register_ws(
 
     let serial = query.serial.clone();
     let egress_ip = forwarded_client_ip(&headers);
-    info!(serial = %serial, egress_ip = ?egress_ip, "Device connecting...");
+    let bearer_auth = bearer.is_some();
+    info!(serial = %serial, egress_ip = ?egress_ip, bearer_auth, "Device connecting...");
 
     ws.on_upgrade(move |socket| {
-        handle_device_ws(socket, state, serial.clone(), egress_ip)
+        handle_device_ws(socket, state, serial.clone(), egress_ip, bearer_auth)
             .instrument(info_span!("tunnel_device", serial = %serial))
     })
 }
@@ -669,6 +693,7 @@ async fn handle_device_ws(
     state: RelayState,
     serial: String,
     egress_ip: Option<String>,
+    bearer_auth: bool,
 ) {
     let (mut ws_sink, mut ws_stream) = socket.split();
     let (device_tx, mut device_rx) = mpsc::channel::<TunnelMessage>(256);
@@ -739,6 +764,7 @@ async fn handle_device_ws(
         connection_id,
         serial: serial.clone(),
         api_key,
+        supports_passthrough: bearer_auth,
         device_tx: device_tx.clone(),
         pending_requests: Arc::new(Mutex::new(HashMap::new())),
         clients: shared_clients,
