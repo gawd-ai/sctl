@@ -1,3 +1,10 @@
+# sctl configuration example — every key, with its compiled default.
+# Uncommented keys are the ones most installs set; commented keys show the
+# default they carry when omitted. Full reference: docs/config.md.
+#
+# Gated by CI: scripts/check-config-docs.py requires every config.rs field
+# to appear here (commented or not).
+
 [server]
 # Bind address and port (env: SCTL_LISTEN)
 listen = "0.0.0.0:1337"
@@ -20,23 +27,46 @@ max_batch_size = 20
 # Maximum file size for GET/PUT/DELETE /api/files (bytes, default 50 MB)
 max_file_size = 52428800
 
-# Directory for persistent data (journals, etc). Default /var/lib/sctl
+# Whether GET /api/info enumerates interface IP addresses on demand.
+# Set false to skip request-path address discovery on fragile network stacks.
+# include_interface_addresses_in_info = true
+
+# Directory for persistent data (journals, safe-mode flag, relay history).
+# (env: SCTL_DATA_DIR)
 # data_dir = "/var/lib/sctl"
 
 # Enable output journaling to disk (default true)
 # journal_enabled = true
+
+# Batch fsync interval for journals, milliseconds (0 = fsync every write)
+# journal_fsync_interval_ms = 5000
+
+# Auto-delete journals older than this many hours
+# journal_max_age_hours = 72
 
 # On OpenWrt, keep logd RAM-only by default to protect small overlays.
 # Set true only when local post-crash logs are worth the flash budget.
 # openwrt_persistent_logs = false
 # openwrt_persistent_log_size_kb = 128
 
+# In-memory activity log ring buffer entries
+# activity_log_max_entries = 200
+
+# Cached full exec results kept in memory (backs GET /api/activity/{id}/result)
+# exec_result_cache_size = 100
+
 # Default terminal dimensions for PTY sessions
 # default_terminal_rows = 24
 # default_terminal_cols = 80
 
-# Directory containing playbook markdown files (default /etc/sctl/playbooks)
+# Directory containing playbook markdown files (env: SCTL_PLAYBOOKS_DIR)
 # playbooks_dir = "/etc/sctl/playbooks"
+
+# STP (gawdxfer) chunked file transfer limits
+# max_concurrent_transfers = 4
+# transfer_chunk_size = 262144            # 256 KiB
+# transfer_max_file_size = 1073741824     # 1 GiB
+# transfer_stale_timeout_secs = 3600
 
 [auth]
 # Pre-shared API key for all authenticated endpoints.
@@ -61,19 +91,26 @@ serial = "SCTL-0000-DEV-001"
 # Target-specific directives are accepted for compatibility but only the most verbose level is used.
 level = "info"
 
+# [supervisor]
+# Settings for `sctl supervise` (crash-restart loop; writes safe_mode.flag
+# on a crash-loop — see docs/safe-mode.md).
+# max_backoff = 60           # Max seconds between restart attempts
+# stable_threshold = 60      # Seconds of uptime before backoff resets
+
 # [tunnel]
 # Connect to a relay server for NAT traversal (CGNAT, LTE, etc.)
 # relay = false
 # tunnel_key = "shared-secret-with-relay"
 # url = "wss://relay.example.com/api/tunnel/register"
-# bind_address = "wwan0"           # Bind outbound WS to interface/IP (LTE failover)
+# bind_address = "wwan0"           # Bind outbound WS to an interface NAME (LTE pinning);
+#                                  # an IP literal sets only the source address
 # tls_ca_file = "/etc/sctl/relay-ca.pem"  # Optional extra root CA for wss:// client mode
 # tls_server_cert_sha256 = "..."          # Optional relay leaf cert SHA-256 pin
 # reconnect_delay_secs = 2         # Initial backoff (client mode)
 # reconnect_max_delay_secs = 30    # Max backoff (client mode)
-# heartbeat_interval_secs = 15     # Ping interval (client mode); >15s is clamped for LTE/CGNAT safety
+# heartbeat_interval_secs = 5      # Ping interval (client mode); clamped to [1, 15] for LTE/CGNAT safety
 #
-# To run AS a relay instead of a client:
+# To run AS a relay instead of a client (see relay.toml.example):
 # relay = true
 # tunnel_key = "shared-secret-for-devices"
 # heartbeat_timeout_secs = 45      # Seconds before device is considered dead
@@ -81,7 +118,9 @@ level = "info"
 
 # [comms]
 # External comms provider plugin. Omit this section on relay/VPS/server-only installs.
-# provider = "quectel-at"
+# Required (enabled) whenever [gps] or [lte] is present. Unknown keys in this
+# section are ignored (legacy provisioned units carry removed keys).
+# provider = "quectel-at"          # "none" disables external comms
 # library = "/usr/lib/sctl/comms/libsctl_comms_quectel.so"
 # device = "/dev/ttyUSB2"          # Optional provider hint; autodetect is preferred when available
 # startup_timeout_secs = 15
@@ -89,13 +128,26 @@ level = "info"
 
 # [gps]
 # GPS/location tracking through the active comms provider.
+# device = "/dev/ttyUSB2"          # Optional AT-port hint; [comms].device wins; autodetect preferred
 # poll_interval_secs = 30
 # history_size = 100
 # auto_enable = true
 
 # [lte]
 # LTE/cellular monitoring through the active comms provider.
+# device = "/dev/ttyUSB2"          # Optional AT-port hint; [comms].device wins; autodetect preferred
 # poll_interval_secs = 60
 # interface = "wwan0"                   # Network interface for IP checks and speed tests
+# watchdog = true                       # Autonomous modem recovery (acts only when tunnel is down)
+# watchdog_grace_secs = 120             # Tunnel-down seconds before the watchdog acts
+# notregistered_grace_secs = 180        # NotRegistered seconds tolerated before actionable
+# max_escalation_level = 3              # >= 4 opts in to automatic USB power-cycle (last resort)
+# reachability_host = "8.8.8.8"         # Default: relay host from tunnel.url, else 8.8.8.8
+# interface_restart_cmd = "ifdown wwan && sleep 2 && ifup wwan"  # Overrides auto-detection
 # speed_test_url = "http://speedtest.tele2.net/10MB.zip"  # Download speed test URL
 # speed_test_upload_url = "http://speedtest.tele2.net/upload.php"  # Upload speed test URL
+
+# [lte.usb_cycle_evidence]
+# Evidence gates for the AUTOMATIC USB power-cycle path (manual
+# POST /api/lte/usb_cycle ignores these).
+# min_sustained_secs = 600         # Sustained symptom seconds required before auto USB cycle

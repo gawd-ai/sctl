@@ -32,6 +32,11 @@ jobs:
       # that no longer exists). Keeps the hand-written API reference honest.
       - name: HTTP API docs drift gate
         run: python3 scripts/check-http-api-docs.py
+      # Every `pub` field on every struct in server/src/config.rs must appear
+      # in docs/config.md and in server/sctl.toml.example (commented-out
+      # counts). Keeps the config reference and the example file honest.
+      - name: Config docs drift gate
+        run: python3 scripts/check-config-docs.py
       # `cargo test` above regenerated the ts-rs bindings (export_bindings).
       # A dirty tree here means someone changed a Rust type and committed
       # without re-running the tests — the web client would type-check green

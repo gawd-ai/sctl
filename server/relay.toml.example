@@ -11,8 +11,9 @@
 # Bind address — use 0.0.0.0 for public-facing relay
 listen = "0.0.0.0:8443"
 
-# Relay doesn't need data_dir, playbooks, or shell config.
-# Journal is disabled since the relay doesn't run commands.
+# Relay doesn't need playbooks or shell config. Journal is disabled since
+# the relay doesn't run commands. data_dir (default /var/lib/sctl) IS used:
+# device connection history persists there across relay restarts.
 journal_enabled = false
 
 [auth]
