@@ -141,10 +141,31 @@ That splits a rollout into two distinct steps:
    fetch: a service restart, or naturally on the next **power cycle**
    (tmpfs is cleared, so a reboot always re-fetches and re-verifies).
 
+On a fielded unit still running the pre-supervisor init, **prefer natural
+power-cycle activation over a remote service restart**: the old init
+backgrounds the wrapper exactly once with no respawn, and after a conf
+publish the cache is invalid, so a restart forces a fresh fetch over
+whatever link the vehicle has right now — if that fetch exhausts its
+attempts, sctl stays down for the rest of the power-on and the tunnel was
+the only way in. A power cycle risks the same fetch but happens when the
+vehicle would re-fetch anyway. Units running the supervised init retry
+every 10 s and may activate either way.
+
 Never re-point a payload URL at different bytes without updating the hash
 on the device — the boot-time verification would fail and the unit would
 retry-loop instead of starting sctl. Publish new payloads under new names
-or update URL and hash together.
+or update URL and hash together. **Keep the previous payload hosted at its
+exact URL until every device's `ramboot.conf` is confirmed repointed**: a
+not-yet-repointed device that power-cycles must still be able to fetch the
+bytes its flash pins, or it goes dark until the next cycle.
+
+The point of no return for a device is the `ramboot.conf` write, not the
+publish. Before pinning a new SHA on a remote CGNAT unit: (a) boot the
+exact artifact on a bench unit of the same class first — a payload that
+cannot reach registration leaves no tunnel to write a corrected conf
+through; (b) read and record the device's current `ramboot.conf` URL+SHA
+as the rollback reference; (c) verify the out-of-band path (WireGuard)
+actually works on that specific unit if one is claimed.
 
 SSH-deployed devices (RUT241 class) and relays have no publish step:
 `rundev.sh device upgrade` / `device upgrade-remote` / `relay upgrade`
@@ -164,14 +185,21 @@ in production):
    scheme](#version-scheme)); update the root `CHANGELOG.md`.
 3. **Build payloads** with `devices/build.sh <target>` from the tagged-to-be
    commit; record artifact SHA-256s.
-4. **Payload soak before relay deploy.** Publish + activate on a
-   representative device first and let it soak — tunnel stable through
-   heartbeat cycles, exec/files/sessions exercised, watchdog quiet, no
-   supervisor restarts. Device payloads talk to the *old* relay during the
-   soak, which is exactly the compatibility that matters: devices upgrade
-   before relays, so new-device-old-relay must hold.
-5. **Deploy the relay** (`rundev.sh relay upgrade`) only after the soak;
-   verify `relay status` shows every expected device re-registered.
+4. **Payload before relay, activation confirmed.** Publish + activate on a
+   bench device of the same class first (a payload that cannot reach
+   registration leaves a CGNAT unit with no remote recovery), then the
+   fleet. Device payloads talk to the *old* relay in this window, which is
+   exactly the compatibility that matters: devices upgrade before relays,
+   so new-device-old-relay must hold. How long to soak is a judgment call,
+   but the relay gate is not: the relay deploys only once every fleet
+   device is **confirmed activated** (check versions on `/api/health`), not
+   merely published-to — a device still on the old payload answers no
+   HTTP proxying at all under the new relay (`DEVICE_PAYLOAD_OUTDATED`)
+   and its health polling reads as down.
+5. **Deploy the relay** (`rundev.sh relay upgrade`) after that gate;
+   verify `relay status` shows every expected device re-registered. Rotate
+   relay keys only after the whole fleet runs 0.6.0+ (the new client
+   slow-retries a rotated key forever; the old client exits).
 6. **Tag at deploy.** Tag (`v0.6.0`) the exact commit the deployed
    artifacts were built from, when they are live — not when the branch
    merges. The tag is the statement "this is what production runs".
