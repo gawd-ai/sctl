@@ -528,7 +528,10 @@ The `GET /api/gps` endpoint returns:
 - **History:** configurable ring buffer of recent fixes
 - **Status:** active/inactive, fix age, total fixes, error count
 
-GPS fixes are also broadcast over WebSocket as `gps.fix` messages.
+GPS fixes also travel the device→relay tunnel as `gps.fix` frames, which the
+relay folds into its device snapshots. They are **tunnel-internal**: a client
+attached to the device's own `/api/ws` never receives them — poll
+`GET /api/gps` instead.
 
 MCP tool: `device_gps` returns the same data.
 
@@ -579,7 +582,10 @@ The `GET /api/info` response includes LTE metrics when configured:
 - **Modem:** model, firmware, IMEI, ICCID
 - **Neighbor cells:** visible cells and their signal strength
 
-LTE signal updates are broadcast over WebSocket as `lte.signal` messages.
+LTE signal updates also travel the device→relay tunnel as `lte.signal`
+frames, folded into the relay's device snapshots. Like `gps.fix` they are
+**tunnel-internal** — never delivered on the device's `/api/ws`; poll
+`GET /api/lte` instead.
 
 ### Band control
 
