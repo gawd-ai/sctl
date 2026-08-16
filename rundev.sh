@@ -86,13 +86,13 @@ DEVICE_SERIAL="DEV-LOCAL-001"
 CLOUDFLARED_PID_FILE="$DATA_DIR/cloudflared.pid"
 
 # Relay VPS deployment
-RELAY_X86_BIN="$SCTL_DIR/target/release/sctl"
+RELAY_X86_BIN="$REPO_DIR/target/release/sctl"
 RELAY_REMOTE_BIN="/usr/local/bin/sctl"
 RELAY_REMOTE_CONFIG="/etc/sctl/relay.toml"
 
 # Binaries (release for speed, debug takes too long on PTY-heavy sessions)
-SCTL_BIN="$SCTL_DIR/target/release/sctl"
-MCP_BIN="$MCP_DIR/target/release/mcp-sctl"
+SCTL_BIN="$REPO_DIR/target/release/sctl"
+MCP_BIN="$REPO_DIR/target/release/mcp-sctl"
 QUECTEL_DRIVER_LIB_NAME="libsctl_comms_quectel.so"
 COMMS_REMOTE_DIR="/usr/lib/sctl/comms"
 
@@ -606,12 +606,12 @@ arch_to_bin() {
     local target
     target=$(arch_to_target "$arch")
     if [[ "$target" == "native" ]]; then
-        echo "$SCTL_DIR/target/release/sctl"
+        echo "$REPO_DIR/target/release/sctl"
     elif [[ "$target" == "unknown" ]]; then
         err "Unknown architecture: $arch"
         return 1
     else
-        echo "$SCTL_DIR/target/$target/release/sctl"
+        echo "$REPO_DIR/target/$target/release/sctl"
     fi
 }
 
@@ -647,9 +647,9 @@ comms_provider_bin() {
             ;;
         quectel-at)
             if [[ "$target" == "native" ]]; then
-                echo "$QUECTEL_DRIVER_DIR/target/release/$QUECTEL_DRIVER_LIB_NAME"
+                echo "$REPO_DIR/target/release/$QUECTEL_DRIVER_LIB_NAME"
             else
-                echo "$QUECTEL_DRIVER_DIR/target/$target/release/$QUECTEL_DRIVER_LIB_NAME"
+                echo "$REPO_DIR/target/$target/release/$QUECTEL_DRIVER_LIB_NAME"
             fi
             ;;
         *)

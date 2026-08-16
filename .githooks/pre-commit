@@ -1,17 +1,24 @@
 #!/bin/sh
-# Pre-commit hook: ensure cargo fmt is satisfied
+# Pre-commit hook: formatting must be clean and no staged secrets.
+# (core.hooksPath already points here; this file is the whole hook chain.)
 
 failed=0
 
-for crate in server mcp; do
-    if ! cargo fmt --check --manifest-path "$crate/Cargo.toml" >/dev/null 2>&1; then
-        echo "error: $crate/ has formatting issues. Run: (cd $crate && cargo fmt)"
-        failed=1
-    fi
-done
+# One workspace, one fmt check — covers server, mcp, and both plugin crates.
+if ! cargo fmt --all --check >/dev/null 2>&1; then
+    echo "error: formatting issues. Run: cargo fmt --all"
+    failed=1
+fi
+
+# scripts/pre-commit-secret-scan.sh existed for months while nothing called
+# it — .gitignore's dedicated rules for *.toml.bpi and .env.* are the record
+# of why it needs to run. Exit 1 from the scan blocks the commit.
+if ! sh "$(git rev-parse --show-toplevel)/scripts/pre-commit-secret-scan.sh"; then
+    failed=1
+fi
 
 if [ "$failed" -eq 1 ]; then
     echo ""
-    echo "Commit blocked - fix formatting first."
+    echo "Commit blocked - fix the issues above first."
     exit 1
 fi

@@ -10,7 +10,14 @@
 
 set -e
 
-STAGED=$(git diff --cached --diff-filter=ACM -U0)
+# Lockfiles are excluded at diff time: every entry in Cargo.lock and
+# package-lock.json carries a 64-char hex checksum, which is exactly the
+# shape of the hex-token pattern below. (Found the hard way — the commit
+# that first wired this scanner into the pre-commit hook also migrated
+# Cargo.lock, and the scanner blocked its own installation.)
+STAGED=$(git diff --cached --diff-filter=ACM -U0 -- . \
+    ':(exclude)Cargo.lock' ':(exclude)**/Cargo.lock' \
+    ':(exclude)package-lock.json' ':(exclude)**/package-lock.json')
 
 if [ -z "$STAGED" ]; then
     exit 0

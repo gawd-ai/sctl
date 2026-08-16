@@ -48,12 +48,6 @@ serde_yaml = "0.9"
 tokio-util = { version = "0.7", features = ["io"] }
 libloading = "0.8"
 
-[profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
-strip = true
-panic = "abort"
 
 [dev-dependencies]
 ts-rs = { version = "^12", features = ["serde-json-impl"] }

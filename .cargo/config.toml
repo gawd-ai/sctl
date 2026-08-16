@@ -1,0 +1,18 @@
+# Workspace-level cargo config (moved from server/.cargo/ at the workspace
+# conversion — cargo walks up from the invocation dir, so this applies both
+# from the root and from inside any member).
+
+[target.armv7-unknown-linux-musleabihf]
+linker = "arm-linux-musleabihf-gcc"
+
+# ts-rs typegen — runs via `cargo test export_bindings` (server crate).
+# Writes one .ts file per #[ts(export)] type into web/src/lib/types/generated/.
+# `relative = true` resolves against THIS file's parent (the repo root), so the
+# output lands in the same place no matter which directory the test runs from —
+# the stray bigint-flavored server/bindings/ tree existed precisely because a
+# run once escaped the old server/-local config.
+# `large_int = number` collapses u64/i64 → number (file sizes & elapsed_ms all
+# fit comfortably in JS Number; we don't need BigInt precision).
+[env]
+TS_RS_EXPORT_DIR = { value = "web/src/lib/types/generated", relative = true }
+TS_RS_LARGE_INT = "number"
