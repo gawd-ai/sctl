@@ -197,7 +197,7 @@ async fn check_http(
             let parts: Vec<&str> = stdout.split_whitespace().collect();
             let status_code: u16 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
             let time_secs: f64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            #[allow(clippy::cast_sign_loss)]
             let latency = (time_secs * 1000.0) as u64;
             let latency = if latency == 0 { elapsed } else { latency };
 
@@ -476,7 +476,7 @@ async fn read_child_output(
 // ─── String helpers ─────────────────────────────────────────────────
 
 /// Parse RTT from ping output (e.g., "time=12.3 ms").
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(clippy::cast_sign_loss)]
 fn parse_ping_rtt(stdout: &str) -> Option<u64> {
     stdout
         .find("time=")

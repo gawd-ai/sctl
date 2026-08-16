@@ -26,7 +26,7 @@ pub struct SctlClient {
 
 impl SctlClient {
     /// Create a new client for a sctl device at the given URL.
-    pub fn new(base_url: String, api_key: String) -> Self {
+    pub fn new(base_url: &str, api_key: String) -> Self {
         let mut default_headers = reqwest::header::HeaderMap::new();
         default_headers.insert(
             reqwest::header::HeaderName::from_static("x-sctl-client"),
@@ -35,7 +35,7 @@ impl SctlClient {
         let http = reqwest::Client::builder()
             .default_headers(default_headers)
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_mins(2))
             .build()
             .expect("Failed to build HTTP client");
         // Strip trailing slash for consistent URL construction
@@ -349,7 +349,7 @@ impl SctlClient {
         // 2. Upload chunks — use a longer timeout for chunk uploads
         let chunk_client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_mins(2))
             .build()
             .map_err(|e| ClientError::Protocol(format!("Failed to build chunk client: {e}")))?;
 
@@ -395,7 +395,7 @@ impl SctlClient {
 
         if status.is_success() {
             serde_json::from_str(&body)
-                .map_err(|e| ClientError::Protocol(format!("Invalid JSON from device: {}", e)))
+                .map_err(|e| ClientError::Protocol(format!("Invalid JSON from device: {e}")))
         } else {
             // Try to extract error message from JSON body
             let message = serde_json::from_str::<serde_json::Value>(&body)
@@ -439,11 +439,11 @@ impl ClientError {
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClientError::Request(e) => write!(f, "HTTP request failed: {}", e),
+            ClientError::Request(e) => write!(f, "HTTP request failed: {e}"),
             ClientError::Device { status, message } => {
-                write!(f, "Device error (HTTP {}): {}", status, message)
+                write!(f, "Device error (HTTP {status}): {message}")
             }
-            ClientError::Protocol(msg) => write!(f, "Protocol error: {}", msg),
+            ClientError::Protocol(msg) => write!(f, "Protocol error: {msg}"),
         }
     }
 }

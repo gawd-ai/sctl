@@ -56,8 +56,7 @@ impl PlaybookRegistry {
     fn dir_for(&self, device: &str) -> &str {
         self.device_dirs
             .get(device)
-            .map(String::as_str)
-            .unwrap_or(&self.default_dir)
+            .map_or(&self.default_dir, String::as_str)
     }
 
     /// Check if any devices still need their playbooks fetched.
@@ -93,17 +92,16 @@ impl PlaybookRegistry {
                 let name = name.clone();
                 let client = *client;
                 async move {
-                    match tokio::time::timeout(
+                    if let Ok(playbooks) = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
                         fetch_device_playbooks(client, &dir, &name),
                     )
                     .await
                     {
-                        Ok(playbooks) => (name, playbooks),
-                        Err(_) => {
-                            eprintln!("mcp-sctl: playbooks: {name}: timed out fetching (5s)");
-                            (name, Vec::new())
-                        }
+                        (name, playbooks)
+                    } else {
+                        eprintln!("mcp-sctl: playbooks: {name}: timed out fetching (5s)");
+                        (name, Vec::new())
                     }
                 }
             })
@@ -233,9 +231,8 @@ async fn fetch_device_playbooks_rest(
 
     let mut playbooks = Vec::new();
     for item in &items {
-        let name = match item.get("name").and_then(|v| v.as_str()) {
-            Some(n) => n,
-            None => continue,
+        let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
+            continue;
         };
 
         // Fetch full content for each playbook individually.
@@ -247,14 +244,11 @@ async fn fetch_device_playbooks_rest(
             }
         };
 
-        let raw_content = match detail.get("raw_content").and_then(|v| v.as_str()) {
-            Some(c) => c,
-            None => {
-                eprintln!(
-                    "mcp-sctl: playbooks: {device_name}: skip {name}: no raw_content in response"
-                );
-                continue;
-            }
+        let Some(raw_content) = detail.get("raw_content").and_then(|v| v.as_str()) else {
+            eprintln!(
+                "mcp-sctl: playbooks: {device_name}: skip {name}: no raw_content in response"
+            );
+            continue;
         };
 
         match playbooks::parse_playbook(raw_content, device_name, name) {
@@ -286,17 +280,19 @@ async fn fetch_device_playbooks_files(
     };
 
     // The listing response has an "entries" array of objects with "name" and "type"
-    let entries = match listing.get("entries").and_then(|v| v.as_array()) {
-        Some(arr) => arr,
-        None => return Vec::new(),
+    let Some(entries) = listing.get("entries").and_then(|v| v.as_array()) else {
+        return Vec::new();
     };
 
+    // Devices write playbooks as lowercase `.md`; a case-insensitive match
+    // would silently change which files this fallback fetches.
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
     let md_files: Vec<String> = entries
         .iter()
         .filter_map(|entry| {
             let name = entry.get("name")?.as_str()?;
             if name.ends_with(".md") {
-                Some(format!("{}/{}", dir, name))
+                Some(format!("{dir}/{name}"))
             } else {
                 None
             }

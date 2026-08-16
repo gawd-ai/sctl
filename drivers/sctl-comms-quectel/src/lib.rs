@@ -1,8 +1,8 @@
-#![deny(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::missing_safety_doc)]
 
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_void};
+use std::fmt::Write as _;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sctl_comms_abi::{
@@ -175,7 +175,7 @@ impl Plugin {
         }
     }
 
-    fn capabilities(&self) -> u64 {
+    fn capabilities() -> u64 {
         SCTL_COMMS_CAP_LOCATION_GNSS
             | SCTL_COMMS_CAP_LINK_CELLULAR
             | SCTL_COMMS_CAP_CELLULAR_BAND_CONTROL
@@ -279,7 +279,7 @@ impl Plugin {
             true,
         );
         out.push_str(",\"capabilities\":");
-        push_capabilities(&mut out, self.capabilities());
+        push_capabilities(&mut out, Self::capabilities());
         out.push('}');
         out
     }
@@ -340,7 +340,7 @@ impl Plugin {
         "{\"status\":\"ok\"}".to_string()
     }
 
-    fn poll_link(&mut self, params: &SctlCommsLinkPollParams) -> Result<String, i32> {
+    fn poll_link(&mut self, params: SctlCommsLinkPollParams) -> Result<String, i32> {
         if !self.config.lte_enabled {
             return Err(SCTL_COMMS_ERR_UNSUPPORTED);
         }
@@ -379,8 +379,7 @@ impl Plugin {
         let (technology, qnw_band) = if full {
             self.at("AT+QNWINFO", 5_000)
                 .ok()
-                .map(|resp| parse_qnwinfo(&resp))
-                .unwrap_or((None, None))
+                .map_or((None, None), |resp| parse_qnwinfo(&resp))
         } else {
             (None, None)
         };
@@ -647,7 +646,7 @@ extern "C" fn plugin_probe(ctx: *mut c_void, out: *mut SctlCommsProbeResult) -> 
     plugin.detected_path.clone_from(&detected);
     // SAFETY: out is checked non-null.
     unsafe {
-        (*out).capabilities = plugin.capabilities();
+        (*out).capabilities = Plugin::capabilities();
         if let Some(path) = detected {
             write_c_array(&mut (*out).detected_path, &path);
         }
@@ -720,7 +719,7 @@ extern "C" fn plugin_poll_link(
         return SCTL_COMMS_ERR_INVALID;
     }
     // SAFETY: params is checked non-null and valid for the call.
-    match plugin.poll_link(unsafe { &*params }) {
+    match plugin.poll_link(unsafe { *params }) {
         Ok(json) => write_out(out, json.as_bytes()),
         Err(rc) => rc,
     }
@@ -1238,6 +1237,10 @@ fn write_out(out: SctlCommsMutSlice, bytes: &[u8]) -> i32 {
     SCTL_COMMS_OK
 }
 
+// `as c_char` wraps on purpose: c_char is i8 on x86 but u8 on ARM targets, so
+// the portable byte-reinterpreting cast must stay `as` (cast_signed() would
+// only compile where c_char = i8).
+#[allow(clippy::cast_possible_wrap)]
 fn write_c_array(out: &mut [c_char; SCTL_COMMS_MAX_STR], value: &str) {
     for b in out.iter_mut() {
         *b = 0;
@@ -1351,7 +1354,9 @@ fn field_opt_f64(out: &mut String, name: &str, value: Option<f64>, comma: bool) 
     push_json_str(out, name);
     out.push(':');
     match value {
-        Some(value) if value.is_finite() => out.push_str(&format!("{value:.1}")),
+        Some(value) if value.is_finite() => {
+            let _ = write!(out, "{value:.1}");
+        }
         _ => out.push_str("null"),
     }
 }
@@ -1365,7 +1370,9 @@ fn push_json_str(out: &mut String, value: &str) {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
             c => out.push(c),
         }
     }
@@ -1528,7 +1535,6 @@ mod tests {
         ) -> i32 {
             let command = slice_to_string(command);
             let response = match command.as_str() {
-                "AT+QGPS=1" => "OK\r\n",
                 "AT+CGMM" => "EC25-AF\r\nOK\r\n",
                 "AT+CGMR" => "EC25AFFDR07A10M4G\r\nOK\r\n",
                 "AT+GSN" => "868748070457085\r\nOK\r\n",
@@ -1540,7 +1546,8 @@ mod tests {
                 }
                 "AT+QNWINFO" => "+QNWINFO: \"FDD LTE\",\"302720\",\"LTE BAND 4\",2100\r\nOK\r\n",
                 "AT+COPS?" => "+COPS: 0,0,\"ROGERS ROGERS\",7\r\nOK\r\n",
-                "AT+QENG=\"neighbourcell\"" => "OK\r\n",
+                // "AT+QGPS=1" and "AT+QENG=\"neighbourcell\"" fall through to
+                // the wildcard's plain OK.
                 "AT+QCFG=\"band\"" => "+QCFG: \"band\",0x260,0x808,0x0\r\nOK\r\n",
                 "AT+QCFG=\"bandpri\"" => "+QCFG: \"bandpri\",4\r\nOK\r\n",
                 _ => "OK\r\n",
@@ -1559,7 +1566,7 @@ mod tests {
             usb_cycle: None,
         };
         let mut api = SctlCommsPluginV1::default();
-        let rc = unsafe { sctl_comms_plugin_init_v1(&host, &mut api) };
+        let rc = unsafe { sctl_comms_plugin_init_v1(&raw const host, &raw mut api) };
         assert_eq!(rc, SCTL_COMMS_OK);
 
         let provider = "quectel-at";
@@ -1585,7 +1592,11 @@ mod tests {
         let mut len = 0usize;
         let open = api.open.unwrap();
         assert_eq!(
-            open(api.plugin_ctx, &open_config, mut_slice(&mut buf, &mut len)),
+            open(
+                api.plugin_ctx,
+                &raw const open_config,
+                mut_slice(&mut buf, &mut len)
+            ),
             SCTL_COMMS_OK
         );
         let opened = String::from_utf8_lossy(&buf[..len]);
@@ -1598,7 +1609,11 @@ mod tests {
             tunnel_connected: true,
         };
         assert_eq!(
-            poll(api.plugin_ctx, &params, mut_slice(&mut buf, &mut len)),
+            poll(
+                api.plugin_ctx,
+                &raw const params,
+                mut_slice(&mut buf, &mut len)
+            ),
             SCTL_COMMS_OK
         );
         let lte = String::from_utf8_lossy(&buf[..len]);

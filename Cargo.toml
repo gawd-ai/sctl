@@ -13,6 +13,34 @@ members = [
     "drivers/sctl-comms-quectel",
 ]
 
+# One lint policy for every member (each declares `[lints] workspace = true`).
+# Before this table, server/lib.rs carried 9 allows, server/main.rs only 3 of
+# them (stricter by accident), mcp had no lint attributes at all, and the two
+# plugin crates were never linted in CI to begin with.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+# Pedantic guard against any owned-return going unused. ~50 candidates
+# triggered when re-enabled; almost none represent real bug-bait (every
+# internal caller uses the return), so the annotation pressure outweighs the
+# diagnostic value. Re-enable when a real "ignored result" bug shows up.
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
+too_many_lines = "allow"
+cast_possible_truncation = "allow"
+unused_async = "allow"
+# Suggests adding `S: BuildHasher` generics to functions taking HashMap
+# params. The hits live in axum extractor signatures + shell helpers where
+# the public API is keyed on `HashMap<String, String>`; generalizing would
+# propagate the parameter through callers without any practical benefit.
+implicit_hasher = "allow"
+
 # Moved verbatim from server/ (abi and the quectel driver carried identical
 # copies; mcp gains it deliberately — a size-trimmed proxy binary is fine).
 # Workspaces ignore non-root [profile.*] sections, so this is the only copy

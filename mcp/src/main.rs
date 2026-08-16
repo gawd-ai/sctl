@@ -69,7 +69,7 @@ async fn main() {
     let resolved = match config::load_config(&cli) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("mcp-sctl: configuration error: {}", e);
+            eprintln!("mcp-sctl: configuration error: {e}");
             std::process::exit(1);
         }
     };
@@ -95,10 +95,7 @@ async fn main() {
     };
     let pb_registry = PlaybookRegistry::with_defaults(device_dirs);
 
-    eprintln!(
-        "mcp-sctl: {} device(s) configured, default={}",
-        device_count, default
-    );
+    eprintln!("mcp-sctl: {device_count} device(s) configured, default={default}");
 
     mcp::run_stdio(registry, pb_registry).await;
 }

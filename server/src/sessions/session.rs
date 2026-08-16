@@ -400,15 +400,6 @@ impl ManagedSession {
             .map_err(|_| "Session stdin closed".to_string())
     }
 
-    /// Send raw bytes to the session's stdin.
-    #[allow(dead_code)]
-    pub async fn write_stdin_bytes(&self, data: Vec<u8>) -> Result<(), String> {
-        self.stdin_tx
-            .send(data)
-            .await
-            .map_err(|_| "Session stdin closed".to_string())
-    }
-
     /// Clone the stdin sender so callers can drop outer locks before awaiting.
     #[must_use]
     pub fn stdin_sender(&self) -> mpsc::Sender<Vec<u8>> {

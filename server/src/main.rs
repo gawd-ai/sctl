@@ -1,7 +1,3 @@
-#![deny(clippy::all)]
-#![warn(clippy::pedantic)]
-#![allow(clippy::module_name_repetitions)]
-
 //! # sctl
 //!
 //! Remote shell control service for Linux devices.
@@ -291,7 +287,6 @@ async fn run_supervisor_mode(config_path: Option<&str>) -> ! {
     supervisor::run_supervisor(config_path, &config.supervisor).await
 }
 
-#[allow(clippy::too_many_lines)]
 async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     let config = Config::load(config_path);
 

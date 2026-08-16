@@ -498,6 +498,8 @@ impl DeviceWsConnection {
         command: &str,
         timeout_ms: u64,
     ) -> Result<ExecWaitResult, String> {
+        const DISCONNECT_GRACE_SECS: u64 = 10;
+
         let nonce = format!(
             "{:x}",
             std::time::SystemTime::now()
@@ -505,14 +507,13 @@ impl DeviceWsConnection {
                 .unwrap_or_default()
                 .as_nanos()
         );
-        let start_marker = format!("__SCTL_{}_START__", nonce);
-        let done_marker = format!("__SCTL_{}_DONE_", nonce);
+        let start_marker = format!("__SCTL_{nonce}_START__");
+        let done_marker = format!("__SCTL_{nonce}_DONE_");
 
         // Wrap command with start and done markers.
         // The start marker lets us reliably skip the PTY echo of the command.
         let wrapped = format!(
-            "printf '{}\\n'; {} ; printf '\\n{}%s__\\n' \"$?\"",
-            start_marker, command, done_marker
+            "printf '{start_marker}\\n'; {command} ; printf '\\n{done_marker}%s__\\n' \"$?\""
         );
 
         // Record current position before sending
@@ -537,7 +538,6 @@ impl DeviceWsConnection {
         let mut accumulated = String::new();
         let mut last_read_seq = start_seq;
         let mut disconnected_since: Option<tokio::time::Instant> = None;
-        const DISCONNECT_GRACE_SECS: u64 = 10;
 
         loop {
             let remaining = deadline.duration_since(tokio::time::Instant::now());
@@ -556,8 +556,7 @@ impl DeviceWsConnection {
                 let since = disconnected_since.get_or_insert_with(tokio::time::Instant::now);
                 if since.elapsed().as_secs() >= DISCONNECT_GRACE_SECS {
                     return Err(format!(
-                        "WebSocket disconnected for {}s during exec_wait",
-                        DISCONNECT_GRACE_SECS
+                        "WebSocket disconnected for {DISCONNECT_GRACE_SECS}s during exec_wait"
                     ));
                 }
             }
@@ -619,17 +618,13 @@ impl DeviceWsConnection {
                 // real output is between start_marker\n and \n before done_marker.
                 // Use rfind within the region before done_pos to skip the
                 // PTY echo (which also contains the start marker text).
-                let output_start = accumulated[..done_pos]
-                    .rfind(&start_marker)
-                    .map(|p| {
-                        // Skip past the start marker and its trailing \n
-                        let after = p + start_marker.len();
-                        accumulated[after..done_pos]
-                            .find('\n')
-                            .map(|nl| after + nl + 1)
-                            .unwrap_or(after)
-                    })
-                    .unwrap_or(0);
+                let output_start = accumulated[..done_pos].rfind(&start_marker).map_or(0, |p| {
+                    // Skip past the start marker and its trailing \n
+                    let after = p + start_marker.len();
+                    accumulated[after..done_pos]
+                        .find('\n')
+                        .map_or(after, |nl| after + nl + 1)
+                });
 
                 let output_end = accumulated[..done_pos].rfind('\n').unwrap_or(done_pos);
 
@@ -913,9 +908,6 @@ async fn dispatch_message(
                 eprintln!("mcp-sctl: WS error: {error_msg}");
             }
         }
-        "session.resize.ack" | "session.rename.ack" | "session.allow_ai.ack" => {
-            // Acknowledged — no action needed, the tool already returned ok
-        }
         "session.ai_status.ack" => {
             // Sync local tracking from the ack
             let session_id = msg["session_id"].as_str().unwrap_or("");
@@ -952,7 +944,7 @@ async fn dispatch_message(
             if !session_id.is_empty() {
                 let last_seq = {
                     let sessions = sessions.lock().await;
-                    sessions.get(session_id).map(|b| b.last_seq).unwrap_or(0)
+                    sessions.get(session_id).map_or(0, |b| b.last_seq)
                 };
                 // Queue a re-attach. We can't call self.attach_session here since
                 // we don't have the sender. Instead, synthesize a system entry so
@@ -976,7 +968,9 @@ async fn dispatch_message(
             let session_id = msg["session_id"].as_str().unwrap_or("unknown");
             eprintln!("mcp-sctl: broadcast {msg_type} for session {session_id}");
         }
-        _ => {} // pong, ack, etc.
+        // pong plus the acks that need no action (resize/rename/allow_ai —
+        // the tool already returned ok).
+        _ => {}
     }
 }
 

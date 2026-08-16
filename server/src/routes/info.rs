@@ -116,11 +116,10 @@ pub(crate) async fn info_with_groups(
         let meminfo = read_proc_file("/proc/meminfo");
         let loadavg = read_proc_file("/proc/loadavg");
         let cpuinfo = read_proc_file("/proc/cpuinfo");
-        #[allow(clippy::cast_possible_truncation)]
         let proc_ms = proc_started.elapsed().as_millis() as u64;
         debug!(req_id, proc_ms, "api.info: phase proc complete");
 
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[allow(clippy::cast_sign_loss)]
         let system_uptime = uptime_str
             .split_whitespace()
             .next()
@@ -167,7 +166,6 @@ pub(crate) async fn info_with_groups(
             state.config.server.include_interface_addresses_in_info,
         )
         .await;
-        #[allow(clippy::cast_possible_truncation)]
         let interfaces_ms = interfaces_started.elapsed().as_millis() as u64;
         debug!(
             req_id,
@@ -187,7 +185,6 @@ pub(crate) async fn info_with_groups(
         // (always 100% on squashfs) is misleading.
         let disk = get_disk_usage("/");
         let disks = collect_disks();
-        #[allow(clippy::cast_possible_truncation)]
         let disk_ms = disk_started.elapsed().as_millis() as u64;
         debug!(
             req_id,
@@ -238,7 +235,6 @@ pub(crate) async fn info_with_groups(
                 response["gps"] = projected;
             }
         }
-        #[allow(clippy::cast_possible_truncation)]
         let gps_lock_wait_ms = gps_lock_started.elapsed().as_millis() as u64;
         debug!(req_id, gps_lock_wait_ms, "api.info: phase gps complete");
     }
@@ -248,7 +244,6 @@ pub(crate) async fn info_with_groups(
         if let Some(ref comms_state) = state.comms_state {
             let lock_started = Instant::now();
             let cs = comms_state.lock().await;
-            #[allow(clippy::cast_possible_truncation)]
             {
                 lte_lock_wait_ms = lock_started.elapsed().as_millis() as u64;
             }
@@ -268,14 +263,12 @@ pub(crate) async fn info_with_groups(
 
     let serialize_started = Instant::now();
     let response_body_len = serde_json::to_string(&response).map_or(0, |s| s.len());
-    #[allow(clippy::cast_possible_truncation)]
     let serialize_ms = serialize_started.elapsed().as_millis() as u64;
     debug!(
         req_id,
         serialize_ms, response_body_len, "api.info: phase serialize complete"
     );
 
-    #[allow(clippy::cast_possible_truncation)]
     let total_ms = start.elapsed().as_millis() as u64;
     if lte_lock_wait_ms >= 250 {
         warn!(
@@ -380,7 +373,6 @@ async fn collect_interfaces(req_id: &str, include_addresses: bool) -> Vec<Value>
     if include_addresses {
         let addr_started = Instant::now();
         if let Some(addresses_by_name) = collect_interface_addresses(req_id) {
-            #[allow(clippy::cast_possible_truncation)]
             let addr_ms = addr_started.elapsed().as_millis() as u64;
             debug!(
                 req_id,
@@ -397,7 +389,6 @@ async fn collect_interfaces(req_id: &str, include_addresses: bool) -> Vec<Value>
                 }
             }
         } else {
-            #[allow(clippy::cast_possible_truncation)]
             let addr_ms = addr_started.elapsed().as_millis() as u64;
             warn!(
                 req_id,
@@ -411,7 +402,6 @@ async fn collect_interfaces(req_id: &str, include_addresses: bool) -> Vec<Value>
         );
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     let total_ms = start.elapsed().as_millis() as u64;
     debug!(
         req_id,
@@ -464,7 +454,6 @@ fn collect_interface_addresses(
         values.dedup();
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     let total_ms = start.elapsed().as_millis() as u64;
     let address_count: usize = addresses.values().map(std::vec::Vec::len).sum();
     debug!(
@@ -484,17 +473,20 @@ unsafe fn format_interface_address(
     addr: *const libc::sockaddr,
     netmask: *const libc::sockaddr,
 ) -> Option<String> {
-    match i32::from((*addr).sa_family) {
+    // SAFETY: caller passes pointers straight out of getifaddrs(); addr is
+    // non-null (checked by the caller) and the kernel sized the sockaddr to
+    // match its own sa_family.
+    match i32::from(unsafe { (*addr).sa_family }) {
         libc::AF_INET => {
-            let addr_in = &*addr.cast::<libc::sockaddr_in>();
+            let addr_in = unsafe { &*addr.cast::<libc::sockaddr_in>() };
             let ip = std::net::Ipv4Addr::from(u32::from_be(addr_in.sin_addr.s_addr));
-            let prefix = prefix_len_v4(netmask);
+            let prefix = unsafe { prefix_len_v4(netmask) };
             Some(format!("{ip}/{prefix}"))
         }
         libc::AF_INET6 => {
-            let addr_in6 = &*addr.cast::<libc::sockaddr_in6>();
+            let addr_in6 = unsafe { &*addr.cast::<libc::sockaddr_in6>() };
             let ip = std::net::Ipv6Addr::from(addr_in6.sin6_addr.s6_addr);
-            let prefix = prefix_len_v6(netmask);
+            let prefix = unsafe { prefix_len_v6(netmask) };
             Some(format!("{ip}/{prefix}"))
         }
         _ => None,
@@ -503,19 +495,23 @@ unsafe fn format_interface_address(
 
 #[allow(clippy::cast_ptr_alignment)]
 unsafe fn prefix_len_v4(netmask: *const libc::sockaddr) -> u32 {
-    if netmask.is_null() || i32::from((*netmask).sa_family) != libc::AF_INET {
+    // SAFETY: null is checked first; a non-null getifaddrs netmask with
+    // AF_INET family is a kernel-written sockaddr_in.
+    if netmask.is_null() || i32::from(unsafe { (*netmask).sa_family }) != libc::AF_INET {
         return 0;
     }
-    let mask = &*netmask.cast::<libc::sockaddr_in>();
+    let mask = unsafe { &*netmask.cast::<libc::sockaddr_in>() };
     u32::from_be(mask.sin_addr.s_addr).count_ones()
 }
 
 #[allow(clippy::cast_ptr_alignment)]
 unsafe fn prefix_len_v6(netmask: *const libc::sockaddr) -> u32 {
-    if netmask.is_null() || i32::from((*netmask).sa_family) != libc::AF_INET6 {
+    // SAFETY: null is checked first; a non-null getifaddrs netmask with
+    // AF_INET6 family is a kernel-written sockaddr_in6.
+    if netmask.is_null() || i32::from(unsafe { (*netmask).sa_family }) != libc::AF_INET6 {
         return 0;
     }
-    let mask = &*netmask.cast::<libc::sockaddr_in6>();
+    let mask = unsafe { &*netmask.cast::<libc::sockaddr_in6>() };
     mask.sin6_addr.s6_addr.iter().map(|b| b.count_ones()).sum()
 }
 

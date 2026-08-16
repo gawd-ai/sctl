@@ -145,14 +145,12 @@ impl DeviceRegistry {
     /// Check if the config file has changed and reload if so.
     /// Called automatically before device resolution.
     pub async fn maybe_reload(&self) {
-        let path = match &self.config_path {
-            Some(p) => p,
-            None => return,
+        let Some(path) = &self.config_path else {
+            return;
         };
 
-        let current_mtime = match std::fs::metadata(path).and_then(|m| m.modified()) {
-            Ok(t) => t,
-            Err(_) => return,
+        let Ok(current_mtime) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+            return;
         };
 
         let mut last = self.last_mtime.lock().await;
@@ -164,7 +162,7 @@ impl DeviceRegistry {
         let new_config = match config::load_config_from_file(path) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("mcp-sctl: config reload failed: {}", e);
+                eprintln!("mcp-sctl: config reload failed: {e}");
                 return;
             }
         };
@@ -208,7 +206,7 @@ impl DeviceRegistry {
             .clients
             .get(name)
             .cloned()
-            .ok_or_else(|| format!("Unknown device: '{}'", name))
+            .ok_or_else(|| format!("Unknown device: '{name}'"))
     }
 
     /// Resolve and return both the device name and a cloned client.
@@ -289,7 +287,7 @@ fn build_clients(devices: HashMap<String, DeviceEntry>) -> HashMap<String, SctlC
     devices
         .into_iter()
         .map(|(name, entry)| {
-            let client = SctlClient::new(entry.url, entry.api_key);
+            let client = SctlClient::new(&entry.url, entry.api_key);
             (name, client)
         })
         .collect()

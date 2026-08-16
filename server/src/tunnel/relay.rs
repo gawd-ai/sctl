@@ -64,7 +64,6 @@ impl RelayConnectionHistory {
         if sessions.len() >= MAX_CONNECTION_HISTORY {
             sessions.pop_front();
         }
-        #[allow(clippy::cast_possible_truncation)]
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -86,7 +85,6 @@ impl RelayConnectionHistory {
         last_heartbeat_age_ms: Option<u64>,
     ) {
         let mut sessions = self.sessions.lock().await;
-        #[allow(clippy::cast_possible_truncation)]
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -309,7 +307,8 @@ pub struct RelayState {
     pub devices: Arc<RwLock<HashMap<String, ConnectedDevice>>>,
     /// The shared tunnel key for device registration auth.
     pub tunnel_key: String,
-    /// Seconds before a device is evicted for missed heartbeat (default 20).
+    /// Seconds before a device is evicted for missed heartbeat (default 45,
+    /// from `[tunnel] heartbeat_timeout_secs`).
     pub heartbeat_timeout_secs: u64,
     /// Default proxy request timeout in seconds (default 60).
     pub tunnel_proxy_timeout_secs: u64,
@@ -436,7 +435,6 @@ impl RelayState {
     /// TOCTOU races (device could send heartbeat between read-lock and write-lock).
     pub async fn sweep_dead_devices(&self) -> Vec<String> {
         let timeout_ms = self.heartbeat_timeout_secs * 1000;
-        #[allow(clippy::cast_possible_truncation)]
         let now_ms = self.epoch.elapsed().as_millis() as u64;
 
         let mut devices = self.devices.write().await;
@@ -564,7 +562,6 @@ impl RelayState {
 
     /// Snapshot currently connected devices for health/status surfaces.
     pub async fn live_device_statuses(&self) -> Vec<LiveDeviceStatus> {
-        #[allow(clippy::cast_possible_truncation)]
         let now_ms = self.epoch.elapsed().as_millis() as u64;
         let devices = self.devices.read().await;
         let mut list = Vec::with_capacity(devices.len());
@@ -572,7 +569,6 @@ impl RelayState {
         for device in devices.values() {
             let last_hb_ms = device.last_heartbeat_ms.load(Ordering::Relaxed);
             let last_heartbeat_age_ms = now_ms.saturating_sub(last_hb_ms);
-            #[allow(clippy::cast_possible_truncation)]
             let connected_since_ms = device.connected_since.elapsed().as_millis() as u64;
             let pending_requests_count = device.pending_requests.lock().await.len();
             let client_count = device.clients.read().await.len();
@@ -801,7 +797,6 @@ async fn device_register_ws(
 }
 
 /// Handle a registered device's WebSocket connection.
-#[allow(clippy::too_many_lines)]
 async fn handle_device_ws(
     socket: axum::extract::ws::WebSocket,
     state: RelayState,
@@ -840,7 +835,6 @@ async fn handle_device_ws(
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
-    #[allow(clippy::cast_possible_truncation)]
     let now_ms = state.epoch.elapsed().as_millis() as u64;
     // Reuse the old device's clients + session_subscriptions Arcs (if any).
     // When a device reconnects (LTE flap, etc.), WS clients are still connected
@@ -1134,7 +1128,6 @@ async fn handle_device_ws(
                 match msg_type {
                     "tunnel.ping" => {
                         // Device heartbeat — respond and update timestamp (lock-free)
-                        #[allow(clippy::cast_possible_truncation)]
                         let now_ms = relay_epoch.elapsed().as_millis() as u64;
                         heartbeat_ms.store(now_ms, Ordering::Relaxed);
                         // Device heartbeat arriving proves the connection is alive.
@@ -1170,7 +1163,6 @@ async fn handle_device_ws(
                     }
                     "tunnel.pong" => {
                         // Response to relay-initiated ping — update heartbeat timestamp
-                        #[allow(clippy::cast_possible_truncation)]
                         let now_ms = relay_epoch.elapsed().as_millis() as u64;
                         heartbeat_ms.store(now_ms, Ordering::Relaxed);
                         pong_count.fetch_add(1, Ordering::Relaxed);
@@ -1362,7 +1354,6 @@ async fn handle_device_ws(
         info!(serial = %serial, "Device handler exiting (replaced, skipping cleanup)");
     } else {
         // Compute heartbeat age before removing device from map
-        #[allow(clippy::cast_possible_truncation)]
         let hb_age = {
             let devices = state.devices.read().await;
             devices.get(&serial).map(|d| {
@@ -1414,7 +1405,6 @@ async fn list_devices(
     let devices = state.devices.read().await;
     let mut list: Vec<Value> = Vec::with_capacity(devices.len());
 
-    #[allow(clippy::cast_possible_truncation)]
     let now_ms = state.epoch.elapsed().as_millis() as u64;
     for d in devices.values() {
         let last_hb_ms = d.last_heartbeat_ms.load(Ordering::Relaxed);
@@ -1427,7 +1417,6 @@ async fn list_devices(
             .iter()
             .map(|(sid, cids)| (sid, cids.iter().collect()))
             .collect();
-        #[allow(clippy::cast_possible_truncation)]
         let connected_ms = d.connected_since.elapsed().as_millis() as u64;
 
         list.push(json!({
@@ -1677,7 +1666,6 @@ async fn proxy_health(
     if status == 200 {
         Ok(Json(body))
     } else {
-        #[allow(clippy::cast_possible_truncation)]
         Err((
             StatusCode::from_u16(status as u16).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             Json(body),
@@ -1753,7 +1741,6 @@ async fn proxy_info(
         let status = response["status"].as_u64().unwrap_or(200);
         let body = response["body"].clone();
         if status != 200 {
-            #[allow(clippy::cast_possible_truncation)]
             return Err((
                 StatusCode::from_u16(status as u16).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 Json(body),
@@ -2088,7 +2075,6 @@ pub fn proxy_response_to_http(response: &Value) -> Result<Json<Value>, (StatusCo
     if (200..300).contains(&status) {
         Ok(Json(body))
     } else {
-        #[allow(clippy::cast_possible_truncation)]
         Err((
             StatusCode::from_u16(status as u16).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             Json(body),
@@ -3266,7 +3252,6 @@ async fn proxy_stp_download_chunk(
     match response {
         TunnelResponse::Binary { header, data } => {
             let chunk_hash = header["chunk_hash"].as_str().unwrap_or("");
-            #[allow(clippy::cast_possible_truncation)]
             let chunk_index = header["chunk_index"].as_u64().unwrap_or(0) as u32;
             let transfer_id = header["transfer_id"].as_str().unwrap_or("");
 
@@ -3282,7 +3267,6 @@ async fn proxy_stp_download_chunk(
         TunnelResponse::Json(v) => {
             let status = v["status"].as_u64().unwrap_or(500);
             let body = v["body"].clone();
-            #[allow(clippy::cast_possible_truncation)]
             Err((
                 StatusCode::from_u16(status as u16).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 Json(body),
@@ -3345,7 +3329,6 @@ async fn proxy_stp_upload_chunk(
             let status = v["status"].as_u64().unwrap_or(200);
             if status >= 400 {
                 let body = v["body"].clone();
-                #[allow(clippy::cast_possible_truncation)]
                 return Err((
                     StatusCode::from_u16(status as u16)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),

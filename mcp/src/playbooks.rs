@@ -66,8 +66,7 @@ pub fn validate_name(name: &str) -> Result<(), String> {
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
         return Err(format!(
-            "Invalid playbook name '{}': only alphanumeric, hyphens, and underscores allowed",
-            name
+            "Invalid playbook name '{name}': only alphanumeric, hyphens, and underscores allowed"
         ));
     }
     Ok(())
@@ -182,7 +181,6 @@ fn extract_script_block(body: &str) -> Result<String, String> {
             let trimmed = line.trim();
             if trimmed.starts_with("```sh") || trimmed.starts_with("```bash") {
                 in_block = true;
-                continue;
             }
         } else if line.trim().starts_with("```") {
             // End of block
@@ -271,7 +269,7 @@ pub fn render_script(pb: &Playbook, args: &Value) -> Result<String, String> {
     let mut script = pb.script.clone();
 
     for (name, def) in &pb.params {
-        let placeholder = format!("{{{{{}}}}}", name);
+        let placeholder = format!("{{{{{name}}}}}");
         if !script.contains(&placeholder) {
             continue;
         }
@@ -297,8 +295,7 @@ pub fn render_script(pb: &Playbook, args: &Value) -> Result<String, String> {
         if let Some(end) = script[start + 2..].find("}}") {
             let undeclared = &script[start + 2..start + 2 + end];
             return Err(format!(
-                "Script references undeclared parameter: {{{{{}}}}}",
-                undeclared
+                "Script references undeclared parameter: {{{{{undeclared}}}}}"
             ));
         }
     }

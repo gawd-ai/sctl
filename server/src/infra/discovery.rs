@@ -69,7 +69,6 @@ pub async fn discover(
                 if let Some(ref infra) = infra {
                     if let Ok(mut g) = infra.try_lock() {
                         if g.discovery_progress.active {
-                            #[allow(clippy::cast_possible_truncation)]
                             {
                                 g.discovery_progress.elapsed_ms =
                                     start.elapsed().as_millis() as u64;
@@ -86,9 +85,8 @@ pub async fn discover(
     };
 
     // Helper: update progress in shared state (non-blocking)
-    let mk_progress = |phase: &str, num: u8, devices: &HashMap<String, DiscoveredDevice>| {
-        #[allow(clippy::cast_possible_truncation)]
-        DiscoveryProgress {
+    let mk_progress =
+        |phase: &str, num: u8, devices: &HashMap<String, DiscoveredDevice>| DiscoveryProgress {
             active: true,
             phase: phase.to_string(),
             phase_number: num,
@@ -97,8 +95,7 @@ pub async fn discover(
             devices: devices.values().cloned().collect(),
             started_at: Some(started_at.clone()),
             elapsed_ms: start.elapsed().as_millis() as u64,
-        }
-    };
+        };
 
     // Phase 1: ARP table scan
     set_progress(infra.as_ref(), mk_progress("arp", 1, &HashMap::new()));
@@ -171,7 +168,6 @@ pub async fn discover(
         }
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     let scan_duration_ms = start.elapsed().as_millis() as u64;
 
     let results = DiscoveryResults {

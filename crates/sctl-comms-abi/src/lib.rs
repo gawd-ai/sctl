@@ -4,8 +4,6 @@
 //! fixed-layout structs, function pointers, caller-owned buffers, and integer
 //! result codes. Rust traits and heap-owned Rust types stay on either side.
 
-#![deny(unsafe_op_in_unsafe_fn)]
-
 use core::ffi::{c_char, c_void};
 
 pub const SCTL_COMMS_ABI_VERSION: u32 = 1;

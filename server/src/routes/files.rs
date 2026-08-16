@@ -244,7 +244,6 @@ pub async fn get_file(
 /// (seek + bounded read) and sets `truncated: true` if the file extends
 /// beyond the returned bytes.  Without range parameters the original
 /// behaviour is preserved: files larger than `max_size` are rejected.
-#[allow(clippy::too_many_lines)]
 async fn read_file(
     path: &Path,
     max_size: usize,
@@ -279,7 +278,6 @@ async fn read_file(
     let read_limit = limit.map_or(max_size, |l| l.min(max_size));
 
     // Without range params, enforce the old behaviour: reject oversized files.
-    #[allow(clippy::cast_possible_truncation)]
     if offset.is_none() && limit.is_none() && file_size as usize > max_size {
         return Err(ApiError::new(
             codes::FILE_TOO_LARGE,
@@ -315,7 +313,6 @@ async fn read_file(
                 })?;
         }
 
-        #[allow(clippy::cast_possible_truncation)]
         let remaining = file_size.saturating_sub(read_offset) as usize;
         let to_read = read_limit.min(remaining);
         let mut buf = vec![0u8; to_read];

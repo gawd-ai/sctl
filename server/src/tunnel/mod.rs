@@ -28,7 +28,6 @@ pub enum TunnelResponse {
 /// Encode a binary frame: `[header_len: u32 BE][JSON header][payload]`.
 pub fn encode_binary_frame(header: &Value, payload: &[u8]) -> Vec<u8> {
     let header_bytes = serde_json::to_vec(header).expect("Value serializes");
-    #[allow(clippy::cast_possible_truncation)]
     let header_len = header_bytes.len() as u32;
     let mut frame = Vec::with_capacity(4 + header_bytes.len() + payload.len());
     frame.extend_from_slice(&header_len.to_be_bytes());

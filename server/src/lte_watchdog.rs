@@ -660,7 +660,11 @@ async fn execute(client: &CommsClient, cfg: &LteConfig, action: Action) -> Strin
             )
             .await
         {
-            // The plugin reopens the AT port after re-enumeration.
+            // The HOST reopens the AT port after re-enumeration (the
+            // RECOVERY_USB_CYCLE arm in comms.rs calls reopen_after_probe);
+            // the plugin has no way to ask for a reopen — the v1 ABI carries
+            // no such callback. This is currently the ONLY path that ever
+            // reopens the port after the modem re-enumerates.
             Ok(_) => "usb power-cycle ok".to_string(),
             Err(e) => format!("usb power-cycle failed: {e}"),
         },

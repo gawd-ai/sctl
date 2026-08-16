@@ -75,7 +75,7 @@ fn collect_system_info() -> Value {
     let meminfo = read_proc_file("/proc/meminfo");
     let loadavg_str = read_proc_file("/proc/loadavg");
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(clippy::cast_sign_loss)]
     let os_uptime_secs = uptime_str
         .split_whitespace()
         .next()
@@ -301,7 +301,6 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    #[allow(clippy::cast_possible_truncation)]
     (y as i32, m, d)
 }
 

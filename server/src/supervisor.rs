@@ -101,7 +101,6 @@ fn record_crash_and_pick_backoff(
 }
 
 /// Run the supervisor loop. Does not return unless the child exits cleanly.
-#[allow(clippy::too_many_lines)]
 pub async fn run_supervisor(config_path: Option<&str>, sup_config: &SupervisorConfig) -> ! {
     let mut backoff = 1u64;
     let max_backoff = sup_config.max_backoff;

@@ -78,7 +78,6 @@ impl OutputBuffer {
         let seq = self.next_seq;
         self.next_seq += 1;
 
-        #[allow(clippy::cast_possible_truncation)]
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);

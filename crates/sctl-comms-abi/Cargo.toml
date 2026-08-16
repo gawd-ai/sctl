@@ -10,3 +10,6 @@ rust-version = "1.97"
 [lib]
 path = "src/lib.rs"
 
+
+[lints]
+workspace = true

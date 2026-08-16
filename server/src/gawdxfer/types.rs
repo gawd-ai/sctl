@@ -20,18 +20,6 @@ pub enum Direction {
 }
 
 /// Transfer lifecycle phase.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum Phase {
-    Init,
-    Transferring,
-    Paused,
-    Verifying,
-    Complete,
-    Failed(String),
-    Aborted,
-}
-
 /// Immutable metadata set at transfer init time.
 pub struct TransferSpec {
     pub transfer_id: String,
@@ -59,6 +47,21 @@ pub struct TransferProgress {
 }
 
 // ─── Protocol Request/Response Messages ──────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+// Not dead — `Progress.phase` and the manager's state machine live on this.
+// The allow silences UNCONSTRUCTED VARIANTS (Paused/Verifying are parsed and
+// matched but never built by current code paths), which dead_code also flags.
+#[allow(dead_code)]
+pub enum Phase {
+    Init,
+    Transferring,
+    Paused,
+    Verifying,
+    Complete,
+    Failed(String),
+    Aborted,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -168,6 +171,9 @@ pub struct TransferError {
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, optional_fields))]
+// Never constructed in Rust — the frame is built as raw JSON — but this
+// struct is the ts-rs source of the web client's generated binding. The
+// allow is load-bearing: delete the type and the web loses its wire type.
 #[allow(dead_code)]
 pub struct Abort {
     pub transfer_id: String,
@@ -177,6 +183,9 @@ pub struct Abort {
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, optional_fields))]
+// Never constructed in Rust — the frame is built as raw JSON — but this
+// struct is the ts-rs source of the web client's generated binding. The
+// allow is load-bearing: delete the type and the web loses its wire type.
 #[allow(dead_code)]
 pub struct Resume {
     pub transfer_id: String,

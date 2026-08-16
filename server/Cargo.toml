@@ -51,3 +51,6 @@ libloading = "0.8"
 
 [dev-dependencies]
 ts-rs = { version = "^12", features = ["serde-json-impl"] }
+
+[lints]
+workspace = true

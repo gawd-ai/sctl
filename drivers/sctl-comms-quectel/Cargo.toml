@@ -15,3 +15,6 @@ path = "src/lib.rs"
 [dependencies]
 sctl-comms-abi = { path = "../../crates/sctl-comms-abi" }
 
+
+[lints]
+workspace = true

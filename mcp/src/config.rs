@@ -111,16 +111,16 @@ fn load_from_file(path: &Path) -> Result<ResolvedConfig, String> {
 
     for (name, entry) in &config.devices {
         if entry.url.is_empty() {
-            return Err(format!("Device '{}' has empty url", name));
+            return Err(format!("Device '{name}' has empty url"));
         }
         if entry.api_key.is_empty() {
-            return Err(format!("Device '{}' has empty api_key", name));
+            return Err(format!("Device '{name}' has empty api_key"));
         }
     }
 
     let default_device = if let Some(d) = &config.default_device {
         if !config.devices.contains_key(d) {
-            return Err(format!("default_device '{}' not found in devices", d));
+            return Err(format!("default_device '{d}' not found in devices"));
         }
         d.clone()
     } else if config.devices.len() == 1 {

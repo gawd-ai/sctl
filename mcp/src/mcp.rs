@@ -56,7 +56,7 @@ pub async fn run_stdio(registry: DeviceRegistry, pb_registry: PlaybookRegistry) 
             Ok(0) => break, // EOF
             Ok(_) => {}
             Err(e) => {
-                eprintln!("mcp-sctl: stdin read error: {}", e);
+                eprintln!("mcp-sctl: stdin read error: {e}");
                 break;
             }
         }
@@ -90,7 +90,7 @@ pub async fn run_stdio(registry: DeviceRegistry, pb_registry: PlaybookRegistry) 
             match method {
                 "notifications/initialized" | "notifications/cancelled" => {}
                 _ => {
-                    eprintln!("mcp-sctl: unknown notification: {}", method);
+                    eprintln!("mcp-sctl: unknown notification: {method}");
                 }
             }
             continue;
@@ -235,9 +235,9 @@ async fn write_response(stdout: &mut tokio::io::Stdout, response: &Value) {
     let mut output = serde_json::to_string(response).unwrap_or_default();
     output.push('\n');
     if let Err(e) = stdout.write_all(output.as_bytes()).await {
-        eprintln!("mcp-sctl: stdout write error: {}", e);
+        eprintln!("mcp-sctl: stdout write error: {e}");
     }
     if let Err(e) = stdout.flush().await {
-        eprintln!("mcp-sctl: stdout flush error: {}", e);
+        eprintln!("mcp-sctl: stdout flush error: {e}");
     }
 }

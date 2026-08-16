@@ -108,7 +108,9 @@ impl AtPort {
 }
 
 unsafe fn borrow_fd(fd: RawFd) -> BorrowedFd<'static> {
-    BorrowedFd::borrow_raw(fd)
+    // SAFETY: contract inherited from this fn's own safety requirement —
+    // the caller guarantees fd stays open for the borrow's lifetime.
+    unsafe { BorrowedFd::borrow_raw(fd) }
 }
 
 fn configure_termios(fd: RawFd) -> Result<(), String> {

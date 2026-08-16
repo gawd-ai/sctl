@@ -120,7 +120,6 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
         if let Some(ref cs) = state.comms_state {
             let lock_started = Instant::now();
             let cs = cs.lock().await;
-            #[allow(clippy::cast_possible_truncation)]
             {
                 lte_lock_wait_ms = lock_started.elapsed().as_millis() as u64;
             }
@@ -146,7 +145,6 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
     // Connection history (relay mode only)
     let connection_history = if let Some(ref history) = state.relay_history {
         let sessions_snap = history.snapshot().await;
-        #[allow(clippy::cast_possible_truncation)]
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -219,7 +217,6 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
     if let Some(ld) = live_devices {
         resp["live_devices"] = json!(ld);
     }
-    #[allow(clippy::cast_possible_truncation)]
     let total_ms = start.elapsed().as_millis() as u64;
     if lte_lock_wait_ms >= 250 {
         warn!(

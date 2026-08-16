@@ -92,13 +92,12 @@ pub async fn run(args: Vec<String>) {
         loop {
             line.clear();
             match reader.read_line(&mut line).await {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(_) => {
                     if stdin_tx.send(line.clone()).await.is_err() {
                         break;
                     }
                 }
-                Err(_) => break,
             }
         }
         // Claude closed stdin — exit the whole supervisor
@@ -368,7 +367,8 @@ async fn drain_worker(
 
         line.clear();
         match tokio::time::timeout(remaining, reader.read_line(&mut line)).await {
-            Ok(Ok(0)) => return, // Clean EOF
+            // Clean EOF, read error, or timeout
+            Ok(Ok(0) | Err(_)) | Err(_) => return,
             Ok(Ok(_)) => {
                 state.track_response(&line);
                 let _ = stdout.write_all(line.as_bytes()).await;
@@ -378,7 +378,6 @@ async fn drain_worker(
                     return;
                 }
             }
-            Ok(Err(_)) | Err(_) => return,
         }
     }
 }
@@ -397,14 +396,13 @@ async fn binary_watcher(binary: PathBuf, reload_tx: mpsc::Sender<()>) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-        let meta = match std::fs::metadata(&binary) {
-            Ok(m) => m,
-            Err(_) => continue, // Binary missing (mid-compile), skip cycle
+        // Binary missing (mid-compile) → skip cycle
+        let Ok(meta) = std::fs::metadata(&binary) else {
+            continue;
         };
 
-        let current_mtime = match meta.modified() {
-            Ok(t) => t,
-            Err(_) => continue,
+        let Ok(current_mtime) = meta.modified() else {
+            continue;
         };
 
         // Quick check: mtime unchanged → skip
@@ -415,9 +413,8 @@ async fn binary_watcher(binary: PathBuf, reload_tx: mpsc::Sender<()>) {
         last_mtime = Some(current_mtime);
 
         // mtime changed — compute hash to confirm actual change
-        let current_hash = match hash_file(&binary) {
-            Some(h) => h,
-            None => continue,
+        let Some(current_hash) = hash_file(&binary) else {
+            continue;
         };
 
         if Some(&current_hash) == last_hash.as_ref() {

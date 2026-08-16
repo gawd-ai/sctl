@@ -152,7 +152,6 @@ impl ActivityLog {
         request_id: Option<String>,
     ) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        #[allow(clippy::cast_possible_truncation)]
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

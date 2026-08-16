@@ -704,7 +704,7 @@ pub async fn handle_tool_call(
         "playbook_get" => handle_playbook_get(args, registry, pb_reg).await,
         "playbook_put" => handle_playbook_put(args, registry, pb_reg).await,
         _ if name.starts_with("pb_") => handle_playbook_exec(name, args, registry, pb_reg).await,
-        _ => ToolResult::error(format!("Unknown tool: {}", name)),
+        _ => ToolResult::error(&format!("Unknown tool: {name}")),
     }
 }
 
@@ -719,8 +719,8 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
-    fn success(value: Value) -> Self {
-        let text = serde_json::to_string_pretty(&value).unwrap_or_default();
+    fn success(value: &Value) -> Self {
+        let text = serde_json::to_string_pretty(value).unwrap_or_default();
         Self {
             content: vec![json!({ "type": "text", "text": text })],
             is_error: false,
@@ -728,7 +728,7 @@ impl ToolResult {
         }
     }
 
-    fn error(message: String) -> Self {
+    fn error(message: &str) -> Self {
         Self {
             content: vec![json!({ "type": "text", "text": message })],
             is_error: true,
@@ -749,7 +749,7 @@ async fn handle_device_list(registry: &DeviceRegistry) -> ToolResult {
         .map(|d| json!({ "name": d.name, "url": d.url }))
         .collect();
 
-    ToolResult::success(json!({
+    ToolResult::success(&json!({
         "devices": devices,
         "default_device": registry.default_device().await
     }))
@@ -758,34 +758,33 @@ async fn handle_device_list(registry: &DeviceRegistry) -> ToolResult {
 async fn handle_device_health(args: &Value, registry: &DeviceRegistry) -> ToolResult {
     let client = match registry.resolve(get_device_param(args)).await {
         Ok(c) => c,
-        Err(e) => return ToolResult::error(e),
+        Err(e) => return ToolResult::error(&e),
     };
     match client.health().await {
-        Ok(v) => ToolResult::success(v),
-        Err(e) => ToolResult::error(e.to_string()),
+        Ok(v) => ToolResult::success(&v),
+        Err(e) => ToolResult::error(&e.to_string()),
     }
 }
 
 async fn handle_device_info(args: &Value, registry: &DeviceRegistry) -> ToolResult {
     let client = match registry.resolve(get_device_param(args)).await {
         Ok(c) => c,
-        Err(e) => return ToolResult::error(e),
+        Err(e) => return ToolResult::error(&e),
     };
     match client.info().await {
-        Ok(v) => ToolResult::success(v),
-        Err(e) => ToolResult::error(e.to_string()),
+        Ok(v) => ToolResult::success(&v),
+        Err(e) => ToolResult::error(&e.to_string()),
     }
 }
 
 async fn handle_device_exec(args: &Value, registry: &DeviceRegistry) -> ToolResult {
     let client = match registry.resolve(get_device_param(args)).await {
         Ok(c) => c,
-        Err(e) => return ToolResult::error(e),
+        Err(e) => return ToolResult::error(&e),
     };
 
-    let command = match args.get("command").and_then(Value::as_str) {
-        Some(c) => c,
-        None => return ToolResult::error("Missing required parameter: command".into()),
+    let Some(command) = args.get("command").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: command");
     };
 
     let timeout_ms = args.get("timeout_ms").and_then(Value::as_u64);
@@ -798,20 +797,19 @@ async fn handle_device_exec(args: &Value, registry: &DeviceRegistry) -> ToolResu
         .exec(command, timeout_ms, working_dir, env.as_ref())
         .await
     {
-        Ok(v) => ToolResult::success(v),
-        Err(e) => ToolResult::error(e.to_string()),
+        Ok(v) => ToolResult::success(&v),
+        Err(e) => ToolResult::error(&e.to_string()),
     }
 }
 
 async fn handle_device_exec_batch(args: &Value, registry: &DeviceRegistry) -> ToolResult {
     let client = match registry.resolve(get_device_param(args)).await {
         Ok(c) => c,
-        Err(e) => return ToolResult::error(e),
+        Err(e) => return ToolResult::error(&e),
     };
 
-    let commands = match args.get("commands").and_then(Value::as_array) {
-        Some(c) => c,
-        None => return ToolResult::error("Missing required parameter: commands (array)".into()),
+    let Some(commands) = args.get("commands").and_then(Value::as_array) else {
+        return ToolResult::error("Missing required parameter: commands (array)");
     };
 
     // Normalize: strings become { "command": "..." } objects
@@ -835,27 +833,26 @@ async fn handle_device_exec_batch(args: &Value, registry: &DeviceRegistry) -> To
         .exec_batch(&normalized, working_dir, env.as_ref())
         .await
     {
-        Ok(v) => ToolResult::success(v),
-        Err(e) => ToolResult::error(e.to_string()),
+        Ok(v) => ToolResult::success(&v),
+        Err(e) => ToolResult::error(&e.to_string()),
     }
 }
 
 async fn handle_device_file_read(args: &Value, registry: &DeviceRegistry) -> ToolResult {
     let client = match registry.resolve(get_device_param(args)).await {
         Ok(c) => c,
-        Err(e) => return ToolResult::error(e),
+        Err(e) => return ToolResult::error(&e),
     };
 
-    let path = match args.get("path").and_then(Value::as_str) {
-        Some(p) => p,
-        None => return ToolResult::error("Missing required parameter: path".into()),
+    let Some(path) = args.get("path").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: path");
     };
 
     let list = args.get("list").and_then(Value::as_bool).unwrap_or(false);
 
     match client.file_read(path, list).await {
-        Ok(v) => ToolResult::success(v),
-        Err(e) => ToolResult::error(e.to_string()),
+        Ok(v) => ToolResult::success(&v),
+        Err(e) => ToolResult::error(&e.to_string()),
     }
 }
 
@@ -867,17 +864,15 @@ const CHUNKED_UPLOAD_THRESHOLD: usize = 2 * 1024 * 1024;
 async fn handle_device_file_write(args: &Value, registry: &DeviceRegistry) -> ToolResult {
     let client = match registry.resolve(get_device_param(args)).await {
         Ok(c) => c,
-        Err(e) => return ToolResult::error(e),
+        Err(e) => return ToolResult::error(&e),
     };
 
-    let path = match args.get("path").and_then(Value::as_str) {
-        Some(p) => p,
-        None => return ToolResult::error("Missing required parameter: path".into()),
+    let Some(path) = args.get("path").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: path");
     };
 
-    let content = match args.get("content").and_then(Value::as_str) {
-        Some(c) => c,
-        None => return ToolResult::error("Missing required parameter: content".into()),
+    let Some(content) = args.get("content").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: content");
     };
 
     let encoding = args.get("encoding").and_then(Value::as_str);
@@ -900,12 +895,12 @@ async fn handle_device_file_write(args: &Value, registry: &DeviceRegistry) -> To
                     }
                 }
                 return match client.file_write_chunked(path, &raw_bytes, mode).await {
-                    Ok(v) => ToolResult::success(v),
-                    Err(e) => ToolResult::error(e.to_string()),
+                    Ok(v) => ToolResult::success(&v),
+                    Err(e) => ToolResult::error(&e.to_string()),
                 };
             }
             Ok(_) => {} // Under threshold, use normal path
-            Err(e) => return ToolResult::error(format!("Invalid base64 content: {e}")),
+            Err(e) => return ToolResult::error(&format!("Invalid base64 content: {e}")),
         }
     }
 
@@ -913,55 +908,54 @@ async fn handle_device_file_write(args: &Value, registry: &DeviceRegistry) -> To
         .file_write(path, content, encoding, mode, create_dirs)
         .await
     {
-        Ok(v) => ToolResult::success(v),
-        Err(e) => ToolResult::error(e.to_string()),
+        Ok(v) => ToolResult::success(&v),
+        Err(e) => ToolResult::error(&e.to_string()),
     }
 }
 
 async fn handle_device_file_delete(args: &Value, registry: &DeviceRegistry) -> ToolResult {
     let client = match registry.resolve(get_device_param(args)).await {
         Ok(c) => c,
-        Err(e) => return ToolResult::error(e),
+        Err(e) => return ToolResult::error(&e),
     };
 
-    let path = match args.get("path").and_then(Value::as_str) {
-        Some(p) => p,
-        None => return ToolResult::error("Missing required parameter: path".into()),
+    let Some(path) = args.get("path").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: path");
     };
 
     match client.file_delete(path).await {
-        Ok(v) => ToolResult::success(v),
-        Err(e) => ToolResult::error(e.to_string()),
+        Ok(v) => ToolResult::success(&v),
+        Err(e) => ToolResult::error(&e.to_string()),
     }
 }
 
 async fn handle_device_activity(args: &Value, registry: &DeviceRegistry) -> ToolResult {
     let client = match registry.resolve(get_device_param(args)).await {
         Ok(c) => c,
-        Err(e) => return ToolResult::error(e),
+        Err(e) => return ToolResult::error(&e),
     };
 
     let since_id = args.get("since_id").and_then(Value::as_u64).unwrap_or(0);
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50);
 
     match client.activity(since_id, limit).await {
-        Ok(v) => ToolResult::success(v),
-        Err(e) => ToolResult::error(e.to_string()),
+        Ok(v) => ToolResult::success(&v),
+        Err(e) => ToolResult::error(&e.to_string()),
     }
 }
 
 async fn handle_device_gps(args: &Value, registry: &DeviceRegistry) -> ToolResult {
     let client = match registry.resolve(get_device_param(args)).await {
         Ok(c) => c,
-        Err(e) => return ToolResult::error(e),
+        Err(e) => return ToolResult::error(&e),
     };
     match client.gps().await {
-        Ok(v) => ToolResult::success(v),
+        Ok(v) => ToolResult::success(&v),
         Err(e) => {
             if e.is_not_found() {
-                ToolResult::error("GPS not configured on this device".into())
+                ToolResult::error("GPS not configured on this device")
             } else {
-                ToolResult::error(e.to_string())
+                ToolResult::error(&e.to_string())
             }
         }
     }
@@ -986,13 +980,13 @@ async fn get_ws_connection(
     };
     let (name, client) = match registry.resolve_with_name(device.as_deref()).await {
         Ok(v) => v,
-        Err(e) => return Err(ToolResult::error(e)),
+        Err(e) => return Err(ToolResult::error(&e)),
     };
     registry
         .ws_pool
         .get_or_connect(&name, &client)
         .await
-        .map_err(|e| ToolResult::error(format!("WebSocket connection failed: {e}")))
+        .map_err(|e| ToolResult::error(&format!("WebSocket connection failed: {e}")))
 }
 
 async fn handle_session_start(args: &Value, registry: &DeviceRegistry) -> ToolResult {
@@ -1034,12 +1028,7 @@ async fn handle_session_start(args: &Value, registry: &DeviceRegistry) -> ToolRe
         Ok(v) => {
             // Check if it's an error response
             if v["type"].as_str() == Some("error") {
-                ToolResult::error(
-                    v["message"]
-                        .as_str()
-                        .unwrap_or("Session start failed")
-                        .to_string(),
-                )
+                ToolResult::error(v["message"].as_str().unwrap_or("Session start failed"))
             } else {
                 // Register session→device mapping for auto-routing
                 if let Some(sid) = v["session_id"].as_str() {
@@ -1057,10 +1046,10 @@ async fn handle_session_start(args: &Value, registry: &DeviceRegistry) -> ToolRe
                 if let Some(n) = v["name"].as_str() {
                     result["name"] = json!(n);
                 }
-                ToolResult::success(result)
+                ToolResult::success(&result)
             }
         }
-        Err(e) => ToolResult::error(e),
+        Err(e) => ToolResult::error(&e),
     }
 }
 
@@ -1070,13 +1059,11 @@ async fn handle_session_exec(args: &Value, registry: &DeviceRegistry) -> ToolRes
         Err(e) => return e,
     };
 
-    let session_id = match args.get("session_id").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return ToolResult::error("Missing required parameter: session_id".into()),
+    let Some(session_id) = args.get("session_id").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: session_id");
     };
-    let command = match args.get("command").and_then(Value::as_str) {
-        Some(c) => c,
-        None => return ToolResult::error("Missing required parameter: command".into()),
+    let Some(command) = args.get("command").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: command");
     };
 
     // Auto-set AI working status
@@ -1090,8 +1077,8 @@ async fn handle_session_exec(args: &Value, registry: &DeviceRegistry) -> ToolRes
         }))
         .await
     {
-        Ok(()) => ToolResult::success(json!({ "ok": true })),
-        Err(e) => ToolResult::error(e),
+        Ok(()) => ToolResult::success(&json!({ "ok": true })),
+        Err(e) => ToolResult::error(&e),
     }
 }
 
@@ -1177,13 +1164,11 @@ async fn handle_session_send(args: &Value, registry: &DeviceRegistry) -> ToolRes
         Err(e) => return e,
     };
 
-    let session_id = match args.get("session_id").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return ToolResult::error("Missing required parameter: session_id".into()),
+    let Some(session_id) = args.get("session_id").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: session_id");
     };
-    let raw_data = match args.get("data").and_then(Value::as_str) {
-        Some(d) => d,
-        None => return ToolResult::error("Missing required parameter: data".into()),
+    let Some(raw_data) = args.get("data").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: data");
     };
 
     // Auto-set AI working status
@@ -1208,8 +1193,8 @@ async fn handle_session_send(args: &Value, registry: &DeviceRegistry) -> ToolRes
         }))
         .await
     {
-        Ok(()) => ToolResult::success(json!({ "ok": true })),
-        Err(e) => ToolResult::error(e),
+        Ok(()) => ToolResult::success(&json!({ "ok": true })),
+        Err(e) => ToolResult::error(&e),
     }
 }
 
@@ -1219,9 +1204,8 @@ async fn handle_session_read(args: &Value, registry: &DeviceRegistry) -> ToolRes
         Err(e) => return e,
     };
 
-    let session_id = match args.get("session_id").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return ToolResult::error("Missing required parameter: session_id".into()),
+    let Some(session_id) = args.get("session_id").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: session_id");
     };
     let since = args.get("since").and_then(Value::as_u64).unwrap_or(0);
     let timeout_ms = args
@@ -1254,7 +1238,7 @@ async fn handle_session_read(args: &Value, registry: &DeviceRegistry) -> ToolRes
                 crate::websocket::SessionStatus::Exited => "exited",
             };
 
-            ToolResult::success(json!({
+            ToolResult::success(&json!({
                 "entries": entries,
                 "last_seq": last_seq,
                 "status": status,
@@ -1262,7 +1246,7 @@ async fn handle_session_read(args: &Value, registry: &DeviceRegistry) -> ToolRes
                 "dropped_entries": result.dropped_count,
             }))
         }
-        Err(e) => ToolResult::error(e),
+        Err(e) => ToolResult::error(&e),
     }
 }
 
@@ -1272,13 +1256,11 @@ async fn handle_session_signal(args: &Value, registry: &DeviceRegistry) -> ToolR
         Err(e) => return e,
     };
 
-    let session_id = match args.get("session_id").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return ToolResult::error("Missing required parameter: session_id".into()),
+    let Some(session_id) = args.get("session_id").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: session_id");
     };
-    let signal = match args.get("signal").and_then(Value::as_i64) {
-        Some(s) => s,
-        None => return ToolResult::error("Missing required parameter: signal".into()),
+    let Some(signal) = args.get("signal").and_then(Value::as_i64) else {
+        return ToolResult::error("Missing required parameter: signal");
     };
 
     match ws
@@ -1289,8 +1271,8 @@ async fn handle_session_signal(args: &Value, registry: &DeviceRegistry) -> ToolR
         }))
         .await
     {
-        Ok(()) => ToolResult::success(json!({ "ok": true })),
-        Err(e) => ToolResult::error(e),
+        Ok(()) => ToolResult::success(&json!({ "ok": true })),
+        Err(e) => ToolResult::error(&e),
     }
 }
 
@@ -1300,9 +1282,8 @@ async fn handle_session_kill(args: &Value, registry: &DeviceRegistry) -> ToolRes
         Err(e) => return e,
     };
 
-    let session_id = match args.get("session_id").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return ToolResult::error("Missing required parameter: session_id".into()),
+    let Some(session_id) = args.get("session_id").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: session_id");
     };
 
     match ws
@@ -1312,8 +1293,8 @@ async fn handle_session_kill(args: &Value, registry: &DeviceRegistry) -> ToolRes
         }))
         .await
     {
-        Ok(()) => ToolResult::success(json!({ "ok": true })),
-        Err(e) => ToolResult::error(e),
+        Ok(()) => ToolResult::success(&json!({ "ok": true })),
+        Err(e) => ToolResult::error(&e),
     }
 }
 
@@ -1323,17 +1304,14 @@ async fn handle_session_resize(args: &Value, registry: &DeviceRegistry) -> ToolR
         Err(e) => return e,
     };
 
-    let session_id = match args.get("session_id").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return ToolResult::error("Missing required parameter: session_id".into()),
+    let Some(session_id) = args.get("session_id").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: session_id");
     };
-    let rows = match args.get("rows").and_then(Value::as_u64) {
-        Some(r) => r,
-        None => return ToolResult::error("Missing required parameter: rows".into()),
+    let Some(rows) = args.get("rows").and_then(Value::as_u64) else {
+        return ToolResult::error("Missing required parameter: rows");
     };
-    let cols = match args.get("cols").and_then(Value::as_u64) {
-        Some(c) => c,
-        None => return ToolResult::error("Missing required parameter: cols".into()),
+    let Some(cols) = args.get("cols").and_then(Value::as_u64) else {
+        return ToolResult::error("Missing required parameter: cols");
     };
 
     match ws
@@ -1345,8 +1323,8 @@ async fn handle_session_resize(args: &Value, registry: &DeviceRegistry) -> ToolR
         }))
         .await
     {
-        Ok(()) => ToolResult::success(json!({ "ok": true, "rows": rows, "cols": cols })),
-        Err(e) => ToolResult::error(e),
+        Ok(()) => ToolResult::success(&json!({ "ok": true, "rows": rows, "cols": cols })),
+        Err(e) => ToolResult::error(&e),
     }
 }
 
@@ -1368,7 +1346,7 @@ async fn handle_session_list(args: &Value, registry: &DeviceRegistry) -> ToolRes
                     }
                 }
             }
-            Err(e) => return ToolResult::error(e),
+            Err(e) => return ToolResult::error(&e),
         }
     } else {
         // Iterate all configured devices (not just already-connected ones)
@@ -1412,7 +1390,7 @@ async fn handle_session_list(args: &Value, registry: &DeviceRegistry) -> ToolRes
         .collect();
 
     let count = sessions.len();
-    ToolResult::success(json!({
+    ToolResult::success(&json!({
         "sessions": sessions,
         "count": count,
     }))
@@ -1424,13 +1402,11 @@ async fn handle_session_exec_wait(args: &Value, registry: &DeviceRegistry) -> To
         Err(e) => return e,
     };
 
-    let session_id = match args.get("session_id").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return ToolResult::error("Missing required parameter: session_id".into()),
+    let Some(session_id) = args.get("session_id").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: session_id");
     };
-    let command = match args.get("command").and_then(Value::as_str) {
-        Some(c) => c,
-        None => return ToolResult::error("Missing required parameter: command".into()),
+    let Some(command) = args.get("command").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: command");
     };
     let timeout_ms = args
         .get("timeout_ms")
@@ -1441,12 +1417,12 @@ async fn handle_session_exec_wait(args: &Value, registry: &DeviceRegistry) -> To
     ws.auto_set_ai_working(session_id, "write").await;
 
     match ws.exec_wait(session_id, command, timeout_ms).await {
-        Ok(result) => ToolResult::success(json!({
+        Ok(result) => ToolResult::success(&json!({
             "output": result.output,
             "exit_code": result.exit_code,
             "timed_out": result.timed_out,
         })),
-        Err(e) => ToolResult::error(e),
+        Err(e) => ToolResult::error(&e),
     }
 }
 
@@ -1456,9 +1432,8 @@ async fn handle_session_attach(args: &Value, registry: &DeviceRegistry) -> ToolR
         Err(e) => return e,
     };
 
-    let session_id = match args.get("session_id").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return ToolResult::error("Missing required parameter: session_id".into()),
+    let Some(session_id) = args.get("session_id").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: session_id");
     };
     let since = args.get("since").and_then(Value::as_u64).unwrap_or(0);
 
@@ -1484,7 +1459,7 @@ async fn handle_session_attach(args: &Value, registry: &DeviceRegistry) -> ToolR
                 crate::websocket::SessionStatus::Exited => "exited",
             };
 
-            ToolResult::success(json!({
+            ToolResult::success(&json!({
                 "session_id": session_id,
                 "entries": entries,
                 "last_seq": last_seq,
@@ -1492,7 +1467,7 @@ async fn handle_session_attach(args: &Value, registry: &DeviceRegistry) -> ToolR
                 "exit_code": result.exit_code,
             }))
         }
-        Err(e) => ToolResult::error(e),
+        Err(e) => ToolResult::error(&e),
     }
 }
 
@@ -1502,13 +1477,11 @@ async fn handle_session_rename(args: &Value, registry: &DeviceRegistry) -> ToolR
         Err(e) => return e,
     };
 
-    let session_id = match args.get("session_id").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return ToolResult::error("Missing required parameter: session_id".into()),
+    let Some(session_id) = args.get("session_id").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: session_id");
     };
-    let name = match args.get("name").and_then(Value::as_str) {
-        Some(n) => n,
-        None => return ToolResult::error("Missing required parameter: name".into()),
+    let Some(name) = args.get("name").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: name");
     };
 
     match ws
@@ -1519,12 +1492,12 @@ async fn handle_session_rename(args: &Value, registry: &DeviceRegistry) -> ToolR
         }))
         .await
     {
-        Ok(()) => ToolResult::success(json!({
+        Ok(()) => ToolResult::success(&json!({
             "ok": true,
             "session_id": session_id,
             "name": name,
         })),
-        Err(e) => ToolResult::error(e),
+        Err(e) => ToolResult::error(&e),
     }
 }
 
@@ -1534,13 +1507,11 @@ async fn handle_session_allow_ai(args: &Value, registry: &DeviceRegistry) -> Too
         Err(e) => return e,
     };
 
-    let session_id = match args.get("session_id").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return ToolResult::error("Missing required parameter: session_id".into()),
+    let Some(session_id) = args.get("session_id").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: session_id");
     };
-    let allowed = match args.get("allowed").and_then(Value::as_bool) {
-        Some(a) => a,
-        None => return ToolResult::error("Missing required parameter: allowed (bool)".into()),
+    let Some(allowed) = args.get("allowed").and_then(Value::as_bool) else {
+        return ToolResult::error("Missing required parameter: allowed (bool)");
     };
 
     match ws
@@ -1551,12 +1522,12 @@ async fn handle_session_allow_ai(args: &Value, registry: &DeviceRegistry) -> Too
         }))
         .await
     {
-        Ok(()) => ToolResult::success(json!({
+        Ok(()) => ToolResult::success(&json!({
             "ok": true,
             "session_id": session_id,
             "allowed": allowed,
         })),
-        Err(e) => ToolResult::error(e),
+        Err(e) => ToolResult::error(&e),
     }
 }
 
@@ -1566,13 +1537,11 @@ async fn handle_session_ai_status(args: &Value, registry: &DeviceRegistry) -> To
         Err(e) => return e,
     };
 
-    let session_id = match args.get("session_id").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return ToolResult::error("Missing required parameter: session_id".into()),
+    let Some(session_id) = args.get("session_id").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: session_id");
     };
-    let working = match args.get("working").and_then(Value::as_bool) {
-        Some(w) => w,
-        None => return ToolResult::error("Missing required parameter: working (bool)".into()),
+    let Some(working) = args.get("working").and_then(Value::as_bool) else {
+        return ToolResult::error("Missing required parameter: working (bool)");
     };
     let activity = args.get("activity").and_then(Value::as_str);
     let message = args.get("message").and_then(Value::as_str);
@@ -1599,9 +1568,9 @@ async fn handle_session_ai_status(args: &Value, registry: &DeviceRegistry) -> To
             if let Some(m) = v["message"].as_str() {
                 result["message"] = json!(m);
             }
-            ToolResult::success(result)
+            ToolResult::success(&result)
         }
-        Err(e) => ToolResult::error(e),
+        Err(e) => ToolResult::error(&e),
     }
 }
 
@@ -1622,7 +1591,7 @@ async fn handle_playbook_list(
     let playbooks = if let Some(dev) = device {
         let client = match registry.resolve(Some(dev)).await {
             Ok(c) => c,
-            Err(e) => return ToolResult::error(e),
+            Err(e) => return ToolResult::error(&e),
         };
         pb_reg.refresh_device(dev, &client).await
     } else {
@@ -1657,7 +1626,7 @@ async fn handle_playbook_list(
         })
         .collect();
 
-    ToolResult::success(json!({
+    ToolResult::success(&json!({
         "playbooks": items,
         "count": items.len(),
     }))
@@ -1668,17 +1637,16 @@ async fn handle_playbook_get(
     registry: &DeviceRegistry,
     pb_reg: &PlaybookRegistry,
 ) -> ToolResult {
-    let name = match args.get("name").and_then(Value::as_str) {
-        Some(n) => n,
-        None => return ToolResult::error("Missing required parameter: name".into()),
+    let Some(name) = args.get("name").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: name");
     };
     if let Err(e) = playbooks::validate_name(name) {
-        return ToolResult::error(e);
+        return ToolResult::error(&e);
     }
 
     let (dev_name, client) = match registry.resolve_with_name(get_device_param(args)).await {
         Ok(v) => v,
-        Err(e) => return ToolResult::error(e),
+        Err(e) => return ToolResult::error(&e),
     };
 
     // Try REST endpoint first, fall back to file-based.
@@ -1689,7 +1657,7 @@ async fn handle_playbook_get(
                 .and_then(|c| c.as_str())
                 .unwrap_or_default();
             let path = v.get("path").and_then(|p| p.as_str()).unwrap_or_default();
-            return ToolResult::success(json!({
+            return ToolResult::success(&json!({
                 "name": name,
                 "device": &dev_name,
                 "path": path,
@@ -1699,12 +1667,12 @@ async fn handle_playbook_get(
         Err(e) if e.is_not_found() => {
             // Fall through to file-based approach
         }
-        Err(e) => return ToolResult::error(format!("Cannot read playbook '{}': {}", name, e)),
+        Err(e) => return ToolResult::error(&format!("Cannot read playbook '{name}': {e}")),
     }
 
     // File-based fallback for older servers.
     let dir = get_playbooks_dir(&dev_name, pb_reg);
-    let path = format!("{}/{}.md", dir, name);
+    let path = format!("{dir}/{name}.md");
 
     match client.file_read(&path, false).await {
         Ok(v) => {
@@ -1712,14 +1680,14 @@ async fn handle_playbook_get(
                 .get("content")
                 .and_then(|c| c.as_str())
                 .unwrap_or_default();
-            ToolResult::success(json!({
+            ToolResult::success(&json!({
                 "name": name,
                 "device": &dev_name,
                 "path": path,
                 "content": content,
             }))
         }
-        Err(e) => ToolResult::error(format!("Cannot read playbook '{}': {}", name, e)),
+        Err(e) => ToolResult::error(&format!("Cannot read playbook '{name}': {e}")),
     }
 }
 
@@ -1728,22 +1696,20 @@ async fn handle_playbook_put(
     registry: &DeviceRegistry,
     pb_reg: &PlaybookRegistry,
 ) -> ToolResult {
-    let name = match args.get("name").and_then(Value::as_str) {
-        Some(n) => n,
-        None => return ToolResult::error("Missing required parameter: name".into()),
+    let Some(name) = args.get("name").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: name");
     };
     if let Err(e) = playbooks::validate_name(name) {
-        return ToolResult::error(e);
+        return ToolResult::error(&e);
     }
 
-    let content = match args.get("content").and_then(Value::as_str) {
-        Some(c) => c,
-        None => return ToolResult::error("Missing required parameter: content".into()),
+    let Some(content) = args.get("content").and_then(Value::as_str) else {
+        return ToolResult::error("Missing required parameter: content");
     };
 
     let (dev_name, client) = match registry.resolve_with_name(get_device_param(args)).await {
         Ok(v) => v,
-        Err(e) => return ToolResult::error(e),
+        Err(e) => return ToolResult::error(&e),
     };
 
     if content.is_empty() {
@@ -1751,7 +1717,7 @@ async fn handle_playbook_put(
         match client.delete_playbook(name).await {
             Ok(_) => {
                 pb_reg.invalidate_device(&dev_name).await;
-                let mut result = ToolResult::success(json!({
+                let mut result = ToolResult::success(&json!({
                     "action": "deleted",
                     "name": name,
                     "device": &dev_name,
@@ -1762,19 +1728,17 @@ async fn handle_playbook_put(
             Err(e) if e.is_not_found() => {
                 // Fall through to file-based approach
             }
-            Err(e) => {
-                return ToolResult::error(format!("Cannot delete playbook '{}': {}", name, e))
-            }
+            Err(e) => return ToolResult::error(&format!("Cannot delete playbook '{name}': {e}")),
         }
 
         // File-based fallback for delete.
         let dir = get_playbooks_dir(&dev_name, pb_reg);
-        let path = format!("{}/{}.md", dir, name);
-        let rm_cmd = format!("rm -f '{}'", path);
+        let path = format!("{dir}/{name}.md");
+        let rm_cmd = format!("rm -f '{path}'");
         match client.exec(&rm_cmd, None, None, None).await {
             Ok(_) => {
                 pb_reg.invalidate_device(&dev_name).await;
-                let mut result = ToolResult::success(json!({
+                let mut result = ToolResult::success(&json!({
                     "action": "deleted",
                     "name": name,
                     "device": &dev_name,
@@ -1783,13 +1747,13 @@ async fn handle_playbook_put(
                 result.tools_changed = true;
                 result
             }
-            Err(e) => ToolResult::error(format!("Cannot delete playbook '{}': {}", name, e)),
+            Err(e) => ToolResult::error(&format!("Cannot delete playbook '{name}': {e}")),
         }
     } else {
         // Validate before writing
-        let placeholder_path = format!("{}.md", name);
+        let placeholder_path = format!("{name}.md");
         if let Err(e) = playbooks::parse_playbook(content, &dev_name, &placeholder_path) {
-            return ToolResult::error(format!("Invalid playbook: {}", e));
+            return ToolResult::error(&format!("Invalid playbook: {e}"));
         }
 
         // Create/update — try REST first, fall back to file-based.
@@ -1797,7 +1761,7 @@ async fn handle_playbook_put(
             Ok(v) => {
                 pb_reg.invalidate_device(&dev_name).await;
                 let path = v.get("path").and_then(|p| p.as_str()).unwrap_or_default();
-                let mut result = ToolResult::success(json!({
+                let mut result = ToolResult::success(&json!({
                     "action": "saved",
                     "name": name,
                     "device": &dev_name,
@@ -1809,12 +1773,12 @@ async fn handle_playbook_put(
             Err(e) if e.is_not_found() => {
                 // Fall through to file-based approach
             }
-            Err(e) => return ToolResult::error(format!("Cannot write playbook '{}': {}", name, e)),
+            Err(e) => return ToolResult::error(&format!("Cannot write playbook '{name}': {e}")),
         }
 
         // File-based fallback for create/update.
         let dir = get_playbooks_dir(&dev_name, pb_reg);
-        let path = format!("{}/{}.md", dir, name);
+        let path = format!("{dir}/{name}.md");
 
         match client
             .file_write(&path, content, None, None, Some(true))
@@ -1822,7 +1786,7 @@ async fn handle_playbook_put(
         {
             Ok(_) => {
                 pb_reg.invalidate_device(&dev_name).await;
-                let mut result = ToolResult::success(json!({
+                let mut result = ToolResult::success(&json!({
                     "action": "saved",
                     "name": name,
                     "device": &dev_name,
@@ -1831,7 +1795,7 @@ async fn handle_playbook_put(
                 result.tools_changed = true;
                 result
             }
-            Err(e) => ToolResult::error(format!("Cannot write playbook '{}': {}", name, e)),
+            Err(e) => ToolResult::error(&format!("Cannot write playbook '{name}': {e}")),
         }
     }
 }
@@ -1842,38 +1806,34 @@ async fn handle_playbook_exec(
     registry: &DeviceRegistry,
     pb_reg: &PlaybookRegistry,
 ) -> ToolResult {
-    let pb = match pb_reg.find_by_tool_name(tool_name).await {
-        Some(pb) => pb,
-        None => {
-            return ToolResult::error(format!(
-                "Playbook tool '{}' not found. Try calling playbook_list to refresh.",
-                tool_name
-            ))
-        }
+    let Some(pb) = pb_reg.find_by_tool_name(tool_name).await else {
+        return ToolResult::error(&format!(
+            "Playbook tool '{tool_name}' not found. Try calling playbook_list to refresh."
+        ));
     };
 
     // Determine target device: explicit arg > playbook's source device
     let device = get_device_param(args).unwrap_or(&pb.source_device);
     let client = match registry.resolve(Some(device)).await {
         Ok(c) => c,
-        Err(e) => return ToolResult::error(e),
+        Err(e) => return ToolResult::error(&e),
     };
 
     let script = match playbooks::render_script(&pb, args) {
         Ok(s) => s,
-        Err(e) => return ToolResult::error(e),
+        Err(e) => return ToolResult::error(&e),
     };
 
     let timeout_ms = args.get("timeout_ms").and_then(Value::as_u64);
 
     match client.exec(&script, timeout_ms, None, None).await {
-        Ok(v) => ToolResult::success(json!({
+        Ok(v) => ToolResult::success(&json!({
             "playbook": pb.name,
             "device": device,
             "result": v,
             "script": script,
         })),
-        Err(e) => ToolResult::error(format!(
+        Err(e) => ToolResult::error(&format!(
             "Playbook '{}' execution failed: {}\n\nRendered script:\n{}",
             pb.name, e, script
         )),

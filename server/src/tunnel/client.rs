@@ -362,7 +362,7 @@ impl std::fmt::Display for ConnectError {
 /// give up after `count` failed probes.
 ///
 #[cfg(unix)]
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[allow(clippy::cast_possible_wrap)]
 fn set_tcp_keepalive(stream: &TcpStream, idle: u32, interval: u32, count: u32) {
     use std::ptr;
 
@@ -717,7 +717,6 @@ async fn connect_tunnel_io(
 }
 
 /// A single connection attempt: connect, register, handle messages until disconnect.
-#[allow(clippy::too_many_lines)]
 async fn connect_and_run(
     state: &AppState,
     config: &TunnelConfig,
@@ -947,7 +946,6 @@ async fn connect_and_run(
             interval.tick().await;
 
             // Update uptime counter
-            #[allow(clippy::cast_possible_truncation)]
             let uptime_ms = heartbeat_epoch.elapsed().as_millis() as u64;
             heartbeat_stats
                 .current_uptime_ms
@@ -956,12 +954,10 @@ async fn connect_and_run(
             // Pong watchdog: check if relay is actually responding
             let last = heartbeat_last_pong.load(Ordering::Relaxed);
             // Update pong age for health endpoint
-            #[allow(clippy::cast_possible_truncation)]
             let pong_age = heartbeat_epoch.elapsed().as_millis() as u64;
             heartbeat_stats
                 .last_pong_age_ms
                 .store(pong_age.saturating_sub(last), Ordering::Relaxed);
-            #[allow(clippy::cast_possible_truncation)]
             let now_ms = heartbeat_epoch.elapsed().as_millis() as u64;
             if last > 0 && now_ms.saturating_sub(last) > pong_timeout_ms {
                 warn!(
@@ -1007,7 +1003,6 @@ async fn connect_and_run(
                 }
             }
             // Record ping timestamp for RTT calculation on pong
-            #[allow(clippy::cast_possible_truncation)]
             heartbeat_ping_sent.store(
                 heartbeat_epoch.elapsed().as_millis() as u64,
                 Ordering::Relaxed,
@@ -1057,7 +1052,6 @@ async fn connect_and_run(
                         // Any message from the relay proves the connection is alive.
                         // Update pong timestamp so the pong watchdog doesn't fire
                         // when relay pongs are queued behind sctlin request bursts.
-                        #[allow(clippy::cast_possible_truncation)]
                         last_pong_ms.store(connection_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
                         let msg_type = parsed["type"].as_str().unwrap_or("");
                         match msg_type {
@@ -1068,7 +1062,6 @@ async fn connect_and_run(
                             }
                             // Pong: handle inline — must never be blocked by slow handlers
                             "tunnel.pong" => {
-                                #[allow(clippy::cast_possible_truncation)]
                                 let ms = connection_epoch.elapsed().as_millis() as u64;
                                 last_pong_ms.store(ms, Ordering::Relaxed);
                                 state.tunnel_stats.last_pong_age_ms.store(0, Ordering::Relaxed);
@@ -1179,7 +1172,6 @@ async fn connect_and_run(
     state.transfer_manager.pause_all().await;
 
     // Summary log: single parseable line with everything needed for diagnosis
-    #[allow(clippy::cast_possible_truncation)]
     {
         let duration_secs = connection_epoch.elapsed().as_secs();
         let pong_age_ms = {
@@ -1860,7 +1852,6 @@ async fn handle_tunnel_file_read(
     let list = msg["list"].as_bool().unwrap_or(false);
 
     let offset = msg["offset"].as_u64();
-    #[allow(clippy::cast_possible_truncation)]
     let limit = msg["limit"].as_u64().map(|l| l as usize);
 
     let query = crate::routes::files::FilesQuery {
@@ -2062,7 +2053,6 @@ async fn handle_tunnel_session_signal(
     request_id: Option<&str>,
 ) {
     let session_id = msg["session_id"].as_str().unwrap_or("");
-    #[allow(clippy::cast_possible_truncation)]
     let signal = msg["signal"].as_i64().unwrap_or(0) as i32;
 
     let payload = crate::routes::sessions::SignalRequest { signal };
@@ -2260,7 +2250,6 @@ async fn handle_gx_download_init(
     request_id: Option<&str>,
 ) {
     let path = msg["path"].as_str().unwrap_or("");
-    #[allow(clippy::cast_possible_truncation)]
     let chunk_size = msg["chunk_size"].as_u64().map(|v| v as u32);
 
     match state.transfer_manager.init_download(path, chunk_size).await {
@@ -2298,9 +2287,7 @@ async fn handle_gx_upload_init(
         filename: msg["filename"].as_str().unwrap_or("").to_string(),
         file_size: msg["file_size"].as_u64().unwrap_or(0),
         file_hash: msg["file_hash"].as_str().unwrap_or("").to_string(),
-        #[allow(clippy::cast_possible_truncation)]
         chunk_size: msg["chunk_size"].as_u64().unwrap_or(0) as u32,
-        #[allow(clippy::cast_possible_truncation)]
         total_chunks: msg["total_chunks"].as_u64().unwrap_or(0) as u32,
         mode: msg["mode"].as_str().map(ToString::to_string),
     };
@@ -2336,7 +2323,6 @@ async fn handle_gx_chunk_request(
     request_id: Option<&str>,
 ) {
     let transfer_id = msg["transfer_id"].as_str().unwrap_or("");
-    #[allow(clippy::cast_possible_truncation)]
     let chunk_index = msg["chunk_index"].as_u64().unwrap_or(0) as u32;
 
     match state
@@ -2383,7 +2369,6 @@ async fn handle_gx_chunk_receive(
 ) {
     let request_id = header["request_id"].as_str();
     let transfer_id = header["transfer_id"].as_str().unwrap_or("");
-    #[allow(clippy::cast_possible_truncation)]
     let chunk_index = header["chunk_index"].as_u64().unwrap_or(0) as u32;
     let chunk_hash = header["chunk_hash"].as_str().unwrap_or("");
 
@@ -2548,7 +2533,6 @@ fn gx_error_response(
 ///
 /// These are the same message types as in `ws/mod.rs` but forwarded over the tunnel.
 /// We dispatch to the `SessionManager` and send responses back through the tunnel.
-#[allow(clippy::too_many_lines)]
 async fn handle_forwarded_session_message(
     state: &AppState,
     ws_sink: &WsSink,
@@ -2569,12 +2553,10 @@ async fn handle_forwarded_session_message(
             let use_pty = msg["pty"].as_bool().unwrap_or(false);
             let name = msg["name"].as_str().map(ToString::to_string);
             let user_allows_ai = msg["user_allows_ai"].as_bool();
-            #[allow(clippy::cast_possible_truncation)]
             let rows = msg["rows"]
                 .as_u64()
                 .unwrap_or(u64::from(state.config.server.default_terminal_rows))
                 as u16;
-            #[allow(clippy::cast_possible_truncation)]
             let cols = msg["cols"]
                 .as_u64()
                 .unwrap_or(u64::from(state.config.server.default_terminal_cols))
@@ -2917,7 +2899,6 @@ async fn handle_forwarded_session_message(
             let session_id = msg["session_id"].as_str().unwrap_or("");
             let signal = msg["signal"].as_i64().unwrap_or(0);
             if !session_id.is_empty() && signal != 0 {
-                #[allow(clippy::cast_possible_truncation)]
                 let signal_i32 = signal as i32;
                 match state
                     .session_manager
@@ -3056,9 +3037,7 @@ async fn handle_forwarded_session_message(
         }
         "session.resize" => {
             let session_id = msg["session_id"].as_str().unwrap_or("");
-            #[allow(clippy::cast_possible_truncation)]
             let rows = msg["rows"].as_u64().unwrap_or(0) as u16;
-            #[allow(clippy::cast_possible_truncation)]
             let cols = msg["cols"].as_u64().unwrap_or(0) as u16;
             if !session_id.is_empty() && rows > 0 && cols > 0 {
                 match state

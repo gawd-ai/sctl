@@ -24,19 +24,6 @@ const MAX_EXEC_OUTPUT: usize = 1024 * 1024;
 /// SIGKILL. Callers are expected to take ownership of the stdio handles via
 /// `child.stdin.take()` etc.
 ///
-/// **Note:** For sessions that need signal delivery to the process tree, use
-/// [`spawn_shell_pgroup`] instead.
-#[allow(dead_code)]
-pub fn spawn_shell(shell: &str, working_dir: &str) -> std::io::Result<Child> {
-    Command::new(shell)
-        .current_dir(working_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-}
-
 /// Spawn an interactive shell in its own process group with piped I/O.
 ///
 /// Like [`spawn_shell`] but calls `setpgid(0, 0)` via `pre_exec` so the shell
@@ -163,7 +150,6 @@ pub async fn exec_command(
             .await
             .map_err(|e| ExecError::ProcessFailed(e.to_string()))?;
 
-        #[allow(clippy::cast_possible_truncation)]
         let duration_ms = start.elapsed().as_millis() as u64;
 
         Ok::<_, ExecError>(ExecResult {

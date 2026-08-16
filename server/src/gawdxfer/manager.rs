@@ -190,7 +190,6 @@ impl TransferManager {
 
     // ─── Upload Init ─────────────────────────────────────────────────────────
 
-    #[allow(clippy::too_many_lines)]
     pub async fn init_upload(&self, req: InitUpload) -> Result<InitUploadResult, TransferError> {
         let dir_path = validate_transfer_path(&req.path)?;
 
@@ -363,7 +362,6 @@ impl TransferManager {
 
     // ─── Serve Chunk (Download) ──────────────────────────────────────────────
 
-    #[allow(clippy::too_many_lines)]
     pub async fn serve_chunk(
         &self,
         transfer_id: &str,
@@ -432,7 +430,6 @@ impl TransferManager {
         }
 
         let offset = u64::from(chunk_index) * u64::from(transfer.spec.chunk_size);
-        #[allow(clippy::cast_possible_truncation)]
         let chunk_len = std::cmp::min(
             u64::from(transfer.spec.chunk_size),
             transfer.spec.file_size.saturating_sub(offset),
@@ -476,7 +473,6 @@ impl TransferManager {
                 let all_done = t.progress.chunks_done.iter().all(|&v| v);
                 if all_done {
                     t.progress.phase = Phase::Complete;
-                    #[allow(clippy::cast_possible_truncation)]
                     let elapsed_ms = t.spec.created_at.elapsed().as_millis() as u64;
                     let complete = Complete {
                         transfer_id: transfer_id.to_string(),
@@ -535,7 +531,6 @@ impl TransferManager {
 
     // ─── Receive Chunk (Upload) ──────────────────────────────────────────────
 
-    #[allow(clippy::too_many_lines)]
     pub async fn receive_chunk(
         &self,
         transfer_id: &str,
@@ -762,7 +757,6 @@ impl TransferManager {
         let mut transfers = self.transfers.write().await;
         if let Some(t) = transfers.get_mut(transfer_id) {
             t.progress.phase = Phase::Complete;
-            #[allow(clippy::cast_possible_truncation)]
             let elapsed_ms = t.spec.created_at.elapsed().as_millis() as u64;
             let complete = Complete {
                 transfer_id: transfer_id.to_string(),
@@ -843,11 +837,7 @@ impl TransferManager {
             .iter()
             .enumerate()
             .filter(|(_, &done)| done)
-            .map(|(i, _)| {
-                #[allow(clippy::cast_possible_truncation)]
-                let idx = i as u32;
-                idx
-            })
+            .map(|(i, _)| i as u32)
             .collect();
 
         Ok(ResumeResult {
@@ -898,9 +888,7 @@ impl TransferManager {
             )
         })?;
 
-        #[allow(clippy::cast_possible_truncation)]
         let chunks_done = transfer.progress.chunks_done.iter().filter(|&&v| v).count() as u32;
-        #[allow(clippy::cast_possible_truncation)]
         let elapsed_ms = transfer.spec.created_at.elapsed().as_millis() as u64;
 
         Ok(StatusResult {
@@ -924,7 +912,6 @@ impl TransferManager {
         let summaries = transfers
             .values()
             .map(|t| {
-                #[allow(clippy::cast_possible_truncation)]
                 let chunks_done = t.progress.chunks_done.iter().filter(|&&v| v).count() as u32;
                 TransferSummary {
                     transfer_id: t.spec.transfer_id.clone(),
@@ -995,9 +982,7 @@ impl TransferManager {
 
     /// Get a progress snapshot for broadcasting.
     fn progress_snapshot(transfer: &Transfer) -> Progress {
-        #[allow(clippy::cast_possible_truncation)]
         let chunks_done = transfer.progress.chunks_done.iter().filter(|&&v| v).count() as u32;
-        #[allow(clippy::cast_possible_truncation)]
         let elapsed_ms = transfer.spec.created_at.elapsed().as_millis() as u64;
         let rate_bps = (transfer.progress.bytes_transferred * 1000)
             .checked_div(elapsed_ms)
@@ -1033,7 +1018,6 @@ pub fn compute_chunks(file_size: u64, chunk_size: u32) -> u32 {
     if file_size == 0 {
         return 1; // Empty files still have one (empty) chunk
     }
-    #[allow(clippy::cast_possible_truncation)]
     {
         file_size.div_ceil(u64::from(chunk_size)) as u32
     }

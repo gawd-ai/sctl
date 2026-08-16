@@ -159,7 +159,6 @@ async fn subscriber_task(
 /// Uses `tokio::select!` to concurrently process:
 /// - Incoming WebSocket messages from the client
 /// - Broadcast events (session lifecycle) from other connections
-#[allow(clippy::too_many_lines)]
 async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
     let (mut ws_sink, mut ws_stream) = socket.split();
 
@@ -245,12 +244,10 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                                 let use_pty = parsed["pty"].as_bool().unwrap_or(false);
                                 let name = parsed["name"].as_str().map(ToString::to_string);
                                 let user_allows_ai = parsed["user_allows_ai"].as_bool();
-                                #[allow(clippy::cast_possible_truncation)]
                                 let rows = parsed["rows"]
                                     .as_u64()
                                     .unwrap_or(u64::from(state.config.server.default_terminal_rows))
                                     as u16;
-                                #[allow(clippy::cast_possible_truncation)]
                                 let cols = parsed["cols"]
                                     .as_u64()
                                     .unwrap_or(u64::from(state.config.server.default_terminal_cols))
@@ -394,7 +391,6 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                                     }.to_value()).await;
                                     continue;
                                 }
-                                #[allow(clippy::cast_possible_truncation)]
                                 let signal_i32 = signal as i32;
                                 handle_session_signal(
                                     &state,
@@ -436,9 +432,7 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                             }
                             "session.resize" => {
                                 let session_id = parsed["session_id"].as_str().unwrap_or("");
-                                #[allow(clippy::cast_possible_truncation)]
                                 let rows = parsed["rows"].as_u64().unwrap_or(0) as u16;
-                                #[allow(clippy::cast_possible_truncation)]
                                 let cols = parsed["cols"].as_u64().unwrap_or(0) as u16;
                                 if session_id.is_empty() || rows == 0 || cols == 0 {
                                     let _ = tx.send(WsServerMsg::Error {

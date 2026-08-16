@@ -5,7 +5,7 @@
 use sha2::{Digest, Sha256};
 use std::io;
 use std::path::Path;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::AsyncReadExt;
 
 const BUF_SIZE: usize = 64 * 1024; // 64 KiB
 
@@ -20,26 +20,6 @@ pub async fn hash_file(path: &Path) -> io::Result<String> {
             break;
         }
         hasher.update(&buf[..n]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
-/// Compute SHA-256 of a file region (for chunk serving). Returns lowercase hex string.
-#[allow(dead_code)]
-pub async fn hash_file_region(path: &Path, offset: u64, len: usize) -> io::Result<String> {
-    let mut file = tokio::fs::File::open(path).await?;
-    file.seek(io::SeekFrom::Start(offset)).await?;
-    let mut hasher = Sha256::new();
-    let mut remaining = len;
-    let mut buf = vec![0u8; BUF_SIZE.min(remaining)];
-    while remaining > 0 {
-        let to_read = buf.len().min(remaining);
-        let n = file.read(&mut buf[..to_read]).await?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        remaining -= n;
     }
     Ok(hex::encode(hasher.finalize()))
 }
