@@ -18,7 +18,8 @@ use crate::config::Config;
 use crate::gawdxfer::manager::TransferManager;
 use crate::infra::InfraState;
 use crate::sessions::SessionManager;
-use crate::tunnel::relay::{DeviceSnapshot, RelayConnectionHistory, RelayState};
+use crate::tunnel::history::RelayConnectionHistory;
+use crate::tunnel::relay::{DeviceSnapshot, RelayState};
 
 /// Shared application state for the sctl server.
 #[derive(Clone)]

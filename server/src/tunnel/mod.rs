@@ -10,6 +10,7 @@
 use serde_json::Value;
 
 pub mod client;
+pub mod history;
 pub mod relay;
 
 /// A message that can be sent to a device over the tunnel WS.
