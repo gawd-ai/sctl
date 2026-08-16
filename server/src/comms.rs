@@ -178,7 +178,7 @@ impl CommsClient {
             let guard = this.inner.blocking_lock();
             let Some(probe) = guard.plugin.probe else {
                 return Err(CommsCallError::new(
-                    "COMMS_CAPABILITY_UNSUPPORTED",
+                    crate::error::codes::COMMS_CAPABILITY_UNSUPPORTED,
                     "plugin does not implement probe",
                 ));
             };
@@ -234,7 +234,7 @@ impl CommsClient {
             move |plugin| {
                 let Some(open) = plugin.plugin.open else {
                     return Err(CommsCallError::new(
-                        "COMMS_CAPABILITY_UNSUPPORTED",
+                        crate::error::codes::COMMS_CAPABILITY_UNSUPPORTED,
                         "plugin does not implement open",
                     ));
                 };
@@ -1019,14 +1019,16 @@ fn caps_to_strings(caps: u64) -> Vec<&'static str> {
 
 fn unsupported(method: &str) -> CommsCallError {
     CommsCallError::new(
-        "COMMS_CAPABILITY_UNSUPPORTED",
+        crate::error::codes::COMMS_CAPABILITY_UNSUPPORTED,
         format!("active comms plugin does not support {method}"),
     )
 }
 
 fn code_to_error(code: i32, fallback: &str) -> CommsCallError {
     match code {
-        SCTL_COMMS_ERR_UNSUPPORTED => CommsCallError::new("COMMS_CAPABILITY_UNSUPPORTED", fallback),
+        SCTL_COMMS_ERR_UNSUPPORTED => {
+            CommsCallError::new(crate::error::codes::COMMS_CAPABILITY_UNSUPPORTED, fallback)
+        }
         SCTL_COMMS_ERR_INVALID => CommsCallError::new("INVALID_REQUEST", fallback),
         SCTL_COMMS_ERR_BUFFER_TOO_SMALL => CommsCallError::new("COMMS_BUFFER_TOO_SMALL", fallback),
         SCTL_COMMS_ERR_MODEM_UNAVAILABLE => CommsCallError::new("MODEM_UNAVAILABLE", fallback),

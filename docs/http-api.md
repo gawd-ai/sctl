@@ -273,7 +273,7 @@ cache).
 
 All paths must be absolute, without `..` components or NUL bytes
 (`400` `INVALID_PATH` otherwise). Reads/writes are capped at
-`server.max_file_size` (default 2 MB) except `GET /api/files/raw`.
+`server.max_file_size` (default 50 MB) except `GET /api/files/raw`.
 
 ### `GET /api/files`
 

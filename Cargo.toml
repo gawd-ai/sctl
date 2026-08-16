@@ -51,11 +51,10 @@ implicit_hasher = "allow"
 # handler, the JoinError-restart supervisor in main — was dead code: one
 # panic took the whole daemon down. Measured cost on the WE826 MIPS payload
 # (opt-level z, lto, strip): server 2,531,300 -> 3,142,074 gzipped, +24%.
-# That exceeds the 10% revisit threshold from the 2026-08-16 owner decision,
-# so this line is explicitly still open: the fallback position is abort +
-# the ramboot supervisor respawn (which now exists and turns a panic into a
-# process restart instead of a brick, at the cost of dropped sessions and a
-# tunnel blip). Do not publish payload #1 before the owner picks one.
+# That exceeded the 10% revisit threshold; the owner reviewed the measurement
+# on 2026-08-16 and accepted unwind at that cost. The fallback position
+# (abort + the ramboot supervisor respawn) remains documented in case a
+# future target can't carry the size.
 [profile.release]
 opt-level = "z"
 lto = true

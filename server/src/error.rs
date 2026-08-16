@@ -84,6 +84,11 @@ pub mod codes {
     pub const EXEC_FAILED: &str = "EXEC_FAILED";
     pub const TIMEOUT: &str = "TIMEOUT";
     pub const BATCH_TOO_LARGE: &str = "BATCH_TOO_LARGE";
+    /// The device's payload predates the generic `http.request` passthrough
+    /// (relay-only code; the device answers again once it activates 0.6.0+).
+    pub const DEVICE_PAYLOAD_OUTDATED: &str = "DEVICE_PAYLOAD_OUTDATED";
+    /// The loaded comms plugin does not implement the requested capability.
+    pub const COMMS_CAPABILITY_UNSUPPORTED: &str = "COMMS_CAPABILITY_UNSUPPORTED";
     pub const MULTIPART_ERROR: &str = "MULTIPART_ERROR";
     pub const AI_NOT_ALLOWED: &str = "AI_NOT_ALLOWED";
     pub const MODEM_UNAVAILABLE: &str = "MODEM_UNAVAILABLE";

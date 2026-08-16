@@ -158,7 +158,7 @@ pub struct ServerConfig {
     /// Maximum commands per `POST /api/exec/batch` request (default 20).
     #[serde(default = "default_max_batch_size")]
     pub max_batch_size: usize,
-    /// Maximum file size in bytes for `/api/files` read/write (default 2 MB).
+    /// Maximum file size in bytes for `/api/files` read/write (default 50 MB).
     #[serde(default = "default_max_file_size")]
     pub max_file_size: usize,
     /// Maximum output entries kept per session buffer (default 1000).
