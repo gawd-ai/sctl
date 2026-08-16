@@ -291,7 +291,7 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
                 warn!(
                     "Tunnel: flap detected ({FLAP_CHECK_COUNT} connections lasted <{FLAP_THRESHOLD_SECS}s), extending backoff to 60s"
                 );
-                delay = Duration::from_secs(60);
+                delay = Duration::from_mins(1);
                 escalate_backoff = false; // don't double-escalate
             }
         }

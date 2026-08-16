@@ -174,7 +174,7 @@ pub async fn speed_test(State(state): State<AppState>) -> ApiResult<Value> {
                 "download_url": lte_config.speed_test_url.clone(),
                 "upload_url": lte_config.speed_test_upload_url.clone(),
             }),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
         )
         .await
         .map_err(provider_error)?;
@@ -193,7 +193,7 @@ pub async fn manual_usb_cycle(State(state): State<AppState>) -> ApiResult<Value>
         .call_with_timeout(
             methods::RECOVERY_USB_CYCLE,
             json!({}),
-            Duration::from_secs(120),
+            Duration::from_mins(2),
         )
         .await
         .map_err(provider_error)?;

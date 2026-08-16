@@ -31,7 +31,7 @@ use sctl::config::SupervisorConfig;
 /// Crash threshold: this many recent failures within `CRASH_LOOP_WINDOW`
 /// triggers safe-mode.
 const CRASH_LOOP_THRESHOLD: usize = 3;
-const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(180);
+const CRASH_LOOP_WINDOW: Duration = Duration::from_mins(3);
 
 /// Once safe-mode is engaged the supervisor backs off restarts to this
 /// interval (vs. the regular exponential ramp) so we don't spin on a flag the

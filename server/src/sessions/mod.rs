@@ -700,7 +700,7 @@ impl SessionManager {
                 })
                 .collect::<Vec<_>>()
         };
-        let idle_threshold = std::time::Duration::from_secs(60);
+        let idle_threshold = std::time::Duration::from_mins(1);
         let mut items = Vec::with_capacity(sessions_snapshot.len());
         for (
             id,
@@ -865,7 +865,7 @@ impl SessionManager {
             }
         }
 
-        let ai_idle_timeout = std::time::Duration::from_secs(60);
+        let ai_idle_timeout = std::time::Duration::from_mins(1);
         let mut events: Vec<SweepEvent> = Vec::new();
         let mut sessions = self.sessions.write().await;
 

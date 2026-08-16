@@ -45,14 +45,14 @@ use crate::state::{TunnelEventType, TunnelStats};
 const TICK: Duration = Duration::from_secs(30);
 /// Re-probe interval when the diagnosis is non-actionable (e.g. a live bearer
 /// with a relay/upstream problem) — keeps watchdog AT off a working bearer.
-const CALM_TICK: Duration = Duration::from_secs(300);
-const DORMANT_TICK: Duration = Duration::from_secs(900);
+const CALM_TICK: Duration = Duration::from_mins(5);
+const DORMANT_TICK: Duration = Duration::from_mins(15);
 
 // --- tunnel-stability resets ---
 /// Tunnel up this long → clear the current episode's action counters.
 const STABLE_LIGHT_RESET: Duration = Duration::from_secs(90);
 /// Tunnel up this long → also clear the USB-cycle count and dormant fuse.
-const STABLE_HEAVY_RESET: Duration = Duration::from_secs(300);
+const STABLE_HEAVY_RESET: Duration = Duration::from_mins(5);
 
 // --- per-episode action caps (thrash protection) ---
 const MAX_REREGISTERS: u32 = 1;
@@ -62,10 +62,10 @@ const MAX_AIRPLANE_CYCLES: u32 = 2;
 const MAX_USB_CYCLES: u32 = 3;
 
 // --- cooldowns between actions (let each one work before the next) ---
-const COOLDOWN_REREGISTER: Duration = Duration::from_secs(60);
-const COOLDOWN_MEDIUM: Duration = Duration::from_secs(120);
-const COOLDOWN_USB_BASE: Duration = Duration::from_secs(300);
-const COOLDOWN_USB_MAX: Duration = Duration::from_secs(1800);
+const COOLDOWN_REREGISTER: Duration = Duration::from_mins(1);
+const COOLDOWN_MEDIUM: Duration = Duration::from_mins(2);
+const COOLDOWN_USB_BASE: Duration = Duration::from_mins(5);
+const COOLDOWN_USB_MAX: Duration = Duration::from_mins(30);
 
 /// Consecutive AT failures after which the modem is treated as hung and the
 /// watchdog skips interface restarts straight to the (gated) USB cycle.
@@ -77,7 +77,7 @@ const RSSI_USABLE_MIN: u8 = 5;
 
 const HISTORY_MAX_BYTES: u64 = 5 * 1024 * 1024;
 const SNAPSHOT_EVENTS: usize = 20;
-const REGRESSION_WINDOW: Duration = Duration::from_secs(3600);
+const REGRESSION_WINDOW: Duration = Duration::from_hours(1);
 const REGRESSION_THRESHOLD: usize = 3;
 
 /// What the watchdog believes is wrong with the link.

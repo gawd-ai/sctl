@@ -762,7 +762,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     // Tunnel relay: periodic snapshot persistence (60s, debounced via dirty flag)
     let relay_snapshot_task = relay_state_opt.clone().map(|rs| {
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_mins(1));
             loop {
                 interval.tick().await;
                 rs.save_snapshots().await;
@@ -774,7 +774,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     let tunnel_events_flush_task = {
         let flush_stats = state.tunnel_stats.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_mins(1));
             loop {
                 interval.tick().await;
                 flush_stats.save_events().await;
