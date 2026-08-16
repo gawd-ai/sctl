@@ -825,7 +825,24 @@ async fn connect_and_run(
     )
     .await
     .map_err(|_| ConnectError::Transient("TLS/WS handshake timed out (15s)".into()))?
-    .map_err(|e| ConnectError::Transient(e.into()))?;
+    .map_err(|e| match &e {
+        // The relay validates the tunnel key AT THE UPGRADE (it rides the
+        // registration URL), so a rotated key surfaces as an HTTP 401/403
+        // rejection here — not as the in-band FORBIDDEN frame below. Both
+        // must land on the slow AuthRejected cadence; classifying this as
+        // transient would keep a rejected fleet hammering on flap cadence.
+        // (Observed live: local relay with a rotated key → "HTTP error:
+        // 403 Forbidden" → flap's 60-90s instead of auth's 5-15min.)
+        tokio_tungstenite::tungstenite::Error::Http(resp)
+            if matches!(resp.status().as_u16(), 401 | 403) =>
+        {
+            ConnectError::AuthRejected(format!(
+                "relay refused the WS upgrade: HTTP {}",
+                resp.status()
+            ))
+        }
+        _ => ConnectError::Transient(e.into()),
+    })?;
     let tls_elapsed = tls_start.elapsed();
 
     let (mut raw_ws_sink, mut ws_stream) = ws_stream.split();
