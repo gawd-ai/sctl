@@ -790,6 +790,46 @@ async fn connect_tunnel_io(
     Ok(TunnelIo::Tls(Box::new(tls_stream)))
 }
 
+/// Panic-path cleanup for `connect_and_run`: mirrors its normal-exit cleanup
+/// so an unwinding panic cannot leak the connection's heartbeat, writer and
+/// subscriber tasks, attached sessions or unpaused transfers into the
+/// respawned client. The normal exit path disarms it and cleans up inline.
+struct CleanupGuard {
+    armed: bool,
+    heartbeat: tokio::task::AbortHandle,
+    writer: tokio::task::AbortHandle,
+    subscribers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    session_manager: crate::sessions::SessionManager,
+    transfer_manager: Arc<crate::gawdxfer::manager::TransferManager>,
+}
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        warn!("Tunnel: connection loop unwinding, running panic-path cleanup");
+        self.heartbeat.abort();
+        self.writer.abort();
+        let subscribers = self.subscribers.clone();
+        let sessions = self.session_manager.clone();
+        let transfers = self.transfer_manager.clone();
+        tokio::spawn(async move {
+            let ids: Vec<String> = {
+                let tasks = subscribers.lock().await;
+                for task in tasks.values() {
+                    task.abort();
+                }
+                tasks.keys().cloned().collect()
+            };
+            if !ids.is_empty() {
+                sessions.detach_all(&ids).await;
+            }
+            transfers.pause_all().await;
+        });
+    }
+}
+
 /// A single connection attempt: connect, register, handle messages until disconnect.
 async fn connect_and_run(
     state: &AppState,
@@ -1116,6 +1156,22 @@ async fn connect_and_run(
         }
     });
 
+    // Panic-path cleanup. A panic in the select loop below unwinds out of
+    // this function into the JoinError-restart supervisor in main; without
+    // this guard the heartbeat/writer/subscriber tasks of the dead
+    // connection kept running, sessions stayed attached and in-flight
+    // transfers were never paused — the cleanup block after the loop only
+    // runs on normal exit. Drop runs during the unwind and finishes the
+    // job; the normal path disarms the guard first.
+    let mut cleanup_guard = CleanupGuard {
+        armed: true,
+        heartbeat: heartbeat_task.abort_handle(),
+        writer: writer_task.abort_handle(),
+        subscribers: subscriber_tasks.clone(),
+        session_manager: state.session_manager.clone(),
+        transfer_manager: state.transfer_manager.clone(),
+    };
+
     // Periodic reaping of finished subscriber tasks (30s interval)
     let mut reap_interval = tokio::time::interval(Duration::from_secs(30));
     reap_interval.tick().await; // consume the immediate first tick
@@ -1255,7 +1311,8 @@ async fn connect_and_run(
         }
     }
 
-    // Cleanup
+    // Cleanup (normal exit — the panic path runs CleanupGuard instead)
+    cleanup_guard.armed = false;
     heartbeat_task.abort();
     writer_task.abort();
     let attached_sessions: Vec<String> = {
@@ -1700,7 +1757,7 @@ async fn handle_tunnel_exec_batch(
                 "status": 400,
                 "body": {
                     "error": format!("Too many commands (max {})", state.config.server.max_batch_size),
-                    "code": "BATCH_TOO_LARGE"
+                    "code": crate::error::codes::BATCH_TOO_LARGE
                 }
             }),
         ).await;
