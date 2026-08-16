@@ -15,8 +15,7 @@ does not exist, and CI fails.
 ## Contents
 
 - [Authentication](#authentication)
-- [Error shape](#error-shape)
-- [Error codes](#error-codes)
+- [Errors](#errors)
 - [Health and info](#health-and-info)
 - [Exec](#exec)
 - [Activity](#activity)
@@ -57,7 +56,7 @@ Malformed JSON bodies on JSON routes are rejected by the framework (axum)
 with a `4xx` plain-text response before the handler runs; those rejections do
 not carry the unified error shape below.
 
-## Error shape
+## Errors
 
 Every handler-produced error body is the unified [`ApiError`]
 (`server/src/error.rs`) shape:
@@ -70,86 +69,15 @@ Every handler-produced error body is the unified [`ApiError`]
 }
 ```
 
-- `code` — stable machine-readable identifier. Match on this, never on
-  `message`.
-- `message` — safe to display in UIs.
-- `detail` — optional structured context (request inputs, `transfer_id`,
-  `recoverable` flag, `request_id` echo, downstream errors). Omitted when
-  there is nothing structured to say.
-- **Legacy `error` duplicate** — error bodies produced by the tunnel relay
-  and by the infra routes additionally duplicate the message under a legacy
-  `"error"` key. It is redundant with `message` and will be removed in 0.7.0;
-  do not write new code against it.
+Match on `code`, never on `message`. Relay- and infra-produced bodies also
+duplicate the message under a legacy `"error"` key until 0.7.0, and
+relay transport-loss errors carry `"retryable": true`.
 
-### `retryable: true`
-
-Relay-originated error bodies carry `"retryable": true` when the transport
-was lost **while the request was in flight** — the request may never have
-reached the device, or may have completed on the device with the response
-lost on the way back. This appears on:
-
-- `DEVICE_DISCONNECTED` (`502`) — device tunnel dropped with the request
-  pending.
-- `DEVICE_RECONNECTING` (`502`) — device re-registered mid-request; the old
-  connection's pending requests were drained.
-- `TIMEOUT` (`504`, relay) — the device did not answer within the proxy
-  timeout.
-
-An error **without** `retryable: true` was a rejection, not a transport loss —
-blind-retrying it will not help. Before retrying anything side-effectful
-(exec in particular), check `GET /api/activity/{id}/result` — the device
-caches completed exec results, so a "lost" command may in fact have run.
-
-## Error codes
-
-Device catalog (`server/src/error.rs::codes`), with the HTTP statuses routes
-pair them with:
-
-| Code | Typical status | Meaning |
-|------|----------------|---------|
-| `AUTH_MISSING_TOKEN` | 401 | Authorization header missing or malformed |
-| `AUTH_INVALID_TOKEN` | 403 | Key present but wrong |
-| `INVALID_REQUEST` | 400 | Bad parameter / body field |
-| `INVALID_PATH` | 400 | Path not absolute, contains `..` or NUL |
-| `INVALID_MODE` | 400 | Bad octal mode string |
-| `INVALID_CONTENT` | 400/422 | base64 decode failed / unparsable playbook |
-| `FILE_NOT_FOUND` | 404 | File or directory does not exist |
-| `FILE_TOO_LARGE` | 400/413 | Exceeds `max_file_size` (or playbook 1 MB cap) |
-| `IS_DIRECTORY` | 400 | Path is a directory where a file was expected |
-| `NOT_A_DIRECTORY` | 400 | Upload target is not a directory |
-| `NOT_FOUND` | 404 | Resource (activity result, playbook, subsystem) absent |
-| `PERMISSION_DENIED` | 403 | OS permission error |
-| `IO_ERROR` | 500 | Other I/O failure |
-| `SESSION_NOT_FOUND` | 404 | No such session |
-| `EXEC_FAILED` | 500 | Spawn or wait failure |
-| `TIMEOUT` | 504 | Command / fetch / device response timed out |
-| `BATCH_TOO_LARGE` | 400 | More commands than `max_batch_size` |
-| `MULTIPART_ERROR` | 400 | Malformed multipart upload |
-| `AI_NOT_ALLOWED` | 409 | AI status change on a session the user has not allowed |
-| `MODEM_UNAVAILABLE` | 503 | Comms provider not available |
-| `MODEM_AT_FAILED` | 500 | AT command failure (provider) |
-| `TUNNEL_CONNECTED` | 409 | Band change/scan refused while tunnel is up (`force:true` overrides) |
-| `SCAN_RUNNING` | 409 | A band scan is already in progress |
-| `INVALID_URL` | 400 | Unparsable / non-http(s) fetch URL |
-| `FETCH_FAILED` | 502 | Fetch connection/protocol failure |
-| `CERT_PIN_MISMATCH` | 502 | Presented certificate differs from its pin — never retry through this |
-| `CERT_UNTRUSTED` | 502 | No CA path, no pin, TOFU not requested |
-| `SERVER_CONFIG_ERROR` | 500 | Server's own configuration broken |
-| `TOO_MANY_CONNECTIONS` | 429 | SSE connection cap reached |
-| `INFRA_UNAVAILABLE` | 404 | Infra subsystem not available on this device |
-| `COMMS_CAPABILITY_UNSUPPORTED` | 501 | Active comms provider lacks the capability |
-
-STP transfer errors reuse the shape with gawdxfer codes
-(`TRANSFER_NOT_FOUND` 404, `HASH_MISMATCH` / `CHUNK_INTEGRITY` /
-`FILE_CHANGED` 400, `DISK_FULL` 507, `MAX_TRANSFERS` 429, plus
-`FILE_NOT_FOUND` / `PERMISSION_DENIED` / `FILE_TOO_LARGE` / `INVALID_PATH` /
-`INVALID_REQUEST` as above) and put `{transfer_id, recoverable}` in `detail`.
-
-Relay-originated codes: `DEVICE_NOT_FOUND` 404, `DEVICE_DISCONNECTED` 502,
-`DEVICE_RECONNECTING` 502, `DEVICE_SEND_FAILED` 502, `DEVICE_QUEUE_STALLED`
-502, `OVERLOADED` 503, `TIMEOUT` 504, `UNEXPECTED_BINARY` 500,
-`DEVICE_RESPONSE_INVALID` 502, `DEVICE_DISPATCH_ERROR` (device's status),
-`ROUTE_NOT_PROXIED` 404, `PAYLOAD_TOO_LARGE` 413, `INTERNAL` 500.
+The full error model — the shape's field semantics, the `retryable`/retry
+rules (including the exec-result check before re-running anything
+side-effectful), and the complete code catalog with per-code meaning and
+typical HTTP status — lives in [errors.md](errors.md). Per-endpoint
+sections below list only the codes specific to that endpoint.
 
 ---
 
@@ -444,7 +372,7 @@ Errors: `400` `INVALID_PATH` / `NOT_A_DIRECTORY` / `FILE_TOO_LARGE` /
 Chunked, hash-verified, resumable transfers (gawdxfer). Chunk endpoints use
 raw `application/octet-stream` bodies with `X-Gx-*` headers — no JSON
 wrapping. All STP errors carry `detail: {transfer_id, recoverable}`; see
-[Error codes](#error-codes) for the status mapping.
+[errors.md](errors.md#stp-transfer-codes) for the status mapping.
 
 ### `POST /api/stp/download`
 
@@ -962,8 +890,8 @@ same path prefixed with `/d/{serial}` — e.g. `POST /d/{serial}/api/exec`,
   ride a request/response frame; the passthrough refuses them with `404`
   `ROUTE_NOT_PROXIED`. Interactive streaming goes through the named
   `GET /d/{serial}/api/ws` route below.
-- **Relay-added failure modes** (see [Error shape](#error-shape) for
-  `retryable` semantics): `502` `DEVICE_DISCONNECTED` /
+- **Relay-added failure modes** (see [errors.md](errors.md#retryable-true)
+  for `retryable` semantics): `502` `DEVICE_DISCONNECTED` /
   `DEVICE_RECONNECTING` / `DEVICE_SEND_FAILED` / `DEVICE_QUEUE_STALLED` /
   `DEVICE_RESPONSE_INVALID`, `503` `OVERLOADED` (more than 256 pending
   requests for the device), `504` `TIMEOUT` (device did not answer within
