@@ -26,6 +26,12 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # Every .route() registered in server/src/main.rs and
+      # server/src/tunnel/relay.rs must have a matching ### `METHOD /path`
+      # heading in docs/http-api.md (and no heading may document a route
+      # that no longer exists). Keeps the hand-written API reference honest.
+      - name: HTTP API docs drift gate
+        run: python3 scripts/check-http-api-docs.py
       # `cargo test` above regenerated the ts-rs bindings (export_bindings).
       # A dirty tree here means someone changed a Rust type and committed
       # without re-running the tests — the web client would type-check green
