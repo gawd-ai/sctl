@@ -639,10 +639,13 @@ async fn proxy_passthrough(
 
 // ─── Device Registration ─────────────────────────────────────────────────────
 
-/// Query params for the device registration WS.
+/// Query params for the device registration WS. `token` is optional since
+/// 0.6.0: the key's real home is the Authorization header, and the query
+/// fallback exists only for pre-0.6.0 payloads (it goes away in 0.7.0,
+/// taking keys out of fronting-proxy access logs for good).
 #[derive(Deserialize)]
 struct RegisterQuery {
-    token: String,
+    token: Option<String>,
     serial: String,
 }
 
@@ -681,14 +684,22 @@ fn forwarded_client_ip(headers: &axum::http::HeaderMap) -> Option<String> {
     Some(first.to_string())
 }
 
-/// `GET /api/tunnel/register?token=<tunnel_key>&serial=<serial>` — device WS registration.
+/// `GET /api/tunnel/register?serial=<serial>` — device WS registration.
+///
+/// The tunnel key arrives as `Authorization: Bearer` (preferred) or as a
+/// `?token=` query parameter (pre-0.6.0 payloads; removed in 0.7.0).
 async fn device_register_ws(
     State(state): State<RelayState>,
     Query(query): Query<RegisterQuery>,
     headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if !crate::auth::constant_time_eq(state.tunnel_key.as_bytes(), query.token.as_bytes()) {
+    let bearer = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "));
+    let provided = bearer.or(query.token.as_deref()).unwrap_or_default();
+    if !crate::auth::constant_time_eq(state.tunnel_key.as_bytes(), provided.as_bytes()) {
         return (StatusCode::FORBIDDEN, "Invalid tunnel key").into_response();
     }
 

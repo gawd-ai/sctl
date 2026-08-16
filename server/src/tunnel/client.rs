@@ -796,7 +796,11 @@ async fn connect_and_run(
     config: &TunnelConfig,
     relay_url: &str,
 ) -> Result<DisconnectReason, ConnectError> {
-    // Build the URL with auth query params
+    // The key's real home is the Authorization header (added at the WS
+    // handshake below). It ALSO still rides the query because a payload-#1
+    // device may be talking to a pre-0.6.0 relay that only reads `?token=`;
+    // the query copy is deleted in 0.7.0 once the fleet's relay is current,
+    // which is what finally keeps keys out of fronting-proxy access logs.
     let url = format!(
         "{}?token={}&serial={}",
         relay_url, config.tunnel_key, state.config.device.serial
@@ -819,9 +823,18 @@ async fn connect_and_run(
     .await
     .map_err(|_| ConnectError::Transient("TLS handshake timed out (15s)".into()))?
     .map_err(ConnectError::Transient)?;
+    let mut ws_request = {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+        url.as_str()
+            .into_client_request()
+            .map_err(|e| ConnectError::Transient(e.into()))?
+    };
+    if let Ok(hv) = format!("Bearer {}", config.tunnel_key).parse() {
+        ws_request.headers_mut().insert("authorization", hv);
+    }
     let (ws_stream, _response) = tokio::time::timeout(
         Duration::from_secs(15),
-        tokio_tungstenite::client_async(url.as_str(), tunnel_io),
+        tokio_tungstenite::client_async(ws_request, tunnel_io),
     )
     .await
     .map_err(|_| ConnectError::Transient("TLS/WS handshake timed out (15s)".into()))?

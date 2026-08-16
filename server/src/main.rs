@@ -657,9 +657,23 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     }
 
     // GUARD: .layer() only applies to routes merged BEFORE the call.
-    let app = app.layer(cors).layer(TraceLayer::new_for_http()).layer(
-        tower::limit::ConcurrencyLimitLayer::new(state.config.server.max_connections),
-    );
+    // The trace span records the PATH, never the query: the register upgrade
+    // (and, until 0.7.0, some browser WS routes) carry credentials in the
+    // query string, and a span that logged the full URI would copy keys into
+    // every log line a fronting proxy or journald retains.
+    let trace = TraceLayer::new_for_http().make_span_with(|req: &axum::extract::Request| {
+        tracing::info_span!(
+            "request",
+            method = %req.method(),
+            path = %req.uri().path(),
+        )
+    });
+    let app = app
+        .layer(cors)
+        .layer(trace)
+        .layer(tower::limit::ConcurrencyLimitLayer::new(
+            state.config.server.max_connections,
+        ));
 
     let listener = TcpListener::bind(&state.config.server.listen)
         .await
