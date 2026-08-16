@@ -686,15 +686,83 @@ pub async fn download_file(
     let stream = tokio_util::io::ReaderStream::new(file);
     let body = Body::from_stream(stream);
 
-    Ok(Response::builder()
+    Response::builder()
         .header("Content-Type", "application/octet-stream")
         .header(
             "Content-Disposition",
-            format!("attachment; filename=\"{}\"", basename.replace('"', "_")),
+            content_disposition_attachment(&basename),
         )
         .header("Content-Length", file_size)
         .body(body)
-        .unwrap())
+        .map_err(|e| {
+            ApiError::new(codes::IO_ERROR, format!("response build failed: {e}"))
+                .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
+        })
+}
+
+/// Build a `Content-Disposition: attachment` header value that is valid for
+/// any filename, per RFC 6266/5987.
+///
+/// HTTP header values must be visible ASCII; a filename is arbitrary bytes.
+/// The previous `format!("filename=\"{name}\"")` produced an invalid header
+/// value for any non-ASCII or control character, which the response builder
+/// turned into a panic — a remote panic reachable by downloading a file
+/// someone else had written to disk.
+///
+/// Shape: an ASCII-sanitized `filename="..."` fallback always present, plus
+/// a `filename*=UTF-8''...` parameter carrying the percent-encoded true name
+/// whenever sanitization lost information. Compliant clients prefer
+/// `filename*`; older ones use the fallback.
+fn content_disposition_attachment(basename: &str) -> String {
+    // RFC 5987 attr-char: ALPHA / DIGIT / !#$&+-.^_`|~ — everything else is
+    // percent-encoded from its UTF-8 bytes.
+    fn percent_encode(name: &str) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(name.len() * 3);
+        for byte in name.bytes() {
+            match byte {
+                b'A'..=b'Z'
+                | b'a'..=b'z'
+                | b'0'..=b'9'
+                | b'!'
+                | b'#'
+                | b'$'
+                | b'&'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~' => out.push(byte as char),
+                _ => {
+                    let _ = write!(out, "%{byte:02X}");
+                }
+            }
+        }
+        out
+    }
+
+    // Fallback: printable ASCII only, with the two characters that break a
+    // quoted-string (`"` and `\`) replaced alongside anything non-printable.
+    let fallback: String = basename
+        .chars()
+        .map(|c| match c {
+            '"' | '\\' => '_',
+            c if c.is_ascii_graphic() || c == ' ' => c,
+            _ => '_',
+        })
+        .collect();
+
+    if fallback == basename {
+        format!("attachment; filename=\"{fallback}\"")
+    } else {
+        format!(
+            "attachment; filename=\"{fallback}\"; filename*=UTF-8''{}",
+            percent_encode(basename)
+        )
+    }
 }
 
 /// `POST /api/files/upload` — accept multipart file uploads into a directory.
@@ -810,4 +878,72 @@ pub async fn upload_file(
         "ok": true,
         "files": uploaded
     })))
+}
+
+#[cfg(test)]
+mod content_disposition_tests {
+    use axum::http::HeaderValue;
+
+    use super::content_disposition_attachment;
+
+    /// Every produced value must be a legal HTTP header — this is the
+    /// property whose absence was a remotely reachable panic.
+    fn assert_valid_header(value: &str) {
+        assert!(
+            HeaderValue::from_str(value).is_ok(),
+            "not a valid header value: {value:?}"
+        );
+    }
+
+    #[test]
+    fn plain_ascii_gets_no_extended_parameter() {
+        let v = content_disposition_attachment("report.txt");
+        assert_eq!(v, "attachment; filename=\"report.txt\"");
+        assert_valid_header(&v);
+    }
+
+    #[test]
+    fn spaces_survive_inside_the_quoted_fallback() {
+        let v = content_disposition_attachment("my report.txt");
+        assert_eq!(v, "attachment; filename=\"my report.txt\"");
+        assert_valid_header(&v);
+    }
+
+    #[test]
+    fn quotes_and_backslashes_cannot_break_the_quoted_string() {
+        let v = content_disposition_attachment("a\"b\\c.txt");
+        assert!(v.starts_with("attachment; filename=\"a_b_c.txt\";"));
+        assert!(v.contains("filename*=UTF-8''a%22b%5Cc.txt"));
+        assert_valid_header(&v);
+    }
+
+    #[test]
+    fn utf8_names_ride_in_the_extended_parameter() {
+        let v = content_disposition_attachment("résumé.pdf");
+        assert!(v.starts_with("attachment; filename=\"r_sum_.pdf\";"));
+        assert!(v.contains("filename*=UTF-8''r%C3%A9sum%C3%A9.pdf"));
+        assert_valid_header(&v);
+    }
+
+    #[test]
+    fn cjk_names_are_fully_encoded() {
+        let v = content_disposition_attachment("日誌.log");
+        assert!(v.contains("filename*=UTF-8''%E6%97%A5%E8%AA%8C.log"));
+        assert_valid_header(&v);
+    }
+
+    #[test]
+    fn control_characters_never_reach_the_header() {
+        let v = content_disposition_attachment("evil\r\nInjected: header");
+        assert!(!v.contains('\r') && !v.contains('\n'));
+        assert!(v.contains("filename*=UTF-8''evil%0D%0AInjected%3A%20header"));
+        assert_valid_header(&v);
+    }
+
+    #[test]
+    fn del_byte_is_sanitized() {
+        let v = content_disposition_attachment("a\u{7f}b.bin");
+        assert!(v.starts_with("attachment; filename=\"a_b.bin\";"));
+        assert_valid_header(&v);
+    }
 }

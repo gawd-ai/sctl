@@ -24,11 +24,15 @@ pub async fn sctlin_proxy(req: Request) -> Response {
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
-    // Rebuild the request with the upstream URI, preserving method + headers + body.
+    // Rebuild the request with the upstream URI, preserving method + headers
+    // + body. Mutators on an existing Request cannot fail, unlike the
+    // builder path, whose panic-on-error unwraps sat on a route that proxies
+    // arbitrary inbound requests.
     let (parts, body) = req.into_parts();
-    let mut builder = hyper::Request::builder().method(parts.method).uri(uri);
-    *builder.headers_mut().unwrap() = parts.headers;
-    let upstream_req = builder.body(body).unwrap();
+    let mut upstream_req = hyper::Request::new(body);
+    *upstream_req.method_mut() = parts.method;
+    *upstream_req.uri_mut() = uri;
+    *upstream_req.headers_mut() = parts.headers;
 
     match client.request(upstream_req).await {
         Ok(resp) => {
