@@ -563,8 +563,6 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
                 tc.tunnel_proxy_timeout_secs,
                 Some(&data_dir),
             );
-            // Seed connection history from journald (survives restarts)
-            relay_state.history.seed_from_journal().await;
             state.relay_history = Some(relay_state.history.clone());
             state.device_snapshots = Some(relay_state.device_snapshots.clone());
             state.relay_state = Some(relay_state.clone());

@@ -178,13 +178,20 @@ impl RelayState {
         if !snapshots.is_empty() {
             info!("Loaded {} device snapshot(s) from disk", snapshots.len());
         }
+        // History persists as JSONL beside the snapshots. The file starts
+        // empty on first boot — fleet Postgres holds long-term history, this
+        // only has to bridge relay restarts (which the journald re-seed it
+        // replaces did lossily, collapsing every reason to "disconnected").
+        let history = data_dir.map_or_else(RelayConnectionHistory::new, |d| {
+            RelayConnectionHistory::with_persistence(&Path::new(d).join("connection_history.jsonl"))
+        });
         Self {
             devices: Arc::new(RwLock::new(HashMap::new())),
             tunnel_key,
             heartbeat_timeout_secs,
             tunnel_proxy_timeout_secs,
             epoch: Instant::now(),
-            history: Arc::new(RelayConnectionHistory::new()),
+            history: Arc::new(history),
             device_snapshots: Arc::new(RwLock::new(snapshots)),
             next_connection_id: Arc::new(AtomicU64::new(1)),
             snapshots_dirty: Arc::new(AtomicBool::new(false)),
@@ -211,10 +218,11 @@ impl RelayState {
                 let last_hb = device.last_heartbeat_ms.load(Ordering::Relaxed);
                 if now_ms.saturating_sub(last_hb) > timeout_ms {
                     let hb_age = Some(now_ms.saturating_sub(last_hb));
+                    let cid = device.connection_id;
                     drain_device(device, "heartbeat timeout").await;
                     devices.remove(&serial);
                     self.history
-                        .record_disconnect(&serial, "heartbeat_timeout", hb_age)
+                        .record_disconnect(&serial, cid, "heartbeat_timeout", hb_age)
                         .await;
                     warn!(serial = %serial, "Evicted device (heartbeat timeout)");
                     dead_serials.push(serial);
@@ -247,13 +255,17 @@ impl RelayState {
         if !dead_serials.is_empty() {
             let mut devices = self.devices.write().await;
             for serial in &dead_serials {
+                let mut cid = None;
                 if let Some(device) = devices.get(serial) {
+                    cid = Some(device.connection_id);
                     drain_device(device, "broadcast send failed").await;
                 }
                 devices.remove(serial);
-                self.history
-                    .record_disconnect(serial, "send_failed", None)
-                    .await;
+                if let Some(cid) = cid {
+                    self.history
+                        .record_disconnect(serial, cid, "send_failed", None)
+                        .await;
+                }
                 warn!(serial = %serial, "Evicted device (broadcast send failed)");
             }
         }
@@ -265,7 +277,7 @@ impl RelayState {
         for (serial, device) in devices.iter() {
             drain_device(device, "relay shutting down").await;
             self.history
-                .record_disconnect(serial, "relay_shutdown", None)
+                .record_disconnect(serial, device.connection_id, "relay_shutdown", None)
                 .await;
             info!(serial = %serial, "Drained device for relay shutdown");
         }
@@ -684,7 +696,10 @@ async fn handle_device_ws(
         }
         devices.insert(serial.clone(), device);
     }
-    state.history.record_connect(&serial).await;
+    state
+        .history
+        .record_connect(&serial, connection_id, egress_ip.as_deref())
+        .await;
     info!(serial = %serial, "Device registered");
 
     // Send ack
@@ -1113,7 +1128,7 @@ async fn handle_device_ws(
     if replaced {
         state
             .history
-            .record_disconnect(&serial, "replaced", None)
+            .record_disconnect(&serial, connection_id, "replaced", None)
             .await;
         info!(serial = %serial, "Device handler exiting (replaced, skipping cleanup)");
     } else {
@@ -1144,7 +1159,7 @@ async fn handle_device_ws(
         }
         state
             .history
-            .record_disconnect(&serial, disconnect_reason, hb_age)
+            .record_disconnect(&serial, connection_id, disconnect_reason, hb_age)
             .await;
         info!(serial = %serial, reason = disconnect_reason, "Device disconnected");
     }
