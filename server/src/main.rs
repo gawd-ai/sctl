@@ -663,8 +663,10 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     info!("Server ready");
 
     // Tunnel: spawn client if configured, with panic-recovery supervisor.
-    // If the tunnel task panics it will be restarted after 5s. A normal return
-    // (e.g. permanent auth error) stops the supervisor loop.
+    // The client loop never returns on its own (even a rejected tunnel key is
+    // retried on a slow cadence — a tunnel-only device that stops retrying is
+    // unreachable until someone drives to it). If the task panics it is
+    // restarted after 5s.
     let _tunnel_client_task = if let Some(ref tc) = tunnel_config {
         if tc.url.is_some() && !tc.relay {
             info!(
@@ -678,8 +680,9 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
                     let handle = tunnel::client::spawn(tunnel_state.clone(), tc.clone());
                     match handle.await {
                         Ok(()) => {
-                            // Normal return — tunnel client decided to stop (e.g. permanent auth error)
-                            info!("Tunnel client exited normally, not restarting");
+                            // Unreachable in practice (the loop is infinite),
+                            // kept for cancellation safety during shutdown.
+                            info!("Tunnel client exited, not restarting");
                             break;
                         }
                         Err(e) => {

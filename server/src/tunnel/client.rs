@@ -176,8 +176,8 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
         .url
         .as_deref()
         .expect("tunnel.url must be set for client mode");
-    let mut delay = Duration::from_secs(config.reconnect_delay_secs);
-    let max_delay = Duration::from_secs(config.reconnect_max_delay_secs);
+    let mut backoff = Duration::from_secs(config.reconnect_delay_secs);
+    let max_backoff = Duration::from_secs(config.reconnect_max_delay_secs);
     let mut reconnects: u64 = 0;
     let mut connection_durations: VecDeque<u64> = VecDeque::with_capacity(FLAP_WINDOW);
 
@@ -201,14 +201,14 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
             .tunnel_stats
             .reconnecting
             .store(false, Ordering::Relaxed);
-        match result {
+        let class = match result {
             Ok(DisconnectReason::RelayShutdown) => {
-                info!("Tunnel: relay shutting down, reconnecting immediately...");
+                info!("Tunnel: relay shutting down, reconnecting...");
                 state
                     .tunnel_stats
                     .push_event(TunnelEventType::Disconnected, "relay shutdown".into())
                     .await;
-                delay = Duration::ZERO;
+                DelayClass::RelayShutdown
             }
             Ok(
                 reason @ (DisconnectReason::WsClose
@@ -221,19 +221,25 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
                     .tunnel_stats
                     .push_event(TunnelEventType::Disconnected, reason.to_string())
                     .await;
-                delay = Duration::ZERO;
+                DelayClass::CleanClose
             }
-            Err(ConnectError::Permanent(msg)) => {
-                error!("Tunnel: permanent error: {msg} — stopping tunnel client");
+            Err(ConnectError::AuthRejected(msg)) => {
+                // Never exit: a rejected key usually means the relay's key was
+                // rotated ahead of the fleet. The device that gives up needs a
+                // site visit; the device that retries slowly heals the moment
+                // the operator restores the key.
+                error!(
+                    "Tunnel: registration rejected: {msg} — retrying on a slow cadence \
+                     (is tunnel_key current?)"
+                );
                 state
                     .tunnel_stats
-                    .push_event(TunnelEventType::Disconnected, format!("permanent: {msg}"))
+                    .push_event(
+                        TunnelEventType::Disconnected,
+                        format!("auth rejected: {msg}"),
+                    )
                     .await;
-                state
-                    .tunnel_stats
-                    .connected
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-                return;
+                DelayClass::AuthRejected
             }
             Err(ConnectError::Transient(e)) => {
                 let msg = e.to_string();
@@ -245,18 +251,16 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
                     || msg.contains("Address not available")
                     || msg.contains("os error 99")
                 {
-                    // Interface is down (EADDRNOTAVAIL) — use fixed 5s retry, no escalation.
-                    warn!("Tunnel: bind address unavailable ({msg}), retrying in 5s");
-                    delay = Duration::from_secs(5);
+                    // Interface is down (EADDRNOTAVAIL) — fixed cadence, no escalation.
+                    warn!("Tunnel: bind address unavailable ({msg}), retrying in ~5s");
+                    DelayClass::BindUnavailable
                 } else {
-                    warn!(
-                        "Tunnel: connection error: {msg}, reconnecting in {}s",
-                        delay.as_secs()
-                    );
+                    warn!("Tunnel: connection error: {msg}");
                     escalate_backoff = true;
+                    DelayClass::Transient(backoff)
                 }
             }
-        }
+        };
         reconnects += 1;
         state
             .tunnel_stats
@@ -279,8 +283,11 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
         }
         connection_durations.push_back(duration_secs);
 
-        // Flap detection: if last N connections all lasted < threshold, extend backoff
-        if connection_durations.len() >= FLAP_CHECK_COUNT {
+        // Flap detection: if last N connections all lasted < threshold, extend
+        // backoff. An auth-rejected loop is already on a far slower cadence
+        // than the flap window — damping must never *shorten* it.
+        let mut class = class;
+        if class != DelayClass::AuthRejected && connection_durations.len() >= FLAP_CHECK_COUNT {
             let recent: Vec<&u64> = connection_durations
                 .iter()
                 .rev()
@@ -289,20 +296,86 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
             let all_short = recent.iter().all(|&&d| d < FLAP_THRESHOLD_SECS);
             if all_short {
                 warn!(
-                    "Tunnel: flap detected ({FLAP_CHECK_COUNT} connections lasted <{FLAP_THRESHOLD_SECS}s), extending backoff to 60s"
+                    "Tunnel: flap detected ({FLAP_CHECK_COUNT} connections lasted <{FLAP_THRESHOLD_SECS}s), extending backoff"
                 );
-                delay = Duration::from_mins(1);
+                class = DelayClass::Flap;
                 escalate_backoff = false; // don't double-escalate
             }
         }
 
-        tokio::time::sleep(delay).await;
+        let sleep_for = reconnect_delay(class, random_draw());
+        info!("Tunnel: next attempt in {:.1}s", sleep_for.as_secs_f64());
+        tokio::time::sleep(sleep_for).await;
         if escalate_backoff {
-            delay = (delay * 2).min(max_delay);
+            backoff = (backoff * 2).min(max_backoff);
         } else {
-            delay = Duration::from_secs(config.reconnect_delay_secs);
+            backoff = Duration::from_secs(config.reconnect_delay_secs);
         }
     }
+}
+
+/// Classification of the next reconnect delay. Every path through the loop
+/// maps to exactly one class; [`reconnect_delay`] turns a class plus a random
+/// draw into a concrete sleep.
+///
+/// Jitter exists because the relay is a fan-in point: a relay-side event
+/// (shutdown broadcast, crash, restart) disconnects the entire fleet in the
+/// same instant, and identical delays would bring the entire fleet back in
+/// the same instant too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelayClass {
+    /// `tunnel.relay_shutdown` broadcast — every device heard it at once, so
+    /// this class carries the widest spread.
+    RelayShutdown,
+    /// Individual clean close (ws close, pong timeout, writer exit, read
+    /// error). Usually one device, but a relay crash produces these
+    /// fleet-wide in the same instant, so a small spread still applies.
+    CleanClose,
+    /// EADDRNOTAVAIL — the bind interface is down; fixed cadence while the
+    /// link comes back.
+    BindUnavailable,
+    /// Transient connect error, carrying the current exponential backoff
+    /// (whose escalation state lives in the loop).
+    Transient(Duration),
+    /// Flap damping engaged after consecutive short-lived connections.
+    Flap,
+    /// Registration FORBIDDEN — the relay rejected our tunnel key. Slow
+    /// cadence, forever: never stop (recovery is an operator fixing the key,
+    /// not a site visit), never hammer (the key may stay wrong for days).
+    AuthRejected,
+}
+
+/// Map a delay class and a uniform random draw to a concrete delay.
+fn reconnect_delay(class: DelayClass, draw: u64) -> Duration {
+    /// Uniform in `[base, base + spread_ms]`, millisecond granularity.
+    fn uniform(base: Duration, spread_ms: u64, draw: u64) -> Duration {
+        base + Duration::from_millis(draw % spread_ms.saturating_add(1))
+    }
+    match class {
+        DelayClass::RelayShutdown => uniform(Duration::from_secs(2), 10_000, draw),
+        DelayClass::CleanClose => uniform(Duration::from_secs(1), 3_000, draw),
+        DelayClass::BindUnavailable => uniform(Duration::from_secs(5), 2_000, draw),
+        // Equal jitter: keep half the deterministic backoff as a floor so
+        // escalation still means something, randomize the other half.
+        DelayClass::Transient(backoff) => {
+            let half = backoff / 2;
+            let spread_ms = u64::try_from(half.as_millis()).unwrap_or(u64::MAX);
+            uniform(half, spread_ms, draw)
+        }
+        DelayClass::Flap => uniform(Duration::from_mins(1), 30_000, draw),
+        DelayClass::AuthRejected => uniform(Duration::from_mins(5), 600_000, draw),
+    }
+}
+
+/// A uniform-enough random draw without carrying an RNG dependency: every
+/// `RandomState` hashes with a fresh key derived from OS entropy plus a
+/// per-thread counter, so successive draws differ and distinct devices are
+/// decorrelated — which is all jitter needs.
+fn random_draw() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
 }
 
 /// Reason the tunnel connection ended.
@@ -339,8 +412,9 @@ impl std::fmt::Display for DisconnectReason {
 
 /// Classification of connection errors for backoff strategy.
 enum ConnectError {
-    /// Auth rejected, invalid tunnel key — stop retrying entirely.
-    Permanent(String),
+    /// Registration FORBIDDEN (invalid tunnel key) — retry on the slow
+    /// [`DelayClass::AuthRejected`] cadence, forever.
+    AuthRejected(String),
     /// DNS timeout, TCP timeout, TLS failure — exponential backoff.
     Transient(Box<dyn std::error::Error + Send + Sync>),
 }
@@ -348,7 +422,7 @@ enum ConnectError {
 impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConnectError::Permanent(msg) => write!(f, "{msg}"),
+            ConnectError::AuthRejected(msg) => write!(f, "{msg}"),
             ConnectError::Transient(e) => write!(f, "{e}"),
         }
     }
@@ -808,9 +882,7 @@ async fn connect_and_run(
                             let message =
                                 msg["message"].as_str().unwrap_or("registration rejected");
                             if code == "FORBIDDEN" {
-                                return Err(ConnectError::Permanent(format!(
-                                    "Registration rejected: {message}"
-                                )));
+                                return Err(ConnectError::AuthRejected(message.to_string()));
                             }
                             return Err(ConnectError::Transient(
                                 format!("Registration error: {message}").into(),
@@ -4025,5 +4097,96 @@ mod tests {
     fn parse_sha256_pin_rejects_bad_input() {
         assert!(parse_sha256_pin("abc").is_err());
         assert!(parse_sha256_pin(&"g".repeat(64)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod reconnect_delay_tests {
+    use std::time::Duration;
+
+    use super::{reconnect_delay, DelayClass};
+
+    /// Draws that exercise the modulo edges plus a spread of arbitrary values.
+    const DRAWS: [u64; 8] = [
+        0,
+        1,
+        999,
+        10_000,
+        10_001,
+        0x9E37_79B9_7F4A_7C15,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+
+    fn assert_bounds(class: DelayClass, lo: Duration, hi: Duration) {
+        for draw in DRAWS {
+            let d = reconnect_delay(class, draw);
+            assert!(
+                d >= lo && d <= hi,
+                "{class:?} with draw {draw} gave {d:?}, outside [{lo:?}, {hi:?}]"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_shutdown_spreads_two_to_twelve_seconds() {
+        assert_bounds(
+            DelayClass::RelayShutdown,
+            Duration::from_secs(2),
+            Duration::from_secs(12),
+        );
+    }
+
+    #[test]
+    fn clean_close_has_a_floor_and_a_small_spread() {
+        assert_bounds(
+            DelayClass::CleanClose,
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+        );
+    }
+
+    #[test]
+    fn bind_unavailable_keeps_its_five_second_cadence() {
+        assert_bounds(
+            DelayClass::BindUnavailable,
+            Duration::from_secs(5),
+            Duration::from_secs(7),
+        );
+    }
+
+    #[test]
+    fn flap_damping_stays_at_least_a_minute() {
+        assert_bounds(
+            DelayClass::Flap,
+            Duration::from_mins(1),
+            Duration::from_secs(90),
+        );
+    }
+
+    #[test]
+    fn auth_rejected_is_minutes_not_seconds() {
+        assert_bounds(
+            DelayClass::AuthRejected,
+            Duration::from_mins(5),
+            Duration::from_mins(15),
+        );
+    }
+
+    #[test]
+    fn transient_keeps_half_the_backoff_as_a_floor() {
+        for backoff_secs in [2u64, 4, 8, 16, 30] {
+            let backoff = Duration::from_secs(backoff_secs);
+            assert_bounds(DelayClass::Transient(backoff), backoff / 2, backoff);
+        }
+    }
+
+    #[test]
+    fn distinct_draws_actually_spread() {
+        // The anti-stampede property: two devices drawing different values
+        // must not reconnect in the same instant.
+        let a = reconnect_delay(DelayClass::RelayShutdown, 0);
+        let b = reconnect_delay(DelayClass::RelayShutdown, 5_000);
+        assert_ne!(a, b);
     }
 }
