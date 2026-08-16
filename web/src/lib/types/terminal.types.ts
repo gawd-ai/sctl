@@ -315,7 +315,12 @@ export type WsSessionOutputMsg = Extract<
 	{ type: 'session.stdout' | 'session.stderr' | 'session.system' }
 >;
 
-/** Synthetic — not currently emitted by the server, kept for forward compatibility. */
+/**
+ * Emitted by the RELAY (not the device) when session output bound for this
+ * client was dropped under backpressure — the client should re-attach to
+ * recover the gap. Declared by hand because it originates in the relay,
+ * outside the device's typed enum.
+ */
 export interface WsSessionGapMsg {
 	type: 'session.gap';
 	session_id: string;
@@ -323,15 +328,10 @@ export interface WsSessionGapMsg {
 }
 
 /**
- * Emitted by the server when a one-shot **job** process exits (see `job.start`).
- * Not sent for interactive terminal sessions. Declared here rather than derived
- * from the generated union because the device emits it as a raw frame.
+ * Emitted by the device when a one-shot **job** process exits (see
+ * `job.start`). Not sent for interactive terminal sessions.
  */
-export interface WsSessionExitedMsg {
-	type: 'session.exited';
-	session_id: string;
-	exit_code: number;
-}
+export type WsSessionExitedMsg = Extract<GeneratedWsServerMsg, { type: 'session.exited' }>;
 
 export type WsSessionClosedMsg = Extract<GeneratedWsServerMsg, { type: 'session.closed' }>;
 export type WsSessionSignalAckMsg = Extract<GeneratedWsServerMsg, { type: 'session.signal.ack' }>;
@@ -622,10 +622,9 @@ export type WsSessionAiStatusChangedBroadcast = Extract<
 >;
 
 // Canonical server → client union sourced from the Rust enum via ts-rs.
-// Synthetic variants (`session.gap`, `session.exited`) that don't exist on
-// the server today are unioned in so consumers can still narrow on them
-// defensively.
-export type WsServerMsg = GeneratedWsServerMsg | WsSessionGapMsg | WsSessionExitedMsg;
+// `session.gap` is the one hand-declared addition: it is real, but it is
+// emitted by the relay, which sits outside the device's typed enum.
+export type WsServerMsg = GeneratedWsServerMsg | WsSessionGapMsg;
 
 // ── Transfer (gawdxfer / STP) types ────────────────────────────
 // Canonical definitions in ./generated/ (driven by ts-rs from the

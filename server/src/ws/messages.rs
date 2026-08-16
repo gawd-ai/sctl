@@ -83,6 +83,12 @@ pub enum WsServerMsg {
     #[serde(rename = "session.destroyed")]
     SessionDestroyed { session_id: String, reason: String },
 
+    /// Broadcast when a one-shot **job** process exits (see `job.start`), so
+    /// subscribers get the exit code without parsing the system line or
+    /// waiting for the reaper sweep. Not sent for interactive terminals.
+    #[serde(rename = "session.exited")]
+    SessionExited { session_id: String, exit_code: i32 },
+
     /// Response to the originating connection's `session.kill`.
     #[serde(rename = "session.closed")]
     SessionClosed {

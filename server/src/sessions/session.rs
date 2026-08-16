@@ -30,6 +30,7 @@ use tracing::{error, info};
 
 use super::buffer::{OutputBuffer, OutputStream};
 use crate::shell::pty;
+use crate::ws::messages::WsServerMsg;
 
 /// Session lifecycle status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,11 +192,13 @@ impl ManagedSession {
             // line or waiting for the 30s reaper sweep. `None` for interactive
             // terminals (unchanged behavior).
             if let Some(tx) = &exit_events {
-                let _ = tx.send(serde_json::json!({
-                    "type": "session.exited",
-                    "session_id": sid_exit,
-                    "exit_code": code,
-                }));
+                let _ = tx.send(
+                    WsServerMsg::SessionExited {
+                        session_id: sid_exit,
+                        exit_code: code,
+                    }
+                    .to_value(),
+                );
             }
         });
 
@@ -355,11 +358,13 @@ impl ManagedSession {
             // line or waiting for the 30s reaper sweep. `None` for interactive
             // terminals (unchanged behavior).
             if let Some(tx) = &exit_events {
-                let _ = tx.send(serde_json::json!({
-                    "type": "session.exited",
-                    "session_id": sid_exit,
-                    "exit_code": code,
-                }));
+                let _ = tx.send(
+                    WsServerMsg::SessionExited {
+                        session_id: sid_exit,
+                        exit_code: code,
+                    }
+                    .to_value(),
+                );
             }
         });
 
