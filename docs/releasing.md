@@ -113,6 +113,7 @@ Embedded targets are built by device, not by triple:
 ```sh
 devices/build.sh we826-qwd     # dispatches to devices/we826-qwd/build.sh
 devices/build.sh rut241
+devices/build.sh xe300
 ```
 
 Each device's `build.sh` picks its toolchain from `devices/targets/`
@@ -170,6 +171,16 @@ actually works on that specific unit if one is claimed.
 SSH-deployed devices (RUT241 class) and relays have no publish step:
 `rundev.sh device upgrade` / `device upgrade-remote` / `relay upgrade`
 stop, swap the binary, and start.
+
+`rundev.sh device upgrade*` is not universal, though. It resolves a build
+from `uname -m` through `ARCH_TARGET`, so a device reporting an arch that
+is absent from that map (the GL-XE300 reports big-endian `mips`) fails at
+`arch_to_bin`. Adding a map entry would be worse than the failure: those
+paths build a generic `cross` binary rather than the OpenWrt-SDK
+`-Z build-std` one the device was qualified on, and install to
+`/usr/bin/sctl` regardless of where that device keeps its payloads. Use
+the device's own `install.sh` over SSH instead, or push the `.gz` payloads
+via the file API / STP and restart its init script.
 
 ## Release checklist
 

@@ -8,6 +8,7 @@ devices/
   targets/      reusable toolchain target definitions
   rut241/       Teltonika RUT241 install/config/build assets
   we826-qwd/    ZBTLink WE826-Q-WD RAM boot install/config assets
+  xe300/        GL.iNet GL-XE300 install/config/build assets
 ```
 
 Build a device package:
@@ -15,12 +16,14 @@ Build a device package:
 ```sh
 devices/build.sh rut241
 devices/build.sh we826-qwd
+devices/build.sh xe300
 ```
 
 Install a device package:
 
 ```sh
 API_KEY=... devices/rut241/install.sh root@ROUTER_IP
+API_KEY=... devices/xe300/install.sh root@ROUTER_IP
 ```
 
 Install a RAM-boot device package:

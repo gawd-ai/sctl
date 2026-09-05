@@ -1,0 +1,68 @@
+[server]
+listen = "0.0.0.0:1337"
+# data_dir is on the UBI overlay, not tmpfs. The XE300 has ~95 MB of writable
+# overlay, so connection_history.jsonl and safe_mode.flag SURVIVE A REBOOT here.
+# On the RAM-booted WE826 they do not, and that is exactly why a field failure
+# there leaves no forensic trail: the evidence is wiped by the recovery.
+data_dir = "/usr/local/lib/sctl/data"
+journal_enabled = false
+openwrt_persistent_logs = false
+playbooks_dir = "/etc/sctl/playbooks"
+max_connections = 8
+max_sessions = 4
+session_buffer_size = 300
+max_file_size = 2097152
+transfer_chunk_size = 65536
+
+[auth]
+api_key = "{{API_KEY}}"
+
+[shell]
+default_shell = "/bin/sh"
+default_working_dir = "/tmp"
+
+[device]
+serial = "{{SERIAL}}"
+
+[logging]
+level = "info"
+
+# The out-of-band relay tunnel ([tunnel]) is per-deployment and is appended by
+# install.sh, not templated here — either from TUNNEL_URL/TUNNEL_KEY, or by
+# PRESERVING the block already on the device when those are not supplied.
+# install.sh overwrites this whole file, so that preservation is what stops a
+# re-install from silently un-pinning a unit that is only reachable over the
+# tunnel. Do not "simplify" it away.
+
+[comms]
+provider = "quectel-at"
+library = "/tmp/sctl/lib/libsctl_comms_quectel.so"
+# NO `device` hint on purpose — sctl DETECTS the Quectel AT port by USB interface
+# :1.2 (detect_quectel_at_port). The ttyUSB number re-enumerates after a modem
+# cycle (e.g. ttyUSB2 -> ttyUSB3); a hardcoded /dev/ttyUSBn opens the now-stale
+# node at startup, fails, and takes the modem down — the failure that has bricked
+# deployed units. Detection + reopen_after_probe make it self-healing. Do not add
+# a `device` line back unless detection is genuinely unavailable.
+#
+# This matters more here than elsewhere: /etc/init.d/modem-init issues AT+CFUN=1,1
+# at boot to force data-centric mode, which re-enumerates the USB bus by design.
+startup_timeout_secs = 15
+request_timeout_secs = 20
+
+[lte]
+# No `device` hint -> uses the detected comms port (see [comms]).
+poll_interval_secs = 60
+watchdog = false
+# `interface` MUST name the netdev that actually holds the bearer's IPv4 address
+# and default route — the plugin derives data_active from
+# interface_has_ipv4(interface), which is what maps the EC25's spurious
+# NOCONN/LIMSRV/SEARCH serving-cell state to CONNECT when the bearer is really up.
+# Naming a control-only netdev here is the long-standing NOCONN bug.
+#
+# On the XE300 that netdev is wwan0, NOT the RUT241's qmimux0: the EC25-AFXD comes
+# up in the QMI composition (cdc-wdm0 + wwan0, no usb0/qmimux*) and qmi_wwan is in
+# 802.3 mode (/sys/class/net/wwan0/qmi/raw_ip = N), so wwan0 carries the IP itself.
+# RE-CONFIRM ON FIRST SIM: GL's dialer (gl_modem connect, not netifd) picks the
+# ifname at dial time and can also drive usb0/wwan1. Check which netdev holds the
+# IPv4 /32 once a data call is up.
+interface = "{{LTE_INTERFACE}}"
