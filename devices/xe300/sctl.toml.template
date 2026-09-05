@@ -6,7 +6,7 @@ listen = "0.0.0.0:1337"
 # there leaves no forensic trail: the evidence is wiped by the recovery.
 data_dir = "/usr/local/lib/sctl/data"
 journal_enabled = false
-openwrt_persistent_logs = false
+openwrt_persistent_logs = true
 playbooks_dir = "/etc/sctl/playbooks"
 max_connections = 8
 max_sessions = 4
