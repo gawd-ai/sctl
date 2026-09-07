@@ -1,6 +1,6 @@
 {
   "name": "sctlin",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Web interface for sctl with interactive AI and terminal",
   "type": "module",
   "svelte": "./src/lib/index.ts",

@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 This root file is the only changelog; per-component history is recorded here
 under per-component headings. `server/CHANGELOG.md` is frozen.
 
+## [0.6.2] — 2026-09-07
+
+### sctl (server)
+
+- **`state_dir`** — a directory for the few files that must survive a reboot even where `data_dir` is tmpfs: `infra-monitor.json`, `infra-secrets.json`, `tls_pins.json`. Defaults to `data_dir`; the WE826 and RUT241 profiles set `/etc/sctl/state`. Bus 01 lost all eight infra targets and its router credential at every ignition cycle.
+- **Infra results tell the truth at boot** — a loaded config is reflected in `GET /api/infra/results` at once (its version, one `unknown` entry per target) instead of `config_version: 0` and no targets until the first check lands; `0` now means the device holds nothing. A config push drops the targets that left.
+- **Peplink profile** — cellular WANs carry `network` (RAT in use), `rat`, `bands`, `signal_level`, `carrier_aggregation`, `sim_active` and `roaming`; the summary line names the network and breaks the latency down (`login`, `wan`, `reads`).
+
 ## [0.6.1] — 2026-09-07
 
 ### sctl (server)

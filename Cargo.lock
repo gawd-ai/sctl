@@ -774,7 +774,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mcp-sctl"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "base64",
  "clap",
@@ -1167,7 +1167,7 @@ checksum = "a50f4cf475b65d88e057964e0e9bb1f0aa9bbb2036dc65c64596b42932536984"
 
 [[package]]
 name = "sctl"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "axum",
  "base64",
@@ -1201,11 +1201,11 @@ dependencies = [
 
 [[package]]
 name = "sctl-comms-abi"
-version = "0.6.1"
+version = "0.6.2"
 
 [[package]]
 name = "sctl-comms-quectel"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "sctl-comms-abi",
 ]
