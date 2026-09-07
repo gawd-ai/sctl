@@ -67,7 +67,7 @@ const MAX_MAX_BYTES: usize = 8 << 20; // 8 MiB
 
 type Resp<T> = Result<T, (StatusCode, Json<ApiError>)>;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct FetchRequest {
     pub url: String,
     #[serde(default)]
@@ -178,6 +178,7 @@ impl ServerCertVerifier for PinningVerifier {
                 "fetch: {} presented {fp}, expected {expected}",
                 self.host_port
             );
+            record("rejected");
             return Err(TlsError::General(format!(
                 "certificate pin mismatch for {}: presented {fp}",
                 self.host_port
@@ -207,6 +208,7 @@ impl ServerCertVerifier for PinningVerifier {
                 "fetch: {} presented {fp}, pinned {}",
                 self.host_port, entry.sha256
             );
+            record("rejected");
             return Err(TlsError::General(format!(
                 "certificate pin mismatch for {}: presented {fp}, pinned {}",
                 self.host_port, entry.sha256
@@ -225,6 +227,7 @@ impl ServerCertVerifier for PinningVerifier {
             return Ok(ServerCertVerified::assertion());
         }
 
+        record("rejected");
         Err(TlsError::General(format!(
             "no CA path and no pin for {} (presented {fp}); \
              supply pin_sha256 or set allow_tofu",
@@ -300,15 +303,77 @@ fn bad(
     ApiError::new(code, msg).into_response_with(status)
 }
 
-/// `POST /api/fetch`
-pub async fn fetch(
-    State(state): State<AppState>,
-    Json(req): Json<FetchRequest>,
-) -> Resp<Json<FetchResponse>> {
+/// Why an in-process fetch did not produce a response.
+///
+/// The variants mirror the API error codes the route hands out, so a caller
+/// inside the binary (the infra monitor's `http_api` check) can act on a pin
+/// mismatch without parsing the message the route would have built from it.
+#[derive(Debug)]
+pub enum FetchError {
+    /// The request itself was malformed (URL, method, body encoding).
+    Invalid(String),
+    /// No response within the request's timeout.
+    Timeout(u64),
+    /// The certificate presented is not the one pinned. `presented` is the
+    /// hex SHA-256 of the DER actually offered, for re-pinning by a human.
+    PinMismatch {
+        presented: Option<String>,
+        message: String,
+    },
+    /// No CA path, no pin, and TOFU not allowed.
+    Untrusted {
+        presented: Option<String>,
+        message: String,
+    },
+    /// Everything else: connect, TLS, protocol.
+    Failed(String),
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(m) | Self::Failed(m) => write!(f, "{m}"),
+            Self::Timeout(ms) => write!(f, "fetch timed out after {ms}ms"),
+            Self::PinMismatch { message, .. } | Self::Untrusted { message, .. } => {
+                write!(f, "{message}")
+            }
+        }
+    }
+}
+
+impl FetchError {
+    fn api(&self) -> (StatusCode, Json<ApiError>) {
+        match self {
+            Self::Invalid(m) => bad(codes::INVALID_REQUEST, m.clone(), StatusCode::BAD_REQUEST),
+            Self::Timeout(_) => bad(
+                codes::TIMEOUT,
+                self.to_string(),
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+            Self::PinMismatch { message, .. } => bad(
+                codes::CERT_PIN_MISMATCH,
+                message.clone(),
+                StatusCode::BAD_GATEWAY,
+            ),
+            Self::Untrusted { message, .. } => bad(
+                codes::CERT_UNTRUSTED,
+                message.clone(),
+                StatusCode::BAD_GATEWAY,
+            ),
+            Self::Failed(m) => bad(codes::FETCH_FAILED, m.clone(), StatusCode::BAD_GATEWAY),
+        }
+    }
+}
+
+/// Perform a fetch from inside the binary, with the same trust ladder the
+/// route applies. `data_dir` locates the pin store.
+pub(crate) async fn execute(
+    data_dir: &str,
+    req: &FetchRequest,
+) -> Result<FetchResponse, FetchError> {
     let started = Instant::now();
 
-    let target =
-        parse_target(&req.url).map_err(|e| bad(codes::INVALID_URL, e, StatusCode::BAD_REQUEST))?;
+    let target = parse_target(&req.url).map_err(FetchError::Invalid)?;
 
     let timeout = Duration::from_millis(
         req.timeout_ms
@@ -321,13 +386,9 @@ pub async fn fetch(
         .min(MAX_MAX_BYTES);
 
     let method = req.method.as_deref().unwrap_or("GET").to_ascii_uppercase();
-    let method: hyper::Method = method.parse().map_err(|_| {
-        bad(
-            codes::INVALID_REQUEST,
-            format!("invalid method '{method}'"),
-            StatusCode::BAD_REQUEST,
-        )
-    })?;
+    let method: hyper::Method = method
+        .parse()
+        .map_err(|_| FetchError::Invalid(format!("invalid method '{method}'")))?;
 
     let body_bytes = match (&req.body, req.body_base64) {
         (None, _) => Bytes::new(),
@@ -336,11 +397,7 @@ pub async fn fetch(
             base64::engine::general_purpose::STANDARD
                 .decode(b)
                 .map_err(|e| {
-                    bad(
-                        codes::INVALID_CONTENT,
-                        format!("body_base64 is not valid base64: {e}"),
-                        StatusCode::BAD_REQUEST,
-                    )
+                    FetchError::Invalid(format!("body_base64 is not valid base64: {e}"))
                 })?,
         ),
     };
@@ -349,9 +406,9 @@ pub async fn fetch(
     let outcome = tokio::time::timeout(
         timeout,
         perform(
-            &state,
+            data_dir,
             &target,
-            &req,
+            req,
             method,
             body_bytes,
             max_bytes,
@@ -360,33 +417,39 @@ pub async fn fetch(
     )
     .await;
 
+    let presented = || {
+        observed
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|o| o.sha256.clone()))
+    };
+
     let (status, headers, body, truncated, http_version, alpn) = match outcome {
-        Err(_) => {
-            return Err(bad(
-                codes::TIMEOUT,
-                format!("fetch timed out after {}ms", timeout.as_millis()),
-                StatusCode::GATEWAY_TIMEOUT,
-            ))
-        }
+        Err(_) => return Err(FetchError::Timeout(timeout.as_millis() as u64)),
         Ok(Err(e)) => {
             // rustls stringifies a custom verifier rejection as
             // "unexpected error: <ours>". These rejections are the opposite of
             // unexpected -- they are the feature working -- and the prefix makes
             // an operator read a deliberate refusal as an internal fault.
             let raw = e.to_string();
-            let msg = raw
+            let message = raw
                 .strip_prefix("unexpected error: ")
                 .map_or_else(|| raw.clone(), str::to_string);
             // Distinguish interception from an ordinary failure: a pin mismatch
             // must never look like a transient error a caller would retry past.
-            let (code, http) = if msg.contains("pin mismatch") {
-                (codes::CERT_PIN_MISMATCH, StatusCode::BAD_GATEWAY)
-            } else if msg.contains("no CA path and no pin") {
-                (codes::CERT_UNTRUSTED, StatusCode::BAD_GATEWAY)
+            return Err(if message.contains("pin mismatch") {
+                FetchError::PinMismatch {
+                    presented: presented(),
+                    message,
+                }
+            } else if message.contains("no CA path and no pin") {
+                FetchError::Untrusted {
+                    presented: presented(),
+                    message,
+                }
             } else {
-                (codes::FETCH_FAILED, StatusCode::BAD_GATEWAY)
-            };
-            return Err(bad(code, msg, http));
+                FetchError::Failed(message)
+            });
         }
         Ok(Ok(v)) => v,
     };
@@ -410,7 +473,7 @@ pub async fn fetch(
             alpn: alpn.clone(),
         });
 
-    Ok(Json(FetchResponse {
+    Ok(FetchResponse {
         status,
         headers,
         body: body_str,
@@ -419,7 +482,18 @@ pub async fn fetch(
         elapsed_ms: started.elapsed().as_millis() as u64,
         http_version,
         tls,
-    }))
+    })
+}
+
+/// `POST /api/fetch`
+pub async fn fetch(
+    State(state): State<AppState>,
+    Json(req): Json<FetchRequest>,
+) -> Resp<Json<FetchResponse>> {
+    execute(&state.config.server.data_dir, &req)
+        .await
+        .map(Json)
+        .map_err(|e| e.api())
 }
 
 type PerformOk = (
@@ -432,7 +506,7 @@ type PerformOk = (
 );
 
 async fn perform(
-    state: &AppState,
+    data_dir: &str,
     target: &Target,
     req: &FetchRequest,
     method: hyper::Method,
@@ -464,7 +538,7 @@ async fn perform(
             webpki,
             expected: req.pin_sha256.clone(),
             allow_tofu: req.allow_tofu,
-            store: PinStore::new(&state.config.server.data_dir),
+            store: PinStore::new(data_dir),
             host_port,
             observed,
         });

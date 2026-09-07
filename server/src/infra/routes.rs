@@ -17,7 +17,8 @@ use tracing::info;
 use super::monitor;
 use std::collections::HashMap;
 
-use super::{InfraConfig, InfraResults};
+use super::checks::CheckContext;
+use super::{CheckSpec, Credential, InfraConfig, InfraResults};
 use crate::AppState;
 
 /// `POST /api/infra/config` — receive and apply monitoring config.
@@ -116,9 +117,33 @@ pub async fn check_target(
     };
 
     let check_spec = target.check.clone();
+    let ctx = match &check_spec {
+        CheckSpec::HttpApi { credential_id, .. } => CheckContext {
+            data_dir: state.config.server.data_dir.clone(),
+            credential: credential_id
+                .as_ref()
+                .and_then(|id| guard.credentials.get(id).cloned()),
+            session: guard.sessions.get(&target_id).cloned(),
+        },
+        _ => CheckContext::default(),
+    };
     drop(guard); // release lock during check
 
-    let result = super::checks::run_check(&check_spec).await;
+    let result = super::checks::run_check_with(&check_spec, &ctx).await;
+
+    // An on-demand check is also how a fresh session is established, so keep
+    // what it produced for the monitor's next tick.
+    if result.session.is_some() || !result.ok {
+        let mut guard = infra.lock().await;
+        match &result.session {
+            Some(sess) => {
+                guard.sessions.insert(target_id.clone(), sess.clone());
+            }
+            None => {
+                guard.sessions.remove(&target_id);
+            }
+        }
+    }
 
     Ok(Json(json!({
         "target_id": target_id,
@@ -126,7 +151,132 @@ pub async fn check_target(
         "latency_ms": result.latency_ms,
         "detail": result.detail,
         "http_status": result.http_status,
+        "data": result.data,
+        // Present when a TLS target's certificate was not the pinned one (or
+        // none was pinned): the fingerprint an operator may now choose to pin.
+        "presented_sha256": result.presented_sha256,
     })))
+}
+
+/// `GET /api/infra/history/{target_id}` — recent structured readings of one
+/// target (newest last), so a collector can backfill a window it missed.
+pub async fn target_history(
+    State(state): State<AppState>,
+    Path(target_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(ref infra) = state.infra_state else {
+        return Ok(Json(json!({"target_id": target_id, "samples": []})));
+    };
+    let guard = infra.lock().await;
+    let samples: Vec<Value> = guard
+        .data_history
+        .get(&target_id)
+        .map(|ring| {
+            ring.iter()
+                .filter_map(|s| serde_json::to_value(s).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Json(json!({"target_id": target_id, "samples": samples})))
+}
+
+/// Body of `POST /api/infra/credentials`.
+#[derive(Debug, serde::Deserialize)]
+pub struct CredentialUpsert {
+    pub id: String,
+    pub username: String,
+    pub password: String,
+}
+
+/// `POST /api/infra/credentials` — store or replace one credential.
+///
+/// Credentials live in their own owner-only file, never in the monitoring
+/// config, and no route ever returns a password.
+pub async fn upsert_credential(
+    State(state): State<AppState>,
+    Json(body): Json<CredentialUpsert>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(ref infra) = state.infra_state else {
+        return Err(unavailable());
+    };
+    if body.id.trim().is_empty() || body.username.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"code": "INVALID_REQUEST", "message": "id and username are required"})),
+        ));
+    }
+    let mut guard = infra.lock().await;
+    guard.credentials.insert(
+        body.id.clone(),
+        Credential {
+            username: body.username,
+            password: body.password,
+        },
+    );
+    // Any cached session was opened with the old credential.
+    let stale_targets: Vec<String> = guard
+        .config
+        .as_ref()
+        .map(|c| {
+            c.targets
+                .iter()
+                .filter(|t| matches!(&t.check, CheckSpec::HttpApi { credential_id: Some(id), .. } if *id == body.id))
+                .map(|t| t.id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    for id in &stale_targets {
+        guard.sessions.remove(id);
+    }
+    let saved = guard.save_credentials();
+    info!(
+        "Infra credential {} stored ({} targets use it)",
+        body.id,
+        stale_targets.len()
+    );
+    Ok(Json(
+        json!({"status": "ok", "id": body.id, "persisted": saved}),
+    ))
+}
+
+/// `DELETE /api/infra/credentials/{id}` — forget one credential.
+pub async fn delete_credential(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(ref infra) = state.infra_state else {
+        return Err(unavailable());
+    };
+    let mut guard = infra.lock().await;
+    let existed = guard.credentials.remove(&id).is_some();
+    let saved = guard.save_credentials();
+    Ok(Json(
+        json!({"status": "ok", "id": id, "existed": existed, "persisted": saved}),
+    ))
+}
+
+/// `GET /api/infra/credentials` — ids and usernames only, for reconciliation.
+pub async fn list_credentials(State(state): State<AppState>) -> Json<Value> {
+    let Some(ref infra) = state.infra_state else {
+        return Json(json!({"credentials": []}));
+    };
+    let guard = infra.lock().await;
+    let mut list: Vec<Value> = guard
+        .credentials
+        .iter()
+        .map(|(id, c)| json!({"id": id, "username": c.username}))
+        .collect();
+    list.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    Json(json!({"credentials": list}))
+}
+
+fn unavailable() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(
+            json!({"error": "Infra monitoring not available", "code": "INFRA_UNAVAILABLE", "message": "Infra monitoring not available"}),
+        ),
+    )
 }
 
 /// `GET /api/infra/discover/progress` — return current discovery scan progress.

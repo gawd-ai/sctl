@@ -10,10 +10,10 @@ use std::time::Instant;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-use super::CheckSpec;
+use super::{profiles, ApiProfile, CheckSpec, Credential};
 
 /// Result of a single health check.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CheckResult {
     /// Whether the check succeeded (target responded).
     pub ok: bool,
@@ -23,12 +23,65 @@ pub struct CheckResult {
     pub detail: String,
     /// HTTP status code if applicable.
     pub http_status: Option<u16>,
+    /// Structured snapshot from an `http_api` profile.
+    pub data: Option<serde_json::Value>,
+    /// A login session the profile established or renewed, for the monitor
+    /// to keep for the next tick. `None` leaves the cached one alone.
+    pub session: Option<String>,
+    /// The certificate fingerprint a TLS target presented when the pin did
+    /// not match or none was configured, so an operator can pin it.
+    pub presented_sha256: Option<String>,
+}
+
+impl CheckResult {
+    pub fn failed(detail: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            detail: detail.into(),
+            ..Self::default()
+        }
+    }
+}
+
+/// What a check may need beyond its spec: where the pin store lives, the
+/// credential its spec names, and the session cached from the last run.
+#[derive(Debug, Clone, Default)]
+pub struct CheckContext {
+    pub data_dir: String,
+    pub credential: Option<Credential>,
+    pub session: Option<String>,
 }
 
 /// Run a health check according to the spec. Never panics — errors are
-/// captured in the `CheckResult`.
+/// captured in the `CheckResult`. A kind that needs context (`http_api`)
+/// fails honestly when called this way.
 pub async fn run_check(spec: &CheckSpec) -> CheckResult {
+    run_check_with(spec, &CheckContext::default()).await
+}
+
+/// Run a health check with the context an `http_api` target needs.
+pub async fn run_check_with(spec: &CheckSpec, ctx: &CheckContext) -> CheckResult {
     match spec {
+        CheckSpec::HttpApi {
+            base_url,
+            profile,
+            pin_sha256,
+            credential_id,
+            timeout_ms,
+        } => {
+            if credential_id.is_some() && ctx.credential.is_none() {
+                return CheckResult::failed(format!(
+                    "API NO CREDENTIAL: {} is not in the credentials store",
+                    credential_id.as_deref().unwrap_or("")
+                ));
+            }
+            match profile {
+                ApiProfile::Peplink => {
+                    profiles::peplink::check(ctx, base_url, pin_sha256.as_deref(), *timeout_ms)
+                        .await
+                }
+            }
+        }
         CheckSpec::Ping { host, timeout_ms } => check_ping(host, *timeout_ms).await,
         CheckSpec::Http {
             url,
@@ -110,6 +163,7 @@ async fn check_ping(host: &str, timeout_ms: Option<u64>) -> CheckResult {
             latency_ms: None,
             detail: format!("PING INVALID: {e}"),
             http_status: None,
+            ..CheckResult::default()
         };
     }
     let timeout_secs = timeout_ms.unwrap_or(2000) / 1000;
@@ -135,6 +189,7 @@ async fn check_ping(host: &str, timeout_ms: Option<u64>) -> CheckResult {
                 latency_ms: Some(rtt),
                 detail: format!("PING OK {rtt}ms"),
                 http_status: None,
+                ..CheckResult::default()
             }
         }
         Ok((_exit, _stdout, stderr)) => CheckResult {
@@ -142,12 +197,14 @@ async fn check_ping(host: &str, timeout_ms: Option<u64>) -> CheckResult {
             latency_ms: None,
             detail: format!("PING FAIL: {}", first_line(&stderr).unwrap_or("timeout")),
             http_status: None,
+            ..CheckResult::default()
         },
         Err(e) => CheckResult {
             ok: false,
             latency_ms: None,
             detail: format!("PING ERROR: {e}"),
             http_status: None,
+            ..CheckResult::default()
         },
     }
 }
@@ -165,6 +222,7 @@ async fn check_http(
             latency_ms: None,
             detail: format!("HTTP INVALID: {e}"),
             http_status: None,
+            ..CheckResult::default()
         };
     }
     let connect_timeout = timeout_ms.unwrap_or(5000) / 1000;
@@ -207,6 +265,7 @@ async fn check_http(
                     latency_ms: Some(latency),
                     detail: format!("HTTP {status_code} OK {latency}ms"),
                     http_status: Some(status_code),
+                    ..CheckResult::default()
                 }
             } else {
                 CheckResult {
@@ -214,6 +273,7 @@ async fn check_http(
                     latency_ms: Some(latency),
                     detail: format!("HTTP {status_code} (expected {expected_status}) {latency}ms"),
                     http_status: Some(status_code),
+                    ..CheckResult::default()
                 }
             }
         }
@@ -225,12 +285,14 @@ async fn check_http(
                 first_line(&stderr).unwrap_or("connection refused")
             ),
             http_status: None,
+            ..CheckResult::default()
         },
         Err(e) => CheckResult {
             ok: false,
             latency_ms: None,
             detail: format!("HTTP ERROR: {e}"),
             http_status: None,
+            ..CheckResult::default()
         },
     }
 }
@@ -243,6 +305,7 @@ async fn check_tcp(host: &str, port: u16, timeout_ms: Option<u64>) -> CheckResul
             latency_ms: None,
             detail: format!("TCP INVALID: {e}"),
             http_status: None,
+            ..CheckResult::default()
         };
     }
     let timeout_secs = timeout_ms.unwrap_or(5000) / 1000;
@@ -266,6 +329,7 @@ async fn check_tcp(host: &str, port: u16, timeout_ms: Option<u64>) -> CheckResul
             latency_ms: Some(elapsed),
             detail: format!("TCP {host}:{port} OK {elapsed}ms"),
             http_status: None,
+            ..CheckResult::default()
         },
         Ok((_exit, _stdout, stderr)) => CheckResult {
             ok: false,
@@ -275,12 +339,14 @@ async fn check_tcp(host: &str, port: u16, timeout_ms: Option<u64>) -> CheckResul
                 first_line(&stderr).unwrap_or("connection refused or timeout")
             ),
             http_status: None,
+            ..CheckResult::default()
         },
         Err(e) => CheckResult {
             ok: false,
             latency_ms: None,
             detail: format!("TCP ERROR: {e}"),
             http_status: None,
+            ..CheckResult::default()
         },
     }
 }
@@ -293,6 +359,7 @@ async fn check_snmp(host: &str, community: &str, timeout_ms: Option<u64>) -> Che
             latency_ms: None,
             detail: format!("SNMP INVALID: {e}"),
             http_status: None,
+            ..CheckResult::default()
         };
     }
     if let Err(e) = validate_community(community) {
@@ -301,6 +368,7 @@ async fn check_snmp(host: &str, community: &str, timeout_ms: Option<u64>) -> Che
             latency_ms: None,
             detail: format!("SNMP INVALID: {e}"),
             http_status: None,
+            ..CheckResult::default()
         };
     }
     let timeout_secs = timeout_ms.unwrap_or(5000) / 1000;
@@ -333,6 +401,7 @@ async fn check_snmp(host: &str, community: &str, timeout_ms: Option<u64>) -> Che
             latency_ms: Some(elapsed),
             detail: format!("SNMP OK {elapsed}ms: {}", truncate(&stdout, 100)),
             http_status: None,
+            ..CheckResult::default()
         },
         Ok((_exit, stdout, stderr)) => {
             let err = if stderr.is_empty() { &stdout } else { &stderr };
@@ -341,6 +410,7 @@ async fn check_snmp(host: &str, community: &str, timeout_ms: Option<u64>) -> Che
                 latency_ms: None,
                 detail: format!("SNMP FAIL: {}", first_line(err).unwrap_or("timeout")),
                 http_status: None,
+                ..CheckResult::default()
             }
         }
         Err(e) => CheckResult {
@@ -348,6 +418,7 @@ async fn check_snmp(host: &str, community: &str, timeout_ms: Option<u64>) -> Che
             latency_ms: None,
             detail: format!("SNMP ERROR: {e}"),
             http_status: None,
+            ..CheckResult::default()
         },
     }
 }
@@ -365,6 +436,7 @@ async fn check_custom(command: &str, timeout_ms: Option<u64>) -> CheckResult {
             latency_ms: Some(elapsed),
             detail: format!("SCRIPT OK {elapsed}ms: {}", truncate(stdout.trim(), 100)),
             http_status: None,
+            ..CheckResult::default()
         },
         Ok((exit, stdout, stderr)) => {
             let out = if stderr.is_empty() { &stdout } else { &stderr };
@@ -376,6 +448,7 @@ async fn check_custom(command: &str, timeout_ms: Option<u64>) -> CheckResult {
                     first_line(out).unwrap_or("no output")
                 ),
                 http_status: None,
+                ..CheckResult::default()
             }
         }
         Err(e) => CheckResult {
@@ -383,6 +456,7 @@ async fn check_custom(command: &str, timeout_ms: Option<u64>) -> CheckResult {
             latency_ms: None,
             detail: format!("SCRIPT ERROR: {e}"),
             http_status: None,
+            ..CheckResult::default()
         },
     }
 }

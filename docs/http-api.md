@@ -688,6 +688,19 @@ the new config. **Auth: API key Bearer.**
 Request body: an `InfraConfig` object — `version` (integer) and `targets`
 (array of monitored targets, each with an `id` and a `check` spec).
 
+Check kinds (`check.method`): `ping`, `http`, `https`, `tcp_port`, `snmp`,
+`custom_script`, and `http_api`. An `http_api` check logs into a device's
+JSON management API over sctl's own TLS stack (the same trust ladder as
+`POST /api/fetch`: an explicit `pin_sha256` is authoritative) and reduces
+what it says to a structured `data` object on the result. Fields:
+`base_url` (`https://192.168.50.1`), `profile` (`peplink`), `pin_sha256`
+(hex SHA-256 of the certificate DER; a check without one reports the
+presented fingerprint as `presented_sha256` and fails rather than trusting
+it), `credential_id` (a key into the credentials store, below), and
+`timeout_ms` per request. The reduction runs on the device: for `peplink`
+the client list leaves only as per-VLAN counts, and subscriber identifiers
+(IMSI, ICCID, IMEI) are never carried.
+
 Response `200`: `{status: "ok", config_version, target_count}`.
 
 Errors: `404` `INFRA_UNAVAILABLE`.
@@ -706,18 +719,61 @@ Errors: `404` `INFRA_UNAVAILABLE`.
 Latest monitoring results. **Auth: API key Bearer.**
 
 Response `200`: `{ts, config_version, targets: {target_id: result...},
-recovery_log: [...]}`. When the subsystem is unavailable this returns an
-empty result set (`config_version: 0`), not an error.
+recovery_log: [...]}`. Each result carries `status`, `latency_ms`, `since`,
+`consecutive_ok`, `consecutive_fail`, `last_check`, `detail`, `name`, and,
+for `http_api` targets, `http_status` and `data` (the profile's structured
+snapshot; after a failed check the last good snapshot stays, with the
+status and counters saying it is old). When the subsystem is unavailable
+this returns an empty result set (`config_version: 0`), not an error.
+
+### `GET /api/infra/history/{target_id}`
+
+Recent structured readings of one `http_api` target, newest last (ring of
+30), so a collector that was cut off can backfill the window it missed.
+**Auth: API key Bearer.**
+
+Response `200`: `{target_id, samples: [{ts, status, latency_ms, data}]}`.
 
 ### `POST /api/infra/check/{target_id}`
 
 Run an immediate on-demand check for one configured target. No request
 body. **Auth: API key Bearer.**
 
-Response `200`: `{target_id, ok, latency_ms, detail, http_status}`.
+Response `200`: `{target_id, ok, latency_ms, detail, http_status, data,
+presented_sha256}`. `presented_sha256` is set when a TLS target offered a
+certificate other than the pinned one (or none was pinned): the fingerprint
+an operator may now choose to pin. A session established by this call is
+kept for the monitor.
 
 Errors: `404` `INFRA_UNAVAILABLE` / `NOT_FOUND` (unknown target), `400`
 `NOT_FOUND` (no config loaded).
+
+### `POST /api/infra/credentials`
+
+Store or replace one credential for `http_api` targets. **Auth: API key
+Bearer.**
+
+Request body: `{id, username, password}`. Credentials live in
+`<data_dir>/infra-secrets.json` (owner-readable only), never in the
+monitoring config, and no route ever returns a password. Replacing a
+credential drops the cached login sessions of the targets that use it.
+
+Response `200`: `{status: "ok", id, persisted}`.
+
+Errors: `404` `INFRA_UNAVAILABLE`, `400` `INVALID_REQUEST`.
+
+### `GET /api/infra/credentials`
+
+Ids and usernames of stored credentials, for reconciliation. **Auth: API
+key Bearer.**
+
+Response `200`: `{credentials: [{id, username}]}`.
+
+### `DELETE /api/infra/credentials/{id}`
+
+Forget one credential. **Auth: API key Bearer.**
+
+Response `200`: `{status: "ok", id, existed, persisted}`.
 
 ### `POST /api/infra/discover`
 

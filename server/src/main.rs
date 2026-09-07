@@ -480,6 +480,9 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     let infra_state = {
         let mut is = infra::InfraState::new(&config.server.data_dir);
         is.load_config();
+        is.load_credentials();
+        // The http_api profiles reach the pin store through this; set once.
+        let _ = infra::profiles::peplink::DATA_DIR.set(config.server.data_dir.clone());
         Arc::new(tokio::sync::Mutex::new(is))
     };
 
@@ -575,6 +578,18 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         .route(
             "/api/infra/check/{target_id}",
             post(infra::routes::check_target),
+        )
+        .route(
+            "/api/infra/history/{target_id}",
+            get(infra::routes::target_history),
+        )
+        .route(
+            "/api/infra/credentials",
+            get(infra::routes::list_credentials).post(infra::routes::upsert_credential),
+        )
+        .route(
+            "/api/infra/credentials/{id}",
+            axum::routing::delete(infra::routes::delete_credential),
         )
         .route("/api/infra/discover", post(infra::discovery::discover))
         .route(
