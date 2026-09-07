@@ -74,6 +74,7 @@ HTTP server and resource limits (`ServerConfig`).
 | `max_file_size` | `52428800` (50 MB) | Maximum file size in bytes for `/api/files` read/write. |
 | `session_buffer_size` | `1000` | Maximum output entries kept per session ring buffer. |
 | `data_dir` | `"/var/lib/sctl"` | Directory for persistent data — journals, safe-mode flag, panic markers, relay connection history. Env: `SCTL_DATA_DIR`. |
+| `state_dir` | `""` (= `data_dir`) | Directory for the few small files that must survive a reboot even where `data_dir` is tmpfs: `infra-monitor.json`, `infra-secrets.json`, `tls_pins.json`. Created `0700`. RAM-booted device profiles set it to `/etc/sctl/state`. Env: `SCTL_STATE_DIR`. |
 | `journal_enabled` | `true` | Enable session output journaling to disk. |
 | `openwrt_persistent_logs` | `false` | On OpenWrt, configure logd to persist system logs to overlay. Off by default to spare flash on small embedded devices. |
 | `openwrt_persistent_log_size_kb` | `128` | Persistent OpenWrt log size in KiB when the above is `true`. |

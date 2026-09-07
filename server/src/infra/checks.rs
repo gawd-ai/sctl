@@ -77,8 +77,15 @@ pub async fn run_check_with(spec: &CheckSpec, ctx: &CheckContext) -> CheckResult
             }
             match profile {
                 ApiProfile::Peplink => {
-                    profiles::peplink::check(ctx, base_url, pin_sha256.as_deref(), *timeout_ms)
-                        .await
+                    // Boxed: a seven-request profile is a large future, and it
+                    // would otherwise be inlined into every caller's stack frame.
+                    Box::pin(profiles::peplink::check(
+                        ctx,
+                        base_url,
+                        pin_sha256.as_deref(),
+                        *timeout_ms,
+                    ))
+                    .await
                 }
             }
         }

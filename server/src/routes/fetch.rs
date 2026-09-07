@@ -490,7 +490,7 @@ pub async fn fetch(
     State(state): State<AppState>,
     Json(req): Json<FetchRequest>,
 ) -> Resp<Json<FetchResponse>> {
-    execute(&state.config.server.data_dir, &req)
+    execute(state.config.server.state_dir(), &req)
         .await
         .map(Json)
         .map_err(|e| e.api())

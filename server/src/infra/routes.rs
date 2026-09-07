@@ -48,7 +48,17 @@ pub async fn push_config(
         handle.abort();
     }
 
-    // Store and persist config
+    // Store and persist config. Results reflect the new target set at once:
+    // targets that left are dropped, new ones appear as `unknown`, and the
+    // version is the pushed one, so a collector reading results between the
+    // push and the first check sees the config it pushed, not the old one.
+    let keep: std::collections::HashSet<&str> =
+        config.targets.iter().map(|t| t.id.as_str()).collect();
+    guard
+        .results
+        .targets
+        .retain(|id, _| keep.contains(id.as_str()));
+    guard.seed_results(&config);
     guard.config = Some(config.clone());
     guard.save_config();
 
@@ -119,7 +129,7 @@ pub async fn check_target(
     let check_spec = target.check.clone();
     let ctx = match &check_spec {
         CheckSpec::HttpApi { credential_id, .. } => CheckContext {
-            data_dir: state.config.server.data_dir.clone(),
+            data_dir: state.config.server.state_dir().to_string(),
             credential: credential_id
                 .as_ref()
                 .and_then(|id| guard.credentials.get(id).cloned()),

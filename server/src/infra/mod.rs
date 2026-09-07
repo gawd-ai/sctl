@@ -311,7 +311,9 @@ const MAX_RECOVERY_LOG: usize = 50;
 pub const MAX_DATA_HISTORY: usize = 30;
 
 impl InfraState {
-    pub fn new(data_dir: &str) -> Self {
+    /// `state_dir` is where the config and the credentials persist; on a
+    /// RAM-booted unit it is the one directory that survives a reboot.
+    pub fn new(state_dir: &str) -> Self {
         Self {
             config: None,
             results: InfraResults {
@@ -321,11 +323,11 @@ impl InfraState {
                 recovery_log: Vec::new(),
             },
             recovery_tracker: HashMap::new(),
-            config_path: Path::new(data_dir).join("infra-monitor.json"),
+            config_path: Path::new(state_dir).join("infra-monitor.json"),
             monitor_handle: None,
             discovery_progress: DiscoveryProgress::default(),
             credentials: HashMap::new(),
-            secrets_path: Path::new(data_dir).join("infra-secrets.json"),
+            secrets_path: Path::new(state_dir).join("infra-secrets.json"),
             sessions: HashMap::new(),
             data_history: HashMap::new(),
         }
@@ -374,10 +376,17 @@ impl InfraState {
     }
 
     /// Load config from disk (called at startup).
+    ///
+    /// The results are seeded from it at once: the config version and one
+    /// `unknown` entry per target. Until the first check lands the device
+    /// would otherwise report `config_version: 0` and no targets, which is
+    /// exactly what a device that holds NOTHING reports, and a collector
+    /// cannot tell the two apart. Now `0` means "holds nothing".
     pub fn load_config(&mut self) {
         match std::fs::read_to_string(&self.config_path) {
             Ok(data) => match serde_json::from_str::<InfraConfig>(&data) {
                 Ok(cfg) => {
+                    self.seed_results(&cfg);
                     self.config = Some(cfg);
                 }
                 Err(e) => warn!("Failed to parse infra config: {e}"),
@@ -385,6 +394,35 @@ impl InfraState {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => warn!("Failed to read infra config: {e}"),
         }
+    }
+
+    /// Reflect a config in the results before any check has run: its
+    /// version, and an `unknown` placeholder per target so the target set is
+    /// visible. Entries that already carry a result are left alone.
+    pub fn seed_results(&mut self, cfg: &InfraConfig) {
+        let now = now_iso();
+        for target in &cfg.targets {
+            self.results
+                .targets
+                .entry(target.id.clone())
+                .or_insert_with(|| TargetState {
+                    status: TargetStatus::Unknown,
+                    latency_ms: None,
+                    since: now.clone(),
+                    consecutive_ok: 0,
+                    consecutive_fail: 0,
+                    // Empty: no check has produced a timestamp yet. A
+                    // collector that records observations keys on this
+                    // and must skip an empty one.
+                    last_check: String::new(),
+                    detail: "not checked yet".to_string(),
+                    name: target.name.clone(),
+                    http_status: None,
+                    data: None,
+                });
+        }
+        self.results.config_version = cfg.version;
+        self.results.ts = now;
     }
 
     /// Persist config to disk (atomic write via tmp + rename).
@@ -605,5 +643,35 @@ mod tests {
             Some("hunter2")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_loaded_config_is_visible_in_the_results_before_any_check() {
+        let dir = std::env::temp_dir().join(format!(
+            "sctl-infra-seed-{}-{}",
+            std::process::id(),
+            now_epoch()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = FLEET_HTTP_API_TARGET.replace("__PIN__", FIXTURE_PIN);
+        std::fs::write(
+            dir.join("infra-monitor.json"),
+            format!(r#"{{"version": 7, "targets": [{target}]}}"#),
+        )
+        .unwrap();
+
+        let mut state = InfraState::new(dir.to_str().unwrap());
+        assert_eq!(state.results.config_version, 0, "nothing loaded yet");
+        state.load_config();
+
+        // A device that holds a config never reports the shape of a device
+        // that holds nothing (version 0, no targets).
+        assert_eq!(state.results.config_version, 7);
+        let seeded = &state.results.targets["6f0b2c4e-9d3a-4c1f-8e2b-1a2b3c4d5e6f"];
+        assert_eq!(seeded.status, TargetStatus::Unknown);
+        assert_eq!(seeded.name, "Peplink MAX BR1");
+        assert!(seeded.last_check.is_empty(), "no check has run");
+        assert!(seeded.data.is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

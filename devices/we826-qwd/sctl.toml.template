@@ -1,6 +1,10 @@
 [server]
 listen = "0.0.0.0:1337"
 data_dir = "/tmp/sctl/data"
+# data_dir is tmpfs: an ignition cycle wipes it. The infra monitoring config,
+# the infra credentials and the TLS pins go to flash instead (a few KB, written
+# only when the fleet pushes or an operator trusts a certificate).
+state_dir = "/etc/sctl/state"
 journal_enabled = false
 openwrt_persistent_logs = false
 playbooks_dir = "/etc/sctl/playbooks"

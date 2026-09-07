@@ -478,11 +478,18 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
 
     // ─── Infra monitoring state ───────────────────────────────────
     let infra_state = {
-        let mut is = infra::InfraState::new(&config.server.data_dir);
+        // Reboot-surviving state (infra config, credentials, TLS pins) lives
+        // in `state_dir`, which on a RAM-booted unit is the flash overlay
+        // while `data_dir` is tmpfs. Owner-only: it holds credentials.
+        let state_dir = config.server.state_dir().to_string();
+        if let Err(e) = create_private_dir(&state_dir) {
+            warn!("Could not create state dir {state_dir}: {e}");
+        }
+        let mut is = infra::InfraState::new(&state_dir);
         is.load_config();
         is.load_credentials();
         // The http_api profiles reach the pin store through this; set once.
-        let _ = infra::profiles::peplink::DATA_DIR.set(config.server.data_dir.clone());
+        let _ = infra::profiles::peplink::DATA_DIR.set(state_dir);
         Arc::new(tokio::sync::Mutex::new(is))
     };
 
@@ -1093,4 +1100,16 @@ mod supervision_tests {
         handle.await.expect("supervisor task must not panic");
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
+}
+
+/// Create a directory readable by its owner only (no-op when it exists).
+fn create_private_dir(path: &str) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)
 }

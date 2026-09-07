@@ -167,6 +167,12 @@ pub struct ServerConfig {
     /// Directory for persistent data (journals, etc). Default `/var/lib/sctl`.
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
+    /// Directory for the few small files that must survive a reboot even
+    /// where `data_dir` is tmpfs (RAM-booted units): the infra monitoring
+    /// config, the infra credentials and the TLS pin store. Empty, the
+    /// default, means `data_dir`. Env: `SCTL_STATE_DIR`.
+    #[serde(default)]
+    pub state_dir: String,
     /// Enable output journaling to disk (default true).
     #[serde(default = "default_journal_enabled")]
     pub journal_enabled: bool,
@@ -564,6 +570,19 @@ fn default_tunnel_proxy_timeout() -> u64 {
     60
 }
 
+impl ServerConfig {
+    /// Where reboot-surviving state lives: `state_dir` when set, else
+    /// `data_dir`. Callers that persist infra config, credentials or TLS
+    /// pins go through this, never through `data_dir` directly.
+    pub fn state_dir(&self) -> &str {
+        if self.state_dir.is_empty() {
+            &self.data_dir
+        } else {
+            &self.state_dir
+        }
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -576,6 +595,7 @@ impl Default for ServerConfig {
             max_file_size: default_max_file_size(),
             session_buffer_size: default_session_buffer_size(),
             data_dir: default_data_dir(),
+            state_dir: String::new(),
             journal_enabled: default_journal_enabled(),
             openwrt_persistent_logs: false,
             openwrt_persistent_log_size_kb: default_openwrt_persistent_log_size_kb(),
@@ -761,6 +781,9 @@ impl Config {
         }
         if let Ok(dir) = std::env::var("SCTL_DATA_DIR") {
             config.server.data_dir = dir;
+        }
+        if let Ok(dir) = std::env::var("SCTL_STATE_DIR") {
+            config.server.state_dir = dir;
         }
         if let Ok(dir) = std::env::var("SCTL_PLAYBOOKS_DIR") {
             config.server.playbooks_dir = dir;

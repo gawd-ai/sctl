@@ -47,13 +47,22 @@ pub async fn check(
     let mut session = ctx.session.clone();
     let mut renewed: Option<String> = None;
     let start = Instant::now();
+    // Where the time goes, for the one-line summary: a slow check on a busy
+    // router is a different problem from a slow login.
+    let mut login_ms: u64 = 0;
+    let mut wan_ms: u64 = 0;
 
     // First the WAN status; a 401-in-200 means the session died, so log in
     // once and retry. No session cached means the same path.
     let wan = loop {
         let cookie = match &session {
             Some(c) => c.clone(),
-            None => match login(base, pin_sha256, timeout, &cred.username, &cred.password).await {
+            None => match timed(
+                &mut login_ms,
+                login(base, pin_sha256, timeout, &cred.username, &cred.password),
+            )
+            .await
+            {
                 Ok(c) => {
                     renewed = Some(c.clone());
                     session = Some(c.clone());
@@ -62,7 +71,12 @@ pub async fn check(
                 Err(r) => return r,
             },
         };
-        match get(base, WAN_PATH, &cookie, pin_sha256, timeout).await {
+        match timed(
+            &mut wan_ms,
+            get(base, WAN_PATH, &cookie, pin_sha256, timeout),
+        )
+        .await
+        {
             Ok(resp) if is_unauthorized(&resp.body) => {
                 if renewed.is_some() {
                     return CheckResult::failed(
@@ -103,11 +117,13 @@ pub async fn check(
             }
         }
     };
+    let reads_start = Instant::now();
     let clients = read(CLIENT_PATH).await;
     let location = read(LOCATION_PATH).await;
     let lan = read(LAN_PATH).await;
     let traffic = read(TRAFFIC_PATH).await;
     let system = read(SYSTEM_PATH).await;
+    let reads_ms = reads_start.elapsed().as_millis() as u64;
 
     let data = build_snapshot(
         &wan_resp,
@@ -117,7 +133,8 @@ pub async fn check(
         traffic.as_ref(),
         system.as_ref(),
     );
-    let detail = summary(&data, latency);
+    let timing = format!("login {login_ms}, wan {wan_ms}, reads {reads_ms}");
+    let detail = summary(&data, latency, &timing);
 
     CheckResult {
         ok: true,
@@ -131,6 +148,14 @@ pub async fn check(
 }
 
 // ─── transport ───────────────────────────────────────────────────────
+
+/// Run a request and add its wall time to `slot`.
+async fn timed<T>(slot: &mut u64, fut: impl std::future::Future<Output = T>) -> T {
+    let t = Instant::now();
+    let out = fut.await;
+    *slot = slot.saturating_add(t.elapsed().as_millis() as u64);
+    out
+}
 
 fn request(base: &str, path: &str, pin: Option<&str>, timeout: u64) -> FetchRequest {
     FetchRequest {
@@ -180,9 +205,12 @@ async fn login(
     )]));
     req.body = Some(json!({"username": username, "password": password}).to_string());
     req.max_bytes = Some(4000);
-    let resp = execute(&dir_of(), &req)
-        .await
-        .map_err(|e| transport_failure(LOGIN_PATH, &e))?;
+    // The TLS engine's future is large: boxed, and bound BEFORE the await so
+    // the moved-from temporary is not kept across it. That is what keeps
+    // every caller up the chain (the check, the monitor) small.
+    let dir = dir_of();
+    let fut = Box::pin(execute(&dir, &req));
+    let resp = fut.await.map_err(|e| transport_failure(LOGIN_PATH, &e))?;
     let cookie = resp
         .headers
         .get("set-cookie")
@@ -211,9 +239,9 @@ async fn get(
 ) -> Result<FetchResponse, CheckResult> {
     let mut req = request(base, path, pin, timeout);
     req.headers = Some(HashMap::from([("Cookie".to_string(), cookie.to_string())]));
-    execute(&dir_of(), &req)
-        .await
-        .map_err(|e| transport_failure(path, &e))
+    let dir = dir_of();
+    let fut = Box::pin(execute(&dir, &req));
+    fut.await.map_err(|e| transport_failure(path, &e))
 }
 
 /// The pin store location. Set once by the monitor before any check runs;
@@ -278,9 +306,10 @@ fn same_subnet(ip: u32, net: u32, mask: u32) -> bool {
     (ip & m) == (net & m)
 }
 
-/// One line for the results table: which WAN carries, what cellular is doing,
-/// how many riders.
-fn summary(data: &Value, latency: u64) -> String {
+/// One line for the results table: which WAN carries, what cellular is doing
+/// (and on which network), how many riders. `timing` is the breakdown of the
+/// latency, empty when there is none to show.
+fn summary(data: &Value, latency: u64, timing: &str) -> String {
     let active = data["ap_active_wan"].as_str().unwrap_or("");
     let up = data["ap_wan_up"].as_i64().unwrap_or(0);
     let riders = data["riders_associated"]
@@ -289,13 +318,24 @@ fn summary(data: &Value, latency: u64) -> String {
     let cellular = data["wans"]
         .as_array()
         .and_then(|w| w.iter().find(|x| x["type"] == "cellular"))
-        .and_then(|c| c["message"].as_str())
-        .map(|m| format!(", cellular {}", m.to_ascii_lowercase()))
+        .map(|c| {
+            let message = c["message"].as_str().unwrap_or("").to_ascii_lowercase();
+            let network = c["network"]
+                .as_str()
+                .map(|n| format!(" on {n}"))
+                .unwrap_or_default();
+            format!(", cellular {message}{network}")
+        })
         .unwrap_or_default();
-    if up == 0 {
-        format!("API OK {latency}ms: no WAN up{cellular}, {riders}")
+    let took = if timing.is_empty() {
+        format!("{latency}ms")
     } else {
-        format!("API OK {latency}ms: {active} carrying ({up} up){cellular}, {riders}")
+        format!("{latency}ms ({timing})")
+    };
+    if up == 0 {
+        format!("API OK {took}: no WAN up{cellular}, {riders}")
+    } else {
+        format!("API OK {took}: {active} carrying ({up} up){cellular}, {riders}")
     }
 }
 
@@ -372,7 +412,7 @@ pub fn build_snapshot(
                     }));
                 }
             }
-            wans.push(json!({
+            let mut entry = json!({
                 "id": key,
                 "name": name,
                 "type": v.get("type").and_then(Value::as_str).unwrap_or(""),
@@ -386,7 +426,67 @@ pub fn build_snapshot(
                 "uptime_secs": uptime,
                 "signal": v.pointer("/cellular/rat/0/band/0/signal").cloned(),
                 "carrier": v.pointer("/cellular/carrier/name").cloned(),
-            }));
+            });
+            // The radio facts the technical view needs to answer "is it on
+            // 5G, which bands, is it roaming": names and levels only.
+            if let Some(c) = v.get("cellular") {
+                let rat = c.get("rat").and_then(Value::as_array);
+                let names: Vec<Value> = rat
+                    .map(|r| r.iter().filter_map(|x| x.get("name").cloned()).collect())
+                    .unwrap_or_default();
+                let bands: Vec<Value> = rat
+                    .map(|r| {
+                        r.iter()
+                            .filter_map(|x| x.get("band").and_then(Value::as_array))
+                            .flatten()
+                            .filter_map(|b| b.get("name").cloned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let sim_active = ["1", "2"]
+                    .into_iter()
+                    .find(|slot| {
+                        c.pointer(&format!("/sim/{slot}/active"))
+                            .and_then(Value::as_bool)
+                            == Some(true)
+                    })
+                    .map(str::to_string)
+                    .or_else(|| {
+                        (c.pointer("/speedfusionConnect5gLte/active")
+                            .and_then(Value::as_bool)
+                            == Some(true))
+                        .then(|| "esim".to_string())
+                    });
+                let roaming = c.get("roamingStatus").map(|r| {
+                    json!({
+                        "enabled": r.get("enable").cloned(),
+                        "name": r.get("name").cloned(),
+                        "plmn": r.get("plmn").cloned(),
+                    })
+                });
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert(
+                        "network".into(),
+                        c.get("mobileType").cloned().unwrap_or(Value::Null),
+                    );
+                    obj.insert("rat".into(), Value::Array(names));
+                    obj.insert("bands".into(), Value::Array(bands));
+                    obj.insert(
+                        "signal_level".into(),
+                        c.get("signalLevel").cloned().unwrap_or(Value::Null),
+                    );
+                    obj.insert(
+                        "carrier_aggregation".into(),
+                        c.get("carrierAggregation").cloned().unwrap_or(Value::Null),
+                    );
+                    obj.insert(
+                        "sim_active".into(),
+                        sim_active.map_or(Value::Null, Value::String),
+                    );
+                    obj.insert("roaming".into(), roaming.unwrap_or(Value::Null));
+                }
+            }
+            wans.push(entry);
         }
     }
 
@@ -828,8 +928,82 @@ mod tests {
             None,
         );
         assert_eq!(
-            summary(&s, 42),
+            summary(&s, 42, ""),
             "API OK 42ms: WAN carrying (1 up), cellular standby, 2 riders"
+        );
+        assert_eq!(
+            summary(&s, 933, "login 410, wan 523, reads 1802"),
+            "API OK 933ms (login 410, wan 523, reads 1802): WAN carrying (1 up), cellular standby, 2 riders"
+        );
+    }
+
+    /// The radio block as the API doc (8.1.2+) shapes it: `mobileType`,
+    /// `rat[].name`, `rat[].band[].name`, `signalLevel`, `roamingStatus`.
+    fn wan_with_radio() -> Value {
+        let mut w = real_wan();
+        let c = &mut w["2"]["cellular"];
+        c["mobileType"] = json!("5G NSA");
+        c["signalLevel"] = json!(4);
+        c["carrierAggregation"] = json!(true);
+        c["rat"] = json!([
+            {"name": "5G", "band": [{"name": "n71", "channel": 128_000, "signal": {"rsrp": -98, "sinr": 12.0}}]},
+            {"name": "LTE", "band": [{"name": "B7", "signal": {"rsrp": -104}}, {"name": "B12", "signal": {"rsrp": -110}}]}
+        ]);
+        c["roamingStatus"] = json!({"name": "T-Mobile", "plmn": "310260"});
+        c["sim"]["1"]["active"] = json!(true);
+        c["speedfusionConnect5gLte"]["active"] = json!(false);
+        w
+    }
+
+    #[test]
+    fn the_cellular_wan_names_its_network_bands_sim_and_roaming() {
+        let s = build_snapshot(&wan_with_radio(), None, None, None, None, None);
+        let cell = s["wans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["type"] == "cellular")
+            .unwrap();
+        assert_eq!(cell["network"], "5G NSA");
+        assert_eq!(cell["rat"], json!(["5G", "LTE"]));
+        assert_eq!(cell["bands"], json!(["n71", "B7", "B12"]));
+        assert_eq!(cell["signal_level"], 4);
+        assert_eq!(cell["carrier_aggregation"], true);
+        assert_eq!(cell["sim_active"], "1");
+        assert_eq!(cell["roaming"]["plmn"], "310260");
+        assert_eq!(
+            cell["signal"]["rsrp"], -98,
+            "first RAT, first band, as before"
+        );
+        // Nothing that identifies the subscriber rides along.
+        let text = cell.to_string();
+        assert!(!text.contains("imsi") && !text.contains("iccid") && !text.contains("imei"));
+        assert_eq!(
+            summary(&s, 42, ""),
+            "API OK 42ms: WAN carrying (1 up), cellular standby on 5G NSA, riders unknown"
+        );
+    }
+
+    #[test]
+    fn a_wan_without_a_radio_block_carries_no_radio_fields() {
+        let s = build_snapshot(&real_wan(), None, None, None, None, None);
+        let cell = s["wans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["type"] == "cellular")
+            .unwrap();
+        assert_eq!(cell["network"], Value::Null);
+        assert_eq!(cell["rat"], json!([]));
+        assert_eq!(
+            cell["sim_active"], "esim",
+            "the eSIM was the active one that day"
+        );
+        assert_eq!(cell["roaming"], Value::Null);
+        let eth = &s["wans"].as_array().unwrap()[0];
+        assert!(
+            eth.get("network").is_none(),
+            "an ethernet WAN has no radio keys"
         );
     }
 }
