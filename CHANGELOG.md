@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 This root file is the only changelog; per-component history is recorded here
 under per-component headings. `server/CHANGELOG.md` is frozen.
 
+## [0.6.1] — 2026-09-07
+
+### sctl (server)
+
+- **`http_api` infra check kind with vendor profiles** — an Infra target can now log into a device's JSON management API over sctl's own TLS stack (pinned certificate, in-process `fetch` engine with typed errors), keep the session, and reduce the answers on the device to a structured `data` snapshot. First profile: Peplink / Pepwave (MAX BR1 family); the reduction keeps passenger identifiers on the device.
+- **Infra credentials store** — `POST/GET /api/infra/credentials`, `DELETE /api/infra/credentials/{id}`; credentials live in an owner-only `infra-secrets.json`, never in the monitoring config or a reply.
+- **Infra results carry `data` and `http_status`**; a failed check keeps the last good snapshot; `GET /api/infra/history/{target_id}` returns a bounded ring of readings for a collector that was cut off.
+- **Concurrent infra checks** under a small semaphore with a per-check deadline, so a multi-request profile cannot stall ping targets.
+
 ## [Unreleased] — 0.6.0 cycle
 
 ### sctl (server)
