@@ -864,12 +864,16 @@ mod tests {
         assert!(r.detail.starts_with("TCP 127.0.0.1:"), "{}", r.detail);
     }
 
+    /// A socket that is bound but never listens refuses every connect. A
+    /// freed ephemeral port is not the same thing: another test's fixture
+    /// can bind it in the meantime, and did once on CI's floating toolchain.
     #[tokio::test]
     async fn tcp_check_fails_on_a_closed_port() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let held = tokio::net::TcpSocket::new_v4().unwrap();
+        held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = held.local_addr().unwrap().port();
         let r = check_tcp("127.0.0.1", port, Some(2000)).await;
+        drop(held);
         assert!(!r.ok);
         assert!(r.latency_ms.is_none());
         assert!(r.detail.contains("FAIL"), "{}", r.detail);
