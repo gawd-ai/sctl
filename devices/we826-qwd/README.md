@@ -98,3 +98,10 @@ rm -f /etc/sctl/disabled
   `SO_BINDTODEVICE` when the value fails to parse as an IP address
   (`server/src/tunnel/client.rs:474-482`). An IP literal sets only the source address, which
   leaves tunnel egress following the default route — exactly what pinning is meant to prevent.
+- **A pin on the cellular interface is a metering decision, not a routing one.** With
+  `bind_address` on the LTE bearer, every byte of the management plane (tunnel heartbeats,
+  the fleet's health, uplink and infra polls, sessions) rides the SIM even while a wired WAN
+  is up and preferred by metric. The RUT241 at Canphone did that for three months at
+  ~50 MB/day. Pin the wired side when a pin is wanted, or leave `TUNNEL_BIND_ADDRESS` empty
+  so the tunnel follows the default route and fails over to cellular with it (a reconnect
+  of a few seconds instead of a zero-gap handover).

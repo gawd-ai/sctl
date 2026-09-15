@@ -431,9 +431,21 @@ pub fn build_snapshot(
             // 5G, which bands, is it roaming": names and levels only.
             if let Some(c) = v.get("cellular") {
                 let rat = c.get("rat").and_then(Value::as_array);
-                let names: Vec<Value> = rat
+                let mut names: Vec<Value> = rat
                     .map(|r| r.iter().filter_map(|x| x.get("name").cloned()).collect())
                     .unwrap_or_default();
+                // Firmware 8.6.0 ships `rat[]` entries with no `name` (Bus 01,
+                // 2026-09-08: bands and signal present, technology blank).
+                // The technology is still stated elsewhere in the block:
+                // `dataTechnology` ("LTE-A"), else `mobileType`.
+                if names.is_empty() {
+                    if let Some(t) = ["dataTechnology", "mobileType"]
+                        .iter()
+                        .find_map(|k| c.get(*k).filter(|v| v.is_string()).cloned())
+                    {
+                        names.push(t);
+                    }
+                }
                 let bands: Vec<Value> = rat
                     .map(|r| {
                         r.iter()
@@ -982,6 +994,47 @@ mod tests {
             summary(&s, 42, ""),
             "API OK 42ms: WAN carrying (1 up), cellular standby on 5G NSA, riders unknown"
         );
+    }
+
+    /// Firmware 8.6.0 (Bus 01, 2026-09-08): `rat[]` carries bands and signal
+    /// but no `name`, while `dataTechnology` says "LTE-A". The technology
+    /// list must not read as blank on a connected modem.
+    #[test]
+    fn a_nameless_rat_list_falls_back_to_the_stated_technology() {
+        let mut w = wan_with_radio();
+        w["2"]["cellular"]["rat"] = json!([
+            {"band": [{"name": "B7", "signal": {"rsrp": -100}}, {"name": "B66"}, {"name": "B2"}]}
+        ]);
+        w["2"]["cellular"]["dataTechnology"] = json!("LTE-A");
+        w["2"]["cellular"]["mobileType"] = json!("LTE-A");
+        let s = build_snapshot(&w, None, None, None, None, None);
+        let cell = s["wans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["type"] == "cellular")
+            .unwrap();
+        assert_eq!(cell["rat"], json!(["LTE-A"]));
+        assert_eq!(cell["bands"], json!(["B7", "B66", "B2"]));
+
+        // No technology stated anywhere: still an honest empty list.
+        let mut bare = w.clone();
+        bare["2"]["cellular"]
+            .as_object_mut()
+            .unwrap()
+            .remove("dataTechnology");
+        bare["2"]["cellular"]
+            .as_object_mut()
+            .unwrap()
+            .remove("mobileType");
+        let s = build_snapshot(&bare, None, None, None, None, None);
+        let cell = s["wans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["type"] == "cellular")
+            .unwrap();
+        assert_eq!(cell["rat"], json!([]));
     }
 
     #[test]

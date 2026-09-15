@@ -1,6 +1,6 @@
 [package]
 name = "sctl"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 description = "Remote device control server for AI agents — HTTP + WebSocket API with PTY support"
 license = "GPL-3.0-only"
@@ -17,7 +17,7 @@ default = []
 
 [dependencies]
 axum = { version = "0.8", features = ["ws", "multipart"] }
-tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "signal", "sync", "time", "macros", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "net", "signal", "sync", "time", "macros", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sctl-comms-abi = { path = "../crates/sctl-comms-abi" }

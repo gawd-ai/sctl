@@ -35,6 +35,11 @@ max_file_size = 52428800
 # (env: SCTL_DATA_DIR)
 # data_dir = "/var/lib/sctl"
 
+# Directory for the few files that must survive a reboot even where data_dir is
+# tmpfs: the Infra monitor config, its credentials and pinned certificates.
+# Unset means they live in data_dir. Optional.
+# state_dir = "/etc/sctl/state"
+
 # Enable output journaling to disk (default true)
 # journal_enabled = true
 

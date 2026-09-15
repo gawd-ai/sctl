@@ -185,16 +185,22 @@ if [[ -n "$TUNNEL_URL" || -n "$TUNNEL_KEY" ]]; then
         printf '\n[tunnel]\n'
         printf 'tunnel_key = "%s"\n' "$(toml_escape "$TUNNEL_KEY")"
         printf 'url = "%s"\n' "$(toml_escape "$TUNNEL_URL")"
-        printf '# Pinned to an interface NAME so sctl applies SO_BINDTODEVICE — an IP\n'
-        printf '# literal here would only set the source address, leaving tunnel egress\n'
-        printf '# at the mercy of the default route.\n'
-        printf 'bind_address = "%s"\n' "$(toml_escape "$TUNNEL_BIND_ADDRESS")"
+        if [[ -n "$TUNNEL_BIND_ADDRESS" ]]; then
+            printf '# Pinned to an interface NAME so sctl applies SO_BINDTODEVICE; an IP\n'
+            printf '# literal here would only set the source address, leaving tunnel egress\n'
+            printf '# at the mercy of the default route. A pin on the cellular interface\n'
+            printf '# puts the WHOLE management plane on the metered link (RUT241, 2026-09-15:\n'
+            printf '# 50 MB/day of LTE with a healthy wired WAN). Pin the wired side, or\n'
+            printf '# leave it unpinned so the tunnel fails over by route metric.\n'
+            printf 'bind_address = "%s"\n' "$(toml_escape "$TUNNEL_BIND_ADDRESS")"
+        fi
         printf 'reconnect_delay_secs = 2\n'
         printf 'reconnect_max_delay_secs = 30\n'
         printf 'heartbeat_interval_secs = 10\n'
         printf 'heartbeat_timeout_secs = 45\n'
     } >> "$tmpdir/sctl.toml"
-    printf 'tunnel:             configured from env (bind_address=%s)\n' "$TUNNEL_BIND_ADDRESS"
+    printf 'tunnel:             configured from env (bind_address=%s)\n' \
+        "${TUNNEL_BIND_ADDRESS:-<unpinned, follows routing>}"
 else
     # shellcheck disable=SC2086
     existing_tunnel=$($SSH $SSH_OPTS "$HOST" \

@@ -90,16 +90,18 @@ pub async fn run_check_with(spec: &CheckSpec, ctx: &CheckContext) -> CheckResult
             }
         }
         CheckSpec::Ping { host, timeout_ms } => check_ping(host, *timeout_ms).await,
+        // One path for both schemes: the URL carries the scheme and curl
+        // is told to accept the LAN gear's self-signed certificates.
         CheckSpec::Http {
             url,
             expected_status,
             timeout_ms,
-        } => check_http(url, expected_status.unwrap_or(200), *timeout_ms, false).await,
-        CheckSpec::Https {
+        }
+        | CheckSpec::Https {
             url,
             expected_status,
             timeout_ms,
-        } => check_http(url, expected_status.unwrap_or(200), *timeout_ms, true).await,
+        } => check_http(url, expected_status.unwrap_or(200), *timeout_ms).await,
         CheckSpec::TcpPort {
             host,
             port,
@@ -217,12 +219,16 @@ async fn check_ping(host: &str, timeout_ms: Option<u64>) -> CheckResult {
 }
 
 /// HTTP/HTTPS check using curl (args-based, no shell interpretation).
-async fn check_http(
-    url: &str,
-    expected_status: u16,
-    timeout_ms: Option<u64>,
-    _https: bool,
-) -> CheckResult {
+///
+/// HEAD first: the status line and headers are the whole answer, and the
+/// body never crosses the wire. Before 2026-09-15 this was a plain GET with
+/// the body discarded after transfer, which made a 60 s check of a gateway's
+/// 82 KB page cost 118 MB/day on the site's WAN. Only a server that refuses
+/// HEAD (405, 501) gets a GET, and that GET asks for one byte
+/// (`Range: bytes=0-0`); a 206 to that request is the resource saying 200.
+/// A server that ignores Range still sends its page, the old cost, paid only
+/// by HEAD-refusing servers. Latency is time to first byte, not full transfer.
+async fn check_http(url: &str, expected_status: u16, timeout_ms: Option<u64>) -> CheckResult {
     if let Err(e) = validate_url(url) {
         return CheckResult {
             ok: false,
@@ -232,41 +238,31 @@ async fn check_http(
             ..CheckResult::default()
         };
     }
-    let connect_timeout = timeout_ms.unwrap_or(5000) / 1000;
-    let connect_timeout = connect_timeout.max(1);
+    let connect_timeout = (timeout_ms.unwrap_or(5000) / 1000).max(1);
+    let ct = connect_timeout.to_string();
+    let budget = timeout_ms.unwrap_or(10000);
     let start = Instant::now();
 
-    let ct = connect_timeout.to_string();
-    let output = exec_args(
-        "curl",
-        &[
-            "-s",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code} %{time_total}",
-            "--connect-timeout",
-            &ct,
-            "-k",
-            url,
-        ],
-        timeout_ms.unwrap_or(10000),
-    )
-    .await;
+    let mut attempt = curl_status(url, &ct, budget, &["-I"]).await;
+    let mut ranged = false;
+    if let Ok((code, _)) = attempt {
+        if code == 405 || code == 501 {
+            attempt = curl_status(url, &ct, budget, &["-r", "0-0"]).await;
+            ranged = true;
+        }
+    }
 
     let elapsed = start.elapsed().as_millis() as u64;
 
-    match output {
-        Ok((0, stdout, _stderr)) => {
-            // Parse "200 0.045123" from curl output
-            let parts: Vec<&str> = stdout.split_whitespace().collect();
-            let status_code: u16 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let time_secs: f64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    match attempt {
+        Ok((status_code, time_secs)) => {
             #[allow(clippy::cast_sign_loss)]
             let latency = (time_secs * 1000.0) as u64;
             let latency = if latency == 0 { elapsed } else { latency };
+            let matched = status_code == expected_status
+                || (ranged && status_code == 206 && expected_status == 200);
 
-            if status_code == expected_status {
+            if matched {
                 CheckResult {
                     ok: true,
                     latency_ms: Some(latency),
@@ -284,17 +280,14 @@ async fn check_http(
                 }
             }
         }
-        Ok((_exit, _stdout, stderr)) => CheckResult {
+        Err(CurlError::Exit(reason)) => CheckResult {
             ok: false,
             latency_ms: None,
-            detail: format!(
-                "HTTP FAIL: {}",
-                first_line(&stderr).unwrap_or("connection refused")
-            ),
+            detail: format!("HTTP FAIL: {reason}"),
             http_status: None,
             ..CheckResult::default()
         },
-        Err(e) => CheckResult {
+        Err(CurlError::Spawn(e)) => CheckResult {
             ok: false,
             latency_ms: None,
             detail: format!("HTTP ERROR: {e}"),
@@ -304,7 +297,57 @@ async fn check_http(
     }
 }
 
-/// TCP port reachability check using nc (args-based, no shell interpretation).
+enum CurlError {
+    /// curl ran and reported a failure (its first stderr line).
+    Exit(String),
+    /// curl could not be spawned or timed out.
+    Spawn(String),
+}
+
+/// One curl request that reads status and time-to-first-byte only. `extra`
+/// selects the method shape (`-I` for HEAD, `-r 0-0` for a one-byte GET).
+async fn curl_status(
+    url: &str,
+    connect_timeout_secs: &str,
+    budget_ms: u64,
+    extra: &[&str],
+) -> Result<(u16, f64), CurlError> {
+    let mut args: Vec<&str> = vec![
+        "-s",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code} %{time_starttransfer}",
+        "--connect-timeout",
+        connect_timeout_secs,
+        "-k",
+    ];
+    args.extend_from_slice(extra);
+    args.push(url);
+
+    match exec_args("curl", &args, budget_ms).await {
+        Ok((0, stdout, _stderr)) => {
+            // "200 0.045123"
+            let parts: Vec<&str> = stdout.split_whitespace().collect();
+            let status_code: u16 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let time_secs: f64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            Ok((status_code, time_secs))
+        }
+        Ok((_exit, _stdout, stderr)) => Err(CurlError::Exit(
+            first_line(&stderr)
+                .unwrap_or("connection refused")
+                .to_string(),
+        )),
+        Err(e) => Err(CurlError::Spawn(e)),
+    }
+}
+
+/// TCP port reachability check: a native connect with a deadline.
+///
+/// This used to shell out to `nc -z -w`, and the busybox nc on RUTOS
+/// (RUT241) accepts only `nc IPADDR PORT`, so every tcp_port target on that
+/// unit failed. A connect needs no helper binary and its duration is the
+/// latency.
 async fn check_tcp(host: &str, port: u16, timeout_ms: Option<u64>) -> CheckResult {
     if let Err(e) = validate_host(host) {
         return CheckResult {
@@ -315,43 +358,35 @@ async fn check_tcp(host: &str, port: u16, timeout_ms: Option<u64>) -> CheckResul
             ..CheckResult::default()
         };
     }
-    let timeout_secs = timeout_ms.unwrap_or(5000) / 1000;
-    let timeout_secs = timeout_secs.max(1);
+    let budget = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1));
     let start = Instant::now();
 
-    let ts = timeout_secs.to_string();
-    let port_str = port.to_string();
-    let output = exec_args(
-        "nc",
-        &["-z", "-w", &ts, host, &port_str],
-        timeout_ms.unwrap_or(10000),
-    )
-    .await;
+    let attempt = tokio::time::timeout(budget, tokio::net::TcpStream::connect((host, port))).await;
 
     let elapsed = start.elapsed().as_millis() as u64;
 
-    match output {
-        Ok((0, _, _)) => CheckResult {
+    match attempt {
+        Ok(Ok(_stream)) => CheckResult {
             ok: true,
             latency_ms: Some(elapsed),
             detail: format!("TCP {host}:{port} OK {elapsed}ms"),
             http_status: None,
             ..CheckResult::default()
         },
-        Ok((_exit, _stdout, stderr)) => CheckResult {
+        Ok(Err(e)) => CheckResult {
             ok: false,
             latency_ms: None,
-            detail: format!(
-                "TCP {host}:{port} FAIL: {}",
-                first_line(&stderr).unwrap_or("connection refused or timeout")
-            ),
+            detail: format!("TCP {host}:{port} FAIL: {e}"),
             http_status: None,
             ..CheckResult::default()
         },
-        Err(e) => CheckResult {
+        Err(_) => CheckResult {
             ok: false,
             latency_ms: None,
-            detail: format!("TCP ERROR: {e}"),
+            detail: format!(
+                "TCP {host}:{port} FAIL: no connection within {}ms",
+                budget.as_millis()
+            ),
             http_status: None,
             ..CheckResult::default()
         },
@@ -673,5 +708,170 @@ mod tests {
     fn test_truncate_utf8_safe() {
         assert_eq!(truncate("hello world", 5), "hello...");
         assert_eq!(truncate("hi", 5), "hi");
+    }
+
+    // ─── HTTP check fixtures ─────────────────────────────────────────
+    //
+    // A tiny in-process HTTP server that records every request head and
+    // counts the bytes it writes, so a test can prove the body never left.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::AsyncWriteExt;
+
+    #[derive(Clone, Copy)]
+    enum FixtureMode {
+        /// HEAD and GET both answer 200 with a 1 MiB Content-Length; the
+        /// body is written only for GET.
+        HeadOk,
+        /// HEAD is refused with 405; a GET with `Range: bytes=0-0` gets a
+        /// one-byte 206; any other GET gets the full 1 MiB.
+        HeadRefused,
+    }
+
+    struct Fixture {
+        addr: std::net::SocketAddr,
+        seen: Arc<Mutex<Vec<String>>>,
+        bytes_out: Arc<AtomicUsize>,
+    }
+
+    const BIG: usize = 1024 * 1024;
+
+    async fn spawn_fixture(mode: FixtureMode) -> Fixture {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let bytes_out = Arc::new(AtomicUsize::new(0));
+        let (seen2, bytes2) = (seen.clone(), bytes_out.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        break;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    head.extend_from_slice(&buf[..n]);
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                seen2.lock().unwrap().push(head.clone());
+                let first = head.lines().next().unwrap_or("").to_string();
+                let is_head = first.starts_with("HEAD ");
+                let ranged = head.to_ascii_lowercase().contains("range: bytes=0-0");
+                let response: Vec<u8> = match (mode, is_head, ranged) {
+                    (FixtureMode::HeadOk, true, _) => {
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {BIG}\r\nConnection: close\r\n\r\n")
+                            .into_bytes()
+                    }
+                    (FixtureMode::HeadRefused, true, _) => {
+                        b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_vec()
+                    }
+                    (FixtureMode::HeadRefused, false, true) => {
+                        format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/{BIG}\r\nContent-Length: 1\r\nConnection: close\r\n\r\n<")
+                            .into_bytes()
+                    }
+                    _ => {
+                        let mut v = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {BIG}\r\nConnection: close\r\n\r\n"
+                        )
+                        .into_bytes();
+                        v.resize(v.len() + BIG, b'x');
+                        v
+                    }
+                };
+                if sock.write_all(&response).await.is_ok() {
+                    bytes2.fetch_add(response.len(), Ordering::SeqCst);
+                }
+                let _ = sock.shutdown().await;
+            }
+        });
+        Fixture {
+            addr,
+            seen,
+            bytes_out,
+        }
+    }
+
+    fn curl_available() -> bool {
+        std::process::Command::new("curl")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    #[tokio::test]
+    async fn http_check_uses_head_and_never_transfers_the_body() {
+        if !curl_available() {
+            return;
+        }
+        let fx = spawn_fixture(FixtureMode::HeadOk).await;
+        let r = check_http(&format!("http://{}/", fx.addr), 200, Some(3000)).await;
+        assert!(r.ok, "{}", r.detail);
+        assert_eq!(r.http_status, Some(200));
+        assert!(r.latency_ms.is_some());
+        let seen = fx.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "one request: {seen:?}");
+        assert!(seen[0].starts_with("HEAD /"), "{}", seen[0]);
+        assert!(fx.bytes_out.load(Ordering::SeqCst) < 1024);
+    }
+
+    #[tokio::test]
+    async fn http_check_falls_back_to_a_one_byte_range_get_when_head_is_refused() {
+        if !curl_available() {
+            return;
+        }
+        let fx = spawn_fixture(FixtureMode::HeadRefused).await;
+        let r = check_http(&format!("http://{}/", fx.addr), 200, Some(3000)).await;
+        assert!(r.ok, "{}", r.detail);
+        assert_eq!(r.http_status, Some(206));
+        let seen = fx.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "HEAD then GET: {seen:?}");
+        assert!(seen[1].starts_with("GET /"), "{}", seen[1]);
+        assert!(
+            seen[1].to_ascii_lowercase().contains("range: bytes=0-0"),
+            "{}",
+            seen[1]
+        );
+        assert!(fx.bytes_out.load(Ordering::SeqCst) < 1024);
+    }
+
+    #[tokio::test]
+    async fn http_check_reports_an_unexpected_status_without_matching_it() {
+        if !curl_available() {
+            return;
+        }
+        let fx = spawn_fixture(FixtureMode::HeadOk).await;
+        let r = check_http(&format!("http://{}/", fx.addr), 204, Some(3000)).await;
+        assert!(!r.ok);
+        assert_eq!(r.http_status, Some(200));
+        assert!(r.detail.contains("expected 204"), "{}", r.detail);
+    }
+
+    #[tokio::test]
+    async fn tcp_check_connects_natively() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let r = check_tcp("127.0.0.1", addr.port(), Some(2000)).await;
+        assert!(r.ok, "{}", r.detail);
+        assert!(r.latency_ms.is_some());
+        assert!(r.detail.starts_with("TCP 127.0.0.1:"), "{}", r.detail);
+    }
+
+    #[tokio::test]
+    async fn tcp_check_fails_on_a_closed_port() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let r = check_tcp("127.0.0.1", port, Some(2000)).await;
+        assert!(!r.ok);
+        assert!(r.latency_ms.is_none());
+        assert!(r.detail.contains("FAIL"), "{}", r.detail);
     }
 }
