@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 This root file is the only changelog; per-component history is recorded here
 under per-component headings. `server/CHANGELOG.md` is frozen.
 
+## [0.6.3] — 2026-09-15
+
+### sctl (server)
+
+- **`http`/`https` infra checks no longer transfer the page** — the check sends HEAD and reads the status and headers; only a server that refuses HEAD (405, 501) gets a GET, and that GET asks for one byte (`Range: bytes=0-0`, a 206 counts as the expected 200). Latency is now time to first byte. Before, `curl -o /dev/null` still pulled the whole body: a 60 s check of a gateway's 82 KB page cost 118 MB/day on the site's WAN (RUT241, Canphone).
+- **`tcp_port` checks connect natively** — no more `nc -z -w`, which the busybox nc on RUTOS does not accept (every tcp_port target on a RUT241 was DOWN). A `TcpStream::connect` with a deadline; its duration is the latency.
+- **Peplink profile** — when firmware 8.6.0 ships `rat[]` entries without a `name`, the cellular WAN's `rat` list falls back to `dataTechnology`, then `mobileType`, instead of reading blank.
+
+### devices
+
+- **Install templates** — the WE826 template wrote `bind_address = ""` when `TUNNEL_BIND_ADDRESS` was empty, which the tunnel treats as an unavailable interface and retries forever; the line is now conditional, as on the XE300. Both templates and the WE826 README say why a pin on the cellular interface is a metering decision: it puts the whole management plane on the SIM.
+
 ## [0.6.2] — 2026-09-07
 
 ### sctl (server)
