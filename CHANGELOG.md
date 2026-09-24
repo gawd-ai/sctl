@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 This root file is the only changelog; per-component history is recorded here
 under per-component headings. `server/CHANGELOG.md` is frozen.
 
+## [0.6.4] - 2026-09-24
+
+### web (sctlin)
+
+- **Playbook components are themeable**: `PlaybookViewer` and `PlaybookExecutor` take every colour, font and size from `--sctl-*` custom properties whose defaults are the existing dark look, so a consuming app can restyle them to its own palette (light or dark) without forking. The run output has its own pair (`--sctl-output-bg`, `--sctl-output-text`) so it can stay terminal-dark while the rest follows the page.
+- **Host-driven runs**: the viewer takes `header={false}`; the executor takes `actions={false}` and `description={false}`, exposes `run()` and `cancel()` on the instance and reports `PlaybookRunState` through `onstatechange`, so a host can put Run and Stop in its own toolbar. Parameter labels are now `<label for>` their fields.
+
+### sctl (server)
+
+- The closed-port `tcp_port` test holds a bound, non-listening socket instead of assuming a port is free.
+
 ## [0.6.3] — 2026-09-15
 
 ### sctl (server)
