@@ -105,6 +105,28 @@ Widgets                (self-contained: each creates its own clients internally)
 | `SplitPane` | Resizable split pane layout |
 | `ToastContainer` | Toast notifications |
 
+### Theming the playbook components
+
+`PlaybookViewer` and `PlaybookExecutor` read their colours, fonts and sizes from `--sctl-*` custom properties. The defaults are the dark console look, so nothing changes until a host sets them on an ancestor:
+
+```css
+.my-runbooks {
+	--sctl-bg: transparent;
+	--sctl-font: var(--font-sans);
+	--sctl-text-xs: 0.875rem;       /* body; --sctl-text-2xs, --sctl-text-sm, --sctl-text-label too */
+	--sctl-text: #374151;           /* --sctl-text-strong, -secondary, -muted, -faint */
+	--sctl-surface: #f9fafb;
+	--sctl-border: #e5e7eb;
+	--sctl-field-bg: #f9fafb;       /* --sctl-field-border, --sctl-focus, --sctl-field-padding */
+	--sctl-code-bg: #f9fafb;        /* script; --sctl-code-text */
+	--sctl-output-bg: #111827;      /* run output; --sctl-output-text, --sctl-output-max-height */
+	--sctl-success: #15803d;        /* --sctl-success-bg, --sctl-danger*, --sctl-accent* */
+	--sctl-radius: 0.5rem;
+}
+```
+
+A host that renders its own title and buttons passes `header={false}` to the viewer and `actions={false}` (and optionally `description={false}`) to the executor, then drives the run with the instance methods `run()` and `cancel()` and follows `onstatechange` (`PlaybookRunState`: `executing`, `canCancel`, `canceling`, `exitCode`).
+
 ## Widgets
 
 Widgets bundle connection logic + UI. Pass a simple `DeviceConnectionConfig` instead of managing clients:

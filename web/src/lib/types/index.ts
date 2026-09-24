@@ -55,6 +55,7 @@ export type {
 	PlaybookParam,
 	PlaybookSummary,
 	PlaybookDetail,
+	PlaybookRunState,
 	SplitGroupInfo,
 	SidePanelTabDef,
 	ViewerTab,

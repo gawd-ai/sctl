@@ -854,3 +854,13 @@ export interface PlaybookDetail {
 	script: string;
 	raw_content: string;
 }
+
+/** PlaybookExecutor's run state, for host-rendered controls (`onstatechange`). */
+export interface PlaybookRunState {
+	executing: boolean;
+	/** A streaming job is running and can be stopped. */
+	canCancel: boolean;
+	canceling: boolean;
+	/** Exit code of the last finished run, or null. */
+	exitCode: number | null;
+}

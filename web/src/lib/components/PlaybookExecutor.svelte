@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { PlaybookDetail, ExecResult, ViewerTab, WsSessionOutputMsg } from '../types/terminal.types';
+	import type { PlaybookDetail, PlaybookRunState, ExecResult, ViewerTab, WsSessionOutputMsg } from '../types/terminal.types';
 	import type { SctlRestClient } from '../utils/rest-client';
 	import type { SctlWsClient } from '../utils/ws-client';
 	import { renderPlaybookScript } from '../utils/playbook-parser';
@@ -19,9 +19,32 @@
 		onRunInTerminal?: (script: string) => void;
 		onOpenViewer?: (tab: ViewerTab) => void;
 		onclose?: () => void;
+		/**
+		 * Show the built-in actions row (Terminal / Cancel / Execute with its
+		 * click-twice confirm). A host that drives the run from its own
+		 * controls passes `false` and calls `run()` / `cancel()` on the
+		 * component instance, following `onstatechange`.
+		 */
+		actions?: boolean;
+		/** Show the playbook description above the parameters. */
+		description?: boolean;
+		/** Fires whenever the run state changes, for host-rendered controls. */
+		onstatechange?: (state: PlaybookRunState) => void;
 	}
 
-	let { playbook, restClient, wsClient = null, onresult, onRunInTerminal, onOpenViewer, onclose }: Props = $props();
+
+	let {
+		playbook,
+		restClient,
+		wsClient = null,
+		onresult,
+		onRunInTerminal,
+		onOpenViewer,
+		onclose,
+		actions = true,
+		description = true,
+		onstatechange
+	}: Props = $props();
 
 	// Parameter values
 	let paramValues: Record<string, string> = $state({});
@@ -59,6 +82,26 @@
 			liveOutput = '';
 		}
 	});
+
+	$effect(() => {
+		onstatechange?.({
+			executing,
+			canCancel: executing && jobSessionId !== null,
+			canceling,
+			exitCode: result ? result.exit_code : null
+		});
+	});
+
+	/** Run now, with no confirm step: the host's control is the confirmation. */
+	export function run(): Promise<void> {
+		confirmingExecute = false;
+		return execute();
+	}
+
+	/** Stop the running streaming job, if any. */
+	export function cancel(): Promise<void> {
+		return cancelJob();
+	}
 
 	// Auto-scroll the live output to the bottom as frames arrive.
 	$effect(() => {
@@ -190,31 +233,37 @@
 	);
 </script>
 
+<!--
+	Themed through --sctl-* custom properties, the same contract as
+	PlaybookViewer (see its style block); defaults are the dark console.
+-->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <!-- svelte-ignore a11y_click_events_have_key_events -->
-<div class="playbook-executor flex flex-col h-full bg-neutral-900 font-mono">
+<div class="playbook-executor sctl-pb flex flex-col h-full">
 	{#if playbook}
 		<div class="flex-1 overflow-y-auto min-h-0 px-3 py-2 space-y-3">
-			<!-- Description -->
-			<div class="text-[10px] text-neutral-500">{playbook.description}</div>
+			{#if description && playbook.description}
+				<div class="pb-muted">{playbook.description}</div>
+			{/if}
 
 			<!-- Parameters form -->
 			{#if paramEntries.length > 0}
 				<div>
-					<div class="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Parameters</div>
+					<div class="pb-label mb-1">Parameters</div>
 					<div class="space-y-1.5">
 						{#each paramEntries as [name, param]}
-							<div class="px-2 py-1.5 bg-neutral-800/30 rounded border border-neutral-800/50">
+							<div class="pb-param px-2 py-1.5">
 								<div class="flex items-baseline gap-1.5 mb-1">
-									<span class="text-[10px] text-neutral-300 font-semibold">{name}</span>
-									<span class="text-[9px] text-neutral-600">{param.type}</span>
+									<label class="pb-strong pb-code font-semibold" for="pb-param-{name}">{name}</label>
+									<span class="pb-faint pb-small">{param.type}</span>
 								</div>
 								{#if param.description}
-									<div class="text-[9px] text-neutral-500 mb-1.5">{param.description}</div>
+									<div class="pb-muted pb-small mb-1.5">{param.description}</div>
 								{/if}
 								{#if param.enum && param.enum.length > 0}
 									<select
-										class="w-full px-1.5 py-1 bg-neutral-800 border border-neutral-700 rounded text-[10px] text-neutral-200 focus:outline-none focus:border-neutral-500"
+										id="pb-param-{name}"
+										class="pb-field w-full"
 										value={paramValues[name] ?? ''}
 										onchange={(e) => { paramValues = { ...paramValues, [name]: (e.target as HTMLSelectElement).value }; }}
 									>
@@ -224,8 +273,9 @@
 									</select>
 								{:else}
 									<input
+										id="pb-param-{name}"
 										type="text"
-										class="w-full px-1.5 py-1 bg-neutral-800 border border-neutral-700 rounded text-[10px] text-neutral-200 focus:outline-none focus:border-neutral-500"
+										class="pb-field w-full"
 										value={paramValues[name] ?? ''}
 										placeholder={param.default !== undefined ? String(param.default) : param.type}
 										oninput={(e) => { paramValues = { ...paramValues, [name]: (e.target as HTMLInputElement).value }; }}
@@ -237,53 +287,49 @@
 				</div>
 			{/if}
 
-			<!-- Actions -->
-			<div class="flex items-center gap-2">
-				{#if onRunInTerminal}
+			{#if actions}
+				<div class="flex items-center gap-2">
+					{#if onRunInTerminal}
+						<button
+							class="pb-btn pb-btn-quiet flex items-center gap-1"
+							onclick={() => onRunInTerminal?.(previewScript)}
+							title="Send script to active terminal session"
+						>
+							<svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+								<polyline points="4 17 10 11 4 5" />
+								<line x1="12" y1="19" x2="20" y2="19" />
+							</svg>
+							Terminal
+						</button>
+					{/if}
+					<div class="flex-1"></div>
+					{#if executing && jobSessionId}
+						<button
+							class="pb-btn pb-btn-danger disabled:opacity-50 disabled:cursor-wait"
+							disabled={canceling}
+							onclick={cancelJob}
+						>{canceling ? 'Stopping...' : 'Cancel'}</button>
+					{/if}
 					<button
-						class="px-2 py-1 rounded text-[10px] transition-colors bg-neutral-800 text-neutral-400 hover:text-neutral-200 hover:bg-neutral-700 flex items-center gap-1"
-						onclick={() => onRunInTerminal?.(previewScript)}
-						title="Send script to active terminal session"
-					>
-						<svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-							<polyline points="4 17 10 11 4 5" />
-							<line x1="12" y1="19" x2="20" y2="19" />
-						</svg>
-						Terminal
-					</button>
-				{/if}
-				<div class="flex-1"></div>
-				{#if executing && jobSessionId}
-					<button
-						class="px-2 py-1 rounded text-[10px] transition-colors bg-red-900/40 text-red-400 hover:bg-red-900/60 disabled:opacity-50 disabled:cursor-wait"
-						disabled={canceling}
-						onclick={cancelJob}
-					>{canceling ? 'Stopping...' : 'Cancel'}</button>
-				{/if}
-				<button
-					class="px-2 py-1 rounded text-[10px] transition-colors
-						{executing
-							? 'bg-neutral-800 text-neutral-500 cursor-wait'
-							: confirmingExecute
-								? 'bg-red-900/40 text-red-400 hover:bg-red-900/60'
-								: 'bg-green-900/40 text-green-400 hover:bg-green-900/60'}"
-					disabled={executing}
-					onclick={() => {
-						if (confirmingExecute) {
-							confirmingExecute = false;
-							execute();
-						} else {
-							confirmingExecute = true;
-						}
-					}}
-					onmouseleave={() => { confirmingExecute = false; }}
-				>{executing ? 'Running...' : confirmingExecute ? 'Confirm?' : 'Execute'}</button>
-			</div>
+						class="pb-btn {executing ? 'pb-btn-quiet cursor-wait' : confirmingExecute ? 'pb-btn-danger' : 'pb-btn-ok'}"
+						disabled={executing}
+						onclick={() => {
+							if (confirmingExecute) {
+								confirmingExecute = false;
+								execute();
+							} else {
+								confirmingExecute = true;
+							}
+						}}
+						onmouseleave={() => { confirmingExecute = false; }}
+					>{executing ? 'Running...' : confirmingExecute ? 'Confirm?' : 'Execute'}</button>
+				</div>
+			{/if}
 
 			<!-- Script preview (collapsible) -->
 			<div>
 				<button
-					class="flex items-center gap-1 text-[10px] text-neutral-500 uppercase tracking-wide mb-1 hover:text-neutral-400 transition-colors"
+					class="pb-label pb-toggle flex items-center gap-1 mb-1"
 					onclick={() => { scriptPreviewExpanded = !scriptPreviewExpanded; }}
 				>
 					<svg class="w-3 h-3 transition-transform {scriptPreviewExpanded ? 'rotate-90' : ''}" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
@@ -292,15 +338,15 @@
 					Script Preview
 				</button>
 				{#if scriptPreviewExpanded}
-					<pre class="p-2 bg-neutral-800/50 border border-neutral-800 rounded text-[10px] text-neutral-300 whitespace-pre-wrap break-all">{previewScript}</pre>
+					<pre class="pb-pre whitespace-pre-wrap break-all">{previewScript}</pre>
 				{/if}
 			</div>
 
 			<!-- Error -->
 			{#if error}
 				<div>
-					<div class="text-[10px] text-red-400 uppercase tracking-wide mb-1">Error</div>
-					<div class="p-2 bg-red-900/20 border border-red-900/40 rounded text-[10px] text-red-300">{error}</div>
+					<div class="pb-label pb-danger-text mb-1">Error</div>
+					<div class="pb-error">{error}</div>
 				</div>
 			{/if}
 
@@ -308,40 +354,116 @@
 			{#if executing || liveOutput || result}
 				<div>
 					<div class="flex items-center gap-2 mb-1">
-						<span class="text-[10px] text-neutral-500 uppercase tracking-wide">Output</span>
+						<span class="pb-label">Output</span>
 						{#if executing}
-							<span class="text-[9px] text-green-400 flex items-center gap-1">
-								<span class="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse"></span>
+							<span class="pb-ok-text pb-small flex items-center gap-1">
+								<span class="pb-pulse w-1.5 h-1.5 rounded-full animate-pulse"></span>
 								running
 							</span>
 						{/if}
 						{#if result}
-							<span class="text-[9px] tabular-nums {result.exit_code === 0 ? 'text-green-400' : 'text-red-400'}">
+							<span class="pb-small tabular-nums {result.exit_code === 0 ? 'pb-ok-text' : 'pb-danger-text'}">
 								exit {result.exit_code}
 							</span>
-							<span class="text-[9px] text-neutral-600 tabular-nums">{result.duration_ms}ms</span>
+							<span class="pb-faint pb-small tabular-nums">{result.duration_ms}ms</span>
 							{#if onOpenViewer}
 								<div class="flex-1"></div>
-								<button
-									class="px-2 py-0.5 rounded text-[9px] bg-blue-500/15 text-blue-400 hover:bg-blue-500/25 transition-colors"
-									onclick={openFullOutput}
-								>view full output</button>
+								<button class="pb-btn pb-btn-info pb-small" onclick={openFullOutput}>view full output</button>
 							{/if}
 						{/if}
 					</div>
 					{#if liveOutput}
 						<pre
 							bind:this={outputEl}
-							class="p-2 bg-neutral-800/50 border border-neutral-800 rounded text-[10px] text-neutral-300 whitespace-pre-wrap break-all max-h-64 overflow-y-auto">{liveOutput}</pre>
+							class="pb-pre pb-output whitespace-pre-wrap break-all overflow-y-auto">{liveOutput}</pre>
 					{:else if executing}
-						<div class="p-2 bg-neutral-800/30 border border-neutral-800/50 rounded text-[10px] text-neutral-600">Waiting for output…</div>
+						<div class="pb-param pb-faint p-2">Waiting for output…</div>
 					{/if}
 				</div>
 			{/if}
 		</div>
 	{:else}
-		<div class="flex items-center justify-center h-full text-[10px] text-neutral-600">
+		<div class="pb-faint flex items-center justify-center h-full">
 			No playbook selected
 		</div>
 	{/if}
 </div>
+
+<style>
+	/* Same theme contract as PlaybookViewer. */
+	.sctl-pb {
+		background: var(--sctl-bg, #171717);
+		color: var(--sctl-text, #d4d4d4);
+		font-family: var(--sctl-font, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+		font-size: var(--sctl-text-xs, 10px);
+	}
+	.pb-strong { color: var(--sctl-text-strong, #e5e5e5); }
+	.pb-muted { color: var(--sctl-text-muted, #737373); }
+	.pb-faint { color: var(--sctl-text-faint, #525252); }
+	.pb-small { font-size: var(--sctl-text-2xs, 9px); }
+	.pb-code { font-family: var(--sctl-font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace); }
+	.pb-label {
+		color: var(--sctl-text-muted, #737373);
+		font-size: var(--sctl-text-label, var(--sctl-text-xs, 10px));
+		font-weight: var(--sctl-label-weight, 400);
+		text-transform: uppercase;
+		letter-spacing: 0.025em;
+	}
+	.pb-toggle { transition: color 150ms; }
+	.pb-toggle:hover { color: var(--sctl-text-secondary, #a3a3a3); }
+	.pb-param {
+		background: var(--sctl-surface, rgb(38 38 38 / 0.3));
+		border: 1px solid var(--sctl-border, rgb(38 38 38 / 0.5));
+		border-radius: var(--sctl-radius, 0.25rem);
+	}
+	.pb-field {
+		padding: var(--sctl-field-padding, 0.25rem 0.375rem);
+		background: var(--sctl-field-bg, #262626);
+		border: 1px solid var(--sctl-field-border, #404040);
+		border-radius: var(--sctl-radius, 0.25rem);
+		color: var(--sctl-text-strong, #e5e5e5);
+		font-family: var(--sctl-font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+		font-size: var(--sctl-text-xs, 10px);
+	}
+	.pb-field:focus { outline: none; border-color: var(--sctl-focus, #737373); box-shadow: none; }
+	.pb-pre {
+		padding: 0.5rem;
+		background: var(--sctl-code-bg, var(--sctl-surface, rgb(38 38 38 / 0.5)));
+		border: 1px solid var(--sctl-border, #262626);
+		border-radius: var(--sctl-radius, 0.25rem);
+		color: var(--sctl-code-text, var(--sctl-text, #d4d4d4));
+		font-family: var(--sctl-font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+		font-size: var(--sctl-text-xs, 10px);
+	}
+	/* Run output: its own pair, so a host can keep output terminal-dark
+	   while the script preview follows the page. */
+	.pb-output {
+		max-height: var(--sctl-output-max-height, 16rem);
+		background: var(--sctl-output-bg, var(--sctl-code-bg, var(--sctl-surface, rgb(38 38 38 / 0.5))));
+		color: var(--sctl-output-text, var(--sctl-code-text, var(--sctl-text, #d4d4d4)));
+	}
+	.pb-error {
+		padding: 0.5rem;
+		background: var(--sctl-danger-bg, rgb(127 29 29 / 0.2));
+		border: 1px solid var(--sctl-danger-border, rgb(127 29 29 / 0.4));
+		border-radius: var(--sctl-radius, 0.25rem);
+		color: var(--sctl-danger-text, #fca5a5);
+	}
+	.pb-ok-text { color: var(--sctl-success, #4ade80); }
+	.pb-danger-text { color: var(--sctl-danger, #f87171); }
+	.pb-pulse { background: var(--sctl-success, #4ade80); }
+	.pb-btn {
+		padding: 0.25rem 0.5rem;
+		border-radius: var(--sctl-radius, 0.25rem);
+		font-size: var(--sctl-text-xs, 10px);
+		transition: background-color 150ms, color 150ms;
+	}
+	.pb-btn-ok { background: var(--sctl-success-bg, rgb(20 83 45 / 0.4)); color: var(--sctl-success, #4ade80); }
+	.pb-btn-ok:hover { background: var(--sctl-success-bg-hover, rgb(20 83 45 / 0.6)); }
+	.pb-btn-danger { background: var(--sctl-danger-btn-bg, rgb(127 29 29 / 0.4)); color: var(--sctl-danger, #f87171); }
+	.pb-btn-danger:hover { background: var(--sctl-danger-btn-bg-hover, rgb(127 29 29 / 0.6)); }
+	.pb-btn-quiet { background: var(--sctl-field-bg, #262626); color: var(--sctl-text-secondary, #a3a3a3); }
+	.pb-btn-quiet:hover { color: var(--sctl-text-strong, #e5e5e5); background: var(--sctl-field-border, #404040); }
+	.pb-btn-info { background: var(--sctl-accent-bg, rgb(59 130 246 / 0.15)); color: var(--sctl-accent, #60a5fa); }
+	.pb-btn-info:hover { background: var(--sctl-accent-bg-hover, rgb(59 130 246 / 0.25)); }
+</style>
