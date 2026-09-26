@@ -86,6 +86,33 @@ pub fn interface_with_ipv4(ip: Ipv4Addr) -> Option<String> {
         .find_map(|(iface, addr)| (addr == ip).then_some(iface))
 }
 
+/// Send everything on the socket `fd` through interface `dev`
+/// (`SO_BINDTODEVICE`), whatever the routing table prefers. Binding to an
+/// address alone only picks the source; the kernel would still route by
+/// metric. Needs root (`CAP_NET_RAW`) on older kernels.
+#[cfg(unix)]
+pub fn bind_to_device(fd: &impl std::os::unix::io::AsRawFd, dev: &str) -> io::Result<()> {
+    let name = std::ffi::CString::new(dev)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid interface name"))?;
+    let len = libc::socklen_t::try_from(name.as_bytes_with_nul().len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface name too long"))?;
+    // SAFETY: the option value is a NUL-terminated name that outlives the call.
+    let ret = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            name.as_ptr().cast(),
+            len,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

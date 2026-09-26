@@ -109,6 +109,10 @@ level = "info"
 # url = "wss://relay.example.com/api/tunnel/register"
 # bind_address = "wwan0"           # Bind outbound WS to an interface NAME (LTE pinning);
 #                                  # an IP literal sets only the source address
+# relay_route = "off"              # "follow_default": sctl keeps one /32 to the relay (proto 83,
+#                                  # metric 0) on the lowest-metric uplink that reaches it.
+#                                  # Opt-in: some units route the relay over LTE on purpose.
+#                                  # Not together with bind_address.
 # tls_ca_file = "/etc/sctl/relay-ca.pem"  # Optional extra root CA for wss:// client mode
 # tls_server_cert_sha256 = "..."          # Optional relay leaf cert SHA-256 pin
 # reconnect_delay_secs = 2         # Initial backoff (client mode)

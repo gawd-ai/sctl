@@ -47,6 +47,7 @@
 //! reconnect_max_delay_secs = 30            # client mode, max backoff
 //! heartbeat_interval_secs = 5              # client mode, ping interval
 //! bind_address = "wwan0"                   # client mode, interface name or IP
+//! relay_route = "off"                      # client mode, "off" or "follow_default"
 //!
 //! # Optional — external comms plugin
 //! [comms]
@@ -304,6 +305,12 @@ pub struct TunnelConfig {
     /// Interface names are resolved to their current IPv4 on each connect
     /// attempt, surviving DHCP/carrier IP changes across reboots.
     pub bind_address: Option<String>,
+    /// Who keeps the host route to the relay (client mode, default `off`).
+    /// With `follow_default`, sctl keeps one `/32` to the relay through the
+    /// lowest-metric default route that reaches it. Conflicts with
+    /// `bind_address`.
+    #[serde(default)]
+    pub relay_route: RelayRouteMode,
     /// Optional PEM file with additional root CA certificates for `wss://`
     /// tunnel client connections. Public webpki roots remain enabled.
     pub tls_ca_file: Option<String>,
@@ -311,6 +318,18 @@ pub struct TunnelConfig {
     /// certificate DER. Checked after the normal rustls certificate validation
     /// and before device registration.
     pub tls_server_cert_sha256: Option<String>,
+}
+
+/// `[tunnel] relay_route`: who keeps the host route to the relay.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayRouteMode {
+    /// sctl leaves the route to the system (netifd, hotplugs, runbooks).
+    #[default]
+    Off,
+    /// sctl keeps one host route to the relay through the lowest-metric
+    /// default route that reaches it (`netwatch::owner`).
+    FollowDefault,
 }
 
 /// GPS/location configuration.
@@ -722,6 +741,14 @@ impl Config {
                     }
                 }
             }
+            if tc.relay_route != RelayRouteMode::Off && tc.bind_address.is_some() {
+                errors.push(
+                    "tunnel.relay_route = \"follow_default\" conflicts with tunnel.bind_address: \
+                     bind_address pins the tunnel to one interface, relay_route moves the \
+                     relay's route between uplinks; set one or the other"
+                        .to_string(),
+                );
+            }
             if tc.relay && tc.tunnel_key.len() < 8 {
                 errors.push(format!(
                     "tunnel.tunnel_key length {} is too short (min 8)",
@@ -818,5 +845,58 @@ impl Config {
             .map_or(default_heartbeat_interval(), |tc| {
                 tc.heartbeat_interval_secs.clamp(1, 15)
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client(extra: &str) -> Config {
+        toml::from_str(&format!(
+            "[tunnel]\ntunnel_key = \"k\"\nurl = \"wss://relay.example.com/api/tunnel/register\"\n{extra}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn relay_route_defaults_to_off() {
+        let config = client("");
+        assert_eq!(config.tunnel.unwrap().relay_route, RelayRouteMode::Off);
+    }
+
+    #[test]
+    fn relay_route_follow_default_is_valid_alone() {
+        let config = client("relay_route = \"follow_default\"");
+        assert_eq!(
+            config.tunnel.as_ref().unwrap().relay_route,
+            RelayRouteMode::FollowDefault
+        );
+        assert!(config.validate().is_empty(), "{:?}", config.validate());
+    }
+
+    #[test]
+    fn relay_route_with_bind_address_is_refused() {
+        let config = client("relay_route = \"follow_default\"\nbind_address = \"wwan0\"");
+        let errors = config.validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("relay_route"));
+        assert!(errors[0].contains("bind_address"));
+    }
+
+    #[test]
+    fn bind_address_alone_and_explicit_off_stay_valid() {
+        assert!(client("bind_address = \"wwan0\"").validate().is_empty());
+        let off = client("relay_route = \"off\"\nbind_address = \"wwan0\"");
+        assert!(off.validate().is_empty());
+    }
+
+    #[test]
+    fn an_unknown_relay_route_value_does_not_parse() {
+        let err = toml::from_str::<Config>(
+            "[tunnel]\ntunnel_key = \"k\"\nrelay_route = \"follow_wire\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("follow_default"), "{err}");
     }
 }

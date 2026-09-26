@@ -18,6 +18,7 @@ use crate::comms::{CommsClient, CommsState};
 use crate::config::Config;
 use crate::gawdxfer::manager::TransferManager;
 use crate::infra::InfraState;
+use crate::netwatch::owner::RelayRoute;
 use crate::netwatch::NetWatch;
 use crate::sessions::SessionManager;
 use crate::tunnel::history::RelayConnectionHistory;
@@ -69,6 +70,9 @@ pub struct AppState {
     /// kernel change (None in relay mode). Stays empty when the kernel's
     /// route socket is unavailable; `netwatch::next_state` waits on it.
     pub netwatch: Option<NetWatch>,
+    /// The relay route owner's shared side (tunnel client mode only): the
+    /// tunnel tells it how its connections go, `/api/health` reads its report.
+    pub relay_route: Option<Arc<RelayRoute>>,
 }
 
 /// Tunnel connection event types.
@@ -83,6 +87,9 @@ pub enum TunnelEventType {
     /// The kernel's route to the relay moved to another address, so the
     /// tunnel was redialed over it.
     Rehome,
+    /// sctl moved its host route to the relay to another uplink
+    /// (`[tunnel] relay_route`), or left it to a route it did not install.
+    RelayRoute,
 }
 
 impl TunnelEventType {
@@ -96,6 +103,7 @@ impl TunnelEventType {
             Self::ReconnectAttempt => "reconnect_attempt",
             Self::WatchdogAction => "watchdog_action",
             Self::Rehome => "rehome",
+            Self::RelayRoute => "relay_route",
         }
     }
 }

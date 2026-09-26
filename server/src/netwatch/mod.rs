@@ -13,6 +13,7 @@
 //! nothing, so its readers behave as if the network never changed.
 
 mod netlink;
+pub mod owner;
 pub mod route;
 pub mod source;
 

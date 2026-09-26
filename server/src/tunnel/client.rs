@@ -30,6 +30,7 @@ use tracing::{error, info, warn};
 use crate::activity::{self, ActivityType, CachedExecResult};
 use crate::atomic::AtomicU64;
 use crate::config::TunnelConfig;
+use crate::netwatch::owner::TunnelSignal;
 use crate::netwatch::{self, source, NetWatch};
 use crate::sessions::buffer::{OutputBuffer, OutputEntry};
 use crate::state::{TunnelEventType, TunnelPath};
@@ -196,6 +197,15 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
             .tunnel_stats
             .reconnecting
             .store(false, Ordering::Relaxed);
+        // What a dead way to the relay causes, as opposed to the relay
+        // answering (a close, a shutdown, a rejected key) or a move.
+        let path_failed = matches!(
+            result,
+            Ok(DisconnectReason::PongTimeout
+                | DisconnectReason::ReadError
+                | DisconnectReason::WriterExit)
+                | Err(ConnectError::Path(_))
+        );
         // The connection is gone; keep where the relay was and which address
         // the attempt left from.
         let from = match state.tunnel_stats.set_path(None) {
@@ -209,6 +219,11 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
             }
             _ => dialed_from,
         };
+        if path_failed {
+            if let Some(route) = &state.relay_route {
+                route.signal(TunnelSignal::Failed { from });
+            }
+        }
         let class = match result {
             Ok(DisconnectReason::Rehome) => {
                 // The move itself was logged and recorded as it was decided.
@@ -255,7 +270,7 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
                     .await;
                 DelayClass::AuthRejected
             }
-            Err(ConnectError::Transient(e)) => {
+            Err(ConnectError::Transient(e) | ConnectError::Path(e)) => {
                 let msg = e.to_string();
                 state
                     .tunnel_stats
@@ -565,13 +580,18 @@ enum ConnectError {
     AuthRejected(String),
     /// DNS timeout, TCP timeout, TLS failure — exponential backoff.
     Transient(Box<dyn std::error::Error + Send + Sync>),
+    /// The way to the relay failed: no address answered the dial, or the
+    /// connection broke or stalled before registration completed. Retried
+    /// exactly like [`ConnectError::Transient`]; the relay route owner also
+    /// counts it against the uplink it left from.
+    Path(Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConnectError::AuthRejected(msg) => write!(f, "{msg}"),
-            ConnectError::Transient(e) => write!(f, "{e}"),
+            ConnectError::Transient(e) | ConnectError::Path(e) => write!(f, "{e}"),
         }
     }
 }
@@ -646,10 +666,13 @@ fn set_tcp_keepalive(stream: &TcpStream, idle: u32, interval: u32, count: u32) {
 /// Many embedded devices (LTE/CGNAT) have broken IPv6 routes that cause ~4 minute
 /// TCP connect timeouts before falling back to IPv4. By sorting IPv4 first we
 /// avoid the delay.
+///
+/// A resolved relay that no address answers is a [`ConnectError::Path`]; a
+/// failed lookup or an unusable `bind_address` is not.
 async fn connect_tcp_ipv4_preferred(
     url: &str,
     bind_address: Option<&str>,
-) -> Result<TcpStream, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<TcpStream, ConnectError> {
     // Parse host:port from wss:// or ws:// URL
     let without_scheme = url
         .strip_prefix("wss://")
@@ -672,16 +695,19 @@ async fn connect_tcp_ipv4_preferred(
     let mut addrs: Vec<SocketAddr> =
         tokio::time::timeout(Duration::from_secs(10), tokio::net::lookup_host(&host_port))
             .await
-            .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("DNS lookup timed out (10s) for {host}").into()
-            })??
+            .map_err(|_| {
+                ConnectError::Transient(format!("DNS lookup timed out (10s) for {host}").into())
+            })?
+            .map_err(|e| ConnectError::Transient(e.into()))?
             .collect();
 
     // Sort: IPv4 first, then IPv6
     addrs.sort_by_key(|a| i32::from(!a.is_ipv4()));
 
     if addrs.is_empty() {
-        return Err(format!("DNS resolution failed for {host}").into());
+        return Err(ConnectError::Transient(
+            format!("DNS resolution failed for {host}").into(),
+        ));
     }
 
     // Resolve bind address (accepts IP or interface name like "wwan0")
@@ -704,10 +730,10 @@ async fn connect_tcp_ipv4_preferred(
                     (Some(ip), iface)
                 }
                 None => {
-                    return Err(format!(
-                        "bind_address '{s}' not available (interface down or no IPv4?)"
-                    )
-                    .into());
+                    return Err(ConnectError::Transient(
+                        format!("bind_address '{s}' not available (interface down or no IPv4?)")
+                            .into(),
+                    ));
                 }
             }
         }
@@ -720,13 +746,16 @@ async fn connect_tcp_ipv4_preferred(
                 s.parse::<std::net::IpAddr>()
                     .map_err(|e| format!("invalid bind_address '{s}': {e}"))
             })
-            .transpose()?;
+            .transpose()
+            .map_err(|e| ConnectError::Transient(e.into()))?;
         (addr, None)
     };
 
     if let Some(ref ba) = bind_addr {
         if !is_local_address_available(ba).await {
-            return Err(format!("bind_address {ba} not available (interface down?)").into());
+            return Err(ConnectError::Transient(
+                format!("bind_address {ba} not available (interface down?)").into(),
+            ));
         }
     }
 
@@ -747,20 +776,7 @@ async fn connect_tcp_ipv4_preferred(
                 // interface (typically eth/LAN), causing asymmetric routing failures.
                 #[cfg(unix)]
                 if let Some(ref iface) = bind_iface {
-                    let fd = socket.as_raw_fd();
-                    let c_iface = std::ffi::CString::new(iface.as_str())
-                        .map_err(|_| std::io::Error::other("invalid interface name"))?;
-                    let ret = unsafe {
-                        libc::setsockopt(
-                            fd,
-                            libc::SOL_SOCKET,
-                            libc::SO_BINDTODEVICE,
-                            c_iface.as_ptr().cast(),
-                            c_iface.as_bytes_with_nul().len() as libc::socklen_t,
-                        )
-                    };
-                    if ret != 0 {
-                        let err = std::io::Error::last_os_error();
+                    if let Err(err) = source::bind_to_device(&socket, iface) {
                         warn!("Tunnel: SO_BINDTODEVICE({iface}) failed: {err}");
                         return Err(err);
                     }
@@ -798,7 +814,9 @@ async fn connect_tcp_ipv4_preferred(
         }
     }
 
-    Err(last_err.unwrap_or_else(|| "all addresses failed".into()))
+    Err(ConnectError::Path(
+        last_err.unwrap_or_else(|| "all addresses failed".into()),
+    ))
 }
 
 fn tunnel_url_host(url: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -1001,9 +1019,7 @@ async fn connect_and_run(
     let connect_start = Instant::now();
 
     // DNS + TCP with IPv4 preference (avoids long IPv6 timeouts on LTE/CGNAT)
-    let tcp_stream = connect_tcp_ipv4_preferred(&url, config.bind_address.as_deref())
-        .await
-        .map_err(ConnectError::Transient)?;
+    let tcp_stream = connect_tcp_ipv4_preferred(&url, config.bind_address.as_deref()).await?;
     let tcp_elapsed = connect_start.elapsed();
     let path = tunnel_path(&tcp_stream);
     if let Some(ref p) = path {
@@ -1040,8 +1056,17 @@ async fn connect_and_run(
         connect_tunnel_io(&url, tcp_stream, config),
     )
     .await
-    .map_err(|_| ConnectError::Transient("TLS handshake timed out (15s)".into()))?
-    .map_err(ConnectError::Transient)?;
+    .map_err(|_| ConnectError::Path("TLS handshake timed out (15s)".into()))?
+    .map_err(|e| {
+        // A handshake that broke on the wire (or met a certificate from
+        // something other than the relay) is an io::Error; a bad CA file or
+        // server name is not, and says nothing about the path.
+        if e.is::<std::io::Error>() {
+            ConnectError::Path(e)
+        } else {
+            ConnectError::Transient(e)
+        }
+    })?;
     let mut ws_request = {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
         url.as_str()
@@ -1056,7 +1081,7 @@ async fn connect_and_run(
         tokio_tungstenite::client_async(ws_request, tunnel_io),
     )
     .await
-    .map_err(|_| ConnectError::Transient("TLS/WS handshake timed out (15s)".into()))?
+    .map_err(|_| ConnectError::Path("TLS/WS handshake timed out (15s)".into()))?
     .map_err(|e| match &e {
         // The relay validates the tunnel key AT THE UPGRADE (it rides the
         // registration URL), so a rotated key surfaces as an HTTP 401/403
@@ -1073,6 +1098,9 @@ async fn connect_and_run(
                 resp.status()
             ))
         }
+        tokio_tungstenite::tungstenite::Error::Io(_)
+        | tokio_tungstenite::tungstenite::Error::ConnectionClosed
+        | tokio_tungstenite::tungstenite::Error::AlreadyClosed => ConnectError::Path(e.into()),
         _ => ConnectError::Transient(e.into()),
     })?;
     let tls_elapsed = tls_start.elapsed();
@@ -1094,7 +1122,7 @@ async fn connect_and_run(
                     .into(),
             ))
             .await
-            .map_err(|e| ConnectError::Transient(e.into()))?;
+            .map_err(|e| ConnectError::Path(e.into()))?;
     }
 
     // Wait for registration ack with timeout
@@ -1125,6 +1153,11 @@ async fn connect_and_run(
                                     format!("latency {}ms", total.as_millis()),
                                 )
                                 .await;
+                            if let (Some(route), Some((relay, local))) =
+                                (&state.relay_route, path.as_ref().and_then(rehome_ends))
+                            {
+                                route.signal(TunnelSignal::Registered { relay, local });
+                            }
                         }
                         "error" => {
                             let code = msg["code"].as_str().unwrap_or("");
@@ -1158,15 +1191,15 @@ async fn connect_and_run(
             ));
         }
         Ok(Some(Err(e))) => {
-            return Err(ConnectError::Transient(e.into()));
+            return Err(ConnectError::Path(e.into()));
         }
         Ok(None) => {
-            return Err(ConnectError::Transient(
+            return Err(ConnectError::Path(
                 "Connection closed during registration".into(),
             ));
         }
         Err(_) => {
-            return Err(ConnectError::Transient(
+            return Err(ConnectError::Path(
                 "Registration ack timed out (10s)".into(),
             ));
         }

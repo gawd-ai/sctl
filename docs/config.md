@@ -57,6 +57,9 @@ exits. The rules:
 - `tunnel.url` must start with `ws://` or `wss://`; the TLS options
   (`tls_ca_file`, `tls_server_cert_sha256`) require a `wss://` URL.
 - Relay mode requires `tunnel.tunnel_key` of at least 8 characters.
+- `tunnel.relay_route = "follow_default"` cannot be combined with
+  `tunnel.bind_address`: one pins the tunnel to an interface, the other moves
+  the relay's route between uplinks.
 - `[gps]` or `[lte]` require an enabled `[comms]` section (see below).
 
 ## `[server]`
@@ -155,6 +158,7 @@ disable tunneling. Two mutually exclusive modes:
 | `heartbeat_timeout_secs` | `45` | Seconds without a heartbeat before the relay declares a device dead (relay mode). |
 | `tunnel_proxy_timeout_secs` | `60` | Default proxy request timeout (relay mode); the source of relay `504 TIMEOUT` errors. |
 | `bind_address` | *(none)* | Local address **or interface name** to bind outbound tunnel connections to (client mode). Interface names are resolved to their current IPv4 on each connect attempt (survives DHCP/carrier changes) and get `SO_BINDTODEVICE`; an IP literal sets only the source address and does **not** pin egress to the interface. Either way the tunnel stays where it is bound and does not follow the kernel's route changes. |
+| `relay_route` | `"off"` | Who keeps the host route to the relay (client mode). `"off"` leaves it to the system. `"follow_default"` makes sctl keep one route to the relay on the best uplink that reaches it; see below. Refused together with `bind_address`. |
 | `tls_ca_file` | *(none)* | PEM file with additional root CAs for `wss://` client connections. Public webpki roots stay enabled. |
 | `tls_server_cert_sha256` | *(none)* | SHA-256 pin (lowercase hex or colon-separated) for the relay's leaf certificate DER; checked after normal rustls validation. |
 
@@ -162,6 +166,47 @@ Routes sctl installs on the device carry route protocol `83`, a value the
 kernel's list leaves unassigned, so `ip route show proto 83` lists exactly
 those. sctl deletes a route only by naming that protocol, so it never
 removes a route that netifd, DHCP or an operator added.
+
+### `relay_route`
+
+With `relay_route = "follow_default"`, sctl owns one route:
+`<relay>/32 via <gw> dev <uplink> metric 0 proto 83`, where `<relay>` is the
+address the tunnel connected to. At metric 0 it outranks the pin netifd adds
+for the WireGuard endpoint (the same address), which is left in place as the
+fallback. The route stays when sctl exits, because WireGuard uses it too.
+
+- **Which uplink.** The lowest-metric default route whose interface is not
+  suspect. netifd's metrics already rank the wire above LTE. The choice is
+  made again on every network change the kernel reports (after a quiet
+  second) and after every registration with the relay.
+- **Only an uplink that answers.** Before the route moves to an uplink the
+  tunnel is not already on, sctl opens a TCP connection to the relay bound
+  to that interface (`SO_BINDTODEVICE`, as `bind_address` does). An uplink
+  that does not answer is marked suspect.
+- **Link up, internet dead.** No kernel event fires, so the tunnel's own
+  failures are the signal: a dial nothing answers, a handshake that breaks
+  or stalls, a pong timeout, a read or write error. After two in a row on
+  the uplink the route uses, every other uplink holding a default route is
+  asked in metric order, and the route moves to the first that answers. The
+  tunnel then follows the route (see the `rehome` event in the HTTP API).
+- **Coming back.** A suspect uplink is asked again at once when the kernel
+  reports a change on it (link, address or default route: a replug, a new
+  DHCP lease). Otherwise, and only while an uplink is suspect, it is probed
+  after 2, 5 and 10 minutes, then every 15 minutes, and it gets the route
+  back after two good probes in a row. With nothing suspect, no timer runs.
+- **Someone else's route.** A `/32` to the relay at metric 0 that sctl did
+  not install (a hand-added pin, an older hotplug) is never replaced: sctl
+  leaves the relay to it, records a `relay_route` event saying so, and takes
+  over once that route is gone.
+- **Reporting.** `/api/health` shows `tunnel.relay_route`, and every move is
+  a `relay_route` tunnel event such as
+  `eth1 -> wwan0 (eth1: no answer from the relay)`.
+
+It is opt-in because some units route the relay on purpose: the BPI units
+keep it on LTE for out-of-band access, and the WE826 pins the tunnel with
+`bind_address`. The answer to a probe arrives
+on the uplink it left by, so reverse-path filtering on the uplinks must be
+loose (`rp_filter = 2`) or off, as `bind_address` already requires.
 
 ## `[comms]`
 

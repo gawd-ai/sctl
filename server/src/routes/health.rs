@@ -84,6 +84,7 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
             "rtt_p95_ms": rtt_p95,
             "recent_events": recent_events,
             "path": ts.path(),
+            "relay_route": state.relay_route.as_ref().map(|r| r.report()),
         })
     } else {
         json!({

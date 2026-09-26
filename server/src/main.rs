@@ -42,7 +42,7 @@ use sctl::{
     activity::ActivityLog,
     auth::ApiKey,
     comms,
-    config::Config,
+    config::{Config, RelayRouteMode},
     infra, lte_watchdog, netwatch, routes, sessions,
     sessions::SessionManager,
     state::{AppState, TunnelStats},
@@ -504,6 +504,12 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         let (tx, rx) = netwatch::channel();
         (Some(Arc::new(tx)), Some(rx))
     };
+    // The relay route owner's shared side, in tunnel client mode.
+    let relay_route = config
+        .tunnel
+        .as_ref()
+        .filter(|tc| tc.url.is_some() && !tc.relay)
+        .map(|tc| Arc::new(netwatch::owner::RelayRoute::new(tc.relay_route)));
 
     let mut state = AppState {
         session_manager,
@@ -524,6 +530,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         infra_state: Some(infra_state.clone()),
         api_router: Arc::new(std::sync::OnceLock::new()),
         netwatch: net_rx,
+        relay_route,
     };
 
     // Build router
@@ -795,6 +802,25 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         })
     });
 
+    // The relay route owner ([tunnel] relay_route = "follow_default"). It
+    // needs the network watch; stopping it leaves its route in place.
+    let relay_route_task = state
+        .relay_route
+        .clone()
+        .filter(|route| route.mode() != RelayRouteMode::Off)
+        .zip(state.netwatch.clone())
+        .map(|(route, net)| {
+            let tunnel_stats = state.tunnel_stats.clone();
+            spawn_supervised("relay_route", SUPERVISED_RESTART_DELAY, move || {
+                netwatch::owner::run(
+                    route.clone(),
+                    net.clone(),
+                    tunnel_stats.clone(),
+                    netwatch::owner::Timing::default(),
+                )
+            })
+        });
+
     // Tunnel: spawn client if configured, with panic-recovery supervisor.
     // The client loop never returns on its own (even a rejected tunnel key is
     // retried on a slow cadence — a tunnel-only device that stops retrying is
@@ -972,6 +998,9 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     sweep_task.abort();
     tunnel_events_flush_task.abort();
     if let Some(task) = netwatch_task {
+        task.abort();
+    }
+    if let Some(task) = relay_route_task {
         task.abort();
     }
     if let Some(task) = relay_sweep_task {

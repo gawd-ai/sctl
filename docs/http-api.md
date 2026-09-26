@@ -106,8 +106,8 @@ Response `200`:
 - `tunnel` — in tunnel-client mode, extended with `uptime_secs`,
   `messages_sent/received`, `last_pong_age_ms`, `dropped_outbound`,
   `stream_backpressure_events`, `stream_replay_events`, `rtt_median_ms`,
-  `rtt_p95_ms`, `recent_events` (last 10 tunnel events) and `path`.
-  Otherwise only `{connected, reconnects}`.
+  `rtt_p95_ms`, `recent_events` (last 10 tunnel events), `path` and
+  `relay_route`. Otherwise only `{connected, reconnects}`.
 - `tunnel.path`: where the tunnel's TCP connection runs,
   `{"local": "192.168.8.20:40022", "remote": "174.138.114.209:443", "dev": "eth1"}`.
   `dev` is the interface holding the local address (`null` for IPv6).
@@ -117,6 +117,13 @@ Response `200`:
   to another address, the tunnel redials over it and records a `rehome`
   event such as `eth1 192.168.8.20 -> wwan0 10.64.3.2` (not with
   `bind_address`, which pins the tunnel).
+- `tunnel.relay_route`: the host route sctl keeps to the relay
+  (`[tunnel] relay_route` in the configuration reference),
+  `{"mode": "follow_default", "dev": "eth1", "via": "10.42.0.1", "suspect": []}`.
+  `mode` is `off` or `follow_default`; `dev` and `via` are `null` while sctl
+  holds no route (always with `off`); `suspect` lists the uplinks that did
+  not answer the relay and are waiting to be asked again. Each move is a
+  `relay_route` event such as `eth1 -> wwan0 (eth1: no answer from the relay)`.
 - `gps` / `lte` — `null` when the subsystem is not configured;
   `{"status": "no_signal"}` / `{"status": "provider_unavailable"}` when
   configured but degraded.
@@ -148,7 +155,8 @@ Response `200` — an object containing only the requested groups:
 - `disk` — `disk` (root filesystem `total_bytes`/`used_bytes`, kept for
   back-compat) plus `disks` (all mounted storages).
 - `tunnel` — `{connected, relay_url, reconnects}` (tunnel-client mode only;
-  absent otherwise), plus `path`, the same object as in `/api/health`.
+  absent otherwise), plus `path` and `relay_route`, the same objects as in
+  `/api/health`.
 - `gps` — `status` plus, when a fix exists, `latitude`, `longitude`,
   `altitude`, `satellites`, `speed_kmh`, `course`, `hdop`, `fix_age_secs`
   (absent when GPS is not configured).
