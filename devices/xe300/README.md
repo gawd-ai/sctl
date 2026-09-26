@@ -112,6 +112,46 @@ the device, and `rundev.sh` prints that log when the upgrade rolls back.
 is `mips`, which has no `ARCH_TARGET` entry. Over SSH, use `install.sh`, which
 preserves the `[tunnel]` block.
 
+### Bench check: can netifd leave the relay alone?
+
+netifd's WireGuard handler pins a `/32` to each peer endpoint, which is the relay,
+through whichever uplink was up when `wg0` came up. The agent's metric 0 route
+outranks that pin, so the pin does no harm, but newer handlers read
+`option nohostroute '1'` on the interface and then add no pin at all. Before
+deciding whether the upgrade should set it, check on a bench unit which handler
+the firmware ships:
+
+```sh
+grep -n nohostroute /lib/netifd/proto/wireguard.sh
+```
+
+Over SSH (see below for the options this dropbear needs):
+
+```sh
+ssh -o 'HostKeyAlgorithms=+ssh-rsa' -o 'PubkeyAcceptedAlgorithms=+ssh-rsa' \
+    root@192.168.8.1 'grep -n nohostroute /lib/netifd/proto/wireguard.sh'
+```
+
+Or through the relay, with the unit's API key and no SSH:
+
+```sh
+curl -sf -X POST "https://<relay>/d/<serial>/api/exec" \
+    -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
+    -d '{"command": "grep -n nohostroute /lib/netifd/proto/wireguard.sh"}' | jq .
+```
+
+- **Lines printed** (exit code 0): the handler supports it. The upgrade could then
+  set it on `wg0` (`uci set network.wg0.nohostroute='1'`, `uci commit network`,
+  `ifup wg0`) so that netifd never pins the endpoint and the agent's route is the
+  only one to the relay.
+- **Nothing printed** (exit code 1): this firmware's handler always pins the
+  endpoint, and the agent's route outranking the pin is the whole answer.
+- **No such file** (exit code 2): WireGuard is not set up through netifd here;
+  look at how `wg0` is brought up before deciding anything.
+
+Neither `install.sh` nor the remote upgrade sets `nohostroute` today: it waits
+for this check.
+
 ## SSH access
 
 GL.iNet firmware 3.x ships **dropbear 2019.78**, which:
