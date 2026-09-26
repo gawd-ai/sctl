@@ -1109,7 +1109,8 @@ one), then `replay.done`, then live frames:
   `ws_close`, `writer_failed`, `write_path_dead`, `heartbeat_timeout`,
   `send_failed` or `relay_shutdown`. A connection replaced by a newer one
   for the same serial gets no `device.disconnected`: the new
-  `device.connected` supersedes it.
+  `device.connected` supersedes it. No `net.state` for a connection follows
+  its `device.disconnected`.
 - `serial` is always the one the relay registered, never a value from the
   device's payload.
 - The replay can repeat a frame that also arrives live; deduplicate by

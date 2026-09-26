@@ -1366,11 +1366,11 @@ async fn handle_device_ws(
                             continue;
                         }
                         // A connection a newer one replaced, or the sweep
-                        // evicted, speaks for nobody.
-                        let current = state
-                            .devices
-                            .read()
-                            .await
+                        // evicted, speaks for nobody. The map stays read-locked
+                        // until the frame is published, so a removal (and its
+                        // device.disconnected) waits for it.
+                        let devices = state.devices.read().await;
+                        let current = devices
                             .get(&serial)
                             .is_some_and(|d| d.connection_id == connection_id);
                         if !current {
@@ -1387,6 +1387,7 @@ async fn handle_device_ws(
                         // subscribes in between finds it in its snapshot.
                         *last_net_state.write().await = Some(stored);
                         state.publish(&frame);
+                        drop(devices);
                         let clients_read = clients.read().await;
                         for client_tx in clients_read.values() {
                             if client_tx.try_send(payload.clone()).is_err() {

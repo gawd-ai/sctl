@@ -386,6 +386,46 @@ async fn departures_are_announced_on_close_and_on_the_sweep() {
 }
 
 #[tokio::test]
+async fn no_net_state_follows_its_connections_departure() {
+    let relay = relay().await;
+    let (mut device, _) = relay.device("DEV-1", json!(["net.state"])).await;
+    let (mut sub, _) = relay.subscribe_replayed().await;
+
+    // Hold the connection's net.state slot: the handler takes the report,
+    // finds its connection current, and waits here to store it.
+    let slot = relay.state.devices.read().await["DEV-1"]
+        .last_net_state
+        .clone();
+    let held = slot.write().await;
+    send(&mut device, &net_state("10.42.0.7/24")).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Meanwhile the sweep evicts the connection.
+    let mut sweeper = relay.state.clone();
+    sweeper.heartbeat_timeout_secs = 0;
+    let sweep = tokio::spawn(async move { sweeper.sweep_dead_devices().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(held);
+    assert_eq!(sweep.await.unwrap(), vec!["DEV-1".to_string()]);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while slot.read().await.is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the handler stores the report it took");
+
+    relay.state.publish(&json!({"type": "test.marker"}));
+    let frames = until(&mut sub, "test.marker").await;
+    let kinds: Vec<&str> = frames.iter().map(|f| f["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        ["net.state", "device.disconnected"],
+        "a report is never published after its connection's departure: {frames:?}"
+    );
+}
+
+#[tokio::test]
 async fn relay_shutdown_announces_every_departure() {
     let relay = relay().await;
     let (_a, _) = relay.device("DEV-A", json!([])).await;
