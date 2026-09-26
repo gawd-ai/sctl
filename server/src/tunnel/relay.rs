@@ -4,10 +4,12 @@
 //! 1. Listens for device WS connections at `/api/tunnel/register`
 //! 2. Exposes REST + WS proxy at `/d/{serial}/api/*`
 //! 3. Translates client requests to tunnel messages over the device WS
+//! 4. Streams device arrivals, departures and `net.state` pushes to at most
+//!    [`MAX_EVENT_SUBSCRIBERS`] subscribers at `/api/tunnel/events`
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -22,8 +24,8 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock};
-use tracing::{info, info_span, warn, Instrument};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, RwLock};
+use tracing::{debug, info, info_span, warn, Instrument};
 
 use crate::atomic::AtomicU64;
 
@@ -32,6 +34,23 @@ use super::{decode_binary_frame, encode_binary_frame, TunnelMessage, TunnelRespo
 
 /// Max time to wait to enqueue a request onto a device's tunnel queue.
 const DEVICE_QUEUE_SEND_TIMEOUT_SECS: u64 = 5;
+
+/// Features this relay advertises in `tunnel.register.ack` and in the event
+/// stream's `hello`.
+const RELAY_FEATURES: [&str; 1] = [super::net_state::FEATURE];
+/// A device's features are kept up to this many entries of this many bytes.
+const MAX_DEVICE_FEATURES: usize = 16;
+const MAX_FEATURE_BYTES: usize = 32;
+/// Frames the event bus holds for its slowest subscriber before that one is
+/// resynchronized.
+pub const EVENT_BUS_CAPACITY: usize = 1024;
+/// Concurrent `/api/tunnel/events` subscribers; the next one gets 429.
+pub const MAX_EVENT_SUBSCRIBERS: usize = 8;
+/// A subscriber that does not take a frame within this is dropped.
+const EVENT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The relay pings each subscriber this often, and drops one it has not
+/// heard from (a pong, anything) in three intervals.
+const EVENT_PING_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Snapshot of last-known device state, persisted across disconnects and relay restarts.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -88,6 +107,23 @@ pub struct RelayState {
     pub snapshots_dirty: Arc<AtomicBool>,
     /// Path to snapshot persistence file (None if no data_dir configured).
     pub snapshots_path: Option<PathBuf>,
+    /// The event bus behind `/api/tunnel/events`: each frame is serialized
+    /// once and published without blocking; a subscriber that falls
+    /// [`EVENT_BUS_CAPACITY`] frames behind is resynchronized.
+    pub events: broadcast::Sender<Arc<str>>,
+    /// Open `/api/tunnel/events` subscribers.
+    pub event_subscribers: Arc<AtomicUsize>,
+    /// When this relay started, unix ms (`relay_epoch` in the stream's hello).
+    pub started_at_ms: u64,
+}
+
+/// The latest `net.state` a device sent on its current connection.
+#[derive(Clone, Debug)]
+pub struct StoredNetState {
+    /// When the relay received it, unix ms.
+    pub received_at: u64,
+    /// The device's message as it sent it.
+    pub state: Value,
 }
 
 /// A device connected to the relay via its outbound WS tunnel.
@@ -133,6 +169,14 @@ pub struct ConnectedDevice {
     /// an error: a direct connection or an unconfigured proxy is a deployment
     /// choice, not a fault.
     pub egress_ip: Option<String>,
+    /// When this connection registered, unix ms.
+    pub connected_at_ms: u64,
+    /// Features the device offered in `tunnel.register` (at most 16, of at
+    /// most 32 bytes each).
+    pub features: Vec<String>,
+    /// The latest `net.state` on this connection. Unlike GPS and LTE it is
+    /// not carried over a reconnect: a new connection starts with none.
+    pub last_net_state: Arc<RwLock<Option<StoredNetState>>>,
 }
 
 /// Drain all pending requests for a device, sending error responses on each oneshot.
@@ -174,6 +218,61 @@ async fn drain_device(device: &ConnectedDevice, reason: &str) {
     }
 }
 
+/// Unix time now, in ms.
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// `device.connected` for the event stream.
+fn device_connected_frame(device: &ConnectedDevice, replay: bool) -> Value {
+    json!({
+        "type": "device.connected",
+        "serial": device.serial,
+        "connection_id": device.connection_id,
+        "connected_at": device.connected_at_ms,
+        "egress_ip": device.egress_ip,
+        "features": device.features,
+        "replay": replay,
+    })
+}
+
+/// `net.state` for the event stream: the device's message under `state`,
+/// named by the serial the relay registered, never one from the payload.
+fn net_state_frame(
+    serial: &str,
+    connection_id: u64,
+    stored: &StoredNetState,
+    replay: bool,
+) -> Value {
+    json!({
+        "type": "net.state",
+        "serial": serial,
+        "connection_id": connection_id,
+        "received_at": stored.received_at,
+        "state": stored.state,
+        "replay": replay,
+    })
+}
+
+/// The features a device offered: strings of 1 to [`MAX_FEATURE_BYTES`]
+/// bytes, at most [`MAX_DEVICE_FEATURES`] of them. Anything else is dropped.
+fn device_features(offered: &Value) -> Vec<String> {
+    offered
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .filter(|f| !f.is_empty() && f.len() <= MAX_FEATURE_BYTES)
+                .take(MAX_DEVICE_FEATURES)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 impl RelayState {
     pub fn new(
         tunnel_key: String,
@@ -206,7 +305,39 @@ impl RelayState {
             next_connection_id: Arc::new(AtomicU64::new(1)),
             snapshots_dirty: Arc::new(AtomicBool::new(false)),
             snapshots_path,
+            events: broadcast::channel(EVENT_BUS_CAPACITY).0,
+            event_subscribers: Arc::new(AtomicUsize::new(0)),
+            started_at_ms: unix_ms(),
         }
+    }
+
+    /// Publish one frame to the event stream's subscribers. Serialized once;
+    /// never waits (with no subscriber the frame is simply dropped).
+    pub fn publish(&self, frame: &Value) {
+        match serde_json::to_string(frame) {
+            Ok(text) => {
+                let _ = self.events.send(Arc::from(text));
+            }
+            Err(e) => warn!("Relay events: serialize failed: {e}"),
+        }
+    }
+
+    /// A device connection registered: call after it is in the device map.
+    fn on_connect(&self, device: &ConnectedDevice) {
+        self.publish(&device_connected_frame(device, false));
+    }
+
+    /// A device connection ended: call after it left the device map, and
+    /// never for a connection a newer one replaced (its `device.connected`
+    /// supersedes this).
+    fn on_disconnect(&self, serial: &str, connection_id: u64, reason: &str) {
+        self.publish(&json!({
+            "type": "device.disconnected",
+            "serial": serial,
+            "connection_id": connection_id,
+            "reason": reason,
+            "replay": false,
+        }));
     }
 
     /// Evict devices whose heartbeat is older than `heartbeat_timeout_secs`.
@@ -231,6 +362,7 @@ impl RelayState {
                     let cid = device.connection_id;
                     drain_device(device, "heartbeat timeout").await;
                     devices.remove(&serial);
+                    self.on_disconnect(&serial, cid, "heartbeat_timeout");
                     self.history
                         .record_disconnect(&serial, cid, "heartbeat_timeout", hb_age)
                         .await;
@@ -272,6 +404,7 @@ impl RelayState {
                 }
                 devices.remove(serial);
                 if let Some(cid) = cid {
+                    self.on_disconnect(serial, cid, "send_failed");
                     self.history
                         .record_disconnect(serial, cid, "send_failed", None)
                         .await;
@@ -284,14 +417,14 @@ impl RelayState {
     /// Drain all devices and clear state (used during relay shutdown).
     pub async fn drain_all(&self) {
         let mut devices = self.devices.write().await;
-        for (serial, device) in devices.iter() {
-            drain_device(device, "relay shutting down").await;
+        for (serial, device) in devices.drain() {
+            drain_device(&device, "relay shutting down").await;
+            self.on_disconnect(&serial, device.connection_id, "relay_shutdown");
             self.history
-                .record_disconnect(serial, device.connection_id, "relay_shutdown", None)
+                .record_disconnect(&serial, device.connection_id, "relay_shutdown", None)
                 .await;
             info!(serial = %serial, "Drained device for relay shutdown");
         }
-        devices.clear();
     }
 
     /// Touch a device's snapshot `last_seen` timestamp (e.g. on device registration).
@@ -433,7 +566,8 @@ pub fn relay_router(relay_state: RelayState) -> Router {
     // Tunnel management endpoints (authenticated with tunnel_key)
     let tunnel_admin = Router::new()
         .route("/api/tunnel/register", get(device_register_ws))
-        .route("/api/tunnel/devices", get(list_devices));
+        .route("/api/tunnel/devices", get(list_devices))
+        .route("/api/tunnel/events", get(tunnel_events_ws));
 
     // Device proxy endpoints: /d/{serial}/api/*
     //
@@ -710,10 +844,11 @@ async fn handle_device_ws(
         warn!(serial = %serial, "Device disconnected before registration");
         return;
     };
-    let api_key = match serde_json::from_str::<Value>(&text) {
-        Ok(msg) if msg["type"].as_str() == Some("tunnel.register") => {
-            msg["api_key"].as_str().unwrap_or("").to_string()
-        }
+    let (api_key, features) = match serde_json::from_str::<Value>(&text) {
+        Ok(msg) if msg["type"].as_str() == Some("tunnel.register") => (
+            msg["api_key"].as_str().unwrap_or("").to_string(),
+            device_features(&msg["features"]),
+        ),
         _ => {
             warn!(serial = %serial, "Device sent invalid registration");
             return;
@@ -776,6 +911,9 @@ async fn handle_device_ws(
         last_gps_fix: shared_gps,
         last_lte_signal: shared_lte,
         egress_ip: egress_ip.clone(),
+        connected_at_ms: unix_ms(),
+        features,
+        last_net_state: Arc::new(RwLock::new(None)),
     };
 
     let pending_requests = device.pending_requests.clone();
@@ -786,6 +924,7 @@ async fn handle_device_ws(
     let dropped_messages = device.dropped_messages.clone();
     let last_gps_fix = device.last_gps_fix.clone();
     let last_lte_signal = device.last_lte_signal.clone();
+    let last_net_state = device.last_net_state.clone();
 
     // Handle duplicate serial: signal old handler to shut down, drain pending
     // REST requests, then replace. Don't notify WS clients — they were migrated above.
@@ -812,6 +951,12 @@ async fn handle_device_ws(
             }
         }
         devices.insert(serial.clone(), device);
+        // After the insert and before the ack: a subscriber subscribes before
+        // it snapshots the map, so it finds the device there, receives this
+        // frame, or both.
+        if let Some(device) = devices.get(&serial) {
+            state.on_connect(device);
+        }
     }
     state
         .history
@@ -820,7 +965,11 @@ async fn handle_device_ws(
     info!(serial = %serial, "Device registered");
 
     // Send ack
-    let ack = json!({"type": "tunnel.register.ack", "serial": &serial});
+    let ack = json!({
+        "type": "tunnel.register.ack",
+        "serial": &serial,
+        "features": RELAY_FEATURES,
+    });
     let _ = ws_sink
         .send(axum::extract::ws::Message::Text(
             serde_json::to_string(&ack).unwrap().into(),
@@ -1204,6 +1353,47 @@ async fn handle_device_ws(
                             }
                         }
                     }
+                    // The device's network: kept for this connection, published
+                    // on the event stream and forwarded to its WS clients.
+                    "net.state" => {
+                        if text.len() > super::net_state::MAX_BYTES {
+                            warn!(
+                                serial = %serial,
+                                bytes = text.len(),
+                                "Dropped net.state over {} bytes",
+                                super::net_state::MAX_BYTES
+                            );
+                            continue;
+                        }
+                        // A connection a newer one replaced, or the sweep
+                        // evicted, speaks for nobody.
+                        let current = state
+                            .devices
+                            .read()
+                            .await
+                            .get(&serial)
+                            .is_some_and(|d| d.connection_id == connection_id);
+                        if !current {
+                            debug!(serial = %serial, connection_id, "net.state from a stale connection ignored");
+                            continue;
+                        }
+                        let stored = StoredNetState {
+                            received_at: unix_ms(),
+                            state: parsed,
+                        };
+                        let frame = net_state_frame(&serial, connection_id, &stored, false);
+                        let payload = Arc::new(stored.state.clone());
+                        // Kept before it is published: a subscriber that
+                        // subscribes in between finds it in its snapshot.
+                        *last_net_state.write().await = Some(stored);
+                        state.publish(&frame);
+                        let clients_read = clients.read().await;
+                        for client_tx in clients_read.values() {
+                            if client_tx.try_send(payload.clone()).is_err() {
+                                dropped_messages.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
                     _ => {
                         warn!(serial = %serial, msg_type, "Unknown message from device");
                     }
@@ -1273,6 +1463,7 @@ async fn handle_device_ws(
         };
         if let Some(device) = removed {
             drain_device(&device, "device disconnected").await;
+            state.on_disconnect(&serial, connection_id, disconnect_reason);
         }
         state
             .history
@@ -1327,10 +1518,183 @@ async fn list_devices(
             "last_gps_fix": *d.last_gps_fix.read().await,
             "last_lte_signal": *d.last_lte_signal.read().await,
             "egress_ip": d.egress_ip,
+            "features": d.features,
         }));
     }
 
     Json(json!({"devices": list})).into_response()
+}
+
+// ─── Event Stream ────────────────────────────────────────────────────────────
+
+type EventSink =
+    futures_util::stream::SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>;
+
+/// One of the [`MAX_EVENT_SUBSCRIBERS`] stream slots, given back on drop:
+/// when the stream ends, and when an upgrade that never completed drops the
+/// handler unrun.
+struct SubscriberSlot(Arc<AtomicUsize>);
+
+impl SubscriberSlot {
+    fn take(open: &Arc<AtomicUsize>) -> Option<Self> {
+        open.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < MAX_EVENT_SUBSCRIBERS).then_some(n + 1)
+        })
+        .ok()?;
+        Some(Self(open.clone()))
+    }
+}
+
+impl Drop for SubscriberSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// `GET /api/tunnel/events`: the relay's device event stream (WebSocket).
+///
+/// Auth is the tunnel key as `Authorization: Bearer` only: a `?token=` query
+/// is never read, so the key stays out of access logs. At most
+/// [`MAX_EVENT_SUBSCRIBERS`] at once; the next gets 429.
+async fn tunnel_events_ws(
+    State(state): State<RelayState>,
+    headers: axum::http::HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let provided = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    if provided.is_empty()
+        || !crate::auth::constant_time_eq(state.tunnel_key.as_bytes(), provided.as_bytes())
+    {
+        return (StatusCode::FORBIDDEN, "Invalid tunnel key").into_response();
+    }
+    let Some(slot) = SubscriberSlot::take(&state.event_subscribers) else {
+        return (StatusCode::TOO_MANY_REQUESTS, "Too many event subscribers").into_response();
+    };
+    ws.on_upgrade(move |socket| {
+        run_event_stream(socket, state, slot).instrument(info_span!("tunnel_events"))
+    })
+}
+
+/// Send one frame, giving up after [`EVENT_WRITE_TIMEOUT`].
+async fn send_event(sink: &mut EventSink, message: axum::extract::ws::Message) -> Result<(), ()> {
+    match tokio::time::timeout(EVENT_WRITE_TIMEOUT, sink.send(message)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            debug!("Relay events: send failed: {e}");
+            Err(())
+        }
+        Err(_) => {
+            warn!(
+                "Relay events: subscriber took no frame in {}s, closing",
+                EVENT_WRITE_TIMEOUT.as_secs()
+            );
+            Err(())
+        }
+    }
+}
+
+async fn send_text(sink: &mut EventSink, text: String) -> Result<(), ()> {
+    send_event(sink, axum::extract::ws::Message::Text(text.into())).await
+}
+
+/// Every connected device as `device.connected`, each followed by its stored
+/// `net.state`, then `replay.done`. Built under the map's read lock, sent
+/// after it is released. The caller subscribes to the bus first.
+async fn replay(state: &RelayState, sink: &mut EventSink) -> Result<(), ()> {
+    let frames = {
+        let devices = state.devices.read().await;
+        let mut connected: Vec<&ConnectedDevice> = devices.values().collect();
+        connected.sort_by(|a, b| a.serial.cmp(&b.serial));
+        let mut frames = Vec::with_capacity(connected.len() * 2 + 1);
+        for device in &connected {
+            frames.push(device_connected_frame(device, true).to_string());
+            if let Some(stored) = device.last_net_state.read().await.as_ref() {
+                frames.push(
+                    net_state_frame(&device.serial, device.connection_id, stored, true).to_string(),
+                );
+            }
+        }
+        frames.push(json!({"type": "replay.done", "devices": connected.len()}).to_string());
+        frames
+    };
+    for frame in frames {
+        send_text(sink, frame).await?;
+    }
+    Ok(())
+}
+
+/// One subscriber: `hello`, the replay, then live frames until it leaves,
+/// stops answering, or cannot keep up with the socket.
+async fn run_event_stream(
+    socket: axum::extract::ws::WebSocket,
+    state: RelayState,
+    slot: SubscriberSlot,
+) {
+    use axum::extract::ws::Message;
+
+    let (mut sink, mut stream) = socket.split();
+    // Subscribed before the snapshot: what changes after it is on the bus.
+    let mut bus = state.events.subscribe();
+    let hello = json!({
+        "type": "hello",
+        "relay_version": crate::VERSION,
+        "relay_epoch": state.started_at_ms,
+        "features": RELAY_FEATURES,
+    });
+    if send_text(&mut sink, hello.to_string()).await.is_err()
+        || replay(&state, &mut sink).await.is_err()
+    {
+        return;
+    }
+    info!(
+        subscribers = state.event_subscribers.load(Ordering::Relaxed),
+        "Relay events: subscriber connected"
+    );
+
+    let start = tokio::time::Instant::now();
+    let mut ping = tokio::time::interval_at(start + EVENT_PING_INTERVAL, EVENT_PING_INTERVAL);
+    let mut heard = start;
+    loop {
+        tokio::select! {
+            frame = bus.recv() => match frame {
+                Ok(text) => {
+                    if send_text(&mut sink, text.to_string()).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    warn!(missed, "Relay events: subscriber fell behind, resynchronizing");
+                    bus = state.events.subscribe();
+                    if send_text(&mut sink, json!({"type": "resync"}).to_string()).await.is_err()
+                        || replay(&state, &mut sink).await.is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            _ = ping.tick() => {
+                if heard.elapsed() > EVENT_PING_INTERVAL * 3 {
+                    warn!("Relay events: subscriber silent for {}s, closing", heard.elapsed().as_secs());
+                    break;
+                }
+                if send_event(&mut sink, Message::Ping(axum::body::Bytes::new())).await.is_err() {
+                    break;
+                }
+            }
+            message = stream.next() => match message {
+                Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                // A pong, or anything else: the subscriber is there.
+                Some(Ok(_)) => heard = tokio::time::Instant::now(),
+            },
+        }
+    }
+    drop(slot);
+    info!("Relay events: subscriber disconnected");
 }
 
 // ─── REST Proxy Helpers ──────────────────────────────────────────────────────

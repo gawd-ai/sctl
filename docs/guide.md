@@ -352,6 +352,7 @@ The tunnel includes built-in resilience features:
 - **Flap detection** -- 3 connections in under 30 seconds triggers a 60-second cooldown backoff
 - **Follows the route** -- when the kernel's route to the relay moves to another address (a cable plugged in, an uplink lost), the tunnel redials over the new one at once, at most once every 5 seconds, without counting toward flap detection. While it waits to redial, a new route to the relay (a cable plugged in, LTE attaching) dials at once. A tunnel pinned with `bind_address` does neither.
 - **Owns the relay route (opt-in)** -- with `relay_route = "follow_default"`, sctl keeps one host route to the relay on the lowest-metric uplink that reaches it, moves it to another uplink after two tunnel failures in a row when that one answers, and brings it back when the first answers two probes in a row. See `docs/config.md`.
+- **Pushes its network** -- when the relay advertises it, the device sends a `net.state` message (interfaces, default routes, its route to the relay and to each WireGuard endpoint) right after registering and whenever the network changes, instead of being polled. `GET /api/net` returns the same message on demand, and the relay streams connections and `net.state` to its subscribers at `GET /api/tunnel/events`. See `docs/http-api.md`.
 - **Writer channel monitoring** -- warns at 75% capacity, prevents backpressure stalls
 - **Health probe** -- relay periodically probes device health; unhealthy state resets on reconnect
 

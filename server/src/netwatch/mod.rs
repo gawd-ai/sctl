@@ -16,6 +16,7 @@ mod netlink;
 pub mod owner;
 pub mod route;
 pub mod source;
+pub mod wg;
 
 use std::collections::HashMap;
 use std::fmt;

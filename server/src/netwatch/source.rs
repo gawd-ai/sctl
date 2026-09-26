@@ -4,10 +4,13 @@
 //! Connecting a UDP socket runs the kernel's route lookup and fixes the
 //! source address without sending anything, so the answer includes every
 //! rule and metric the kernel applies. The interface is then the one holding
-//! that address.
+//! that address. [`route_get`] asks the kernel the same question over
+//! netlink, as `ip route get` does, and also learns the next hop.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+
+use super::netlink::{self, NlSocket, Order, RTA_DST, RTM_GETROUTE, RTM_NEWROUTE};
 
 /// The kernel's current choice for reaching one destination.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,6 +40,59 @@ pub fn route_to(dst: SocketAddrV4) -> io::Result<SourceRoute> {
         source,
         dev: interface_with_ipv4(source),
     })
+}
+
+/// The route the kernel would use for `dst` right now, as `ip route get`
+/// shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelRoute {
+    /// The output interface.
+    pub dev: String,
+    /// The next hop; None when `dst` is on the link.
+    pub via: Option<Ipv4Addr>,
+    /// The source address a new connection would use.
+    pub src: Option<Ipv4Addr>,
+}
+
+/// Look up the kernel's route to `dst` (`RTM_GETROUTE`, what `ip route get`
+/// sends). Nothing is sent to `dst`. Fails with the kernel's errno, typically
+/// `ENETUNREACH`, when no route reaches it.
+pub async fn route_get(dst: Ipv4Addr) -> io::Result<KernelRoute> {
+    let mut socket = NlSocket::open(0)?;
+    let payload = socket
+        .request(
+            RTM_GETROUTE,
+            &netlink::rtmsg(32, 0, 0, 0, 0),
+            &[(RTA_DST, &dst.octets())],
+            RTM_NEWROUTE,
+        )
+        .await?;
+    let route = netlink::parse_route(&payload, Order::NATIVE)
+        .ok_or_else(|| io::Error::other("unreadable route lookup answer"))?;
+    let oif = route
+        .oif
+        .ok_or_else(|| io::Error::other("route lookup answer names no interface"))?;
+    let dev = interface_name(oif)
+        .ok_or_else(|| io::Error::other(format!("no interface with index {oif}")))?;
+    Ok(KernelRoute {
+        dev,
+        via: route.gateway,
+        src: route.prefsrc,
+    })
+}
+
+/// The name of the interface with kernel index `index`.
+pub fn interface_name(index: u32) -> Option<String> {
+    let mut name = [0 as libc::c_char; libc::IF_NAMESIZE];
+    // SAFETY: the buffer is IF_NAMESIZE bytes, the size if_indextoname(3)
+    // writes at most, NUL included; it returns null on failure.
+    let found = unsafe { libc::if_indextoname(index, name.as_mut_ptr()) };
+    if found.is_null() {
+        return None;
+    }
+    // SAFETY: on success the buffer holds a NUL-terminated name.
+    let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
+    name.to_str().ok().map(ToString::to_string)
 }
 
 /// Every IPv4 address held by a local interface, as (interface, address), in
@@ -122,6 +178,36 @@ mod tests {
         let route = route_to(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9)).unwrap();
         assert_eq!(route.source, Ipv4Addr::LOCALHOST);
         assert_eq!(route.dev.as_deref(), Some("lo"));
+    }
+
+    #[tokio::test]
+    async fn the_kernel_routes_loopback_through_lo() {
+        let route = route_get(Ipv4Addr::LOCALHOST).await.unwrap();
+        assert_eq!(route.dev, "lo");
+        assert_eq!(route.via, None);
+        assert_eq!(route.src, Some(Ipv4Addr::LOCALHOST));
+    }
+
+    #[tokio::test]
+    async fn the_netlink_lookup_agrees_with_the_socket_lookup() {
+        // Whatever this host's routes are, both ways of asking agree.
+        let dst = Ipv4Addr::new(192, 0, 2, 1);
+        match (route_get(dst).await, route_to(SocketAddrV4::new(dst, 9))) {
+            (Ok(netlink), Ok(socket)) => {
+                assert_eq!(netlink.src, Some(socket.source));
+                if let Some(dev) = socket.dev {
+                    assert_eq!(netlink.dev, dev);
+                }
+            }
+            (Err(_), Err(_)) => {}
+            (netlink, socket) => panic!("{netlink:?} vs {socket:?}"),
+        }
+    }
+
+    #[test]
+    fn interface_names_come_from_the_index() {
+        assert_eq!(interface_name(1).as_deref(), Some("lo"));
+        assert_eq!(interface_name(u32::MAX), None);
     }
 
     #[test]

@@ -109,4 +109,7 @@ pub mod codes {
     pub const TOO_MANY_CONNECTIONS: &str = "TOO_MANY_CONNECTIONS";
     /// The infra monitoring subsystem is not available on this device.
     pub const INFRA_UNAVAILABLE: &str = "INFRA_UNAVAILABLE";
+    /// The device cannot read its network from the kernel (relay mode, or
+    /// no route socket).
+    pub const NET_UNAVAILABLE: &str = "NET_UNAVAILABLE";
 }

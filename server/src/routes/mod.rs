@@ -14,6 +14,7 @@ pub mod gps;
 pub mod health;
 pub mod info;
 pub mod lte;
+pub mod net;
 pub mod playbooks;
 pub mod safe_mode;
 pub mod sessions;

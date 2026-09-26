@@ -48,7 +48,8 @@ Four auth modes exist, depending on the surface:
    never the query.
 4. **Tunnel key / device key (relay)** — see [Tunnel relay](#tunnel-relay).
    `/api/tunnel/*` admin routes authenticate with the relay's shared
-   `tunnel_key`; `/d/{serial}/api/*` proxy routes authenticate with the
+   `tunnel_key` (`GET /api/tunnel/events` only as `Authorization: Bearer`,
+   never from the query); `/d/{serial}/api/*` proxy routes authenticate with the
    **target device's own API key** as `Authorization: Bearer` (the relay
    checks it against the key the device presented at registration).
 
@@ -183,6 +184,22 @@ hostname/uptime/memory/load, `network` = interface state, `logs` = recent
 service log entries, `log_stats` = counts by severity.
 
 Errors: `500` (plain status) on internal failure.
+
+### `GET /api/net`
+
+The device's network dumped from the kernel now, for a "recheck" that
+cannot wait for the next change. **Auth: API key Bearer.** Reachable
+through the relay like any device route.
+
+Query parameters: none.
+
+Response `200`: the `net.state` message the tunnel pushes (see
+[`net.state`](#netstate-the-devices-network)), built from a fresh dump. `seq`
+is `0`, since a fresh dump is outside the pushed sequence, and `boot` is the
+agent's start as in the pushed messages.
+
+Errors: `503` `NET_UNAVAILABLE` in relay mode (the relay does not watch its
+network) or when the kernel's route socket cannot be opened.
 
 ---
 
@@ -989,12 +1006,68 @@ Query parameters: `serial` (required; 1–64 chars of `[A-Za-z0-9._-]`,
 `400` plain-text on bad format). `403` plain-text on a bad tunnel key.
 
 After the upgrade, the device sends `{"type": "tunnel.register",
-"api_key": "<its API key>"}` and receives `{"type": "tunnel.register.ack",
-"serial": "..."}`. The registered key is what `/d/{serial}/api/*` clients
-must present. Re-registration with the same serial evicts the stale
-connection (pending requests drain as `DEVICE_RECONNECTING`); existing
-relay WS clients are preserved across the reconnect. Devices missing
-heartbeats for `heartbeat_timeout_secs` (default 45 s) are evicted.
+"api_key": "<its API key>", "features": ["net.state"]}` and receives
+`{"type": "tunnel.register.ack", "serial": "...", "features": ["net.state"]}`.
+The registered key is what `/d/{serial}/api/*` clients must present.
+Re-registration with the same serial evicts the stale connection (pending
+requests drain as `DEVICE_RECONNECTING`); existing relay WS clients are
+preserved across the reconnect. Devices missing heartbeats for
+`heartbeat_timeout_secs` (default 45 s) are evicted.
+
+`features` is optional on both sides, and a peer that predates it ignores
+it. The relay keeps up to 16 of the device's entries of at most 32 bytes
+each and drops anything else. A device sends `net.state` only when the ack
+advertises it.
+
+#### `net.state`: the device's network
+
+A device whose relay advertises `net.state` sends this text frame right
+after the ack, then after every network change whose content differs from
+the last one sent on that connection, at most one per second:
+
+```json
+{
+  "type": "net.state", "v": 1,
+  "boot": 1790000000000, "seq": 4, "ts": "2026-09-26T12:00:00Z",
+  "interfaces": [
+    {"name": "eth1", "operstate": "up", "carrier": true, "metric": 10, "ip": "10.42.0.7/24"},
+    {"name": "wwan0", "operstate": "unknown", "carrier": null, "metric": 40, "ip": "10.180.41.231/30"}
+  ],
+  "default_routes": [
+    {"dev": "eth1", "via": "10.42.0.1", "metric": 10},
+    {"dev": "wwan0", "via": null, "metric": 40}
+  ],
+  "relay_route": {"ip": "174.138.114.209", "dev": "eth1", "via": "10.42.0.1", "src": "10.42.0.7"},
+  "tunnel": {"dev": "eth1", "local": "10.42.0.7", "remote": "174.138.114.209"},
+  "wg_routes": [{"ip": "174.138.114.209", "dev": "eth1", "via": "10.42.0.1", "src": "10.42.0.7"}],
+  "truncated": false
+}
+```
+
+- `boot` is when the agent started (unix ms) and `seq` counts distinct
+  network states since then, from 1; a new `boot` restarts `seq`. `ts` is
+  the device's clock, for information only.
+- `interfaces`: every interface but loopback, sorted by name. `operstate`
+  is the sysfs word (`up`, `down`, `lowerlayerdown`, `dormant`, `testing`,
+  `notpresent`, `unknown`); `carrier` is `null` on kernels that do not
+  report it; `metric` is the lowest main-table IPv4 default-route metric on
+  the interface; `ip` is its primary IPv4 address.
+- `default_routes`: main-table IPv4 default routes, lowest metric first.
+- `relay_route`: the kernel's route to the relay the tunnel is connected to,
+  what `ip route get` says (`null` when there is none). `tunnel`: the live
+  tunnel socket's interface and addresses.
+- `wg_routes`: the kernel's route to each IPv4 peer endpoint of `wg0`, read
+  from the kernel as `wg show wg0 endpoints` reads them; empty without `wg0`.
+- Caps: 32 interfaces (those with a default route first, then those with an
+  address), 16 default routes, 8 WireGuard routes, 15-byte names.
+  `truncated` is `true` when a cap left something out. The relay drops a
+  `net.state` over 16 KiB.
+
+The relay keeps the latest `net.state` of each connection (a new
+connection starts with none), publishes it on
+[`GET /api/tunnel/events`](#get-apitunnelevents), and forwards it to the
+device's `GET /d/{serial}/api/ws` clients. `GET /api/net` answers with the
+same message on demand.
 
 ### `GET /api/tunnel/devices`
 
@@ -1004,7 +1077,48 @@ via `?token=` query parameter** (`403` plain-text on mismatch).
 Response `200`: `{devices: [{serial, clients, client_count,
 last_heartbeat_ago_ms, pending_requests_count, session_subscriptions,
 connected_since_ms, dropped_messages, last_gps_fix, last_lte_signal,
-egress_ip}]}`.
+egress_ip, features}]}`. `features` is what the device offered at
+registration.
+
+### `GET /api/tunnel/events`
+
+The relay's device event stream, a WebSocket of JSON text frames: which
+devices are connected and what their network looks like, pushed as it
+changes. **Auth: relay `tunnel_key` as `Authorization: Bearer` only**; a
+`?token=` query is never read. Failures before upgrade (plain text): `403`
+on a missing or wrong key, `429` when 8 subscribers are already connected.
+
+On connect the relay sends `hello`, then replays every connected device
+(its `device.connected`, followed by its latest `net.state` if it has
+one), then `replay.done`, then live frames:
+
+```json
+{"type": "hello", "relay_version": "0.6.4.812", "relay_epoch": 1790000000000, "features": ["net.state"]}
+{"type": "device.connected", "serial": "XE300-1", "connection_id": 17, "connected_at": 1790000123456, "egress_ip": "203.0.113.7", "features": ["net.state"], "replay": true}
+{"type": "net.state", "serial": "XE300-1", "connection_id": 17, "received_at": 1790000123789, "state": {"type": "net.state", "v": 1, "...": "..."}, "replay": true}
+{"type": "replay.done", "devices": 1}
+{"type": "device.disconnected", "serial": "XE300-1", "connection_id": 17, "reason": "ws_close", "replay": false}
+```
+
+- `relay_epoch` is when the relay started, and `connected_at` and
+  `received_at` are relay times, all unix ms. `egress_ip` is `null` when no
+  forwarding header named it.
+- Live frames carry `"replay": false`: `device.connected` when a device
+  registers, `net.state` when it sends one (`state` is the device's message
+  as sent), and `device.disconnected` when a connection ends. `reason` is
+  `ws_close`, `writer_failed`, `write_path_dead`, `heartbeat_timeout`,
+  `send_failed` or `relay_shutdown`. A connection replaced by a newer one
+  for the same serial gets no `device.disconnected`: the new
+  `device.connected` supersedes it.
+- `serial` is always the one the relay registered, never a value from the
+  device's payload.
+- The replay can repeat a frame that also arrives live; deduplicate by
+  `(connection_id, state.boot, state.seq)` for `net.state`.
+- A subscriber that falls more than 1024 frames behind gets
+  `{"type": "resync"}` followed by a fresh replay and `replay.done`, and
+  should rebuild its view from it.
+- The relay pings every 20 s and drops a subscriber it has not heard from
+  in 60 s, or that does not take a frame within 10 s.
 
 ### `GET /d/{serial}/api/ws`
 
@@ -1023,8 +1137,8 @@ device's clients, and additionally delivers relay-only messages:
 `tunnel.device_disconnected`, `tunnel.relay_shutdown`, and `session.gap`
 (`{reason: "backpressure"}`) when output had to be dropped for a slow
 client. Device telemetry broadcasts (`gps.fix`, `lte.signal`,
-`lte.watchdog`) are relay-internal state feeds and are not part of the
-stable client contract.
+`lte.watchdog`, `net.state`) are relay-internal state feeds and are not part
+of the stable client contract.
 
 ### `GET /d/{serial}/api/stp/chunk/{xfer}/{idx}`
 

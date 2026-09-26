@@ -126,6 +126,7 @@ All endpoints except `/api/health` require `Authorization: Bearer <key>`.
 |--------|---------------------------|------|--------------------------------------|
 | GET    | `/api/health`             | No   | Liveness probe                       |
 | GET    | `/api/info`               | Yes  | System info (IPs, CPU, mem, disk)    |
+| GET    | `/api/net`                | Yes  | Network state, dumped fresh          |
 | POST   | `/api/exec`               | Yes  | One-shot command execution           |
 | POST   | `/api/exec/batch`         | Yes  | Batch command execution              |
 | GET    | `/api/files`              | Yes  | Read file or list directory          |
@@ -153,6 +154,7 @@ All endpoints except `/api/health` require `Authorization: Bearer <key>`.
 |--------|-------------------------------------|--------------|-------------------------------|
 | GET    | `/api/tunnel/register`              | `tunnel_key` | Device WS registration        |
 | GET    | `/api/tunnel/devices`               | `tunnel_key` | List connected devices        |
+| GET    | `/api/tunnel/events`                | `tunnel_key` | Device event stream (WS)      |
 | GET    | `/d/{serial}/api/health`            | No           | Proxied device health         |
 | GET    | `/d/{serial}/api/info`              | `api_key`    | Proxied device info           |
 | POST   | `/d/{serial}/api/exec`              | `api_key`    | Proxied command execution     |

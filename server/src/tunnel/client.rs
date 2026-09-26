@@ -36,6 +36,7 @@ use crate::sessions::buffer::{OutputBuffer, OutputEntry};
 use crate::state::{TunnelEventType, TunnelPath};
 use crate::AppState;
 
+use super::net_state;
 use super::{decode_binary_frame, encode_binary_frame};
 
 /// Static heartbeat message — avoids serde allocation on every heartbeat tick.
@@ -964,6 +965,7 @@ struct CleanupGuard {
     armed: bool,
     heartbeat: tokio::task::AbortHandle,
     writer: tokio::task::AbortHandle,
+    net_state: Option<tokio::task::AbortHandle>,
     subscribers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     session_manager: crate::sessions::SessionManager,
     transfer_manager: Arc<crate::gawdxfer::manager::TransferManager>,
@@ -977,6 +979,9 @@ impl Drop for CleanupGuard {
         warn!("Tunnel: connection loop unwinding, running panic-path cleanup");
         self.heartbeat.abort();
         self.writer.abort();
+        if let Some(net_state) = &self.net_state {
+            net_state.abort();
+        }
         let subscribers = self.subscribers.clone();
         let sessions = self.session_manager.clone();
         let transfers = self.transfer_manager.clone();
@@ -1110,11 +1115,15 @@ async fn connect_and_run(
     // Send registration directly on the raw sink (before spawning writer task)
     let reg_start = Instant::now();
     {
-        let reg = json!({
+        let mut reg = json!({
             "type": "tunnel.register",
             "serial": state.config.device.serial,
             "api_key": state.config.auth.api_key,
         });
+        // A relay that predates features ignores the field.
+        if state.netwatch.is_some() {
+            reg["features"] = json!([net_state::FEATURE]);
+        }
         raw_ws_sink
             .send(tokio_tungstenite::tungstenite::Message::Text(
                 serde_json::to_string(&reg)
@@ -1125,6 +1134,9 @@ async fn connect_and_run(
             .map_err(|e| ConnectError::Path(e.into()))?;
     }
 
+    // Whether the relay's ack advertises net.state (an older relay's does not).
+    let relay_takes_net_state;
+
     // Wait for registration ack with timeout
     match tokio::time::timeout(Duration::from_secs(10), ws_stream.next()).await {
         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
@@ -1133,6 +1145,7 @@ async fn connect_and_run(
                     let msg_type = msg["type"].as_str().unwrap_or("");
                     match msg_type {
                         "tunnel.register.ack" => {
+                            relay_takes_net_state = net_state::advertised(&msg);
                             let reg_elapsed = reg_start.elapsed();
                             let total = connect_start.elapsed();
                             info!(
@@ -1264,6 +1277,21 @@ async fn connect_and_run(
         let _ = writer_exit_tx.send(());
     });
 
+    // The device's network, pushed on this connection when the relay takes
+    // it: now, then on every change that says something new.
+    let net_state_task = net_state::spawn_forwarder(
+        relay_takes_net_state,
+        state.netwatch.clone(),
+        ws_sink.request_tx.clone(),
+        {
+            let tunnel_stats = state.tunnel_stats.clone();
+            move |net| {
+                let tunnel = tunnel_stats.path();
+                async move { net_state::look_up(&net, tunnel).await }
+            }
+        },
+    );
+
     // Subscribe to session lifecycle broadcasts so we can forward them
     let mut broadcast_rx = state.session_events.subscribe();
 
@@ -1379,6 +1407,9 @@ async fn connect_and_run(
         armed: true,
         heartbeat: heartbeat_task.abort_handle(),
         writer: writer_task.abort_handle(),
+        net_state: net_state_task
+            .as_ref()
+            .map(tokio::task::JoinHandle::abort_handle),
         subscribers: subscriber_tasks.clone(),
         session_manager: state.session_manager.clone(),
         transfer_manager: state.transfer_manager.clone(),
@@ -1545,6 +1576,9 @@ async fn connect_and_run(
     cleanup_guard.armed = false;
     heartbeat_task.abort();
     writer_task.abort();
+    if let Some(task) = &net_state_task {
+        task.abort();
+    }
     let attached_sessions: Vec<String> = {
         let tasks = subscriber_tasks.lock().await;
         let ids = tasks.keys().cloned().collect();

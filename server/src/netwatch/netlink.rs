@@ -1,5 +1,7 @@
-//! The small slice of rtnetlink that `netwatch` speaks: a socket, request
-//! encoding, and parsing of link, address and route messages.
+//! The small slice of netlink that `netwatch` speaks: a socket, request
+//! encoding, and parsing of link, address and route messages (rtnetlink),
+//! plus the requests and replies generic netlink families such as
+//! WireGuard's are asked through.
 //!
 //! Netlink messages are the kernel's own C structs in the host's byte order,
 //! every part aligned to 4 bytes. Everything here goes through byte slices,
@@ -55,6 +57,7 @@ pub(crate) const RTA_DST: u16 = 1;
 pub(crate) const RTA_OIF: u16 = 4;
 pub(crate) const RTA_GATEWAY: u16 = 5;
 pub(crate) const RTA_PRIORITY: u16 = 6;
+pub(crate) const RTA_PREFSRC: u16 = 7;
 pub(crate) const RTA_TABLE: u16 = 15;
 
 pub(crate) const AF_INET: u8 = 2;
@@ -359,6 +362,9 @@ pub(crate) struct Route {
     pub oif: Option<u32>,
     /// `RTA_PRIORITY`, the metric; 0 when absent.
     pub priority: u32,
+    /// `RTA_PREFSRC`: in the answer to a route lookup, the source address
+    /// the kernel chose.
+    pub prefsrc: Option<Ipv4Addr>,
 }
 
 pub(crate) fn parse_route(payload: &[u8], order: Order) -> Option<Route> {
@@ -376,11 +382,13 @@ pub(crate) fn parse_route(payload: &[u8], order: Order) -> Option<Route> {
         gateway: None,
         oif: None,
         priority: 0,
+        prefsrc: None,
     };
     for (attr, data) in Attrs::new(body, order) {
         match attr {
             RTA_DST => route.dst = ipv4(data),
             RTA_GATEWAY => route.gateway = ipv4(data),
+            RTA_PREFSRC => route.prefsrc = ipv4(data),
             RTA_OIF => route.oif = order.u32_at(data, 0),
             RTA_PRIORITY => route.priority = order.u32_at(data, 0).unwrap_or(0),
             RTA_TABLE => {
@@ -406,6 +414,29 @@ pub(crate) fn ack_in(datagram: &[u8], order: Order, seq: u32) -> Option<io::Resu
         .filter(|m| m.seq == seq && m.kind == NLMSG_ERROR)
         .find_map(|m| order.i32_at(m.payload, 0))
         .map(|code| if code == 0 { Ok(()) } else { Err(errno(code)) })
+}
+
+/// The kernel's answer to request `seq` if this datagram holds it: the
+/// payload of its `reply` message, or the errno of a refusal. For requests
+/// answered by one message rather than a dump.
+pub(crate) fn reply_in(
+    datagram: &[u8],
+    order: Order,
+    seq: u32,
+    reply: u16,
+) -> Option<io::Result<Vec<u8>>> {
+    Messages::new(datagram, order)
+        .filter(|m| m.seq == seq)
+        .find_map(|m| match m.kind {
+            NLMSG_ERROR => Some(match order.i32_at(m.payload, 0) {
+                Some(code) if code < 0 => Err(errno(code)),
+                _ => Err(io::Error::other(
+                    "netlink request answered with an acknowledgement",
+                )),
+            }),
+            kind if kind == reply => Some(Ok(m.payload.to_vec())),
+            _ => None,
+        })
 }
 
 /// Collects the replies to one dump request across datagrams.
@@ -489,22 +520,29 @@ fn recv_raw(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, bool)> {
     Ok((n.unsigned_abs(), msg.msg_flags & libc::MSG_TRUNC != 0))
 }
 
-/// A non-blocking `NETLINK_ROUTE` socket on the tokio reactor.
+/// A non-blocking netlink socket on the tokio reactor.
 pub(crate) struct NlSocket {
     fd: AsyncFd<OwnedFd>,
     seq: u32,
 }
 
 impl NlSocket {
-    /// Open a socket joined to the multicast `groups` (0 for a socket that
-    /// only sends requests and reads their replies). Needs a tokio runtime.
+    /// Open a `NETLINK_ROUTE` socket joined to the multicast `groups` (0 for
+    /// a socket that only sends requests and reads their replies). Needs a
+    /// tokio runtime.
     pub(crate) fn open(groups: u32) -> io::Result<Self> {
-        // SAFETY: socket(2) with constant arguments; the result is checked.
+        Self::open_protocol(libc::NETLINK_ROUTE, groups)
+    }
+
+    /// Open a socket of netlink `protocol` (`NETLINK_ROUTE`,
+    /// `NETLINK_GENERIC`) joined to the multicast `groups`.
+    pub(crate) fn open_protocol(protocol: libc::c_int, groups: u32) -> io::Result<Self> {
+        // SAFETY: socket(2) with plain integer arguments; the result is checked.
         let raw = unsafe {
             libc::socket(
                 libc::AF_NETLINK,
                 libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-                libc::NETLINK_ROUTE,
+                protocol,
             )
         };
         if raw < 0 {
@@ -596,9 +634,26 @@ impl NlSocket {
         family_struct: &[u8],
         buf: &mut [u8],
     ) -> io::Result<Vec<Vec<u8>>> {
+        self.dump_attrs(request, reply, family_struct, &[], buf)
+            .await
+    }
+
+    /// [`Self::dump`] with attributes after the family struct, for a dump
+    /// narrowed to one object (a generic netlink device by name).
+    pub(crate) async fn dump_attrs(
+        &mut self,
+        request: u16,
+        reply: u16,
+        family_struct: &[u8],
+        attrs: &[(u16, &[u8])],
+        buf: &mut [u8],
+    ) -> io::Result<Vec<Vec<u8>>> {
         let mut attempt = 1;
         loop {
-            match self.dump_once(request, reply, family_struct, buf).await {
+            match self
+                .dump_once(request, reply, family_struct, attrs, buf)
+                .await
+            {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted && attempt < DUMP_ATTEMPTS => {
                     attempt += 1;
                 }
@@ -612,6 +667,7 @@ impl NlSocket {
         request: u16,
         reply: u16,
         family_struct: &[u8],
+        attrs: &[(u16, &[u8])],
         buf: &mut [u8],
     ) -> io::Result<Vec<Vec<u8>>> {
         let seq = self.next_seq();
@@ -621,7 +677,7 @@ impl NlSocket {
             NLM_F_REQUEST | NLM_F_DUMP,
             seq,
             family_struct,
-            &[],
+            attrs,
         );
         self.send(&message).await?;
         let mut replies = DumpReply::new(seq, reply);
@@ -629,6 +685,35 @@ impl NlSocket {
             let n = self.recv_reply(buf).await?;
             if replies.feed(&buf[..n], Order::NATIVE)? {
                 return Ok(replies.into_payloads());
+            }
+        }
+    }
+
+    /// Send a request answered by one `reply` message (a route lookup, a
+    /// generic netlink family by name) and return that message's payload,
+    /// or the kernel's errno.
+    pub(crate) async fn request(
+        &mut self,
+        kind: u16,
+        family_struct: &[u8],
+        attrs: &[(u16, &[u8])],
+        reply: u16,
+    ) -> io::Result<Vec<u8>> {
+        let seq = self.next_seq();
+        let message = encode(
+            Order::NATIVE,
+            kind,
+            NLM_F_REQUEST,
+            seq,
+            family_struct,
+            attrs,
+        );
+        self.send(&message).await?;
+        let mut buf = vec![0; RECV_BUF];
+        loop {
+            let n = self.recv_reply(&mut buf).await?;
+            if let Some(answer) = reply_in(&buf[..n], Order::NATIVE, seq, reply) {
+                return answer;
             }
         }
     }
@@ -807,6 +892,7 @@ pub(crate) mod tests {
         assert_eq!(RTA_OIF, libc::RTA_OIF);
         assert_eq!(RTA_GATEWAY, libc::RTA_GATEWAY);
         assert_eq!(RTA_PRIORITY, libc::RTA_PRIORITY);
+        assert_eq!(RTA_PREFSRC, libc::RTA_PREFSRC);
         assert_eq!(RTA_TABLE, libc::RTA_TABLE);
         assert_eq!(i32::from(AF_INET), libc::AF_INET);
         assert_eq!(RT_TABLE_MAIN, libc::RT_TABLE_MAIN);
@@ -854,6 +940,7 @@ pub(crate) mod tests {
                 gateway: Some(Ipv4Addr::new(192, 168, 8, 1)),
                 oif: Some(3),
                 priority: 40,
+                prefsrc: None,
             }
         );
 
@@ -1074,6 +1161,63 @@ pub(crate) mod tests {
             assert!(!reply.feed(&link, order).unwrap());
             let err = reply.feed(&done(order, 1, 0), order).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        }
+    }
+
+    #[test]
+    fn a_single_reply_is_its_payload_or_the_errno() {
+        for order in ORDERS {
+            let mut answer = route_message(order, None, Some([10, 0, 0, 1]), 2, 0, 4, 254);
+            answer[8..12].copy_from_slice(&u32b(order, 6));
+            let payload = reply_in(&answer, order, 6, RTM_NEWROUTE).unwrap().unwrap();
+            assert_eq!(
+                parse_route(&payload, order).unwrap().oif,
+                Some(2),
+                "{order:?}"
+            );
+            // Another request's answer is not ours.
+            assert!(reply_in(&answer, order, 7, RTM_NEWROUTE).is_none());
+            let refused = reply_in(&error(order, 6, -libc::ENETUNREACH), order, 6, RTM_NEWROUTE)
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(refused.raw_os_error(), Some(libc::ENETUNREACH));
+            // A bare acknowledgement answers nothing.
+            assert!(reply_in(&error(order, 6, 0), order, 6, RTM_NEWROUTE)
+                .unwrap()
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn a_route_lookup_answer_carries_the_chosen_source() {
+        for order in ORDERS {
+            let mut answer = route_message(
+                order,
+                Some(([174, 138, 114, 209], 32)),
+                Some([10, 42, 0, 1]),
+                3,
+                0,
+                0,
+                254,
+            );
+            // The answer's RTA_PREFSRC, appended as the kernel does after
+            // the others; the header's length grows with it.
+            answer.extend(attr(order, RTA_PREFSRC, &[10, 42, 0, 7]));
+            let len = answer.len() as u32;
+            answer[..4].copy_from_slice(&u32b(order, len));
+            let message = Messages::new(&answer, order).next().unwrap();
+            let route = parse_route(message.payload, order).unwrap();
+            assert_eq!(
+                route.prefsrc,
+                Some(Ipv4Addr::new(10, 42, 0, 7)),
+                "{order:?}"
+            );
+            assert_eq!(
+                route.gateway,
+                Some(Ipv4Addr::new(10, 42, 0, 1)),
+                "{order:?}"
+            );
+            assert_eq!(route.oif, Some(3), "{order:?}");
         }
     }
 

@@ -543,6 +543,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
             get(routes::safe_mode::get_flag).delete(routes::safe_mode::clear_flag),
         )
         .route("/api/diagnostics", get(routes::diagnostics::diagnostics))
+        .route("/api/net", get(routes::net::net))
         .route("/api/exec", post(routes::exec::exec))
         .route("/api/exec/batch", post(routes::exec::batch_exec))
         .route("/api/fetch", post(routes::fetch::fetch))
