@@ -23,6 +23,13 @@ Environment:
                         dead interface forever, which is what caused the WE826's
                         availability flapping. Only pin when egress must not follow
                         the default route.
+  RELAY_ROUTE           Default: follow_default. Written as [tunnel] relay_route:
+                        the agent keeps the host route to the relay on the best
+                        uplink that answers and moves its tunnel without a
+                        restart, so the 96-wg-repin and 97-sctl-rehome hotplugs
+                        are removed. A tunnel pinned with bind_address keeps its
+                        pin and gets no relay_route (the agent refuses both).
+                        off leaves the key and the hotplugs alone.
   SSH / SCP / SSH_OPTS  Transport overrides. SSH_OPTS defaults to the ssh-rsa
                         algorithm flags this device's dropbear 2019.78 requires.
 
@@ -54,6 +61,8 @@ MIN_MARGIN_KB=${MIN_MARGIN_KB:-4096}
 TUNNEL_URL=${TUNNEL_URL:-}
 TUNNEL_KEY=${TUNNEL_KEY:-}
 TUNNEL_BIND_ADDRESS=${TUNNEL_BIND_ADDRESS:-}
+RELAY_ROUTE_SET=${RELAY_ROUTE+x}
+RELAY_ROUTE=${RELAY_ROUTE:-follow_default}
 
 # GL.iNet firmware 3.x ships dropbear 2019.78: its host key is ssh-rsa only, and it
 # predates ed25519 client-key support, so the client key must be RSA and modern
@@ -63,7 +72,15 @@ SSH=${SSH:-ssh}
 SCP=${SCP:-scp}
 SSH_OPTS=${SSH_OPTS:--o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa}
 
-for file in "$SERVER_GZ" "$PLUGIN_GZ" "$DEVICE_DIR/sctl.init" "$DEVICE_DIR/sctl.toml.template"; do
+case "$RELAY_ROUTE" in
+    off|follow_default) ;;
+    *)
+        echo "RELAY_ROUTE must be off or follow_default" >&2
+        exit 2
+        ;;
+esac
+
+for file in "$SERVER_GZ" "$PLUGIN_GZ" "$DEVICE_DIR/sctl.init" "$DEVICE_DIR/sctl.toml.template" "$DEVICE_DIR/relay-route.sh"; do
     if [[ ! -r "$file" ]]; then
         echo "missing required file: $file" >&2
         exit 1
@@ -139,6 +156,41 @@ else
     fi
 fi
 
+# --- relay_route: the agent keeps the relay route, replacing two hotplugs.
+#
+# 96-wg-repin pinned the relay /32 and 97-sctl-rehome restarted sctl on wan ifup.
+# With relay_route = "follow_default" the agent does both itself, so the device
+# half below removes them, together with the pin they left (relay-route.sh).
+owns_relay_route=0
+if [[ "$RELAY_ROUTE" == "follow_default" ]]; then
+    rc=0
+    sh "$DEVICE_DIR/relay-route.sh" config follow_default "$tmpdir/sctl.toml" \
+        > "$tmpdir/sctl.toml.new" || rc=$?
+    case $rc in
+        0)
+            mv "$tmpdir/sctl.toml.new" "$tmpdir/sctl.toml"
+            owns_relay_route=1
+            printf 'relay route:        follow_default (the route hotplugs are removed)\n'
+            ;;
+        2)
+            if [[ -n "$RELAY_ROUTE_SET" ]]; then
+                echo "RELAY_ROUTE=follow_default conflicts with the tunnel's bind_address" >&2
+                exit 1
+            fi
+            printf 'relay route:        off (the tunnel is pinned with bind_address)\n'
+            ;;
+        3)
+            printf 'relay route:        off (no [tunnel] block)\n'
+            ;;
+        *)
+            echo "could not set relay_route in the generated sctl.toml" >&2
+            exit 1
+            ;;
+    esac
+else
+    printf 'relay route:        off (RELAY_ROUTE=off)\n'
+fi
+
 payload_kb=$(du -k "$SERVER_GZ" "$PLUGIN_GZ" | awk '{s += $1} END {print s + 32}')
 # shellcheck disable=SC2086
 avail_kb=$($SSH $SSH_OPTS "$HOST" "df -k /overlay | awk 'NR==2 {print \$4}'")
@@ -161,10 +213,11 @@ if (( effective_avail_kb < required_kb )); then
 fi
 
 # shellcheck disable=SC2086
-$SCP $SSH_OPTS "$SERVER_GZ" "$PLUGIN_GZ" "$DEVICE_DIR/sctl.init" "$tmpdir/sctl.toml" "$HOST:/tmp/"
+$SCP $SSH_OPTS "$SERVER_GZ" "$PLUGIN_GZ" "$DEVICE_DIR/sctl.init" "$tmpdir/sctl.toml" \
+    "$DEVICE_DIR/relay-route.sh" "$HOST:/tmp/"
 
 # shellcheck disable=SC2086
-$SSH $SSH_OPTS "$HOST" 'sh -s' <<'EOF'
+$SSH $SSH_OPTS "$HOST" "OWN_RELAY_ROUTE=$owns_relay_route sh -s" <<'EOF'
 set -eu
 
 stamp=$(date +%Y%m%d%H%M%S)
@@ -183,6 +236,13 @@ chmod 0644 /usr/local/lib/sctl/*.gz
 chmod 0755 /etc/init.d/sctl
 chmod 0600 /etc/sctl/sctl.toml
 
+# The agent keeps the relay route now; the hotplugs that did it from the shell
+# go, kept in the backup directory. Not fatal: the agent is stopped here.
+if [ "${OWN_RELAY_ROUTE:-0}" = 1 ]; then
+    sh /tmp/relay-route.sh adopt /tmp/sctl-relay-route.backup.$stamp ||
+        echo "relay route: could not remove the route hotplugs (see above)" >&2
+fi
+
 /etc/init.d/sctl enable
 # `start`, not `restart`: the service was explicitly stopped above (to release the
 # old binary before overwriting it), and rc.common's `restart` would run its stop
@@ -193,7 +253,8 @@ chmod 0600 /etc/sctl/sctl.toml
 rm -f /tmp/sctl-server-mips_24kc.gz \
       /tmp/sctl-comms-quectel-mips_24kc.so.gz \
       /tmp/sctl.init \
-      /tmp/sctl.toml
+      /tmp/sctl.toml \
+      /tmp/relay-route.sh
 
 sleep 8
 

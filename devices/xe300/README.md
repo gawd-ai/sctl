@@ -53,14 +53,54 @@ WE826 they do not, which is why a field failure there leaves no forensic trail.
 
 `touch /etc/sctl/disabled` keeps the agent down across reboots for field triage.
 
-### `rundev.sh device upgrade` does NOT work for this device
+### The relay route
 
-`uname -m` returns `mips` (big-endian), which has **no entry** in `rundev.sh`'s
-`ARCH_TARGET` map, so `device upgrade` and `device upgrade-remote` both fail at
-`arch_to_bin`. Do not "fix" that by adding a map entry: those paths build a generic
-`cross` binary rather than the proven OpenWrt-SDK `-Z build-std` one, and install to
-`/usr/bin/sctl`, which is not where this device keeps it. Use `install.sh` over SSH,
-or push the `.gz` files via the file API / STP and restart the init script.
+`install.sh` writes `relay_route = "follow_default"` into `[tunnel]` (`RELAY_ROUTE`,
+default `follow_default`). The agent then keeps the host route to the relay on the
+best uplink that answers and moves its tunnel without a restart (`docs/config.md`,
+`relay_route`). A tunnel pinned with `bind_address` keeps its pin and gets no
+`relay_route`: the agent refuses both together.
+
+That replaces two shell hotplugs, which `install.sh` removes together with the pin
+they left (`relay-route.sh`), keeping them in `/tmp/sctl-relay-route.backup.<stamp>`:
+
+- `/etc/hotplug.d/iface/96-wg-repin` pinned the WireGuard endpoint, which is the
+  relay, at metric 0 through the lowest-metric default route. The agent never
+  replaces a route it did not install, so that pin would keep it out.
+- `/etc/hotplug.d/iface/97-sctl-rehome` restarted sctl when the wan came up.
+
+Failing over to another uplink needs `rp_filter` at 0 or 2 on the uplinks: the
+agent's probe of a backup uplink is answered on that uplink.
+
+### Remote upgrade: `rundev.sh device upgrade-remote`
+
+`rundev.sh device upgrade-remote <name>` upgrades a unit through the relay, with no
+SSH. It asks the device how sctl is installed, and when it finds this layout
+(`/usr/local/lib/sctl/sctl-server-mips_24kc.gz` under a procd init) it:
+
+1. builds the payloads with `devices/build.sh xe300`: the OpenWrt SDK build, not the
+   generic `cross` binary, which also does not fit `/usr/bin/sctl`;
+2. stages them in `/tmp/sctl-xe300-upgrade` over STP, with `upgrade.sh` and
+   `relay-route.sh` through the file API, then checks their hashes and that the
+   server runs (`--version`);
+3. refuses a `[tunnel]` pinned with `bind_address` before shipping anything, and
+   warns when `rp_filter` is strict;
+4. starts `upgrade.sh` on the device, detached. It copies the current payloads,
+   `sctl.toml` and hotplugs to `/usr/local/lib/sctl/rollback` (kept afterwards),
+   installs the payloads, sets `[tunnel] relay_route` (every other line of
+   `sctl.toml` stays as it is), removes the two hotplugs and their pin, and
+   restarts the agent once;
+5. puts all of it back and restarts again unless, within 180 s, `/api/health` on
+   the device reports the new version and a connected tunnel twice in a row.
+
+Progress is in `/tmp/sctl-xe300-upgrade/state` and `/tmp/sctl-xe300-upgrade.log` on
+the device, and `rundev.sh` prints that log when the upgrade rolls back.
+`RELAY_ROUTE=off` upgrades the payloads only, leaving `sctl.toml` and the hotplugs
+alone.
+
+`rundev.sh device upgrade` (over SSH) still does not handle this layout: `uname -m`
+is `mips`, which has no `ARCH_TARGET` entry. Over SSH, use `install.sh`, which
+preserves the `[tunnel]` block.
 
 ## SSH access
 

@@ -2036,95 +2036,42 @@ upload_comms_provider_remote() {
     fi
 }
 
-do_device_upgrade_remote() {
-    local name="${1:-}"
-    if [[ -z "$name" ]]; then
-        err "Usage: $0 device upgrade-remote <name>"
-        exit 1
-    fi
-
-    require_jq
-    ensure_config
-
-    if ! cfg_device_exists "$name"; then
-        err "Device '$name' not found"
-        exit 1
-    fi
-
-    local arch url api_key serial
-    arch=$(cfg_device_get "$name" "arch")
-    url=$(cfg_device_get "$name" "url")
-    api_key=$(cfg_device_get "$name" "api_key")
-    serial=$(cfg_device_get "$name" "serial")
-
-    if [[ -z "$url" || -z "$api_key" ]]; then
-        err "Device '$name' missing url or api_key in config"
-        exit 1
-    fi
-    if [[ -z "$arch" ]]; then
-        err "Device '$name' has no arch configured"
-        exit 1
-    fi
-
-    # Step 1: Cross-compile
-    local target bin_path
-    target=$(arch_to_target "$arch")
-    bin_path=$(arch_to_bin "$arch")
-
-    if [[ "$target" == "native" ]]; then
-        log "Building sctl for $arch (native)..."
-        (cd "$SCTL_DIR" && cargo build --release 2>&1)
-    else
-        log "Building sctl for $arch (cross: $target)..."
-        (cd "$SCTL_DIR" && cross build --release --target "$target" 2>&1)
-    fi
-    ok "Build complete: $bin_path"
-
-    # Build + ship the comms plugin in the same pass (relay-only path parity with the
-    # SSH deploy/upgrade paths). Non-fatal: graceful-absent on the device. Done before
-    # the server swap so the restarted sctl finds the plugin already in place.
-    local comms_provider
-    comms_provider=$(device_comms_provider "$name")
-    build_comms_provider "$comms_provider" "$arch"
-    upload_comms_provider_remote "$url" "$api_key" "$comms_provider" "$arch"
-
-    local file_size chunk_size total_chunks expected_hash
-    file_size=$(stat -c%s "$bin_path")
+# Upload one file over STP to <path>/<filename> on a relay-only device, across as
+# many connection windows as it takes, and wait until the device has verified it.
+# Exits the script on failure. Sets xfer_id, total_chunks, windows_used and
+# total_retries (declare them local in the caller).
+# Usage: stp_upload_resilient <url> <api_key> <file> <path> <filename> <mode>
+stp_upload_resilient() {
+    local url="$1" api_key="$2" file="$3" path="$4" filename="$5" mode="$6"
+    local file_size chunk_size
+    file_size=$(stat -c%s "$file")
     # TODO(upload-hardening): GX/STP uploads are still much slower than they should be
     # for mission-critical remote ops. The current path is strictly serialized
     # (one HTTP chunk request per RTT, single in-flight chunk, 64 KiB payloads),
     # which is resilient on flaky links but leaves a lot of throughput on the table.
     # Future protocol work should support a faster mode with larger chunks and/or a
     # sliding window of concurrent in-flight chunks with resumable selective acking.
-    chunk_size=65536  # 64 KiB — small chunks for flaky connections
+    chunk_size=65536  # 64 KiB: small chunks for flaky connections
     total_chunks=$(( (file_size + chunk_size - 1) / chunk_size ))
-    expected_hash=$(sha256sum "$bin_path" | cut -d' ' -f1)
 
-    log "Binary: $bin_path ($file_size bytes, $total_chunks chunks @ 64KiB)"
-    log "Expected binary hash: $expected_hash"
-
-    # ── Phase A: Upload (spans multiple connection windows) ──────────
-
-    log "Phase A: Resilient chunked upload"
-
-    # Step 2: Init upload via STP (with retry across windows)
-    local xfer_id=""
-    if ! resilient_stp_init "$url" "$api_key" "$file_size" "$chunk_size" "$total_chunks"; then
+    # Init via STP (with retry across windows)
+    xfer_id=""
+    if ! resilient_stp_init "$url" "$api_key" "$file_size" "$chunk_size" "$total_chunks" "$path" "$filename" "$mode"; then
         err "Failed to init upload after multiple attempts"
         exit 1
     fi
     ok "Transfer ID: $xfer_id"
 
-    # Step 3: Upload chunks across connection windows
+    # Upload chunks across connection windows
     local idx=0
     local chunk_timeout=8   # per-chunk curl timeout (seconds)
     local max_upload_wait_secs=21600  # 6h wall-clock budget for mission-critical relay-only upgrades
     local upload_started_at
     upload_started_at=$(date +%s)
-    local total_retries=0
-    local windows_used=1
+    total_retries=0
+    windows_used=1
 
-    log "Uploading $total_chunks chunks (retries across connection windows)..."
+    log "Uploading $file ($file_size bytes, $total_chunks chunks @ 64KiB, retries across connection windows)..."
     while [[ $idx -lt $total_chunks ]]; do
         local offset=$((idx * chunk_size))
         local this_size=$chunk_size
@@ -2134,11 +2081,11 @@ do_device_upgrade_remote() {
 
         # Compute hash
         local chunk_hash
-        chunk_hash=$(dd if="$bin_path" bs=1 skip="$offset" count="$this_size" 2>/dev/null | sha256sum | cut -d' ' -f1)
+        chunk_hash=$(dd if="$file" bs=1 skip="$offset" count="$this_size" 2>/dev/null | sha256sum | cut -d' ' -f1)
 
         # Send chunk with short timeout
         local chunk_resp ok_val
-        chunk_resp=$(dd if="$bin_path" bs=1 skip="$offset" count="$this_size" 2>/dev/null | \
+        chunk_resp=$(dd if="$file" bs=1 skip="$offset" count="$this_size" 2>/dev/null | \
             curl -sf --max-time "$chunk_timeout" -X POST "$url/api/stp/chunk/$xfer_id/$idx" \
                 -H "Authorization: Bearer $api_key" \
                 -H "Content-Type: application/octet-stream" \
@@ -2152,7 +2099,7 @@ do_device_upgrade_remote() {
             continue
         fi
 
-        # Chunk failed — determine cause
+        # Chunk failed: determine cause
         total_retries=$((total_retries + 1))
         local now_ts elapsed_secs
         now_ts=$(date +%s)
@@ -2173,11 +2120,11 @@ do_device_upgrade_remote() {
             -H "Authorization: Bearer $api_key" 2>/dev/null) || status_code="000"
 
         if [[ "$status_code" == "404" ]]; then
-            # Process restarted, transfer_id gone — re-init from scratch
+            # Process restarted, transfer_id gone: re-init from scratch
             echo ""
             warn "Transfer lost (process restarted?), re-initializing upload..."
             idx=0
-            if ! resilient_stp_init "$url" "$api_key" "$file_size" "$chunk_size" "$total_chunks"; then
+            if ! resilient_stp_init "$url" "$api_key" "$file_size" "$chunk_size" "$total_chunks" "$path" "$filename" "$mode"; then
                 err "Failed to re-init upload"
                 exit 1
             fi
@@ -2208,7 +2155,7 @@ do_device_upgrade_remote() {
             echo ""
             warn "Transfer entered phase '$phase', re-initializing upload..."
             idx=0
-            if ! resilient_stp_init "$url" "$api_key" "$file_size" "$chunk_size" "$total_chunks"; then
+            if ! resilient_stp_init "$url" "$api_key" "$file_size" "$chunk_size" "$total_chunks" "$path" "$filename" "$mode"; then
                 err "Failed to re-init upload"
                 exit 1
             fi
@@ -2217,7 +2164,7 @@ do_device_upgrade_remote() {
             continue
         fi
 
-        # Connection dropped — wait for next window and retry same chunk
+        # Connection dropped: wait for next window and retry same chunk
         printf "\n  chunk %d failed, waiting for reconnection... " "$idx"
         windows_used=$((windows_used + 1))
         if ! wait_for_device "$url" 360 quiet; then
@@ -2237,7 +2184,7 @@ do_device_upgrade_remote() {
     echo ""
     ok "All $total_chunks chunks uploaded ($windows_used connection windows, $total_retries retries)"
 
-    # Step 4: Wait for transfer completion (verification) — may need a window
+    # Wait for transfer completion (verification), which may need a window
     log "Waiting for transfer verification..."
     local phase="" verify_attempts=0
     while [[ "$phase" != "complete" && $verify_attempts -lt 10 ]]; do
@@ -2270,6 +2217,83 @@ do_device_upgrade_remote() {
         err "Transfer did not complete (phase: $phase)"
         exit 1
     fi
+}
+
+do_device_upgrade_remote() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        err "Usage: $0 device upgrade-remote <name>"
+        exit 1
+    fi
+
+    require_jq
+    ensure_config
+
+    if ! cfg_device_exists "$name"; then
+        err "Device '$name' not found"
+        exit 1
+    fi
+
+    local arch url api_key serial
+    arch=$(cfg_device_get "$name" "arch")
+    url=$(cfg_device_get "$name" "url")
+    api_key=$(cfg_device_get "$name" "api_key")
+    serial=$(cfg_device_get "$name" "serial")
+
+    if [[ -z "$url" || -z "$api_key" ]]; then
+        err "Device '$name' missing url or api_key in config"
+        exit 1
+    fi
+
+    # A GL-XE300 keeps gzipped payloads on its overlay under a procd init script,
+    # which the cross binary and /usr/bin/sctl below do not fit. Ask the device.
+    log "Checking how sctl is installed on '$name'..."
+    local layout
+    layout=$(remote_exec_stdout_trimmed "$url" "$api_key" "$XE300_LAYOUT_PROBE" 5000 3 8) || true
+    if [[ "$layout" == "xe300" ]]; then
+        do_device_upgrade_remote_xe300 "$name" "$url" "$api_key"
+        return
+    fi
+
+    if [[ -z "$arch" ]]; then
+        err "Device '$name' has no arch configured"
+        exit 1
+    fi
+
+    # Step 1: Cross-compile
+    local target bin_path
+    target=$(arch_to_target "$arch")
+    bin_path=$(arch_to_bin "$arch")
+
+    if [[ "$target" == "native" ]]; then
+        log "Building sctl for $arch (native)..."
+        (cd "$SCTL_DIR" && cargo build --release 2>&1)
+    else
+        log "Building sctl for $arch (cross: $target)..."
+        (cd "$SCTL_DIR" && cross build --release --target "$target" 2>&1)
+    fi
+    ok "Build complete: $bin_path"
+
+    # Build + ship the comms plugin in the same pass (relay-only path parity with the
+    # SSH deploy/upgrade paths). Non-fatal: graceful-absent on the device. Done before
+    # the server swap so the restarted sctl finds the plugin already in place.
+    local comms_provider
+    comms_provider=$(device_comms_provider "$name")
+    build_comms_provider "$comms_provider" "$arch"
+    upload_comms_provider_remote "$url" "$api_key" "$comms_provider" "$arch"
+
+    local file_size expected_hash
+    file_size=$(stat -c%s "$bin_path")
+    expected_hash=$(sha256sum "$bin_path" | cut -d' ' -f1)
+
+    log "Binary: $bin_path ($file_size bytes)"
+    log "Expected binary hash: $expected_hash"
+
+    # ── Phase A: Upload (spans multiple connection windows) ──────────
+
+    log "Phase A: Resilient chunked upload"
+    local xfer_id="" total_chunks=0 windows_used=0 total_retries=0
+    stp_upload_resilient "$url" "$api_key" "$bin_path" /tmp sctl-upgrade 0755
 
     # ── Phase B: Swap (must complete in one window) ──────────────────
 
@@ -2400,6 +2424,237 @@ do_device_upgrade_remote() {
         warn "Check status: curl -sf $url/api/health"
         exit 1
     fi
+}
+
+# ─── device upgrade-remote: GL-XE300 ─────────────────────────────────
+#
+# The XE300 keeps gzipped payloads in /usr/local/lib/sctl, and its procd init
+# script expands them into /tmp at start (devices/xe300/README.md), so the
+# generic cross binary, /usr/bin/sctl and the cron watchdog's rollback do not
+# apply. This path builds the OpenWrt-SDK payloads (devices/xe300/build.sh),
+# stages them over STP and hands the swap to devices/xe300/upgrade.sh on the
+# device. With one agent restart, that script installs the payloads, sets
+# [tunnel] relay_route in sctl.toml and removes the route hotplugs the agent
+# replaces (devices/xe300/relay-route.sh). It keeps the previous payloads,
+# sctl.toml and hotplugs in /usr/local/lib/sctl/rollback and puts them all back
+# unless the agent returns with the new version and its tunnel up.
+#
+# RELAY_ROUTE=off upgrades the payloads only: sctl.toml and the hotplugs stay
+# as they are.
+
+XE300_ARTIFACT_DIR="$REPO_DIR/.artifacts/xe300"
+XE300_STAGE="/tmp/sctl-xe300-upgrade"
+XE300_LOG="/tmp/sctl-xe300-upgrade.log"
+XE300_LAYOUT_PROBE="if [ -f /usr/local/lib/sctl/sctl-server-mips_24kc.gz ] && [ -x /etc/init.d/sctl ]; then echo xe300; else echo other; fi"
+
+# Write a local text file to the device through the file API, retrying across
+# short windows.
+# Usage: remote_put_file <url> <api_key> <file> <remote_path> <mode>
+remote_put_file() {
+    local url="$1" api_key="$2" file="$3" remote_path="$4" mode="$5"
+    for attempt in 1 2 3 4 5; do
+        wait_for_device "$url" 360 quiet || return 1
+        if jq -n --rawfile content "$file" --arg path "$remote_path" --arg mode "$mode" \
+                '{path: $path, content: $content, mode: $mode, create_dirs: true}' |
+            curl -sf --max-time 15 -X PUT "$url/api/files" \
+                -H "Authorization: Bearer $api_key" \
+                -H "Content-Type: application/json" \
+                --data-binary @- >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+do_device_upgrade_remote_xe300() {
+    local name="$1" url="$2" api_key="$3"
+    local relay_route="${RELAY_ROUTE:-follow_default}"
+    case "$relay_route" in
+        off|follow_default) ;;
+        *)
+            err "RELAY_ROUTE must be off or follow_default, not '$relay_route'"
+            exit 1
+            ;;
+    esac
+    local server_gz="$XE300_ARTIFACT_DIR/sctl-server-mips_24kc.gz"
+    local plugin_gz="$XE300_ARTIFACT_DIR/sctl-comms-quectel-mips_24kc.so.gz"
+    local d="$XE300_STAGE"
+    ok "'$name' is a GL-XE300: gzipped payloads under procd"
+
+    # Step 1: the proven OpenWrt-SDK build, not the generic cross binary
+    log "Building the XE300 payloads (devices/xe300/build.sh)..."
+    "$REPO_DIR/devices/build.sh" xe300
+    local server_hash plugin_hash
+    server_hash=$(sha256sum "$server_gz" | cut -d' ' -f1)
+    plugin_hash=$(sha256sum "$plugin_gz" | cut -d' ' -f1)
+
+    # Step 2: an empty stage directory, unless an earlier upgrade still runs in it.
+    # Device commands carry no backslash: /api/exec re-quotes them.
+    log "Preparing $d on the device..."
+    local prep
+    prep=$(remote_exec_stdout_trimmed "$url" "$api_key" \
+        'd='"$d"'; case "$(cat $d/state 2>/dev/null)" in ""|done|rolled_back|failed) ;; *) if kill -0 "$(cat $d/pid 2>/dev/null)" 2>/dev/null; then echo busy; exit 0; fi ;; esac; rm -rf $d && mkdir -p $d && echo ready' \
+        5000 5 8) || true
+    case "$prep" in
+        ready) ;;
+        busy)
+            err "An upgrade is still running on '$name' (see $d/state and $XE300_LOG)"
+            exit 1
+            ;;
+        *)
+            err "Could not prepare $d on the device"
+            exit 1
+            ;;
+    esac
+
+    # Step 3: the scripts that do the swap on the device
+    local f
+    for f in upgrade.sh relay-route.sh; do
+        if ! remote_put_file "$url" "$api_key" "$REPO_DIR/devices/xe300/$f" "$d/$f" 0755; then
+            err "Could not write $d/$f on the device"
+            exit 1
+        fi
+    done
+    ok "Upgrade scripts staged"
+
+    # Step 4: refuse a tunnel pinned with bind_address before shipping anything.
+    # Only the helper's exit code comes back; sctl.toml holds the keys.
+    if [[ "$relay_route" == "follow_default" ]]; then
+        local check
+        check=$(remote_exec_stdout_trimmed "$url" "$api_key" \
+            'sh '"$d"'/relay-route.sh config follow_default /etc/sctl/sctl.toml >/dev/null 2>&1; echo "rc$?"' \
+            5000 5 8) || true
+        case "$check" in
+            rc0)
+                ok "sctl.toml: [tunnel] relay_route becomes follow_default"
+                ;;
+            rc3)
+                warn "sctl.toml has no [tunnel] section: relay_route is not set and the route hotplugs stay"
+                ;;
+            rc2)
+                err "sctl.toml pins the tunnel with [tunnel] bind_address, which relay_route cannot be combined with."
+                err "Remove the pin first, or run with RELAY_ROUTE=off to upgrade the payloads only."
+                remote_exec_json "$url" "$api_key" "rm -rf $d" 5000 2 5 >/dev/null 2>&1 || true
+                exit 1
+                ;;
+            *)
+                err "Could not check sctl.toml on the device (${check:-no answer})"
+                exit 1
+                ;;
+        esac
+        # The agent's probe of another uplink is answered on that uplink, which
+        # strict reverse-path filtering drops (docs/config.md, relay_route).
+        local strict
+        strict=$(remote_exec_json "$url" "$api_key" "grep -lx 1 /proc/sys/net/ipv4/conf/*/rp_filter" 5000 3 8 \
+            | jq -r '.stdout // empty' 2>/dev/null | sed 's|/proc/sys/net/ipv4/conf/||; s|/rp_filter||' \
+            | grep -vx lo | tr '\n' ' ') || true
+        if [[ -n "${strict// /}" ]]; then
+            warn "rp_filter = 1 (strict) on: $strict"
+            warn "It drops the answer to the agent's probe of a backup uplink, so the relay route cannot fail over until it is 0 or 2"
+        fi
+    fi
+
+    # Step 5: both payloads over STP, across as many windows as it takes
+    local xfer_id="" total_chunks=0 windows_used=0 total_retries=0
+    stp_upload_resilient "$url" "$api_key" "$plugin_gz" "$d" plugin.gz 0644
+    stp_upload_resilient "$url" "$api_key" "$server_gz" "$d" server.gz 0644
+
+    # Step 6: the staged payloads are the ones built here, and the server runs
+    log "Verifying the staged payloads..."
+    local staged_server staged_plugin
+    staged_server=$(remote_exec_stdout_trimmed "$url" "$api_key" "sha256sum $d/server.gz | cut -d\" \" -f1" 5000 10 8) || true
+    staged_plugin=$(remote_exec_stdout_trimmed "$url" "$api_key" "sha256sum $d/plugin.gz | cut -d\" \" -f1" 5000 10 8) || true
+    if [[ "$staged_server" != "$server_hash" || "$staged_plugin" != "$plugin_hash" ]]; then
+        err "Staged payload hash mismatch (server ${staged_server:-unavailable}, plugin ${staged_plugin:-unavailable})"
+        exit 1
+    fi
+    local version_out version
+    version_out=$(remote_exec_stdout_trimmed "$url" "$api_key" \
+        'd='"$d"'; gzip -dc $d/server.gz > $d/sctl && chmod 0755 $d/sctl && $d/sctl --version; rm -f $d/sctl' \
+        15000 5 20) || true
+    version=${version_out#sctl}
+    if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+        err "The staged server does not run on the device (--version said '${version_out:-nothing}')"
+        exit 1
+    fi
+    ok "Staged payloads verified: sctl $version"
+
+    # Step 7: start the swap detached, since it restarts the agent running this
+    # exec. Idempotent: a retry finds the state file or the running script.
+    log "Handing the swap to $d/upgrade.sh (one restart; it rolls back unless healthy)..."
+    local launch
+    launch=$(remote_exec_stdout_trimmed "$url" "$api_key" \
+        'd='"$d"'; if [ -f $d/state ]; then cat $d/state; elif start-stop-daemon -S -b -o -m -p $d/pid -x /bin/sh -- $d/upgrade.sh '"$version $relay_route"' </dev/null >/dev/null 2>&1; then echo launched; else echo launch_failed; fi' \
+        5000 3 8) || true
+    case "$launch" in
+        launch_failed)
+            err "start-stop-daemon refused to start $d/upgrade.sh; nothing was changed"
+            exit 1
+            ;;
+        "")
+            warn "No answer to the launch; waiting for its state anyway"
+            ;;
+    esac
+
+    # Step 8: the outcome, read from the state file once the agent answers again
+    log "Waiting for the outcome (the device rolls back by itself after 180s unhealthy)..."
+    local outcome="" last="" deadline resp
+    deadline=$(( $(date +%s) + 480 ))
+    while (( $(date +%s) < deadline )); do
+        sleep 5
+        resp=$(curl -sf --max-time 8 -X POST "$url/api/exec" \
+            -H "Authorization: Bearer $api_key" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg command "cat $d/state" '{command: $command, timeout: 5000}')" 2>/dev/null) || {
+            printf "."
+            continue
+        }
+        outcome=$(echo "$resp" | jq -r '.stdout // empty' 2>/dev/null | tr -d '[:space:]')
+        if [[ -n "$outcome" && "$outcome" != "$last" ]]; then
+            printf "\n  state: %s" "$outcome"
+            last="$outcome"
+        fi
+        case "$outcome" in done|rolled_back|failed) break ;; esac
+    done
+    echo ""
+
+    case "$outcome" in
+        done) ;;
+        rolled_back|failed)
+            err "The upgrade on '$name' ended '$outcome': the device runs what it ran before"
+            remote_exec_json "$url" "$api_key" "tail -n 30 $XE300_LOG" 5000 2 8 2>/dev/null \
+                | jq -r '.stdout // empty' 2>/dev/null | sed 's/^/    /' || true
+            exit 1
+            ;;
+        *)
+            err "No outcome within 480s (last state: ${outcome:-unknown})"
+            err "The device rolls back by itself unless the new agent is healthy; see $d/state and $XE300_LOG"
+            exit 1
+            ;;
+    esac
+
+    local health running installed
+    health=$(curl -sf --connect-timeout 3 --max-time 8 "$url/api/health" 2>/dev/null) || true
+    running=$(echo "$health" | jq -r '.version // empty' 2>/dev/null)
+    installed=$(remote_exec_stdout_trimmed "$url" "$api_key" "sha256sum /usr/local/lib/sctl/sctl-server-mips_24kc.gz | cut -d\" \" -f1" 5000 5 8) || true
+    if [[ "$running" != "$version" || "$installed" != "$server_hash" ]]; then
+        err "The device reported done, but answers version '${running:-unavailable}' with payload hash '${installed:-unavailable}'"
+        err "Expected version $version, hash $server_hash"
+        exit 1
+    fi
+    jq --arg name "$name" --arg ver "$version" \
+        '.devices[$name].sctl_version = $ver' \
+        "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    remote_exec_json "$url" "$api_key" "rm -rf $d" 5000 2 5 >/dev/null 2>&1 || true
+
+    echo ""
+    ok "Remote upgrade complete for '$name'"
+    echo "  Version:     $version"
+    echo "  Tunnel path: $(echo "$health" | jq -c '.tunnel.path // null' 2>/dev/null)"
+    echo "  Relay route: $(echo "$health" | jq -c '.tunnel.relay_route // null' 2>/dev/null)"
+    echo "  Previous payloads, sctl.toml and hotplugs: /usr/local/lib/sctl/rollback"
+    echo "  Log on the device: $XE300_LOG"
 }
 
 # ─── playbook library ────────────────────────────────────────────────

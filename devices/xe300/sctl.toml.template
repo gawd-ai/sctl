@@ -28,11 +28,18 @@ serial = "{{SERIAL}}"
 level = "info"
 
 # The out-of-band relay tunnel ([tunnel]) is per-deployment and is appended by
-# install.sh, not templated here — either from TUNNEL_URL/TUNNEL_KEY, or by
+# install.sh, not templated here: either from TUNNEL_URL/TUNNEL_KEY, or by
 # PRESERVING the block already on the device when those are not supplied.
 # install.sh overwrites this whole file, so that preservation is what stops a
 # re-install from silently un-pinning a unit that is only reachable over the
 # tunnel. Do not "simplify" it away.
+#
+# install.sh also writes `relay_route = "follow_default"` into that block
+# (RELAY_ROUTE; never beside a bind_address pin, which the agent refuses): the
+# agent keeps the host route to the relay on the best uplink that answers and
+# moves its tunnel without a restart. That replaces the 96-wg-repin and
+# 97-sctl-rehome hotplugs, which install.sh and `rundev.sh device
+# upgrade-remote` remove.
 
 [comms]
 provider = "quectel-at"
