@@ -2546,13 +2546,17 @@ do_device_upgrade_remote_xe300() {
         esac
         # The agent's probe of another uplink is answered on that uplink, which
         # strict reverse-path filtering drops (docs/config.md, relay_route).
-        # upgrade.sh makes it loose; say where it is strict today.
-        local strict
-        strict=$(remote_exec_json "$url" "$api_key" "grep -lx 1 /proc/sys/net/ipv4/conf/*/rp_filter" 5000 3 8 \
-            | jq -r '.stdout // empty' 2>/dev/null | sed 's|/proc/sys/net/ipv4/conf/||; s|/rp_filter||' \
-            | grep -vx lo | tr '\n' ' ') || true
-        if [[ -n "${strict// /}" ]]; then
-            log "rp_filter = 1 (strict) on: $strict; the upgrade sets it to 2 (loose), now and in /etc/sysctl.conf"
+        # upgrade.sh makes it loose when the agent takes the route (rc0 only:
+        # without [tunnel] it leaves rp_filter alone); say where it is strict
+        # today.
+        if [[ "$check" == rc0 ]]; then
+            local strict
+            strict=$(remote_exec_json "$url" "$api_key" "grep -lx 1 /proc/sys/net/ipv4/conf/*/rp_filter" 5000 3 8 \
+                | jq -r '.stdout // empty' 2>/dev/null | sed 's|/proc/sys/net/ipv4/conf/||; s|/rp_filter||' \
+                | grep -vx lo | tr '\n' ' ') || true
+            if [[ -n "${strict// /}" ]]; then
+                log "rp_filter = 1 (strict) on: $strict; the upgrade sets it to 2 (loose), now and in /etc/sysctl.conf"
+            fi
         fi
     fi
 
