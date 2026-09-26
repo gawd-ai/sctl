@@ -9,9 +9,11 @@
 //! The uplink is the lowest-metric default route whose interface is not
 //! suspect ([`choose`]): netifd's metrics already rank the wire above LTE. It
 //! is chosen again on every network change netwatch publishes and after every
-//! registration. The route only moves to an uplink that answers the relay: a
-//! TCP connect bound to that interface (`SO_BINDTODEVICE`), unless the tunnel
-//! is registered over it already. An uplink that does not answer is suspect.
+//! registration. The route only moves to an uplink that answers the relay,
+//! unless the tunnel is registered over it already. Asking is a [`Probe`]
+//! bound to that interface (`SO_BINDTODEVICE`): the tunnel's own TLS
+//! handshake with the relay, so an uplink that passes TCP but breaks TLS does
+//! not answer. An uplink that does not answer is suspect.
 //!
 //! A link that is up while its internet is dead sends no kernel event. The
 //! tunnel's own failures are the signal: after two in a row on the uplink the
@@ -44,6 +46,7 @@ use std::time::Duration;
 
 use futures_util::future::{join, join_all};
 use serde::Serialize;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -51,8 +54,9 @@ use tracing::{debug, info, warn};
 
 use super::route::{self, OwnedRoute, RTPROT_SCTL};
 use super::{next_state, source, DefaultRoute, HostRoute, NetState, NetWatch};
-use crate::config::RelayRouteMode;
+use crate::config::{RelayRouteMode, TunnelConfig};
 use crate::state::{TunnelEventType, TunnelStats};
+use crate::tunnel::client;
 
 /// Tunnel failures in a row on the route's uplink before the others are asked.
 const FAILURES_TO_FAIL_OVER: u8 = 2;
@@ -69,6 +73,8 @@ pub struct Timing {
     pub return_schedule: Vec<Duration>,
     /// How long one probe's TCP connect may take.
     pub probe_timeout: Duration,
+    /// How long one probe's TLS handshake may take, after the connect.
+    pub handshake_timeout: Duration,
 }
 
 impl Default for Timing {
@@ -80,9 +86,70 @@ impl Default for Timing {
                 Duration::from_mins(10),
                 Duration::from_mins(15),
             ],
-            // What the tunnel itself gives a TCP connect.
+            // What the tunnel itself gives a TCP connect and a TLS handshake.
             probe_timeout: Duration::from_secs(10),
+            handshake_timeout: Duration::from_secs(15),
         }
+    }
+}
+
+/// How a probe asks an uplink whether it reaches the relay: the first steps
+/// of the tunnel's own connection, bound to that uplink.
+///
+/// A bare TCP connect is not enough over `wss://`: an uplink that accepts
+/// TCP but breaks TLS (SSL inspection, a captive portal) would pass it while
+/// the tunnel fails on it, and the route would go back and forth. So the
+/// probe of a `wss://` tunnel makes the tunnel's TLS handshake, with its
+/// server name (SNI), its CA file and its certificate pin, and closes the
+/// connection straight after: no WebSocket upgrade, and the tunnel key is
+/// never sent.
+#[derive(Clone)]
+pub enum Probe {
+    /// A TCP connect, all a plain `ws://` tunnel does before its upgrade.
+    Connect,
+    /// A TCP connect and the TLS handshake of the tunnel configured here.
+    Tls(Arc<TunnelConfig>),
+}
+
+impl Probe {
+    /// The probe that matches the tunnel: its TLS handshake for a `wss://`
+    /// url, a connect otherwise.
+    pub fn for_tunnel(config: &TunnelConfig) -> Self {
+        if config
+            .url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("wss://"))
+        {
+            Self::Tls(Arc::new(config.clone()))
+        } else {
+            Self::Connect
+        }
+    }
+
+    /// Ask the relay at `relay` over `dev` alone, from `src`. The error says
+    /// why it did not answer.
+    pub async fn ask(
+        &self,
+        relay: SocketAddrV4,
+        dev: &str,
+        src: Ipv4Addr,
+        timing: &Timing,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tcp = connect_from(relay, dev, src, timing.probe_timeout).await?;
+        let Self::Tls(config) = self else {
+            return Ok(());
+        };
+        let url = config.url.as_deref().unwrap_or_default();
+        let mut tls = tokio::time::timeout(
+            timing.handshake_timeout,
+            client::tls_handshake(url, tcp, config),
+        )
+        .await
+        .map_err(|_| "TLS handshake timed out")??;
+        // A close_notify, so the relay sees the end of a TLS session rather
+        // than a reset. Whether it gets there changes nothing.
+        let _ = tokio::time::timeout(Duration::from_secs(1), tls.shutdown()).await;
+        Ok(())
     }
 }
 
@@ -249,7 +316,7 @@ impl fmt::Display for Change {
 
 /// What the owner does to the world, so tests can stand in for the kernel.
 pub(crate) trait Uplinks {
-    /// Whether a TCP connect to `relay`, bound to `dev` and `src`, succeeds.
+    /// Whether the relay at `relay` answers a probe bound to `dev` and `src`.
     fn answers(
         &self,
         relay: SocketAddrV4,
@@ -704,16 +771,17 @@ pub async fn connect_from(
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))?
 }
 
-/// The real uplinks: kernel routes, bound connects and the tunnel's stats.
+/// The real uplinks: kernel routes, bound probes and the tunnel's stats.
 struct Kernel {
     stats: Arc<TunnelStats>,
-    probe_timeout: Duration,
+    probe: Probe,
+    timing: Timing,
 }
 
 impl Uplinks for Kernel {
     async fn answers(&self, relay: SocketAddrV4, dev: &str, src: Ipv4Addr) -> bool {
-        match connect_from(relay, dev, src, self.probe_timeout).await {
-            Ok(_) => {
+        match self.probe.ask(relay, dev, src, &self.timing).await {
+            Ok(()) => {
                 debug!("relay route: {relay} answers over {dev}");
                 true
             }
@@ -741,24 +809,28 @@ impl Uplinks for Kernel {
 }
 
 /// Keep the relay route until cancelled, recording each move in the tunnel
-/// events. Parks when the mode is off. Cancelling leaves the route in place.
+/// events. `probe` is how an uplink is asked whether it reaches the relay.
+/// Parks when the mode is off. Cancelling leaves the route in place.
 pub async fn run(
     handle: Arc<RelayRoute>,
     mut net: NetWatch,
     stats: Arc<TunnelStats>,
     timing: Timing,
+    probe: Probe,
 ) {
     if handle.mode() == RelayRouteMode::Off {
         return std::future::pending().await;
     }
     // A restarted owner takes the queue back from the one that panicked.
     let mut signals = handle.rx.lock().await;
+    let schedule = timing.return_schedule.clone();
     let mut owner = Owner::new(
         Kernel {
             stats: stats.clone(),
-            probe_timeout: timing.probe_timeout,
+            probe,
+            timing,
         },
-        timing.return_schedule,
+        schedule,
     );
     info!("relay route: keeping the relay's route on the best uplink that answers it");
     loop {
@@ -1651,5 +1723,286 @@ mod tests {
         let on = RelayRoute::new(RelayRouteMode::FollowDefault);
         on.signal(registered(ETH1));
         assert_eq!(on.rx.lock().await.try_recv().unwrap(), registered(ETH1));
+    }
+
+    /// The probe against real sockets on loopback: `lo` stands in for an
+    /// uplink, bound with SO_BINDTODEVICE as a real one is.
+    mod probe {
+        use std::fmt::Write as _;
+
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use sha2::{Digest, Sha256};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        use super::*;
+
+        /// A throwaway CA made for these tests (P-256, valid 2026 to 2126).
+        const TEST_CA: &str = concat!(
+            "-----BEGIN CERTIFICATE-----\n",
+            "MIIBZDCCAQqgAwIBAgIUI8lkzak4ugreveQWWrufISPFMkEwCgYIKoZIzj0EAwIw\n",
+            "HTEbMBkGA1UEAwwSc2N0bCBwcm9iZSB0ZXN0IENBMCAXDTI2MDEwMTAwMDAwMFoY\n",
+            "DzIxMjYwMTAxMDAwMDAwWjAdMRswGQYDVQQDDBJzY3RsIHByb2JlIHRlc3QgQ0Ew\n",
+            "WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS/+4ZtCOXeVxh/Ro517zCMH7htOWqP\n",
+            "HJAceQtDyfsvvJdHk5ppEhla6x2lOLuf80l12LXGvoc4Tt9/yBv9qSsVoyYwJDAS\n",
+            "BgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBBjAKBggqhkjOPQQDAgNI\n",
+            "ADBFAiEAu0f0dQzAqhKndFCjwTJjm1y8nE0wXcHQp9ac6hZms2MCIDYoJMV6N3bF\n",
+            "KlYXgVfjOv/+Hi6b4DhjoxfyHJ5gjtAd\n",
+            "-----END CERTIFICATE-----\n",
+        );
+
+        /// The certificate it signed for `relay.test`.
+        const TEST_LEAF: &str = concat!(
+            "-----BEGIN CERTIFICATE-----\n",
+            "MIIBgzCCASigAwIBAgIUIJlyS63ium/2B898jfQS4NfE3RYwCgYIKoZIzj0EAwIw\n",
+            "HTEbMBkGA1UEAwwSc2N0bCBwcm9iZSB0ZXN0IENBMCAXDTI2MDEwMTAwMDAwMFoY\n",
+            "DzIxMjYwMTAxMDAwMDAwWjAVMRMwEQYDVQQDDApyZWxheS50ZXN0MFkwEwYHKoZI\n",
+            "zj0CAQYIKoZIzj0DAQcDQgAEXieO55mDEdk2QKKYHkKbjAuYNkHx8Mw9yX/pn3bh\n",
+            "wPUMRKjbTUawFqf7N3EFuBt5CzS2Lrw/cwXcB72tasNIrqNMMEowDAYDVR0TAQH/\n",
+            "BAIwADAOBgNVHQ8BAf8EBAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwEwFQYDVR0R\n",
+            "BA4wDIIKcmVsYXkudGVzdDAKBggqhkjOPQQDAgNJADBGAiEA0Iiu/qIOlwDgfRrX\n",
+            "zIBzvyvcRRtcfC19kCrM6uG5QzECIQCcifU2HwKXFb7xkxgFHFwGVBrITiwI5oqV\n",
+            "EfHOfbWFbA==\n",
+            "-----END CERTIFICATE-----\n",
+        );
+
+        /// The leaf's key: a test fixture, used nowhere else.
+        const TEST_LEAF_KEY: &str = concat!(
+            // The scan reads each line through `echo`, which would split
+            // this one at a newline escape, away from its marker.
+            "-----BEGIN PRIVATE KEY-----", // secret-scan: allow
+            "\n",
+            "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgZkgkiXi0zlbhRoIW\n",
+            "CF31gVuRhcnWlqYjrmhPCTAissShRANCAAReJ47nmYMR2TZAopgeQpuMC5g2QfHw\n",
+            "zD3Jf+mfduHA9QxEqNtNRrAWp/s3cQW4G3kLNLYuvD9zBdwHva1qw0iu\n",
+            "-----END PRIVATE KEY-----\n",
+        );
+
+        /// What one connection to a stand-in relay came to.
+        #[derive(Debug, PartialEq, Eq)]
+        enum Seen {
+            /// A completed TLS handshake, then this many bytes of data.
+            Handshake(usize),
+            /// A handshake that failed.
+            NoHandshake,
+        }
+
+        fn leaf_der() -> CertificateDer<'static> {
+            CertificateDer::from_pem_slice(TEST_LEAF.as_bytes()).unwrap()
+        }
+
+        /// A TLS server for `relay.test` on loopback, reporting each
+        /// connection once it ends.
+        async fn tls_relay() -> (SocketAddrV4, mpsc::UnboundedReceiver<Seen>) {
+            let key = PrivateKeyDer::from_pem_slice(TEST_LEAF_KEY.as_bytes()).unwrap();
+            let config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![leaf_der()], key)
+                .unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+                unreachable!("bound to an IPv4 address")
+            };
+            let (tx, rx) = mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                while let Ok((tcp, _)) = listener.accept().await {
+                    let (acceptor, tx) = (acceptor.clone(), tx.clone());
+                    tokio::spawn(async move {
+                        let seen = match acceptor.accept(tcp).await {
+                            Ok(mut tls) => {
+                                let mut data = Vec::new();
+                                let _ = tls.read_to_end(&mut data).await;
+                                Seen::Handshake(data.len())
+                            }
+                            Err(_) => Seen::NoHandshake,
+                        };
+                        let _ = tx.send(seen);
+                    });
+                }
+            });
+            (addr, rx)
+        }
+
+        /// A captive portal: it accepts any TCP connection and answers with a
+        /// redirect, whatever it was sent.
+        async fn captive_portal() -> SocketAddrV4 {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+                unreachable!("bound to an IPv4 address")
+            };
+            tokio::spawn(async move {
+                while let Ok((mut tcp, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 512];
+                        let _ = tcp.read(&mut buf).await;
+                        let _ = tcp
+                            .write_all(
+                                b"HTTP/1.1 302 Found\r\nLocation: http://portal.example/\r\n\
+                                  Content-Length: 0\r\n\r\n",
+                            )
+                            .await;
+                    });
+                }
+            });
+            addr
+        }
+
+        /// A `wss://` tunnel to `relay.test` on `port`, with `extra` keys.
+        fn tunnel(port: u16, extra: &str) -> TunnelConfig {
+            toml::from_str(&format!(
+                "tunnel_key = \"probe-test-key\"\n\
+                 url = \"wss://relay.test:{port}/api/tunnel/register\"\n{extra}"
+            ))
+            .unwrap()
+        }
+
+        /// The test CA as a file, as `tls_ca_file` names one.
+        struct CaFile(std::path::PathBuf);
+
+        impl CaFile {
+            fn new(name: &str) -> Self {
+                let path = std::env::temp_dir()
+                    .join(format!("sctl-probe-{}-{name}.pem", std::process::id()));
+                std::fs::write(&path, TEST_CA).unwrap();
+                Self(path)
+            }
+
+            fn key(&self) -> String {
+                format!("tls_ca_file = \"{}\"", self.0.display())
+            }
+        }
+
+        impl Drop for CaFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        /// Whether this kernel lets an unprivileged socket bind to a device
+        /// (5.7 and later); older ones need CAP_NET_RAW.
+        fn can_bind_to_lo() -> bool {
+            let socket = TcpSocket::new_v4().unwrap();
+            match source::bind_to_device(&socket, "lo") {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("skipped: SO_BINDTODEVICE needs privileges here ({e})");
+                    false
+                }
+            }
+        }
+
+        async fn ask(probe: &Probe, relay: SocketAddrV4) -> Result<(), String> {
+            probe
+                .ask(relay, "lo", Ipv4Addr::LOCALHOST, &Timing::default())
+                .await
+                .map_err(|e| e.to_string())
+        }
+
+        #[tokio::test]
+        async fn a_probe_makes_the_tunnels_tls_handshake_and_sends_nothing_else() {
+            if !can_bind_to_lo() {
+                return;
+            }
+            let (relay, mut seen) = tls_relay().await;
+            let ca = CaFile::new("handshake");
+            let probe = Probe::for_tunnel(&tunnel(relay.port(), &ca.key()));
+            assert!(matches!(probe, Probe::Tls(_)));
+            ask(&probe, relay).await.unwrap();
+            assert_eq!(
+                seen.recv().await,
+                Some(Seen::Handshake(0)),
+                "a handshake, closed with no upgrade and no key"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_uplink_that_accepts_tcp_but_breaks_tls_fails_the_probe() {
+            if !can_bind_to_lo() {
+                return;
+            }
+            let portal = captive_portal().await;
+            let ca = CaFile::new("portal");
+            // A bare connect, the probe before, passes on it.
+            ask(&Probe::Connect, portal).await.unwrap();
+            let probe = Probe::for_tunnel(&tunnel(portal.port(), &ca.key()));
+            let err = ask(&probe, portal).await.unwrap_err();
+            eprintln!("the portal fails the probe: {err}");
+        }
+
+        #[tokio::test]
+        async fn a_probe_checks_the_certificate_as_the_tunnel_does() {
+            if !can_bind_to_lo() {
+                return;
+            }
+            let (relay, mut seen) = tls_relay().await;
+            // Without the CA file the relay's certificate is not trusted.
+            let untrusted = Probe::for_tunnel(&tunnel(relay.port(), ""));
+            let err = ask(&untrusted, relay).await.unwrap_err();
+            assert!(err.contains("certificate"), "{err}");
+            assert_eq!(seen.recv().await, Some(Seen::NoHandshake));
+
+            // The pin of the relay's own certificate passes; another fails.
+            let ca = CaFile::new("pin");
+            let pin =
+                Sha256::digest(leaf_der().as_ref())
+                    .iter()
+                    .fold(String::new(), |mut hex, b| {
+                        let _ = write!(hex, "{b:02x}");
+                        hex
+                    });
+            let pinned = tunnel(
+                relay.port(),
+                &format!("{}\ntls_server_cert_sha256 = \"{pin}\"", ca.key()),
+            );
+            ask(&Probe::for_tunnel(&pinned), relay).await.unwrap();
+            let other = format!(
+                "{}{}",
+                if pin.starts_with('0') { '1' } else { '0' },
+                &pin[1..]
+            );
+            let mispinned = tunnel(
+                relay.port(),
+                &format!("{}\ntls_server_cert_sha256 = \"{other}\"", ca.key()),
+            );
+            let err = ask(&Probe::for_tunnel(&mispinned), relay)
+                .await
+                .unwrap_err();
+            assert!(err.contains("pin mismatch"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn a_probe_is_bound_to_its_uplink() {
+            if !can_bind_to_lo() {
+                return;
+            }
+            // Over an interface that does not exist the probe cannot leave,
+            // even though loopback would reach the relay.
+            let (relay, _seen) = tls_relay().await;
+            let err = Probe::Connect
+                .ask(
+                    relay,
+                    "no-such-if0",
+                    Ipv4Addr::LOCALHOST,
+                    &Timing::default(),
+                )
+                .await
+                .unwrap_err();
+            let errno = err
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::raw_os_error);
+            assert_eq!(errno, Some(libc::ENODEV), "{err}");
+        }
+
+        #[test]
+        fn only_a_wss_tunnel_gets_a_tls_probe() {
+            let plain: TunnelConfig = toml::from_str(
+                "tunnel_key = \"probe-test-key\"\nurl = \"ws://10.0.0.1:8080/api/tunnel/register\"\n",
+            )
+            .unwrap();
+            assert!(matches!(Probe::for_tunnel(&plain), Probe::Connect));
+            assert!(matches!(Probe::for_tunnel(&tunnel(443, "")), Probe::Tls(_)));
+        }
     }
 }

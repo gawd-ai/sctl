@@ -35,7 +35,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use sctl::config::RelayRouteMode;
-use sctl::netwatch::owner::{self, RelayRoute, Report, Timing, TunnelSignal};
+use sctl::netwatch::owner::{self, Probe, RelayRoute, Report, Timing, TunnelSignal};
 use sctl::netwatch::route::{self, OwnedRoute, RTPROT_SCTL};
 use sctl::netwatch::{self, source, HostRoute};
 use sctl::state::{TunnelPath, TunnelStats};
@@ -401,11 +401,15 @@ async fn scenario(ns: &Namespaces, relay: &AtomicBool) {
     // follow_default: the /32 lands on the metric-0 link, beside netifd's pin.
     let route = Arc::new(RelayRoute::new(RelayRouteMode::FollowDefault));
     let stats = Arc::new(TunnelStats::new());
+    // The stand-in relay speaks plain TCP, as a ws:// relay would; the TLS
+    // handshake a wss:// probe adds is tested against a TLS server on
+    // loopback in the owner's unit tests.
     let owner_task = tokio::spawn(owner::run(
         route.clone(),
         net.clone(),
         stats.clone(),
         timing,
+        Probe::Connect,
     ));
     let tunnel_task = tokio::spawn(tunnel(route.clone(), stats.clone()));
     let took = wait_until(
@@ -549,6 +553,7 @@ async fn scenario(ns: &Namespaces, relay: &AtomicBool) {
         net.clone(),
         stats.clone(),
         Timing::default(),
+        Probe::Connect,
     ));
     let tunnel_task = tokio::spawn(tunnel(off.clone(), stats.clone()));
     wait_until(

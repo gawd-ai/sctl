@@ -812,12 +812,21 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         .zip(state.netwatch.clone())
         .map(|(route, net)| {
             let tunnel_stats = state.tunnel_stats.clone();
+            // A probe of an uplink makes the tunnel's own TLS handshake.
+            let probe = state
+                .config
+                .tunnel
+                .as_ref()
+                .map_or(netwatch::owner::Probe::Connect, |tc| {
+                    netwatch::owner::Probe::for_tunnel(tc)
+                });
             spawn_supervised("relay_route", SUPERVISED_RESTART_DELAY, move || {
                 netwatch::owner::run(
                     route.clone(),
                     net.clone(),
                     tunnel_stats.clone(),
                     netwatch::owner::Timing::default(),
+                    probe.clone(),
                 )
             })
         });

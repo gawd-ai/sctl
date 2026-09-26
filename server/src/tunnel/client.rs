@@ -1011,7 +1011,23 @@ async fn connect_tunnel_io(
     if !url.starts_with("wss://") {
         return Ok(TunnelIo::Plain(tcp_stream));
     }
+    Ok(TunnelIo::Tls(Box::new(
+        tls_handshake(url, tcp_stream, config).await?,
+    )))
+}
 
+/// The tunnel's TLS handshake over `tcp_stream`: the host of `url` as the
+/// server name (SNI), the public roots plus `tls_ca_file`, then the
+/// `tls_server_cert_sha256` pin. The relay route owner's probe makes the
+/// same handshake, so an uplink that breaks TLS fails the probe as it fails
+/// the tunnel. A handshake that broke on the wire, or met a certificate from
+/// something other than the relay, is an `io::Error`; a bad CA file or server
+/// name is not.
+pub(crate) async fn tls_handshake(
+    url: &str,
+    tcp_stream: TcpStream,
+    config: &TunnelConfig,
+) -> Result<TlsStream<TcpStream>, Box<dyn std::error::Error + Send + Sync>> {
     let host = tunnel_url_host(url)?;
     let server_name = ServerName::try_from(host.as_str())
         .map_err(|_| format!("invalid TLS server name in tunnel URL: {host}"))?
@@ -1021,7 +1037,7 @@ async fn connect_tunnel_io(
     if let Some(pin) = config.tls_server_cert_sha256.as_deref() {
         verify_tls_server_pin(&tls_stream, pin)?;
     }
-    Ok(TunnelIo::Tls(Box::new(tls_stream)))
+    Ok(tls_stream)
 }
 
 /// Panic-path cleanup for `connect_and_run`: mirrors its normal-exit cleanup

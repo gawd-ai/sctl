@@ -180,9 +180,13 @@ fallback. The route stays when sctl exits, because WireGuard uses it too.
   made again on every network change the kernel reports (after a quiet
   second) and after every registration with the relay.
 - **Only an uplink that answers.** Before the route moves to an uplink the
-  tunnel is not already on, sctl opens a TCP connection to the relay bound
-  to that interface (`SO_BINDTODEVICE`, as `bind_address` does). An uplink
-  that does not answer is marked suspect.
+  tunnel is not already on, sctl probes the relay over that interface
+  alone (`SO_BINDTODEVICE`, as `bind_address` does). Over `wss://` the probe
+  is the tunnel's own TLS handshake, with its server name, `tls_ca_file` and
+  `tls_server_cert_sha256`, closed straight after (no WebSocket upgrade, no
+  key sent), so an uplink that passes TCP but breaks TLS (SSL inspection, a
+  captive portal) does not answer. Over `ws://` it is a TCP connect. An
+  uplink that does not answer is marked suspect.
 - **Link up, internet dead.** No kernel event fires, so the tunnel's own
   failures are the signal: a dial nothing answers, a handshake that breaks
   or stalls, a pong timeout, a read or write error. After two in a row on
