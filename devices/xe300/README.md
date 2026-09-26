@@ -69,8 +69,16 @@ they left (`relay-route.sh`), keeping them in `/tmp/sctl-relay-route.backup.<sta
   replaces a route it did not install, so that pin would keep it out.
 - `/etc/hotplug.d/iface/97-sctl-rehome` restarted sctl when the wan came up.
 
-Failing over to another uplink needs `rp_filter` at 0 or 2 on the uplinks: the
-agent's probe of a backup uplink is answered on that uplink.
+Failing over, and coming back, needs `rp_filter` at 0 or 2 on the uplinks: the
+agent's probe of an uplink the route does not use is answered on that uplink, and
+strict filtering (1) drops the answer, so that uplink would stay suspect for good.
+With the agent keeping the route, `install.sh` (and the remote upgrade) runs
+`relay-route.sh rp-filter`, which makes it 2 (loose) at once for `all`, `default`
+and every interface, and keeps `net.ipv4.conf.all.rp_filter=2` and
+`net.ipv4.conf.default.rp_filter=2` in `/etc/sysctl.conf` (the file the fleet's
+onboarding already uses for `ignore_routes_with_linkdown`) for every boot. Run
+again, it changes nothing. The agent names any uplink still strict in
+`/api/health` under `tunnel.relay_route.rp_filter_strict`.
 
 ### Remote upgrade: `rundev.sh device upgrade-remote`
 
@@ -84,19 +92,21 @@ SSH. It asks the device how sctl is installed, and when it finds this layout
    `relay-route.sh` through the file API, then checks their hashes and that the
    server runs (`--version`);
 3. refuses a `[tunnel]` pinned with `bind_address` before shipping anything, and
-   warns when `rp_filter` is strict;
+   says where `rp_filter` is strict today;
 4. starts `upgrade.sh` on the device, detached. It copies the current payloads,
    `sctl.toml` and hotplugs to `/usr/local/lib/sctl/rollback` (kept afterwards),
    installs the payloads, sets `[tunnel] relay_route` (every other line of
-   `sctl.toml` stays as it is), removes the two hotplugs and their pin, and
-   restarts the agent once;
+   `sctl.toml` stays as it is), removes the two hotplugs and their pin, makes
+   `rp_filter` loose as above, and restarts the agent once;
 5. puts all of it back and restarts again unless, within 180 s, `/api/health` on
-   the device reports the new version and a connected tunnel twice in a row.
+   the device reports the new version and a connected tunnel twice in a row. The
+   loose `rp_filter` stays: it is harmless to any agent, and `bind_address` needs
+   it too.
 
 Progress is in `/tmp/sctl-xe300-upgrade/state` and `/tmp/sctl-xe300-upgrade.log` on
 the device, and `rundev.sh` prints that log when the upgrade rolls back.
-`RELAY_ROUTE=off` upgrades the payloads only, leaving `sctl.toml` and the hotplugs
-alone.
+`RELAY_ROUTE=off` upgrades the payloads only, leaving `sctl.toml`, the hotplugs and
+`rp_filter` alone.
 
 `rundev.sh device upgrade` (over SSH) still does not handle this layout: `uname -m`
 is `mips`, which has no `ARCH_TARGET` entry. Over SSH, use `install.sh`, which

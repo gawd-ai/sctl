@@ -22,14 +22,21 @@
 #       Remove the two hotplugs and the pins, saving them in <backup_dir>.
 #   relay-route.sh restore <backup_dir>
 #       Put them back, and drop the route sctl installed (protocol 83).
+#   relay-route.sh rp-filter
+#       Make reverse-path filtering loose (2), now and at every boot. Run
+#       again, it changes nothing.
 #
 # busybox sh and awk; `ip` may be iproute2 or the busybox applet.
 
 HOTPLUG_DIR=/etc/hotplug.d/iface
 HOTPLUGS="96-wg-repin 97-sctl-rehome"
+# Where rp-filter writes, and with what; tests point them elsewhere.
+SYSCTL_CONF=${RELAY_ROUTE_SYSCTL_CONF:-/etc/sysctl.conf}
+IPV4_CONF=${RELAY_ROUTE_IPV4_CONF:-/proc/sys/net/ipv4/conf}
+SYSCTL=${RELAY_ROUTE_SYSCTL:-sysctl}
 
 usage() {
-    echo "usage: relay-route.sh config <off|follow_default> <sctl.toml> | adopt <backup_dir> | restore <backup_dir>" >&2
+    echo "usage: relay-route.sh config <off|follow_default> <sctl.toml> | adopt <backup_dir> | restore <backup_dir> | rp-filter" >&2
     exit 1
 }
 
@@ -124,6 +131,38 @@ restore() {
     done < "$backup/pins"
 }
 
+# Loose reverse-path filtering (rp_filter = 2), now and at every boot. The
+# agent probes the relay over an uplink the relay route does not use, and the
+# answer comes back on that uplink; strict filtering (1) drops it there, so a
+# route that failed over could never come back. The kernel applies the larger
+# of conf/all and conf/<dev>, so all = 2 makes every interface loose, default
+# = 2 covers interfaces made later, and every existing one is written as well,
+# through /proc (sysctl would read the dot in a name like eth0.2 as a
+# separator). At boot /etc/init.d/sysctl applies /etc/sysctl.conf after
+# /etc/sysctl.d/*.conf, and the fleet's onboarding already keeps
+# ignore_routes_with_linkdown there.
+rp_filter() {
+    if [ -f "$SYSCTL_CONF" ]; then
+        sed -i \
+            -e '/^[[:space:]]*net\.ipv4\.conf\.all\.rp_filter[[:space:]]*=/d' \
+            -e '/^[[:space:]]*net\.ipv4\.conf\.default\.rp_filter[[:space:]]*=/d' \
+            "$SYSCTL_CONF" || return 1
+        # A last line without its newline would swallow the first one added.
+        if [ -s "$SYSCTL_CONF" ] && [ -n "$(tail -c 1 "$SYSCTL_CONF")" ]; then
+            echo >> "$SYSCTL_CONF" || return 1
+        fi
+    fi
+    printf '%s\n' net.ipv4.conf.all.rp_filter=2 net.ipv4.conf.default.rp_filter=2 \
+        >> "$SYSCTL_CONF" || return 1
+    "$SYSCTL" -w net.ipv4.conf.all.rp_filter=2 >/dev/null || return 1
+    "$SYSCTL" -w net.ipv4.conf.default.rp_filter=2 >/dev/null || return 1
+    for f in "$IPV4_CONF"/*/rp_filter; do
+        [ -e "$f" ] || continue
+        [ "$(cat "$f")" = 2 ] || echo 2 > "$f" || return 1
+    done
+    echo "relay route: rp_filter is 2 (loose) on every interface, and set so in $SYSCTL_CONF"
+}
+
 case ${1:-} in
     config)
         [ $# -eq 3 ] || usage
@@ -137,6 +176,10 @@ case ${1:-} in
     restore)
         [ $# -eq 2 ] || usage
         restore "$2"
+        ;;
+    rp-filter)
+        [ $# -eq 1 ] || usage
+        rp_filter
         ;;
     *)
         usage

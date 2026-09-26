@@ -13,6 +13,8 @@
 # Before it changes anything, the payloads, sctl.toml and (when the agent takes
 # over the relay route) the route hotplugs and their pins are copied to
 # /usr/local/lib/sctl/rollback, on the overlay, where they stay afterwards.
+# Taking over the relay route also makes rp_filter loose (2), now and in
+# /etc/sysctl.conf; a rollback leaves that as it is.
 # Healthy means /api/health on the device answers with the expected version
 # and, when sctl.toml has a [tunnel] section, a connected tunnel, twice in a
 # row within WAIT_SECS of the restart.
@@ -125,6 +127,12 @@ mv -f "$PAYLOAD_DIR/.$SERVER.new" "$PAYLOAD_DIR/$SERVER" &&
     mv -f "$CONFIG.new" "$CONFIG" || rollback
 if [ "$OWN" = 1 ]; then
     sh "$STAGE/relay-route.sh" adopt "$BACKUP" || rollback
+    # Loose rp_filter, now and in /etc/sysctl.conf, lets the answer to the
+    # agent's probe of an uplink the route does not use through. Not undone
+    # by a rollback: it is harmless to any agent, and bind_address needs it
+    # too.
+    sh "$STAGE/relay-route.sh" rp-filter ||
+        say "could not make rp_filter loose; a route that failed over may not come back"
 fi
 # The init script needs 16 MB free in /tmp to expand the payloads.
 rm -f "$STAGE/server.gz" "$STAGE/plugin.gz" "$STAGE/sctl.toml"

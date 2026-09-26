@@ -120,10 +120,14 @@ Response `200`:
   `bind_address`, which pins the tunnel).
 - `tunnel.relay_route`: the host route sctl keeps to the relay
   (`[tunnel] relay_route` in the configuration reference),
-  `{"mode": "follow_default", "dev": "eth1", "via": "10.42.0.1", "suspect": []}`.
+  `{"mode": "follow_default", "dev": "eth1", "via": "10.42.0.1", "suspect": [], "rp_filter_strict": []}`.
   `mode` is `off` or `follow_default`; `dev` and `via` are `null` while sctl
   holds no route (always with `off`); `suspect` lists the uplinks that did
-  not answer the relay and are waiting to be asked again. Each move is a
+  not answer the relay and are waiting to be asked again. `rp_filter_strict`
+  lists the uplinks sctl may probe whose reverse-path filtering is strict
+  (`rp_filter` 1, from the larger of `conf/all` and `conf/<dev>`, read when
+  the health is asked for): the answer to a probe is dropped there, so such
+  an uplink cannot be proven. Always empty with `off`. Each move is a
   `relay_route` event such as `eth1 -> wwan0 (eth1: no answer from the relay)`.
 - `gps` / `lte` — `null` when the subsystem is not configured;
   `{"status": "no_signal"}` / `{"status": "provider_unavailable"}` when

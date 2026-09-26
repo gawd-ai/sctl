@@ -27,9 +27,10 @@ Environment:
                         the agent keeps the host route to the relay on the best
                         uplink that answers and moves its tunnel without a
                         restart, so the 96-wg-repin and 97-sctl-rehome hotplugs
-                        are removed. A tunnel pinned with bind_address keeps its
-                        pin and gets no relay_route (the agent refuses both).
-                        off leaves the key and the hotplugs alone.
+                        are removed, and rp_filter becomes 2 (loose) now and in
+                        /etc/sysctl.conf. A tunnel pinned with bind_address keeps
+                        its pin and gets no relay_route (the agent refuses both).
+                        off leaves the key, the hotplugs and rp_filter alone.
   SSH / SCP / SSH_OPTS  Transport overrides. SSH_OPTS defaults to the ssh-rsa
                         algorithm flags this device's dropbear 2019.78 requires.
 
@@ -170,7 +171,7 @@ if [[ "$RELAY_ROUTE" == "follow_default" ]]; then
         0)
             mv "$tmpdir/sctl.toml.new" "$tmpdir/sctl.toml"
             owns_relay_route=1
-            printf 'relay route:        follow_default (the route hotplugs are removed)\n'
+            printf 'relay route:        follow_default (the route hotplugs are removed, rp_filter loose)\n'
             ;;
         2)
             if [[ -n "$RELAY_ROUTE_SET" ]]; then
@@ -238,9 +239,13 @@ chmod 0600 /etc/sctl/sctl.toml
 
 # The agent keeps the relay route now; the hotplugs that did it from the shell
 # go, kept in the backup directory. Not fatal: the agent is stopped here.
+# Loose rp_filter lets the answer to the agent's probe of an uplink the route
+# does not use through; strict would keep a failed-over route from coming back.
 if [ "${OWN_RELAY_ROUTE:-0}" = 1 ]; then
     sh /tmp/relay-route.sh adopt /tmp/sctl-relay-route.backup.$stamp ||
         echo "relay route: could not remove the route hotplugs (see above)" >&2
+    sh /tmp/relay-route.sh rp-filter ||
+        echo "relay route: could not make rp_filter loose; a route that failed over may not come back" >&2
 fi
 
 /etc/init.d/sctl enable

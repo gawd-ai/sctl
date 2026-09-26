@@ -231,9 +231,15 @@ fallback. The route stays when sctl exits, because WireGuard uses it too.
 
 It is opt-in because some units route the relay on purpose: the BPI units
 keep it on LTE for out-of-band access, and the WE826 pins the tunnel with
-`bind_address`. The answer to a probe arrives
-on the uplink it left by, so reverse-path filtering on the uplinks must be
-loose (`rp_filter = 2`) or off, as `bind_address` already requires.
+`bind_address`.
+
+The answer to a probe arrives on the uplink it left by, so reverse-path
+filtering on the uplinks must be loose (`rp_filter = 2`) or off, as
+`bind_address` already requires: with strict filtering (1) an uplink the
+route does not use never answers, and once suspect it stays suspect.
+`/api/health` lists the uplinks where it is strict in
+`tunnel.relay_route.rp_filter_strict`, and the XE300 packaging sets it loose
+(`devices/xe300/README.md`).
 
 ## `[comms]`
 

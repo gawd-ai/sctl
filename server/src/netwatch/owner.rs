@@ -194,6 +194,41 @@ pub struct Report {
     pub via: Option<Ipv4Addr>,
     /// Uplinks that did not answer the relay, waiting to be asked again.
     pub suspect: Vec<String>,
+    /// Uplinks the owner may probe whose reverse-path filtering is strict
+    /// (`rp_filter` 1), read when the report is asked for. The answer to a
+    /// probe arrives on the uplink it left by, which strict filtering drops
+    /// while the relay route uses another one: such an uplink never answers,
+    /// and once suspect it stays suspect.
+    pub rp_filter_strict: Vec<String>,
+    /// Every uplink with a default route: the ones the owner may probe.
+    #[serde(skip)]
+    uplinks: Vec<String>,
+}
+
+/// The uplinks among `uplinks` where reverse-path filtering is strict, with
+/// `read` giving `net.ipv4.conf.<name>.rp_filter`. The kernel applies the
+/// larger of `conf/all` and `conf/<dev>`, so an uplink is strict when that
+/// larger value is 1. A value that cannot be read counts as 0.
+pub(crate) fn strict_rp_filter(
+    uplinks: &[String],
+    read: impl Fn(&str) -> Option<u8>,
+) -> Vec<String> {
+    let all = read("all").unwrap_or(0);
+    uplinks
+        .iter()
+        .filter(|dev| read(dev).unwrap_or(0).max(all) == 1)
+        .cloned()
+        .collect()
+}
+
+/// `/proc/sys/net/ipv4/conf/<name>/rp_filter`, as this network namespace
+/// sees it.
+fn read_rp_filter(name: &str) -> Option<u8> {
+    std::fs::read_to_string(format!("/proc/sys/net/ipv4/conf/{name}/rp_filter"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// The owner's shared side: the tunnel's signals in, the report out. One per
@@ -218,6 +253,8 @@ impl RelayRoute {
                 dev: None,
                 via: None,
                 suspect: Vec::new(),
+                rp_filter_strict: Vec::new(),
+                uplinks: Vec::new(),
             }),
         }
     }
@@ -234,11 +271,17 @@ impl RelayRoute {
         }
     }
 
+    /// The owner's latest report, with `rp_filter_strict` read now.
     pub fn report(&self) -> Report {
-        self.report
+        let mut report = self
+            .report
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .clone();
+        if self.mode != RelayRouteMode::Off {
+            report.rp_filter_strict = strict_rp_filter(&report.uplinks, read_rp_filter);
+        }
+        report
     }
 
     fn set_report(&self, report: Report) {
@@ -421,11 +464,19 @@ impl<U: Uplinks> Owner<U> {
     }
 
     pub(crate) fn report(&self, mode: RelayRouteMode) -> Report {
+        let mut uplinks: Vec<String> = Vec::new();
+        for route in self.net.iter().flat_map(|net| &net.default_routes) {
+            if !uplinks.contains(&route.dev) {
+                uplinks.push(route.dev.clone());
+            }
+        }
         Report {
             mode,
             dev: self.held.as_ref().map(|h| h.dev.clone()),
             via: self.held.as_ref().and_then(|h| h.via),
             suspect: self.suspect.keys().cloned().collect(),
+            rp_filter_strict: Vec::new(),
+            uplinks,
         }
     }
 
@@ -944,6 +995,8 @@ pub async fn run(
         schedule,
     );
     info!("relay route: keeping the relay's route on the best uplink that answers it");
+    // Uplinks with strict reverse-path filtering, as last logged.
+    let mut strict: Vec<String> = Vec::new();
     loop {
         let wake = owner.next_probe();
         let changes = tokio::select! {
@@ -960,6 +1013,20 @@ pub async fn run(
                 .await;
         }
         handle.set_report(owner.report(handle.mode()));
+        let now = handle.report().rp_filter_strict;
+        if now != strict {
+            if now.is_empty() {
+                info!("relay route: reverse-path filtering is no longer strict on any uplink");
+            } else {
+                warn!(
+                    "relay route: rp_filter is 1 (strict) on {}: the answer to a probe over an \
+                     uplink the route does not use is dropped there, so it can never be proven; \
+                     set net.ipv4.conf.all.rp_filter = 2",
+                    now.join(", ")
+                );
+            }
+            strict = now;
+        }
     }
 }
 
@@ -1327,7 +1394,13 @@ mod tests {
         let report = owner.report(RelayRouteMode::FollowDefault);
         assert_eq!(
             serde_json::to_value(&report).unwrap(),
-            serde_json::json!({"mode": "follow_default", "dev": "eth1", "via": "10.42.0.1", "suspect": []})
+            serde_json::json!({
+                "mode": "follow_default",
+                "dev": "eth1",
+                "via": "10.42.0.1",
+                "suspect": [],
+                "rp_filter_strict": []
+            })
         );
     }
 
@@ -2043,6 +2116,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn strict_rp_filter_is_the_larger_of_all_and_the_uplink() {
+        let uplinks = ["eth1".to_string(), "wwan0".to_string(), "eth2".to_string()];
+        let reading = |all: u8, values: &'static [(&'static str, u8)]| {
+            move |name: &str| {
+                if name == "all" {
+                    return Some(all);
+                }
+                values.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
+            }
+        };
+        // conf/all 0: each uplink's own value decides; unreadable counts as 0.
+        assert_eq!(
+            strict_rp_filter(&uplinks, reading(0, &[("eth1", 1), ("wwan0", 0)])),
+            ["eth1"]
+        );
+        // conf/all 1 makes every uplink strict but one set loose itself.
+        assert_eq!(
+            strict_rp_filter(&uplinks, reading(1, &[("eth1", 0), ("wwan0", 2)])),
+            ["eth1", "eth2"]
+        );
+        // conf/all 2, what the XE300 packaging sets, makes every one loose.
+        assert!(strict_rp_filter(&uplinks, reading(2, &[("eth1", 1), ("wwan0", 1)])).is_empty());
+        assert!(strict_rp_filter(&uplinks, |_| None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_report_names_every_uplink_it_may_probe() {
+        let fake = Fake::new(travel_router());
+        let owner = settled(&fake).await;
+        let report = owner.report(RelayRouteMode::FollowDefault);
+        assert_eq!(report.uplinks, ["eth1", "wwan0"]);
+        assert!(serde_json::to_value(&report)
+            .unwrap()
+            .get("uplinks")
+            .is_none());
+    }
+
     #[tokio::test]
     async fn an_owner_that_is_off_drops_signals_and_reports_off() {
         let off = RelayRoute::new(RelayRouteMode::Off);
@@ -2050,7 +2161,13 @@ mod tests {
         assert!(off.rx.lock().await.try_recv().is_err());
         assert_eq!(
             serde_json::to_value(off.report()).unwrap(),
-            serde_json::json!({"mode": "off", "dev": null, "via": null, "suspect": []})
+            serde_json::json!({
+                "mode": "off",
+                "dev": null,
+                "via": null,
+                "suspect": [],
+                "rp_filter_strict": []
+            })
         );
 
         let on = RelayRoute::new(RelayRouteMode::FollowDefault);

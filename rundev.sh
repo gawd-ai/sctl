@@ -2434,13 +2434,14 @@ do_device_upgrade_remote() {
 # apply. This path builds the OpenWrt-SDK payloads (devices/xe300/build.sh),
 # stages them over STP and hands the swap to devices/xe300/upgrade.sh on the
 # device. With one agent restart, that script installs the payloads, sets
-# [tunnel] relay_route in sctl.toml and removes the route hotplugs the agent
-# replaces (devices/xe300/relay-route.sh). It keeps the previous payloads,
+# [tunnel] relay_route in sctl.toml, removes the route hotplugs the agent
+# replaces and makes rp_filter loose, now and in /etc/sysctl.conf
+# (devices/xe300/relay-route.sh). It keeps the previous payloads,
 # sctl.toml and hotplugs in /usr/local/lib/sctl/rollback and puts them all back
 # unless the agent returns with the new version and its tunnel up.
 #
-# RELAY_ROUTE=off upgrades the payloads only: sctl.toml and the hotplugs stay
-# as they are.
+# RELAY_ROUTE=off upgrades the payloads only: sctl.toml, the hotplugs and
+# rp_filter stay as they are.
 
 XE300_ARTIFACT_DIR="$REPO_DIR/.artifacts/xe300"
 XE300_STAGE="/tmp/sctl-xe300-upgrade"
@@ -2545,13 +2546,13 @@ do_device_upgrade_remote_xe300() {
         esac
         # The agent's probe of another uplink is answered on that uplink, which
         # strict reverse-path filtering drops (docs/config.md, relay_route).
+        # upgrade.sh makes it loose; say where it is strict today.
         local strict
         strict=$(remote_exec_json "$url" "$api_key" "grep -lx 1 /proc/sys/net/ipv4/conf/*/rp_filter" 5000 3 8 \
             | jq -r '.stdout // empty' 2>/dev/null | sed 's|/proc/sys/net/ipv4/conf/||; s|/rp_filter||' \
             | grep -vx lo | tr '\n' ' ') || true
         if [[ -n "${strict// /}" ]]; then
-            warn "rp_filter = 1 (strict) on: $strict"
-            warn "It drops the answer to the agent's probe of a backup uplink, so the relay route cannot fail over until it is 0 or 2"
+            log "rp_filter = 1 (strict) on: $strict; the upgrade sets it to 2 (loose), now and in /etc/sysctl.conf"
         fi
     fi
 

@@ -138,20 +138,18 @@ impl Namespaces {
         // A probe's answer arrives on the uplink it left by while the relay
         // route points at the other one; as with bind_address, that needs
         // reverse-path filtering loose (2) or off (0), never strict (1).
-        let sysctl = Command::new("ip")
-            .args([
-                "netns",
-                "exec",
-                dev,
-                "sysctl",
-                "-qw",
-                "net.ipv4.conf.all.rp_filter=2",
-            ])
-            .status()
-            .expect("sysctl runs");
-        assert!(sysctl.success());
+        sysctl(dev, "net.ipv4.conf.all.rp_filter=2");
         ns
     }
+}
+
+/// Set one sysctl inside namespace `ns`.
+fn sysctl(ns: &str, setting: &str) {
+    let status = Command::new("ip")
+        .args(["netns", "exec", ns, "sysctl", "-qw", setting])
+        .status()
+        .expect("sysctl runs");
+    assert!(status.success(), "sysctl {setting} in {ns}");
 }
 
 impl Drop for Namespaces {
@@ -534,6 +532,19 @@ async fn scenario(ns: &Namespaces, relay: &AtomicBool) {
     assert!(events(&stats)
         .await
         .contains(&"wan1 -> wan0 (wan0 answers the relay again)".to_string()));
+
+    // Strict reverse-path filtering on an uplink the owner may probe shows
+    // in its report, read from this namespace's /proc when asked for.
+    assert!(route.report().rp_filter_strict.is_empty());
+    sysctl(&ns.dev, "net.ipv4.conf.all.rp_filter=0");
+    sysctl(&ns.dev, "net.ipv4.conf.wan1.rp_filter=1");
+    assert_eq!(route.report().rp_filter_strict, ["wan1"]);
+    sysctl(&ns.dev, "net.ipv4.conf.all.rp_filter=2");
+    assert!(
+        route.report().rp_filter_strict.is_empty(),
+        "conf/all 2 makes every interface loose"
+    );
+    sysctl(&ns.dev, "net.ipv4.conf.wan1.rp_filter=0");
 
     // relay_route = "off": the same tunnel, and nothing changes. Stopping the
     // owner leaves its route; take it out to start from netifd's pin alone.
