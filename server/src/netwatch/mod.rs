@@ -95,6 +95,11 @@ pub struct DefaultRoute {
     pub dev: String,
     pub gw: Option<Ipv4Addr>,
     pub metric: u32,
+    /// The gateway is declared on the link (`onlink`), as it must be when it
+    /// lies outside the interface's prefix. A route through it must say so
+    /// too, or the kernel refuses it.
+    #[serde(skip)]
+    pub onlink: bool,
 }
 
 /// A `/32` route in the main table.
@@ -162,6 +167,7 @@ impl NetState {
                     dev: (*dev).to_string(),
                     gw: route.gateway,
                     metric: route.priority,
+                    onlink: route.flags & netlink::RTNH_F_ONLINK != 0,
                 }),
                 (32, Some(dst)) => host_routes.push(HostRoute {
                     dst,
@@ -423,7 +429,7 @@ fn drain(events: &NlSocket, buf: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::netlink::tests::{addr_message, link_message, route_message};
+    use super::netlink::tests::{addr_message, link_message, route_message, with_rtm_flags};
     use super::netlink::{Messages, IFA_F_SECONDARY};
     use super::*;
 
@@ -522,11 +528,13 @@ mod tests {
                     dev: "eth1".into(),
                     gw: Some(Ipv4Addr::new(10, 42, 0, 1)),
                     metric: 10,
+                    onlink: false,
                 },
                 DefaultRoute {
                     dev: "wwan0".into(),
                     gw: Some(Ipv4Addr::new(10, 180, 41, 232)),
                     metric: 40,
+                    onlink: false,
                 },
             ],
             "main table only, sorted by metric"
@@ -544,6 +552,43 @@ mod tests {
     }
 
     #[test]
+    fn an_onlink_default_route_is_marked_so() {
+        for order in [Order::Little, Order::Big] {
+            let (links, addrs, _) = fixture_dumps(order);
+            // eth1's gateway lies outside 10.42.0.0/24: `onlink`.
+            let mut routes = with_rtm_flags(
+                order,
+                route_message(order, None, Some([10, 9, 9, 1]), 3, 10, 4, 254),
+                netlink::RTNH_F_ONLINK,
+            );
+            routes.extend(route_message(
+                order,
+                None,
+                Some([10, 180, 41, 232]),
+                7,
+                40,
+                4,
+                254,
+            ));
+            let state = state_from(order, &(links, addrs, routes));
+            let onlink: Vec<(&str, bool)> = state
+                .default_routes
+                .iter()
+                .map(|r| (r.dev.as_str(), r.onlink))
+                .collect();
+            assert_eq!(onlink, [("eth1", true), ("wwan0", false)], "{order:?}");
+            let mut plain = state.clone();
+            plain.default_routes[0].onlink = false;
+            assert!(
+                !state.same_network(&plain),
+                "the flag is part of the network"
+            );
+        }
+        let fixture = state_from(Order::NATIVE, &fixture_dumps(Order::NATIVE));
+        assert!(fixture.default_routes.iter().all(|r| !r.onlink));
+    }
+
+    #[test]
     fn lowest_default_picks_the_lowest_metric_then_the_first_name() {
         let state = state_from(Order::NATIVE, &fixture_dumps(Order::NATIVE));
         assert_eq!(state.lowest_default().unwrap().dev, "eth1");
@@ -554,16 +599,19 @@ mod tests {
                 dev: "wwan0".into(),
                 gw: None,
                 metric: 5,
+                onlink: false,
             },
             DefaultRoute {
                 dev: "eth1".into(),
                 gw: None,
                 metric: 5,
+                onlink: false,
             },
             DefaultRoute {
                 dev: "eth0".into(),
                 gw: None,
                 metric: 7,
+                onlink: false,
             },
         ];
         assert_eq!(tied.lowest_default().unwrap().dev, "eth1");
@@ -775,6 +823,7 @@ mod tests {
             via: None,
             oif: lo,
             metric: 7,
+            onlink: false,
         };
         let (tx, mut rx) = channel();
         let watcher = tokio::spawn(run(Arc::new(tx), 1));

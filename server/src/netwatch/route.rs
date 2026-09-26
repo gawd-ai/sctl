@@ -9,8 +9,8 @@ use std::net::Ipv4Addr;
 
 use super::netlink::{
     self, NlSocket, Order, NLM_F_ACK, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST, RTA_DST,
-    RTA_GATEWAY, RTA_OIF, RTA_PRIORITY, RTM_DELROUTE, RTM_NEWROUTE, RTN_UNICAST, RT_SCOPE_LINK,
-    RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN,
+    RTA_GATEWAY, RTA_OIF, RTA_PRIORITY, RTM_DELROUTE, RTM_NEWROUTE, RTNH_F_ONLINK, RTN_UNICAST,
+    RT_SCOPE_LINK, RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN,
 };
 
 /// `rtm_protocol` of every route sctl installs. 83 (ASCII `S`) is unassigned
@@ -21,7 +21,7 @@ use super::netlink::{
 pub const RTPROT_SCTL: u8 = 83;
 
 /// One host route owned by sctl:
-/// `dst/32 [via via] dev <oif> metric <metric> proto 83`.
+/// `dst/32 [via via] dev <oif> metric <metric> proto 83 [onlink]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnedRoute {
     pub dst: Ipv4Addr,
@@ -31,6 +31,11 @@ pub struct OwnedRoute {
     pub oif: u32,
     /// Route metric (`RTA_PRIORITY`).
     pub metric: u32,
+    /// Declare `via` on the link (`RTNH_F_ONLINK`), as the default route it
+    /// follows does when its gateway lies outside the interface's prefix.
+    /// Without it the kernel refuses such a next hop (`EINVAL`). Ignored
+    /// without `via`, where the kernel refuses the flag instead.
+    pub onlink: bool,
 }
 
 /// Create the route, or replace the one already at `dst` with this metric.
@@ -63,12 +68,17 @@ pub(crate) fn encode_replace(order: Order, seq: u32, route: &OwnedRoute) -> Vec<
     } else {
         RT_SCOPE_LINK
     };
+    let mut family = netlink::rtmsg(32, RT_TABLE_MAIN, RTPROT_SCTL, scope, RTN_UNICAST);
+    if route.onlink && route.via.is_some() {
+        // rtm_flags, the struct's last field, in host order.
+        family[8..].copy_from_slice(&order.u32_bytes(RTNH_F_ONLINK));
+    }
     encode(
         order,
         RTM_NEWROUTE,
         NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
         seq,
-        &netlink::rtmsg(32, RT_TABLE_MAIN, RTPROT_SCTL, scope, RTN_UNICAST),
+        &family,
         route,
     )
 }
@@ -117,6 +127,7 @@ mod tests {
         via: Some(Ipv4Addr::new(10, 42, 0, 1)),
         oif: 3,
         metric: 0,
+        onlink: false,
     };
 
     fn expected(
@@ -165,6 +176,62 @@ mod tests {
             assert_eq!(
                 encode_replace(order, 11, &direct),
                 expected(order, RTM_NEWROUTE, 0x0505, family, &direct)
+            );
+        }
+    }
+
+    #[test]
+    fn an_onlink_replace_sets_rtnh_f_onlink_in_rtm_flags() {
+        let onlink = OwnedRoute {
+            via: Some(Ipv4Addr::new(10, 9, 9, 1)),
+            onlink: true,
+            ..ROUTE
+        };
+        for order in [Order::Little, Order::Big] {
+            let mut family = [2, 32, 0, 0, 254, RTPROT_SCTL, 0, 1, 0, 0, 0, 0];
+            family[8..].copy_from_slice(&u32b(order, 4));
+            let bytes = encode_replace(order, 11, &onlink);
+            assert_eq!(
+                bytes,
+                expected(order, RTM_NEWROUTE, 0x0505, family, &onlink),
+                "{order:?}"
+            );
+            // Byte 8 of the rtmsg in little-endian order, byte 11 in big.
+            let flags = &bytes[16 + 8..16 + 12];
+            match order {
+                Order::Little => assert_eq!(flags, [4, 0, 0, 0]),
+                Order::Big => assert_eq!(flags, [0, 0, 0, 4]),
+            }
+        }
+    }
+
+    #[test]
+    fn onlink_without_a_gateway_is_left_out() {
+        // The kernel refuses RTNH_F_ONLINK on a next hop with no gateway.
+        let direct = OwnedRoute {
+            via: None,
+            onlink: true,
+            ..ROUTE
+        };
+        for order in [Order::Little, Order::Big] {
+            let family = [2, 32, 0, 0, 254, RTPROT_SCTL, 253, 1, 0, 0, 0, 0];
+            assert_eq!(
+                encode_replace(order, 11, &direct),
+                expected(order, RTM_NEWROUTE, 0x0505, family, &direct)
+            );
+        }
+    }
+
+    #[test]
+    fn a_delete_carries_no_flags() {
+        let onlink = OwnedRoute {
+            onlink: true,
+            ..ROUTE
+        };
+        for order in [Order::Little, Order::Big] {
+            assert_eq!(
+                encode_delete(order, 11, &onlink),
+                encode_delete(order, 11, &ROUTE)
             );
         }
     }

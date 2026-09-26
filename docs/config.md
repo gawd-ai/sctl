@@ -171,8 +171,11 @@ removes a route that netifd, DHCP or an operator added.
 
 With `relay_route = "follow_default"`, sctl owns one route:
 `<relay>/32 via <gw> dev <uplink> metric 0 proto 83`, where `<relay>` is the
-address the tunnel connected to. At metric 0 it outranks the pin netifd adds
-for the WireGuard endpoint (the same address), which is left in place as the
+address the tunnel connected to, and `<gw>` the gateway of the uplink's
+default route. When that default route declares its gateway `onlink` (a
+gateway outside the uplink's prefix), sctl's route does too; the kernel
+refuses it otherwise. At metric 0 it outranks the pin netifd adds for the
+WireGuard endpoint (the same address), which is left in place as the
 fallback. The route stays when sctl exits, because WireGuard uses it too.
 
 - **Which uplink.** The lowest-metric default route whose interface is not

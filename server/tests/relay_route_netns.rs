@@ -2,7 +2,9 @@
 //!
 //! Two network namespaces stand in for the device and the internet, joined by
 //! two veth "uplinks": wan0 with its default route at metric 0 (the wire) and
-//! wan1 at metric 40 (LTE), where netifd's pin for the relay also sits. A TCP
+//! wan1 at metric 40 (LTE), where netifd's pin for the relay also sits. LTE's
+//! gateway lies outside its prefix (`onlink`), as some carriers hand out, so
+//! the owner's route through it must be written onlink too. A TCP
 //! listener stands in for the relay, and a small loop stands in for the
 //! tunnel with the client's own timings: a 10 s dial, a ping every 5 s, 15 s
 //! without an answer ends the connection, and a redial 1 s later. It follows
@@ -43,7 +45,11 @@ use sctl::state::{TunnelPath, TunnelStats};
 const RELAY: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(10, 99, 0, 1), 7443);
 const WAN0: Ipv4Addr = Ipv4Addr::new(10, 10, 1, 2);
 const WAN0_GW: Ipv4Addr = Ipv4Addr::new(10, 10, 1, 1);
-const WAN1_GW: Ipv4Addr = Ipv4Addr::new(10, 10, 2, 1);
+/// LTE's default route: `default via 10.10.9.1 dev wan1 onlink`, a gateway
+/// outside wan1's 10.10.2.0/24 that the upstream side answers ARP for.
+const WAN1_GW: Ipv4Addr = Ipv4Addr::new(10, 10, 9, 1);
+/// netifd's pin for the relay, through an ordinary gateway on wan1.
+const WAN1_PIN_GW: Ipv4Addr = Ipv4Addr::new(10, 10, 2, 1);
 /// The owner's probe rounds while an uplink is suspect, shortened.
 const PROBE_EVERY: Duration = Duration::from_secs(3);
 /// The tunnel client's own timings: its TCP connect timeout, heartbeat,
@@ -85,6 +91,7 @@ impl Namespaces {
         ip(&["-n", dev, "link", "set", "lo", "up"]);
         ip(&["-n", up, "link", "set", "lo", "up"]);
         ip(&["-n", up, "addr", "add", "10.99.0.1/32", "dev", "lo"]);
+        ip(&["-n", up, "addr", "add", "10.10.9.1/32", "dev", "wan1p"]);
         ip(&[
             "-n",
             dev,
@@ -105,9 +112,10 @@ impl Namespaces {
             "add",
             "default",
             "via",
-            "10.10.2.1",
+            "10.10.9.1",
             "dev",
             "wan1",
+            "onlink",
             "metric",
             "40",
         ]);
@@ -318,9 +326,9 @@ impl Seen {
     }
 
     fn netifd_pin_intact(&self) -> bool {
-        self.routes
-            .iter()
-            .any(|r| r.dev == "wan1" && r.via == Some(WAN1_GW) && r.metric == 40 && r.protocol == 4)
+        self.routes.iter().any(|r| {
+            r.dev == "wan1" && r.via == Some(WAN1_PIN_GW) && r.metric == 40 && r.protocol == 4
+        })
     }
 }
 
@@ -536,6 +544,7 @@ async fn scenario(ns: &Namespaces, relay: &AtomicBool) {
         via: None,
         oif: 0,
         metric: 0,
+        onlink: false,
     };
     let left = seen(&route, &stats).await;
     assert_eq!(

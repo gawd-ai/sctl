@@ -414,11 +414,13 @@ mod tests {
                     dev: "eth1".into(),
                     gw: Some(Ipv4Addr::new(10, 42, 0, 1)),
                     metric: 10,
+                    onlink: false,
                 },
                 DefaultRoute {
                     dev: "wwan0".into(),
                     gw: None,
                     metric: 40,
+                    onlink: false,
                 },
             ],
             host_routes: Vec::new(),
@@ -512,6 +514,7 @@ mod tests {
                 dev: format!("if{metric:02}"),
                 gw: None,
                 metric,
+                onlink: false,
             })
             .collect();
         NetState {
@@ -616,6 +619,7 @@ mod tests {
                 dev: name.clone(),
                 gw: Some(Ipv4Addr::BROADCAST),
                 metric: u32::MAX,
+                onlink: false,
             });
         }
         let route = RouteEntry {

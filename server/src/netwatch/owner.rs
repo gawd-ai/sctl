@@ -718,6 +718,7 @@ impl<U: Uplinks> Owner<U> {
                     via: None,
                     oif: 0,
                     metric: 0,
+                    onlink: false,
                 };
                 if !self.write(Write::Delete(any)).await {
                     return Vec::new();
@@ -744,11 +745,14 @@ impl<U: Uplinks> Owner<U> {
             let Some(oif) = net.interface(&want.dev).map(|i| i.index) else {
                 return Vec::new();
             };
+            // A gateway the default route declares on the link must be
+            // declared so here too.
             let route = OwnedRoute {
                 dst: relay_ip,
                 via: want.gw,
                 oif,
                 metric: 0,
+                onlink: want.onlink,
             };
             if !self.write(Write::Replace(route)).await {
                 return Vec::new();
@@ -779,6 +783,7 @@ impl<U: Uplinks> Owner<U> {
                 via: None,
                 oif: 0,
                 metric: 0,
+                onlink: false,
             };
             self.write(Write::Delete(any)).await;
             info!("relay route: the relay is no longer at {old}; its route is removed");
@@ -989,6 +994,7 @@ mod tests {
             dev: dev.into(),
             gw: Some(gw),
             metric,
+            onlink: false,
         }
     }
 
@@ -1107,10 +1113,11 @@ mod tests {
                 protocol: RTPROT_SCTL,
             });
             self.writes.lock().unwrap().push(format!(
-                "replace {} via {} dev {dev} metric {}",
+                "replace {} via {} dev {dev} metric {}{}",
                 route.dst,
                 route.via.map_or("-".into(), |v| v.to_string()),
-                route.metric
+                route.metric,
+                if route.onlink { " onlink" } else { "" }
             ));
             Ok(())
         }
@@ -1321,6 +1328,33 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&report).unwrap(),
             serde_json::json!({"mode": "follow_default", "dev": "eth1", "via": "10.42.0.1", "suspect": []})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_route_through_an_onlink_gateway_is_written_onlink() {
+        let mut net = travel_router();
+        // The wire's gateway lies outside its prefix:
+        // `default via 10.9.9.1 dev eth1 onlink`.
+        net.default_routes[0].gw = Some(Ipv4Addr::new(10, 9, 9, 1));
+        net.default_routes[0].onlink = true;
+        let fake = Fake::new(net);
+        let mut owner = Owner::new(fake.clone(), schedule());
+        fake.tunnel_on(Some("eth1"));
+        owner.on_net(fake.state()).await;
+        owner.on_signal(registered(ETH1)).await;
+        assert_eq!(
+            fake.writes(),
+            ["replace 174.138.114.209 via 10.9.9.1 dev eth1 metric 0 onlink"]
+        );
+        // LTE's gateway is in its prefix: no flag.
+        fake.kill("eth1");
+        fake.tunnel_on(None);
+        owner.on_signal(failed(ETH1)).await;
+        owner.on_signal(failed(ETH1)).await;
+        assert_eq!(
+            fake.writes(),
+            ["replace 174.138.114.209 via 10.180.41.232 dev wwan0 metric 0"]
         );
     }
 

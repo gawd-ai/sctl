@@ -66,6 +66,10 @@ pub(crate) const RTN_UNICAST: u8 = 1;
 pub(crate) const RT_SCOPE_UNIVERSE: u8 = 0;
 pub(crate) const RT_SCOPE_LINK: u8 = 253;
 pub(crate) const RT_SCOPE_NOWHERE: u8 = 255;
+/// `rtm_flags`: the gateway is on the link whatever the prefixes say (`ip
+/// route ... onlink`). From linux/rtnetlink.h; the libc crate does not carry
+/// the `RTNH_F_*` flags.
+pub(crate) const RTNH_F_ONLINK: u32 = 4;
 pub(crate) const IFF_LOOPBACK: u32 = 0x8;
 
 /// `struct ifinfomsg`: family, pad, type, index, flags, change.
@@ -357,6 +361,9 @@ pub(crate) struct Route {
     pub protocol: u8,
     pub scope: u8,
     pub kind: u8,
+    /// `rtm_flags`: for a route with one next hop, that next hop's
+    /// `RTNH_F_*` flags, [`RTNH_F_ONLINK`] among them.
+    pub flags: u32,
     pub dst: Option<Ipv4Addr>,
     pub gateway: Option<Ipv4Addr>,
     pub oif: Option<u32>,
@@ -378,6 +385,7 @@ pub(crate) fn parse_route(payload: &[u8], order: Order) -> Option<Route> {
         protocol: payload[5],
         scope: payload[6],
         kind: payload[7],
+        flags: order.u32_at(payload, 8)?,
         dst: None,
         gateway: None,
         oif: None,
@@ -836,6 +844,13 @@ pub(crate) mod tests {
         message(order, RTM_NEWROUTE, 2, 7, &body)
     }
 
+    /// `message`, one route message, with its `rtm_flags` set to `flags`.
+    pub(crate) fn with_rtm_flags(order: Order, mut message: Vec<u8>, flags: u32) -> Vec<u8> {
+        let at = NLMSG_HDRLEN + 8;
+        message[at..at + 4].copy_from_slice(&u32b(order, flags));
+        message
+    }
+
     fn unhex(s: &str) -> Vec<u8> {
         (0..s.len())
             .step_by(2)
@@ -936,6 +951,7 @@ pub(crate) mod tests {
                 protocol: 4,
                 scope: 0,
                 kind: RTN_UNICAST,
+                flags: 0,
                 dst: Some(Ipv4Addr::new(174, 138, 114, 209)),
                 gateway: Some(Ipv4Addr::new(192, 168, 8, 1)),
                 oif: Some(3),
@@ -1015,6 +1031,32 @@ pub(crate) mod tests {
             assert_eq!(parsed.priority, 0x0a0b_0c0d, "{order:?}");
             assert_eq!(parsed.protocol, 83, "{order:?}");
         }
+    }
+
+    #[test]
+    fn route_flags_are_read_in_both_byte_orders() {
+        // `default via 10.9.9.1 dev eth1 onlink` on a link that is down:
+        // RTNH_F_ONLINK with RTNH_F_LINKDOWN (16) beside it.
+        for order in ORDERS {
+            let message = with_rtm_flags(
+                order,
+                route_message(order, None, Some([10, 9, 9, 1]), 3, 10, 3, 254),
+                RTNH_F_ONLINK | 16,
+            );
+            let parsed = Messages::new(&message, order)
+                .next()
+                .and_then(|m| parse_route(m.payload, order))
+                .unwrap();
+            assert_eq!(parsed.flags, RTNH_F_ONLINK | 16, "{order:?}");
+            assert_eq!(parsed.gateway, Some(Ipv4Addr::new(10, 9, 9, 1)));
+        }
+        // The captures carry none.
+        let bytes = unhex(CAPTURED_DEFAULT);
+        let message = Messages::new(&bytes, Order::Little).next().unwrap();
+        assert_eq!(
+            parse_route(message.payload, Order::Little).unwrap().flags,
+            0
+        );
     }
 
     #[test]
