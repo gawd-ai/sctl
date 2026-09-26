@@ -51,6 +51,8 @@ libloading = "0.8"
 
 [dev-dependencies]
 ts-rs = { version = "^12", features = ["serde-json-impl"] }
+# The paused clock (start_paused) for tests of hour-long probe schedules.
+tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true

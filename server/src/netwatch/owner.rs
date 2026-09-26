@@ -26,10 +26,14 @@
 //! is down: nothing moves and nothing becomes suspect.
 //!
 //! A suspect uplink is asked again at once when netwatch reports a change on
-//! it (link, address or default route: a replug, a new lease). Otherwise it
-//! is probed on a schedule that exists only while something is suspect: after
-//! 2, 5 and 10 minutes, then every 15. It gets the route back after two good
-//! probes in a row. In steady state the owner runs no timer at all.
+//! it (link, address or default route: a replug, a new lease), or no longer
+//! suspect once the tunnel registers over it. Otherwise it is probed on its
+//! own schedule, which exists only while it is suspect: after 2, 5 and 10
+//! minutes, then every 15. It gets the route back after two good probes in a
+//! row. An uplink that fails again within 10 minutes of getting the route
+//! back is flapping: its waits double each time (never above an hour), until
+//! it keeps the route for an hour. In steady state the owner runs no timer at
+//! all.
 //!
 //! Only routes carrying [`RTPROT_SCTL`] are written or deleted. A route
 //! someone else installed at the same destination and metric would be
@@ -64,6 +68,15 @@ const FAILURES_TO_FAIL_OVER: u8 = 2;
 const PROBES_TO_RETURN: u8 = 2;
 /// Tunnel signals queued for the owner; newer ones are dropped past this.
 const SIGNAL_QUEUE: usize = 16;
+/// An uplink that fails again this soon after the route came back to it is
+/// flapping: its waits before it is asked again double.
+const RELAPSE_WINDOW: Duration = Duration::from_mins(10);
+/// A flapping uplink's waits stop growing here.
+const MAX_RETURN_WAIT: Duration = Duration::from_hours(1);
+/// An uplink that keeps the route this long is forgiven its flapping.
+const FORGIVE_AFTER: Duration = Duration::from_hours(1);
+/// The doubling stops here: 2 minutes times 32 is past the hour already.
+const MAX_STRETCH: u32 = 32;
 
 /// How the owner paces its probes. Tests shorten it.
 #[derive(Clone, Debug)]
@@ -336,6 +349,40 @@ struct Held {
     via: Option<Ipv4Addr>,
 }
 
+/// An uplink that did not answer the relay, waiting to be asked again.
+#[derive(Clone, Copy, Debug)]
+struct Suspect {
+    /// Good probes in a row.
+    good: u8,
+    /// Probes since it became suspect: its place in the return schedule.
+    probes: usize,
+    /// When it is asked next.
+    due: Instant,
+}
+
+/// What the owner remembers of an uplink that has been suspect, so that one
+/// which keeps failing soon after it gets the route back waits longer each
+/// time.
+#[derive(Clone, Copy, Debug)]
+struct Flaps {
+    /// What its waits in the return schedule are multiplied by: 1, doubled
+    /// by every quick relapse.
+    stretch: u32,
+    /// When the route last came back to it, until it fails again.
+    returned: Option<Instant>,
+}
+
+/// The wait before probe number `probes` of a suspect whose waits are
+/// multiplied by `stretch`: never above [`MAX_RETURN_WAIT`] once stretched.
+fn return_wait(schedule: &[Duration], probes: usize, stretch: u32) -> Duration {
+    let base = schedule
+        .get(probes)
+        .or(schedule.last())
+        .copied()
+        .unwrap_or(Duration::from_mins(15));
+    base.saturating_mul(stretch).min(MAX_RETURN_WAIT).max(base)
+}
+
 /// The owner's state, fed one event at a time.
 pub(crate) struct Owner<U> {
     uplinks: U,
@@ -345,13 +392,12 @@ pub(crate) struct Owner<U> {
     /// sctl's route as sctl last wrote it (or found it, once, at start).
     held: Option<Held>,
     adopted: bool,
-    /// Suspect uplinks, each with its good probes in a row.
-    suspect: BTreeMap<String, u8>,
+    /// Uplinks that did not answer the relay.
+    suspect: BTreeMap<String, Suspect>,
+    /// Uplinks that have been suspect, and how they have fared since.
+    flaps: BTreeMap<String, Flaps>,
     /// Tunnel failures in a row on the held uplink.
     failures: u8,
-    /// Probe rounds since the schedule started, and when the next one is due.
-    rounds: usize,
-    next_probe: Option<Instant>,
     /// The route someone else installed that the owner stands aside for.
     left_to: Option<HostRoute>,
     write_failing: bool,
@@ -367,9 +413,8 @@ impl<U: Uplinks> Owner<U> {
             held: None,
             adopted: false,
             suspect: BTreeMap::new(),
+            flaps: BTreeMap::new(),
             failures: 0,
-            rounds: 0,
-            next_probe: None,
             left_to: None,
             write_failing: false,
         }
@@ -384,9 +429,10 @@ impl<U: Uplinks> Owner<U> {
         }
     }
 
-    /// When the next probe round is due; None outside the degraded state.
+    /// When the next suspect is due to be asked; None outside the degraded
+    /// state.
     pub(crate) fn next_probe(&self) -> Option<Instant> {
-        self.next_probe
+        self.suspect.values().map(|s| s.due).min()
     }
 
     /// A new network state.
@@ -403,7 +449,6 @@ impl<U: Uplinks> Owner<U> {
                 for dev in &back {
                     self.suspect.remove(dev);
                 }
-                self.settle_schedule();
                 reason = format!("{} changed", back.join(", "));
             }
         }
@@ -460,33 +505,55 @@ impl<U: Uplinks> Owner<U> {
         })
     }
 
-    /// Ask every suspect uplink once; one that answered twice in a row gets
-    /// its place back.
+    /// Ask every suspect uplink that is due; one that answered twice in a
+    /// row gets its place back.
     pub(crate) async fn probe_suspects(&mut self) -> Vec<Change> {
+        let now = Instant::now();
+        let due: Vec<String> = self
+            .suspect
+            .iter()
+            .filter(|(_, s)| s.due <= now)
+            .map(|(dev, _)| dev.clone())
+            .collect();
         let (Some(net), Some(relay)) = (self.net.clone(), self.relay) else {
+            // Nothing to ask with yet: each waits its next turn.
+            for dev in &due {
+                self.count_probe(dev, false);
+            }
             return Vec::new();
         };
         let mut back = Vec::new();
-        let devs: Vec<String> = self.suspect.keys().cloned().collect();
-        for dev in devs {
+        for dev in due {
             let answered = self.asks(&net, relay, &dev).await;
-            if let Some(good) = self.suspect.get_mut(&dev) {
-                *good = if answered { *good + 1 } else { 0 };
-                if *good >= PROBES_TO_RETURN {
-                    back.push(dev);
-                }
+            if self.count_probe(&dev, answered) {
+                back.push(dev);
             }
         }
         for dev in &back {
             self.suspect.remove(dev);
         }
-        self.rounds += 1;
-        self.next_probe = (!self.suspect.is_empty()).then(|| Instant::now() + self.delay());
         if back.is_empty() {
             return Vec::new();
         }
         let reason = format!("{} answers the relay again", back.join(", "));
         self.reconcile(&back, reason).await
+    }
+
+    /// Count one probe of suspect `dev` and set when it is asked next. True
+    /// once it has answered twice in a row.
+    fn count_probe(&mut self, dev: &str, answered: bool) -> bool {
+        let stretch = self.flaps.get(dev).map_or(1, |f| f.stretch);
+        let Some(suspect) = self.suspect.get_mut(dev) else {
+            return false;
+        };
+        suspect.good = if answered {
+            suspect.good.saturating_add(1)
+        } else {
+            0
+        };
+        suspect.probes += 1;
+        suspect.due = Instant::now() + return_wait(&self.schedule, suspect.probes, stretch);
+        suspect.good >= PROBES_TO_RETURN
     }
 
     /// Whether `addr` is the held uplink's address.
@@ -670,6 +737,11 @@ impl<U: Uplinks> Owner<U> {
             return Vec::new();
         }
         self.failures = 0;
+        // The route is back on an uplink that had been suspect: failing again
+        // soon counts against it.
+        if let Some(flaps) = self.flaps.get_mut(&want.dev) {
+            flaps.returned = Some(Instant::now());
+        }
         vec![Change::Moved {
             from,
             to: Some(want.dev),
@@ -692,30 +764,42 @@ impl<U: Uplinks> Owner<U> {
         self.failures = 0;
     }
 
-    /// Mark `dev` suspect. A newly suspect uplink starts the probe schedule
-    /// again.
+    /// Mark `dev` suspect, to be asked first after the schedule's first
+    /// wait. An uplink that fails again within [`RELAPSE_WINDOW`] of getting
+    /// the route back waits twice as long as it did last time; one that kept
+    /// the route for [`FORGIVE_AFTER`] starts over.
     fn mark_suspect(&mut self, dev: &str) {
-        if self.suspect.insert(dev.to_string(), 0).is_none() {
-            self.rounds = 0;
-            self.next_probe = Some(Instant::now() + self.delay());
+        if self.suspect.contains_key(dev) {
+            return;
         }
-    }
-
-    /// Stop the schedule once nothing is suspect.
-    fn settle_schedule(&mut self) {
-        if self.suspect.is_empty() {
-            self.rounds = 0;
-            self.next_probe = None;
+        let now = Instant::now();
+        let flaps = self.flaps.entry(dev.to_string()).or_insert(Flaps {
+            stretch: 1,
+            returned: None,
+        });
+        if let Some(returned) = flaps.returned.take() {
+            let kept = now.saturating_duration_since(returned);
+            if kept < RELAPSE_WINDOW {
+                flaps.stretch = flaps.stretch.saturating_mul(2).min(MAX_STRETCH);
+                info!(
+                    "relay route: {dev} failed again {}s after it got the route back; \
+                     its waits to be asked again are now {}x",
+                    kept.as_secs(),
+                    flaps.stretch
+                );
+            } else if kept >= FORGIVE_AFTER {
+                flaps.stretch = 1;
+            }
         }
-    }
-
-    /// The wait before the next probe round.
-    fn delay(&self) -> Duration {
-        self.schedule
-            .get(self.rounds)
-            .or(self.schedule.last())
-            .copied()
-            .unwrap_or(Duration::from_mins(15))
+        let stretch = flaps.stretch;
+        self.suspect.insert(
+            dev.to_string(),
+            Suspect {
+                good: 0,
+                probes: 0,
+                due: now + return_wait(&self.schedule, 0, stretch),
+            },
+        );
     }
 
     /// Write one route; false when the kernel refused. A delete that finds
@@ -1069,6 +1153,18 @@ mod tests {
         fake.probes();
         fake.writes();
         owner
+    }
+
+    /// Run the next probe round once it is due, on the paused clock.
+    async fn next_round(owner: &mut Owner<Arc<Fake>>) -> Vec<Change> {
+        tokio::time::sleep_until(owner.next_probe().expect("a round is due")).await;
+        owner.probe_suspects().await
+    }
+
+    /// Minutes until the next probe round, rounded up.
+    fn minutes_to_next_round(owner: &Owner<Arc<Fake>>) -> u64 {
+        let due = owner.next_probe().expect("a round is due") - Instant::now();
+        due.as_secs().div_ceil(60)
     }
 
     /// An owner that failed over from eth1 to wwan0, with the tunnel there.
@@ -1461,10 +1557,13 @@ mod tests {
             .is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_suspect_returns_only_after_two_good_probes_in_a_row() {
         let fake = Fake::new(travel_router());
         let mut owner = failed_over(&fake).await;
+        // Not due yet: nobody is asked.
+        assert!(owner.probe_suspects().await.is_empty());
+        assert!(fake.probes().is_empty());
         // eth1 answers every other round: never twice in a row.
         for round in 0..4 {
             if round % 2 == 0 {
@@ -1472,7 +1571,7 @@ mod tests {
             } else {
                 fake.kill("eth1");
             }
-            assert!(owner.probe_suspects().await.is_empty(), "round {round}");
+            assert!(next_round(&mut owner).await.is_empty(), "round {round}");
         }
         assert_eq!(fake.probes(), ["eth1"; 4]);
         assert!(fake.writes().is_empty());
@@ -1482,8 +1581,8 @@ mod tests {
         );
 
         fake.revive("eth1");
-        assert!(owner.probe_suspects().await.is_empty());
-        let changes = owner.probe_suspects().await;
+        assert!(next_round(&mut owner).await.is_empty());
+        let changes = next_round(&mut owner).await;
         assert_eq!(
             changes,
             moved(Some("wwan0"), Some("eth1"), "eth1 answers the relay again")
@@ -1503,17 +1602,151 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_probe_schedule_backs_off_to_every_fifteen_minutes() {
         let fake = Fake::new(travel_router());
         let mut owner = failed_over(&fake).await;
         let mut waits = Vec::new();
         for _ in 0..6 {
-            let due = owner.next_probe().unwrap() - Instant::now();
-            waits.push(due.as_secs().div_ceil(60));
-            owner.probe_suspects().await;
+            waits.push(minutes_to_next_round(&owner));
+            next_round(&mut owner).await;
         }
         assert_eq!(waits, [2, 5, 10, 15, 15, 15]);
+    }
+
+    /// eth1, suspect, answers again: two probe rounds give it the route
+    /// back, and the tunnel follows.
+    async fn eth1_returns(owner: &mut Owner<Arc<Fake>>, fake: &Arc<Fake>) {
+        fake.revive("eth1");
+        assert!(next_round(owner).await.is_empty());
+        assert_eq!(
+            next_round(owner).await,
+            moved(Some("wwan0"), Some("eth1"), "eth1 answers the relay again")
+        );
+        fake.tunnel_on(Some("eth1"));
+        owner.on_signal(registered(ETH1)).await;
+    }
+
+    /// eth1, holding the route, dies: two tunnel failures move it to LTE.
+    async fn eth1_dies(owner: &mut Owner<Arc<Fake>>, fake: &Arc<Fake>) {
+        fake.kill("eth1");
+        fake.tunnel_on(None);
+        owner.on_signal(failed(ETH1)).await;
+        assert_eq!(
+            owner.on_signal(failed(ETH1)).await,
+            moved(
+                Some("eth1"),
+                Some("wwan0"),
+                "eth1: no answer from the relay"
+            )
+        );
+        fake.tunnel_on(Some("wwan0"));
+        owner.on_signal(registered(LTE)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_uplink_that_fails_soon_after_its_return_waits_twice_as_long() {
+        let fake = Fake::new(travel_router());
+        let mut owner = failed_over(&fake).await;
+        let mut first_waits = Vec::new();
+        let mut second_waits = Vec::new();
+        for _ in 0..7 {
+            // The same as eth1_returns, reading each wait on the way.
+            first_waits.push(minutes_to_next_round(&owner));
+            fake.revive("eth1");
+            assert!(next_round(&mut owner).await.is_empty());
+            second_waits.push(minutes_to_next_round(&owner));
+            assert_eq!(next_round(&mut owner).await.len(), 1, "back on eth1");
+            fake.tunnel_on(Some("eth1"));
+            owner.on_signal(registered(ETH1)).await;
+            // Five minutes after it got the route back, it dies again.
+            tokio::time::sleep(Duration::from_mins(5)).await;
+            eth1_dies(&mut owner, &fake).await;
+        }
+        assert_eq!(
+            first_waits,
+            [2, 4, 8, 16, 32, 60, 60],
+            "never above an hour"
+        );
+        assert_eq!(second_waits, [5, 10, 20, 40, 60, 60, 60]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_uplink_that_keeps_the_route_for_an_hour_is_forgiven() {
+        let fake = Fake::new(travel_router());
+        let mut owner = failed_over(&fake).await;
+        for _ in 0..2 {
+            eth1_returns(&mut owner, &fake).await;
+            tokio::time::sleep(Duration::from_mins(1)).await;
+            eth1_dies(&mut owner, &fake).await;
+        }
+        assert_eq!(minutes_to_next_round(&owner), 8, "two relapses");
+        eth1_returns(&mut owner, &fake).await;
+        assert!(
+            owner.next_probe().is_none(),
+            "no timer while nothing is suspect"
+        );
+        tokio::time::sleep(Duration::from_mins(61)).await;
+        eth1_dies(&mut owner, &fake).await;
+        assert_eq!(minutes_to_next_round(&owner), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_after_ten_minutes_neither_doubles_nor_forgives() {
+        let fake = Fake::new(travel_router());
+        let mut owner = failed_over(&fake).await;
+        eth1_returns(&mut owner, &fake).await;
+        eth1_dies(&mut owner, &fake).await;
+        assert_eq!(minutes_to_next_round(&owner), 4, "one relapse");
+        eth1_returns(&mut owner, &fake).await;
+        tokio::time::sleep(Duration::from_mins(20)).await;
+        eth1_dies(&mut owner, &fake).await;
+        assert_eq!(minutes_to_next_round(&owner), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_suspect_keeps_its_own_schedule() {
+        let mut net = travel_router();
+        net.interfaces.insert(1, iface("eth2", 4, ETH2, Some(20)));
+        net.default_routes
+            .insert(1, default("eth2", Ipv4Addr::new(192, 168, 1, 1), 20));
+        let fake = Fake::new(net);
+        // eth1 is dead from the start: the route goes to eth2.
+        fake.kill("eth1");
+        let mut owner = Owner::new(fake.clone(), schedule());
+        fake.tunnel_on(Some("wwan0"));
+        owner.on_net(fake.state()).await;
+        owner.on_signal(registered(LTE)).await;
+        fake.tunnel_on(Some("eth2"));
+        owner.on_signal(registered(ETH2)).await;
+        let report = owner.report(RelayRouteMode::FollowDefault);
+        assert_eq!(
+            (report.dev.as_deref(), report.suspect),
+            (Some("eth2"), vec!["eth1".to_string()])
+        );
+
+        // Three minutes on, eth2 dies too and LTE takes the route.
+        tokio::time::sleep(Duration::from_mins(3)).await;
+        fake.kill("eth2");
+        fake.tunnel_on(None);
+        owner.on_signal(failed(ETH2)).await;
+        assert_eq!(
+            owner.on_signal(failed(ETH2)).await,
+            moved(
+                Some("eth2"),
+                Some("wwan0"),
+                "eth2: no answer from the relay"
+            )
+        );
+        fake.probes();
+        // eth1 has been due since minute 2; eth2 is due at minute 5.
+        assert!(next_round(&mut owner).await.is_empty());
+        assert_eq!(fake.probes(), ["eth1"], "only the one that is due");
+        assert_eq!(minutes_to_next_round(&owner), 2);
+        assert!(next_round(&mut owner).await.is_empty());
+        assert_eq!(fake.probes(), ["eth2"]);
+        // eth1's second wait (5) runs from minute 3, eth2's from minute 5.
+        assert_eq!(minutes_to_next_round(&owner), 3);
     }
 
     #[tokio::test]
