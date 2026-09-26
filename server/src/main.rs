@@ -43,7 +43,7 @@ use sctl::{
     auth::ApiKey,
     comms,
     config::Config,
-    infra, lte_watchdog, routes, sessions,
+    infra, lte_watchdog, netwatch, routes, sessions,
     sessions::SessionManager,
     state::{AppState, TunnelStats},
     tunnel, ws, ExecResultsCache,
@@ -493,6 +493,18 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         Arc::new(tokio::sync::Mutex::new(is))
     };
 
+    // ─── Kernel network events (every mode but relay) ─────────────
+    let boot_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let (net_publisher, net_rx) = if config.tunnel.as_ref().is_some_and(|tc| tc.relay) {
+        (None, None)
+    } else {
+        let (tx, rx) = netwatch::channel();
+        (Some(Arc::new(tx)), Some(rx))
+    };
+
     let mut state = AppState {
         session_manager,
         config: Arc::new(config),
@@ -511,6 +523,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         relay_state: None,
         infra_state: Some(infra_state.clone()),
         api_router: Arc::new(std::sync::OnceLock::new()),
+        netwatch: net_rx,
     };
 
     // Build router
@@ -773,6 +786,15 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
 
     info!("Server ready");
 
+    // Kernel network events. Started before the tunnel client so the first
+    // state is on its way when the tunnel dials. The publisher lives in the
+    // closure, so a restart after a panic keeps the same channel and `seq`.
+    let netwatch_task = net_publisher.map(|tx| {
+        spawn_supervised("netwatch", SUPERVISED_RESTART_DELAY, move || {
+            netwatch::run(tx.clone(), boot_unix_ms)
+        })
+    });
+
     // Tunnel: spawn client if configured, with panic-recovery supervisor.
     // The client loop never returns on its own (even a rejected tunnel key is
     // retried on a slow cadence — a tunnel-only device that stops retrying is
@@ -949,6 +971,9 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     info!("Shutting down...");
     sweep_task.abort();
     tunnel_events_flush_task.abort();
+    if let Some(task) = netwatch_task {
+        task.abort();
+    }
     if let Some(task) = relay_sweep_task {
         task.abort();
     }

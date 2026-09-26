@@ -158,6 +158,11 @@ disable tunneling. Two mutually exclusive modes:
 | `tls_ca_file` | *(none)* | PEM file with additional root CAs for `wss://` client connections. Public webpki roots stay enabled. |
 | `tls_server_cert_sha256` | *(none)* | SHA-256 pin (lowercase hex or colon-separated) for the relay's leaf certificate DER; checked after normal rustls validation. |
 
+Routes sctl installs on the device carry route protocol `83`, a value the
+kernel's list leaves unassigned, so `ip route show proto 83` lists exactly
+those. sctl deletes a route only by naming that protocol, so it never
+removes a route that netifd, DHCP or an operator added.
+
 ## `[comms]`
 
 External comms provider plugin (`CommsConfig`) — the C-ABI shared library

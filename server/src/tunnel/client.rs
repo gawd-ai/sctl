@@ -109,36 +109,7 @@ fn resolve_bind_address(value: &str) -> Option<std::net::IpAddr> {
     if let Ok(ip) = value.parse::<std::net::IpAddr>() {
         return Some(ip);
     }
-
-    unsafe {
-        let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&raw mut ifaddrs) != 0 {
-            return None;
-        }
-
-        let mut current = ifaddrs;
-        let mut result = None;
-
-        while !current.is_null() {
-            let ifa = &*current;
-            if !ifa.ifa_name.is_null() && !ifa.ifa_addr.is_null() {
-                let name = std::ffi::CStr::from_ptr(ifa.ifa_name);
-                if let Ok(name_str) = name.to_str() {
-                    if name_str == value && i32::from((*ifa.ifa_addr).sa_family) == libc::AF_INET {
-                        #[allow(clippy::cast_ptr_alignment)]
-                        let addr = &*(ifa.ifa_addr.cast::<libc::sockaddr_in>());
-                        let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
-                        result = Some(std::net::IpAddr::V4(ip));
-                        break;
-                    }
-                }
-            }
-            current = ifa.ifa_next;
-        }
-
-        libc::freeifaddrs(ifaddrs);
-        result
-    }
+    crate::netwatch::source::interface_ipv4(value).map(std::net::IpAddr::V4)
 }
 
 /// Probe whether a local IP address is currently available for binding.

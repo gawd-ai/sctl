@@ -25,6 +25,7 @@ pub mod error;
 pub mod gawdxfer;
 pub mod infra;
 pub mod lte_watchdog;
+pub mod netwatch;
 pub mod pin_store;
 pub mod platform;
 pub mod routes;

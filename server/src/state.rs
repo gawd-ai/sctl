@@ -17,6 +17,7 @@ use crate::comms::{CommsClient, CommsState};
 use crate::config::Config;
 use crate::gawdxfer::manager::TransferManager;
 use crate::infra::InfraState;
+use crate::netwatch::NetWatch;
 use crate::sessions::SessionManager;
 use crate::tunnel::history::RelayConnectionHistory;
 use crate::tunnel::relay::{DeviceSnapshot, RelayState};
@@ -63,6 +64,10 @@ pub struct AppState {
     /// same routing table, same auth middleware, same handlers as the LAN
     /// port, with no per-endpoint tunnel plumbing.
     pub api_router: Arc<std::sync::OnceLock<axum::Router>>,
+    /// The device's links, IPv4 addresses and routes, republished on every
+    /// kernel change (None in relay mode). Stays empty when the kernel's
+    /// route socket is unavailable; `netwatch::next_state` waits on it.
+    pub netwatch: Option<NetWatch>,
 }
 
 /// Tunnel connection event types.
