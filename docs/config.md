@@ -154,7 +154,7 @@ disable tunneling. Two mutually exclusive modes:
 | `heartbeat_interval_secs` | `5` | Ping interval (client mode). **Clamped to `[1, 15]` at use** — on LTE/CGNAT paths, idle periods much above ~15 s get culled by the network long before the logical tunnel timeout, so a stale config cannot silently disable keepalives. |
 | `heartbeat_timeout_secs` | `45` | Seconds without a heartbeat before the relay declares a device dead (relay mode). |
 | `tunnel_proxy_timeout_secs` | `60` | Default proxy request timeout (relay mode); the source of relay `504 TIMEOUT` errors. |
-| `bind_address` | *(none)* | Local address **or interface name** to bind outbound tunnel connections to (client mode). Interface names are resolved to their current IPv4 on each connect attempt (survives DHCP/carrier changes) and get `SO_BINDTODEVICE`; an IP literal sets only the source address and does **not** pin egress to the interface. |
+| `bind_address` | *(none)* | Local address **or interface name** to bind outbound tunnel connections to (client mode). Interface names are resolved to their current IPv4 on each connect attempt (survives DHCP/carrier changes) and get `SO_BINDTODEVICE`; an IP literal sets only the source address and does **not** pin egress to the interface. Either way the tunnel stays where it is bound and does not follow the kernel's route changes. |
 | `tls_ca_file` | *(none)* | PEM file with additional root CAs for `wss://` client connections. Public webpki roots stay enabled. |
 | `tls_server_cert_sha256` | *(none)* | SHA-256 pin (lowercase hex or colon-separated) for the relay's leaf certificate DER; checked after normal rustls validation. |
 

@@ -1,6 +1,7 @@
 //! Shared application state passed to every handler via Axum's `State` extractor.
 
 use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -79,6 +80,9 @@ pub enum TunnelEventType {
     WriterFailed,
     ReconnectAttempt,
     WatchdogAction,
+    /// The kernel's route to the relay moved to another address, so the
+    /// tunnel was redialed over it.
+    Rehome,
 }
 
 impl TunnelEventType {
@@ -91,6 +95,7 @@ impl TunnelEventType {
             Self::WriterFailed => "writer_failed",
             Self::ReconnectAttempt => "reconnect_attempt",
             Self::WatchdogAction => "watchdog_action",
+            Self::Rehome => "rehome",
         }
     }
 }
@@ -102,6 +107,19 @@ pub struct ConnectionEvent {
     pub timestamp: u64,
     pub event_type: TunnelEventType,
     pub detail: String,
+}
+
+/// Where the tunnel's TCP connection runs: its two ends and the interface it
+/// leaves by.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TunnelPath {
+    /// The device's end.
+    pub local: SocketAddr,
+    /// The relay's end.
+    pub remote: SocketAddr,
+    /// The interface holding the local address (None for IPv6, or when no
+    /// interface lists it any more).
+    pub dev: Option<String>,
 }
 
 /// Maximum number of recent events to retain.
@@ -137,6 +155,9 @@ pub struct TunnelStats {
     pub events_path: Option<PathBuf>,
     /// Dirty flag for debounced persistence.
     pub events_dirty: AtomicBool,
+    /// The open tunnel connection's path, None while no TCP connection to
+    /// the relay is open. A plain mutex: it is never held across an await.
+    path: std::sync::Mutex<Option<TunnelPath>>,
 }
 
 impl TunnelStats {
@@ -158,7 +179,28 @@ impl TunnelStats {
             rtt_samples: Mutex::new(VecDeque::with_capacity(MAX_RTT_SAMPLES)),
             events_path: None,
             events_dirty: AtomicBool::new(false),
+            path: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The open tunnel connection's path.
+    pub fn path(&self) -> Option<TunnelPath> {
+        self.path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Record the path of a new connection, or None when it closed. Returns
+    /// the path it replaces.
+    pub fn set_path(&self, path: Option<TunnelPath>) -> Option<TunnelPath> {
+        std::mem::replace(
+            &mut *self
+                .path
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            path,
+        )
     }
 
     /// Push a connection event, evicting oldest if at capacity.

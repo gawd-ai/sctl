@@ -83,6 +83,7 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
             "rtt_median_ms": rtt_median,
             "rtt_p95_ms": rtt_p95,
             "recent_events": recent_events,
+            "path": ts.path(),
         })
     } else {
         json!({

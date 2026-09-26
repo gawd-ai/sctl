@@ -350,6 +350,7 @@ The tunnel includes built-in resilience features:
 - **Heartbeat** -- configurable ping interval with RTT tracking (median and p95)
 - **Auto-reconnect** -- exponential backoff from `reconnect_delay_secs` to `reconnect_max_delay_secs`
 - **Flap detection** -- 3 connections in under 30 seconds triggers a 60-second cooldown backoff
+- **Follows the route** -- when the kernel's route to the relay moves to another address (a cable plugged in, an uplink lost), the tunnel redials over the new one at once, at most once every 5 seconds, without counting toward flap detection. While it waits to redial, a new route to the relay (a cable plugged in, LTE attaching) dials at once. A tunnel pinned with `bind_address` does neither.
 - **Writer channel monitoring** -- warns at 75% capacity, prevents backpressure stalls
 - **Health probe** -- relay periodically probes device health; unhealthy state resets on reconnect
 
@@ -363,7 +364,8 @@ Health metrics are exposed in the `/api/health` response:
     "uptime_secs": 3600,
     "rtt_median_ms": 45,
     "rtt_p95_ms": 120,
-    "dropped_outbound": 0
+    "dropped_outbound": 0,
+    "path": { "local": "192.168.8.20:40022", "remote": "174.138.114.209:443", "dev": "eth1" }
   }
 }
 ```

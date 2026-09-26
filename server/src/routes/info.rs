@@ -203,6 +203,7 @@ pub(crate) async fn info_with_groups(
                     "connected": state.tunnel_stats.connected.load(std::sync::atomic::Ordering::Relaxed),
                     "relay_url": tc.url,
                     "reconnects": state.tunnel_stats.reconnects.load(std::sync::atomic::Ordering::Relaxed),
+                    "path": state.tunnel_stats.path(),
                 });
             }
         }

@@ -5,7 +5,7 @@
 //! handles proxied requests by calling local route handlers.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::panic::AssertUnwindSafe;
@@ -30,8 +30,9 @@ use tracing::{error, info, warn};
 use crate::activity::{self, ActivityType, CachedExecResult};
 use crate::atomic::AtomicU64;
 use crate::config::TunnelConfig;
+use crate::netwatch::{self, source, NetWatch};
 use crate::sessions::buffer::{OutputBuffer, OutputEntry};
-use crate::state::TunnelEventType;
+use crate::state::{TunnelEventType, TunnelPath};
 use crate::AppState;
 
 use super::{decode_binary_frame, encode_binary_frame};
@@ -48,6 +49,17 @@ const TUNNEL_WRITER_SEND_TIMEOUT_SECS: u64 = 20;
 /// larger ones carrying the same bytes.
 const TUNNEL_STREAM_BATCH_MAX_ENTRIES: usize = 32;
 const TUNNEL_STREAM_BATCH_MAX_BYTES: usize = 8 * 1024;
+// Flap detection: track last N connection durations. If recent connections
+// are all short-lived, extend backoff to avoid hammering the relay.
+const FLAP_WINDOW: usize = 10;
+const FLAP_THRESHOLD_SECS: u64 = 30;
+const FLAP_CHECK_COUNT: usize = 3;
+/// At most one re-home per this interval: a route that keeps changing its
+/// mind must not become a stream of reconnects.
+const REHOME_MIN_INTERVAL: Duration = Duration::from_secs(5);
+/// A wait to redial that a network change cuts short still lasts this long,
+/// so a burst of network events cannot become a burst of dials.
+const EARLY_DIAL_FLOOR: Duration = Duration::from_secs(1);
 
 enum TunnelIo {
     Plain(TcpStream),
@@ -137,12 +149,6 @@ pub fn spawn(state: AppState, tunnel_config: TunnelConfig) -> tokio::task::JoinH
 
 /// Main loop: connect, handle messages, reconnect on failure.
 async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
-    // Flap detection: track last N connection durations. If recent connections
-    // are all short-lived, extend backoff to avoid hammering the relay.
-    const FLAP_WINDOW: usize = 10;
-    const FLAP_THRESHOLD_SECS: u64 = 30;
-    const FLAP_CHECK_COUNT: usize = 3;
-
     let relay_url = config
         .url
         .as_deref()
@@ -150,7 +156,20 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
     let mut backoff = Duration::from_secs(config.reconnect_delay_secs);
     let max_backoff = Duration::from_secs(config.reconnect_max_delay_secs);
     let mut reconnects: u64 = 0;
-    let mut connection_durations: VecDeque<u64> = VecDeque::with_capacity(FLAP_WINDOW);
+    let mut flap = FlapWindow::default();
+    // Network changes move the tunnel when the kernel's route to the relay
+    // moves, and cut a wait to redial short. A bind_address pins the tunnel
+    // to one interface on purpose, so a pinned tunnel does not watch.
+    let mut net = if config.bind_address.is_none() {
+        state.netwatch.clone()
+    } else {
+        None
+    };
+    // Where the relay was last reached, and when the tunnel last re-homed.
+    let mut relay: Option<SocketAddrV4> = None;
+    let mut last_rehome: Option<Instant> = None;
+    // A loop restarted after a panic starts with no connection.
+    state.tunnel_stats.set_path(None);
 
     loop {
         info!("Tunnel: connecting to relay at {relay_url}");
@@ -163,16 +182,40 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
             .await;
         let mut escalate_backoff = false;
         let connect_start = Instant::now();
+        // The source this attempt leaves from, for when it fails before it
+        // has a connection to take it from.
+        let dialed_from = relay
+            .filter(|_| net.is_some())
+            .and_then(|relay| source::source_for(relay).ok());
         state
             .tunnel_stats
             .reconnecting
             .store(true, Ordering::Relaxed);
-        let result = connect_and_run(&state, &config, relay_url).await;
+        let result = connect_and_run(&state, &config, relay_url, &mut net).await;
         state
             .tunnel_stats
             .reconnecting
             .store(false, Ordering::Relaxed);
+        // The connection is gone; keep where the relay was and which address
+        // the attempt left from.
+        let from = match state.tunnel_stats.set_path(None) {
+            Some(TunnelPath {
+                local: SocketAddr::V4(local),
+                remote: SocketAddr::V4(remote),
+                ..
+            }) => {
+                relay = Some(remote);
+                Some(*local.ip())
+            }
+            _ => dialed_from,
+        };
         let class = match result {
+            Ok(DisconnectReason::Rehome) => {
+                // The move itself was logged and recorded as it was decided.
+                let wait = rehome_wait(last_rehome.map(|at| at.elapsed()));
+                last_rehome = Some(Instant::now() + wait);
+                DelayClass::Rehome(wait)
+            }
             Ok(DisconnectReason::RelayShutdown) => {
                 info!("Tunnel: relay shutting down, reconnecting...");
                 state
@@ -248,35 +291,21 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
             .store(0, Ordering::Relaxed);
 
         // Track connection duration for flap detection
-        let duration_secs = connect_start.elapsed().as_secs();
-        if connection_durations.len() >= FLAP_WINDOW {
-            connection_durations.pop_front();
-        }
-        connection_durations.push_back(duration_secs);
-
-        // Flap detection: if last N connections all lasted < threshold, extend
-        // backoff. An auth-rejected loop is already on a far slower cadence
-        // than the flap window — damping must never *shorten* it.
-        let mut class = class;
-        if class != DelayClass::AuthRejected && connection_durations.len() >= FLAP_CHECK_COUNT {
-            let recent: Vec<&u64> = connection_durations
-                .iter()
-                .rev()
-                .take(FLAP_CHECK_COUNT)
-                .collect();
-            let all_short = recent.iter().all(|&&d| d < FLAP_THRESHOLD_SECS);
-            if all_short {
-                warn!(
-                    "Tunnel: flap detected ({FLAP_CHECK_COUNT} connections lasted <{FLAP_THRESHOLD_SECS}s), extending backoff"
-                );
-                class = DelayClass::Flap;
-                escalate_backoff = false; // don't double-escalate
-            }
+        let class = flap.record(class, connect_start.elapsed().as_secs());
+        if class == DelayClass::Flap {
+            warn!(
+                "Tunnel: flap detected ({FLAP_CHECK_COUNT} connections lasted <{FLAP_THRESHOLD_SECS}s), extending backoff"
+            );
+            escalate_backoff = false; // don't double-escalate
         }
 
         let sleep_for = reconnect_delay(class, random_draw());
         info!("Tunnel: next attempt in {:.1}s", sleep_for.as_secs_f64());
-        tokio::time::sleep(sleep_for).await;
+        if !class.wakes_on_network_change() {
+            tokio::time::sleep(sleep_for).await;
+        } else if wait_to_dial(sleep_for, &mut net, relay, from).await {
+            info!("Tunnel: the route to the relay changed, dialing now");
+        }
         if escalate_backoff {
             backoff = (backoff * 2).min(max_backoff);
         } else {
@@ -314,6 +343,150 @@ enum DelayClass {
     /// cadence, forever: never stop (recovery is an operator fixing the key,
     /// not a site visit), never hammer (the key may stay wrong for days).
     AuthRejected,
+    /// The kernel's route to the relay moved and the tunnel left to follow
+    /// it. Carries the rest of the [`REHOME_MIN_INTERVAL`] since the last
+    /// re-home, usually zero. No jitter: one device's route moving is not a
+    /// fleet-wide event.
+    Rehome(Duration),
+}
+
+impl DelayClass {
+    /// Whether a move of the kernel's route to the relay may cut this wait
+    /// short: any wait the path could have caused. That includes flap
+    /// damping, since three quick dials with no route engage it and a
+    /// returning uplink is exactly what should end that wait; damping still
+    /// holds while the route stays put. Another route does not bring a
+    /// restarting relay back or fix a rejected key, and the re-home limit
+    /// exists to hold dials back.
+    fn wakes_on_network_change(self) -> bool {
+        matches!(
+            self,
+            Self::CleanClose | Self::BindUnavailable | Self::Transient(_) | Self::Flap
+        )
+    }
+}
+
+/// Flap detection over the last [`FLAP_WINDOW`] connection durations.
+#[derive(Default)]
+struct FlapWindow {
+    durations: VecDeque<u64>,
+}
+
+impl FlapWindow {
+    /// Record an attempt that lasted `duration_secs` and ended on `class`.
+    /// Returns the class to wait on: [`DelayClass::Flap`] when the last
+    /// [`FLAP_CHECK_COUNT`] connections all lasted under
+    /// [`FLAP_THRESHOLD_SECS`], else `class`.
+    fn record(&mut self, class: DelayClass, duration_secs: u64) -> DelayClass {
+        // A re-home is the agent moving on purpose, not a failure: it is
+        // neither counted nor damped.
+        if matches!(class, DelayClass::Rehome(_)) {
+            return class;
+        }
+        if self.durations.len() >= FLAP_WINDOW {
+            self.durations.pop_front();
+        }
+        self.durations.push_back(duration_secs);
+        // An auth-rejected loop is already on a far slower cadence than the
+        // flap window: damping must never *shorten* it.
+        if class != DelayClass::AuthRejected
+            && self.durations.len() >= FLAP_CHECK_COUNT
+            && self
+                .durations
+                .iter()
+                .rev()
+                .take(FLAP_CHECK_COUNT)
+                .all(|&d| d < FLAP_THRESHOLD_SECS)
+        {
+            return DelayClass::Flap;
+        }
+        class
+    }
+}
+
+/// How long a re-home waits, given the time since the last one (None: never).
+fn rehome_wait(since_last: Option<Duration>) -> Duration {
+    since_last.map_or(Duration::ZERO, |since| {
+        REHOME_MIN_INTERVAL.saturating_sub(since)
+    })
+}
+
+/// The kernel's source address toward the relay when it moved away from
+/// `from`, the address the tunnel left from (None: it had none). None when
+/// nothing moved, and when the kernel has no route at all: a dial would only
+/// fail, and a live connection is better left to its own timeouts.
+fn moved_source(from: Option<Ipv4Addr>, now: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
+    now.filter(|now| Some(*now) != from)
+}
+
+/// The path of a freshly connected tunnel socket.
+fn tunnel_path(stream: &TcpStream) -> Option<TunnelPath> {
+    let local = stream.local_addr().ok()?;
+    let remote = stream.peer_addr().ok()?;
+    let dev = match local.ip() {
+        IpAddr::V4(ip) => source::interface_with_ipv4(ip),
+        IpAddr::V6(_) => None,
+    };
+    Some(TunnelPath { local, remote, dev })
+}
+
+/// The relay's address and the tunnel's own, when the tunnel can follow the
+/// kernel's route: the route lookup is IPv4 only.
+fn rehome_ends(path: &TunnelPath) -> Option<(SocketAddrV4, Ipv4Addr)> {
+    match (path.remote, path.local) {
+        (SocketAddr::V4(remote), SocketAddr::V4(local)) => Some((remote, *local.ip())),
+        _ => None,
+    }
+}
+
+/// One end of a move, as `dev address` or the bare address.
+fn path_end(dev: Option<&str>, ip: Ipv4Addr) -> String {
+    match dev {
+        Some(dev) => format!("{dev} {ip}"),
+        None => ip.to_string(),
+    }
+}
+
+/// Sleep `delay` before the next dial, or less when the kernel's route to the
+/// relay moves meanwhile (a cable plugged in, LTE attaching): then dial once
+/// [`EARLY_DIAL_FLOOR`] has passed since the wait began. `relay` is where the
+/// relay was last reached and `from` the address the last attempt left from;
+/// with no known relay, any network change counts. Returns true when the wait
+/// was cut short. Without a network watch, or before it has published, this
+/// is a plain sleep.
+async fn wait_to_dial(
+    delay: Duration,
+    net: &mut Option<NetWatch>,
+    relay: Option<SocketAddrV4>,
+    from: Option<Ipv4Addr>,
+) -> bool {
+    let start = tokio::time::Instant::now();
+    let deadline = start + delay;
+    let early = deadline.min(start + EARLY_DIAL_FLOOR);
+    let moved =
+        || relay.is_none_or(|relay| moved_source(from, source::source_for(relay).ok()).is_some());
+    // Changes already made are judged by the check below, not replayed.
+    let watching = net
+        .as_mut()
+        .is_some_and(|rx| rx.borrow_and_update().is_some());
+    // A move while the last attempt was failing counts too.
+    if watching && relay.is_some() && moved() {
+        tokio::time::sleep_until(early).await;
+        return true;
+    }
+    let sleep = tokio::time::sleep_until(deadline);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            () = &mut sleep => return false,
+            _ = netwatch::next_state(net.as_mut()) => {
+                if moved() {
+                    tokio::time::sleep_until(early).await;
+                    return true;
+                }
+            }
+        }
+    }
 }
 
 /// Map a delay class and a uniform random draw to a concrete delay.
@@ -335,6 +508,7 @@ fn reconnect_delay(class: DelayClass, draw: u64) -> Duration {
         }
         DelayClass::Flap => uniform(Duration::from_mins(1), 30_000, draw),
         DelayClass::AuthRejected => uniform(Duration::from_mins(5), 600_000, draw),
+        DelayClass::Rehome(wait) => wait,
     }
 }
 
@@ -361,6 +535,8 @@ enum DisconnectReason {
     WriterExit,
     /// WS read error.
     ReadError,
+    /// The kernel's route to the relay moved to another source address.
+    Rehome,
 }
 
 impl DisconnectReason {
@@ -371,6 +547,7 @@ impl DisconnectReason {
             Self::PongTimeout => "pong_timeout",
             Self::WriterExit => "writer_exit",
             Self::ReadError => "read_error",
+            Self::Rehome => "rehome",
         }
     }
 }
@@ -801,11 +978,15 @@ impl Drop for CleanupGuard {
     }
 }
 
-/// A single connection attempt: connect, register, handle messages until disconnect.
+/// A single connection attempt: connect, register, handle messages until
+/// disconnect. With `net`, a network change that moves the kernel's route to
+/// the relay away from the tunnel's address ends it with
+/// [`DisconnectReason::Rehome`].
 async fn connect_and_run(
     state: &AppState,
     config: &TunnelConfig,
     relay_url: &str,
+    net: &mut Option<NetWatch>,
 ) -> Result<DisconnectReason, ConnectError> {
     // The key's real home is the Authorization header (added at the WS
     // handshake below). It ALSO still rides the query because a payload-#1
@@ -824,6 +1005,33 @@ async fn connect_and_run(
         .await
         .map_err(ConnectError::Transient)?;
     let tcp_elapsed = connect_start.elapsed();
+    let path = tunnel_path(&tcp_stream);
+    if let Some(ref p) = path {
+        info!(
+            "Tunnel: path {} -> {} on {}",
+            p.local,
+            p.remote,
+            p.dev.as_deref().unwrap_or("?")
+        );
+    }
+    state.tunnel_stats.set_path(path.clone());
+    // Followed only when the kernel's lookup agrees with the address it just
+    // gave this connection. When it does not (a multipath route can answer
+    // each lookup differently), a comparison would move a healthy tunnel.
+    let rehome_from = path
+        .as_ref()
+        .and_then(rehome_ends)
+        .filter(|_| net.is_some())
+        .filter(|&(relay, local)| {
+            let agrees = source::source_for(relay).ok() == Some(local);
+            if !agrees {
+                warn!(
+                    "Tunnel: the kernel's route to the relay does not name {local}; \
+                     route changes will not move this connection"
+                );
+            }
+            agrees
+        });
 
     // TLS + WebSocket handshake with timeout (can hang on riscv64/slow networks)
     let tls_start = Instant::now();
@@ -1278,6 +1486,24 @@ async fn connect_and_run(
                 warn!("Tunnel: writer task exited, disconnecting");
                 disconnect_reason = DisconnectReason::WriterExit;
                 break;
+            }
+            _ = netwatch::next_state(net.as_mut()), if rehome_from.is_some() => {
+                let Some((relay, local)) = rehome_from else { continue };
+                let now = source::route_to(relay).ok();
+                if let Some(to) = moved_source(Some(local), now.as_ref().map(|r| r.source)) {
+                    let detail = format!(
+                        "{} -> {}",
+                        path_end(path.as_ref().and_then(|p| p.dev.as_deref()), local),
+                        path_end(now.as_ref().and_then(|r| r.dev.as_deref()), to),
+                    );
+                    info!("Tunnel: the route to the relay moved ({detail}), re-homing");
+                    state
+                        .tunnel_stats
+                        .push_event(TunnelEventType::Rehome, detail)
+                        .await;
+                    disconnect_reason = DisconnectReason::Rehome;
+                    break;
+                }
             }
         }
     }
@@ -4366,5 +4592,272 @@ mod reconnect_delay_tests {
         let a = reconnect_delay(DelayClass::RelayShutdown, 0);
         let b = reconnect_delay(DelayClass::RelayShutdown, 5_000);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn rehome_waits_exactly_what_it_carries() {
+        assert_bounds(
+            DelayClass::Rehome(Duration::ZERO),
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        let rest = Duration::from_millis(3_500);
+        assert_bounds(DelayClass::Rehome(rest), rest, rest);
+    }
+}
+
+#[cfg(test)]
+mod rehome_tests {
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{
+        moved_source, path_end, rehome_ends, rehome_wait, wait_to_dial, DelayClass, FlapWindow,
+        EARLY_DIAL_FLOOR,
+    };
+    use crate::netwatch::{self, NetState};
+    use crate::state::TunnelPath;
+
+    const ETH: Ipv4Addr = Ipv4Addr::new(192, 168, 8, 20);
+    const LTE: Ipv4Addr = Ipv4Addr::new(10, 64, 3, 2);
+
+    #[test]
+    fn a_moved_route_names_the_new_source() {
+        assert_eq!(moved_source(Some(ETH), Some(LTE)), Some(LTE));
+        assert_eq!(moved_source(Some(LTE), Some(ETH)), Some(ETH));
+    }
+
+    #[test]
+    fn the_same_route_does_not_move() {
+        assert_eq!(moved_source(Some(ETH), Some(ETH)), None);
+    }
+
+    #[test]
+    fn no_route_at_all_is_not_a_move() {
+        // Losing every route is left to the connection's own timeouts; a dial
+        // with no route would only fail.
+        assert_eq!(moved_source(Some(ETH), None), None);
+        assert_eq!(moved_source(None, None), None);
+    }
+
+    #[test]
+    fn a_route_appearing_is_a_move() {
+        assert_eq!(moved_source(None, Some(LTE)), Some(LTE));
+    }
+
+    fn path(local: SocketAddr, remote: SocketAddr) -> TunnelPath {
+        TunnelPath {
+            local,
+            remote,
+            dev: None,
+        }
+    }
+
+    #[test]
+    fn only_an_ipv4_path_is_followed() {
+        let relay = SocketAddrV4::new(Ipv4Addr::new(174, 138, 114, 209), 443);
+        let local = SocketAddrV4::new(ETH, 40_022);
+        assert_eq!(
+            rehome_ends(&path(local.into(), relay.into())),
+            Some((relay, ETH))
+        );
+        let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let v6_local: SocketAddr = "[2001:db8::2]:40022".parse().unwrap();
+        assert_eq!(rehome_ends(&path(v6_local, v6)), None);
+        assert_eq!(rehome_ends(&path(local.into(), v6)), None);
+    }
+
+    #[test]
+    fn a_move_reads_dev_then_address() {
+        assert_eq!(path_end(Some("eth1"), ETH), "eth1 192.168.8.20");
+        assert_eq!(path_end(None, LTE), "10.64.3.2");
+    }
+
+    #[test]
+    fn at_most_one_rehome_per_five_seconds() {
+        assert_eq!(rehome_wait(None), Duration::ZERO);
+        assert_eq!(rehome_wait(Some(Duration::ZERO)), Duration::from_secs(5));
+        assert_eq!(
+            rehome_wait(Some(Duration::from_secs(1))),
+            Duration::from_secs(4)
+        );
+        assert_eq!(rehome_wait(Some(Duration::from_secs(5))), Duration::ZERO);
+        assert_eq!(rehome_wait(Some(Duration::from_mins(1))), Duration::ZERO);
+    }
+
+    #[test]
+    fn three_short_connections_engage_flap_damping() {
+        let mut flap = FlapWindow::default();
+        assert_eq!(
+            flap.record(DelayClass::CleanClose, 2),
+            DelayClass::CleanClose
+        );
+        assert_eq!(
+            flap.record(DelayClass::CleanClose, 2),
+            DelayClass::CleanClose
+        );
+        assert_eq!(flap.record(DelayClass::CleanClose, 2), DelayClass::Flap);
+        // A connection that held breaks the run.
+        assert_eq!(
+            flap.record(DelayClass::CleanClose, 600),
+            DelayClass::CleanClose
+        );
+        assert_eq!(
+            flap.record(DelayClass::CleanClose, 2),
+            DelayClass::CleanClose
+        );
+    }
+
+    #[test]
+    fn an_auth_rejected_loop_is_never_damped() {
+        let mut flap = FlapWindow::default();
+        for _ in 0..5 {
+            assert_eq!(
+                flap.record(DelayClass::AuthRejected, 0),
+                DelayClass::AuthRejected
+            );
+        }
+    }
+
+    #[test]
+    fn a_rehome_is_neither_damped_nor_counted() {
+        let mut flap = FlapWindow::default();
+        flap.record(DelayClass::CleanClose, 2);
+        flap.record(DelayClass::CleanClose, 2);
+        for _ in 0..12 {
+            assert_eq!(
+                flap.record(DelayClass::Rehome(Duration::ZERO), 1),
+                DelayClass::Rehome(Duration::ZERO)
+            );
+        }
+        assert_eq!(flap.durations.len(), 2);
+        // The two short closes before the re-homes still count.
+        assert_eq!(flap.record(DelayClass::CleanClose, 2), DelayClass::Flap);
+    }
+
+    #[test]
+    fn only_a_wait_the_path_could_cause_ends_on_a_network_change() {
+        assert!(DelayClass::CleanClose.wakes_on_network_change());
+        assert!(DelayClass::BindUnavailable.wakes_on_network_change());
+        assert!(DelayClass::Transient(Duration::from_secs(8)).wakes_on_network_change());
+        assert!(DelayClass::Flap.wakes_on_network_change());
+        assert!(!DelayClass::RelayShutdown.wakes_on_network_change());
+        assert!(!DelayClass::AuthRejected.wakes_on_network_change());
+        assert!(!DelayClass::Rehome(Duration::ZERO).wakes_on_network_change());
+    }
+
+    /// The loopback relay: the kernel always reaches it from 127.0.0.1.
+    const LOOPBACK_RELAY: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9);
+
+    fn state(seq: u64) -> Arc<NetState> {
+        Arc::new(NetState {
+            seq,
+            ..NetState::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn without_a_watch_the_wait_is_a_plain_sleep() {
+        let started = tokio::time::Instant::now();
+        let woke = wait_to_dial(
+            Duration::from_millis(80),
+            &mut None,
+            Some(LOOPBACK_RELAY),
+            Some(ETH),
+        )
+        .await;
+        assert!(!woke);
+        assert!(started.elapsed() >= Duration::from_millis(80));
+    }
+
+    #[tokio::test]
+    async fn a_watch_that_never_published_is_a_plain_sleep() {
+        // The listener could not open its socket: the route lookup is not
+        // consulted, even though it would differ from `from`.
+        let (_tx, rx) = netwatch::channel();
+        let started = tokio::time::Instant::now();
+        let woke = wait_to_dial(
+            Duration::from_millis(80),
+            &mut Some(rx),
+            Some(LOOPBACK_RELAY),
+            Some(ETH),
+        )
+        .await;
+        assert!(!woke);
+        assert!(started.elapsed() >= Duration::from_millis(80));
+    }
+
+    #[tokio::test]
+    async fn a_change_that_leaves_the_route_alone_does_not_dial() {
+        let (tx, rx) = netwatch::channel();
+        tx.send(Some(state(1))).unwrap();
+        let tx = Arc::new(tx);
+        let later = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            later.send(Some(state(2))).unwrap();
+        });
+        let woke = wait_to_dial(
+            Duration::from_millis(200),
+            &mut Some(rx),
+            Some(LOOPBACK_RELAY),
+            Some(Ipv4Addr::LOCALHOST),
+        )
+        .await;
+        assert!(!woke);
+    }
+
+    #[tokio::test]
+    async fn a_route_that_moved_during_the_attempt_dials_at_the_floor() {
+        // Published before the wait: judged at once, not replayed.
+        let (tx, rx) = netwatch::channel();
+        tx.send(Some(state(1))).unwrap();
+        let started = tokio::time::Instant::now();
+        let woke = wait_to_dial(
+            Duration::from_secs(30),
+            &mut Some(rx),
+            Some(LOOPBACK_RELAY),
+            Some(ETH),
+        )
+        .await;
+        assert!(woke);
+        let waited = started.elapsed();
+        assert!(waited >= EARLY_DIAL_FLOOR, "{waited:?}");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+    }
+
+    #[tokio::test]
+    async fn any_change_dials_early_while_the_relay_is_unknown() {
+        let (tx, rx) = netwatch::channel();
+        tx.send(Some(state(1))).unwrap();
+        let tx = Arc::new(tx);
+        let later = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            later.send(Some(state(2))).unwrap();
+        });
+        let started = tokio::time::Instant::now();
+        let woke = wait_to_dial(Duration::from_secs(30), &mut Some(rx), None, None).await;
+        assert!(woke);
+        let waited = started.elapsed();
+        assert!(waited >= EARLY_DIAL_FLOOR, "{waited:?}");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+    }
+
+    #[tokio::test]
+    async fn the_floor_never_outlasts_the_delay() {
+        let (tx, rx) = netwatch::channel();
+        tx.send(Some(state(1))).unwrap();
+        let started = tokio::time::Instant::now();
+        let woke = wait_to_dial(
+            Duration::from_millis(150),
+            &mut Some(rx),
+            Some(LOOPBACK_RELAY),
+            Some(ETH),
+        )
+        .await;
+        assert!(woke);
+        assert!(started.elapsed() < EARLY_DIAL_FLOOR);
     }
 }

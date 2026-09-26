@@ -106,8 +106,17 @@ Response `200`:
 - `tunnel` — in tunnel-client mode, extended with `uptime_secs`,
   `messages_sent/received`, `last_pong_age_ms`, `dropped_outbound`,
   `stream_backpressure_events`, `stream_replay_events`, `rtt_median_ms`,
-  `rtt_p95_ms`, and `recent_events` (last 10 tunnel events). Otherwise only
-  `{connected, reconnects}`.
+  `rtt_p95_ms`, `recent_events` (last 10 tunnel events) and `path`.
+  Otherwise only `{connected, reconnects}`.
+- `tunnel.path`: where the tunnel's TCP connection runs,
+  `{"local": "192.168.8.20:40022", "remote": "174.138.114.209:443", "dev": "eth1"}`.
+  `dev` is the interface holding the local address (`null` for IPv6).
+  The object is `null` while no TCP connection to the relay is open. It is
+  set as soon as one opens, before registration, so it can be present while
+  `connected` is still `false`. When the kernel's route to the relay moves
+  to another address, the tunnel redials over it and records a `rehome`
+  event such as `eth1 192.168.8.20 -> wwan0 10.64.3.2` (not with
+  `bind_address`, which pins the tunnel).
 - `gps` / `lte` — `null` when the subsystem is not configured;
   `{"status": "no_signal"}` / `{"status": "provider_unavailable"}` when
   configured but degraded.
@@ -139,7 +148,7 @@ Response `200` — an object containing only the requested groups:
 - `disk` — `disk` (root filesystem `total_bytes`/`used_bytes`, kept for
   back-compat) plus `disks` (all mounted storages).
 - `tunnel` — `{connected, relay_url, reconnects}` (tunnel-client mode only;
-  absent otherwise).
+  absent otherwise), plus `path`, the same object as in `/api/health`.
 - `gps` — `status` plus, when a fix exists, `latitude`, `longitude`,
   `altitude`, `satellites`, `speed_kmh`, `course`, `hdop`, `fix_age_secs`
   (absent when GPS is not configured).
