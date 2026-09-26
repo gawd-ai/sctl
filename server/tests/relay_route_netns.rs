@@ -9,6 +9,11 @@
 //! the kernel's route to the relay and reports to the owner exactly what the
 //! tunnel client reports (registrations, and failures of the path).
 //!
+//! The scenario: the route lands on the wire; the relay goes down and comes
+//! back, which moves nothing; the wire's upstream goes dark and the route
+//! moves to LTE; the upstream returns and so does the route; with
+//! `relay_route = "off"` nothing is written.
+//!
 //! Needs root, so it is ignored by default. Build it as yourself, then run the
 //! binary with sudo:
 //!
@@ -18,11 +23,11 @@
 //! ```
 
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::process::Command;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -175,26 +180,55 @@ fn enter(ns: &str) {
 }
 
 /// The relay: an echo server on 10.99.0.1, inside the upstream namespace.
-fn start_relay(up: &str) {
+/// Storing false in the flag it returns takes it down as a restart does: it
+/// closes every connection and stops listening, so dials are refused on
+/// every uplink. Storing true brings it back.
+fn start_relay(up: &str) -> Arc<AtomicBool> {
     let up = up.to_string();
+    let running = Arc::new(AtomicBool::new(true));
+    let flag = running.clone();
     let (ready, listening) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         enter(&up);
-        let listener = TcpListener::bind(RELAY).expect("relay listens");
-        ready.send(()).unwrap();
-        for mut stream in listener.incoming().flatten() {
-            std::thread::spawn(move || {
-                let mut buf = [0u8; 64];
-                while let Ok(n @ 1..) = stream.read(&mut buf) {
-                    if stream.write_all(&buf[..n]).is_err() {
-                        break;
+        let mut ready = Some(ready);
+        loop {
+            while !flag.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let listener = TcpListener::bind(RELAY).expect("relay listens");
+            listener.set_nonblocking(true).unwrap();
+            if let Some(ready) = ready.take() {
+                ready.send(()).unwrap();
+            }
+            let mut open: Vec<std::net::TcpStream> = Vec::new();
+            while flag.load(Ordering::SeqCst) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                open.push(stream.try_clone().unwrap());
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 64];
+                    while let Ok(n @ 1..) = stream.read(&mut buf) {
+                        if stream.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
                     }
-                }
-            });
+                });
+            }
+            drop(listener);
+            for stream in open {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
         }
     });
     listening.recv().expect("relay started");
+    running
 }
+
+/// Failures of the path the stand-in tunnel has reported.
+static PATH_FAILURES: AtomicUsize = AtomicUsize::new(0);
 
 /// The tunnel, reduced to what the owner hears from it.
 async fn tunnel(route: Arc<RelayRoute>, stats: Arc<TunnelStats>) {
@@ -202,6 +236,7 @@ async fn tunnel(route: Arc<RelayRoute>, stats: Arc<TunnelStats>) {
         let from = source::source_for(RELAY).ok();
         let dialed = tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(RELAY)).await;
         let Ok(Ok(mut stream)) = dialed else {
+            PATH_FAILURES.fetch_add(1, Ordering::SeqCst);
             route.signal(TunnelSignal::Failed {
                 from,
                 relay: Some(RELAY),
@@ -251,6 +286,7 @@ async fn tunnel(route: Arc<RelayRoute>, stats: Arc<TunnelStats>) {
         stats.connected.store(false, Ordering::Relaxed);
         stats.set_path(None);
         if failed {
+            PATH_FAILURES.fetch_add(1, Ordering::SeqCst);
             route.signal(TunnelSignal::Failed {
                 from: Some(local),
                 relay: Some(RELAY),
@@ -344,16 +380,16 @@ fn the_relay_route_follows_the_uplink_that_reaches_the_relay() {
     assert_eq!(unsafe { libc::geteuid() }, 0, "SCTL_NETNS_TEST needs root");
 
     let ns = Namespaces::create();
-    start_relay(&ns.up);
+    let relay = start_relay(&ns.up);
     enter(&ns.dev);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    runtime.block_on(scenario(&ns));
+    runtime.block_on(scenario(&ns, &relay));
 }
 
-async fn scenario(ns: &Namespaces) {
+async fn scenario(ns: &Namespaces, relay: &AtomicBool) {
     let (publisher, net) = netwatch::channel();
     tokio::spawn(netwatch::run(Arc::new(publisher), 1));
     // Only the wait between probe rounds is shortened.
@@ -386,6 +422,50 @@ async fn scenario(ns: &Namespaces) {
     )
     .await;
     eprintln!("route on wan0 after {took:?}");
+
+    // The relay goes down (a restart, a deploy) while both uplinks work. Every
+    // dial is refused, on both links: each pair of failures is a fail-over
+    // round that finds no uplink answering, so nothing moves, nothing becomes
+    // suspect, and the tunnel comes back on the wire.
+    let before = PATH_FAILURES.load(Ordering::SeqCst);
+    relay.store(false, Ordering::SeqCst);
+    let outage = Instant::now();
+    while outage.elapsed() < Duration::from_secs(8) {
+        let now = seen(&route, &stats).await;
+        assert_eq!(
+            now.ours(),
+            Some(("wan0", Some(WAN0_GW))),
+            "the relay is down, not the wire: {now:#?}"
+        );
+        assert!(now.report.suspect.is_empty(), "{now:#?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let failures = PATH_FAILURES.load(Ordering::SeqCst) - before;
+    assert!(
+        failures >= 4,
+        "at least two fail-over rounds ran during the outage: {failures} failures"
+    );
+    relay.store(true, Ordering::SeqCst);
+    let took = wait_until(
+        "the tunnel comes back on the wire after the relay outage",
+        Duration::from_secs(10),
+        &route,
+        &stats,
+        |s| {
+            s.ours() == Some(("wan0", Some(WAN0_GW)))
+                && s.report.suspect.is_empty()
+                && s.tunnel.as_deref() == Some("wan0")
+        },
+    )
+    .await;
+    eprintln!(
+        "tunnel back on wan0 {took:?} after the relay, {failures} failures during the outage"
+    );
+    assert_eq!(
+        events(&stats).await,
+        ["none -> wan0 (lowest-metric default route)"],
+        "a relay outage moves nothing"
+    );
 
     // The wire's upstream goes dark while its link stays up.
     ip(&[

@@ -186,9 +186,15 @@ fallback. The route stays when sctl exits, because WireGuard uses it too.
 - **Link up, internet dead.** No kernel event fires, so the tunnel's own
   failures are the signal: a dial nothing answers, a handshake that breaks
   or stalls, a pong timeout, a read or write error. After two in a row on
-  the uplink the route uses, every other uplink holding a default route is
-  asked in metric order, and the route moves to the first that answers. The
-  tunnel then follows the route (see the `rehome` event in the HTTP API).
+  the uplink the route uses, that uplink and every other one holding a
+  default route are asked in the same round, all at once. The route moves
+  only when its own uplink does not answer while another does, to the first
+  of those in metric order, and the tunnel then follows the route (see the
+  `rehome` event in the HTTP API).
+- **The relay is down.** Then no uplink answers, the route's own included,
+  so nothing moves and nothing becomes suspect: a relay restart never sends
+  a unit to LTE. When the route's own uplink answers, the failures were the
+  relay's, and the route stays too.
 - **When the relay's name stops resolving.** The resolver's upstream servers
   are usually reached through the same dead uplink, so the tunnel dials the
   relay's known address when a lookup fails: where it last reached the relay

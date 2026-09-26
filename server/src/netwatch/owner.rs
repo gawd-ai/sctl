@@ -16,10 +16,12 @@
 //! A link that is up while its internet is dead sends no kernel event. The
 //! tunnel's own failures are the signal: after two in a row on the uplink the
 //! route uses (a dial nothing answered, a handshake that broke or stalled, a
-//! pong timeout, a read or write error), every other uplink with a default
-//! route is asked in metric order and the route moves to the first that
-//! answers. The failing uplink, and any ranked above the one that answered,
-//! become suspect.
+//! pong timeout, a read or write error), that uplink and every other one
+//! with a default route are asked in the same round. The route moves only
+//! when its own uplink does not answer while another does, to the first of
+//! those in metric order. The failing uplink, and any ranked above the one
+//! that answered, become suspect. When every uplink fails, the relay itself
+//! is down: nothing moves and nothing becomes suspect.
 //!
 //! A suspect uplink is asked again at once when netwatch reports a change on
 //! it (link, address or default route: a replug, a new lease). Otherwise it
@@ -40,6 +42,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::future::{join, join_all};
 use serde::Serialize;
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::mpsc;
@@ -437,33 +440,62 @@ impl<U: Uplinks> Owner<U> {
         }
     }
 
-    /// Two failures in a row on the held uplink: move to the first other
-    /// uplink that answers.
+    /// Two failures in a row on the held uplink. The held uplink and every
+    /// other one are asked in the same round, all at once, so they all see
+    /// the relay as it is at that moment. The route moves only when the held
+    /// uplink does not answer while another does: to the first of those in
+    /// metric order. When the held uplink answers, the failures were the
+    /// relay's, not the path's; when nothing answers, the relay itself is
+    /// most likely down. Either way nothing moves and nothing becomes
+    /// suspect, so a relay outage never sends a unit to LTE.
     async fn fail_over(&mut self) -> Vec<Change> {
         let (Some(net), Some(relay), Some(held)) =
             (self.net.clone(), self.relay, self.held.clone())
         else {
             return Vec::new();
         };
-        let mut silent: Vec<String> = Vec::new();
-        for (dev, src) in candidates(&net, &held.dev) {
-            if self.uplinks.answers(relay, &dev, src).await {
-                self.suspect.remove(&dev);
-                self.mark_suspect(&held.dev);
-                for quiet in &silent {
-                    self.mark_suspect(quiet);
-                }
-                let reason = format!("{}: no answer from the relay", held.dev);
-                return self.reconcile(&[dev], reason).await;
-            }
-            silent.push(dev);
+        let others = candidates(&net, &held.dev);
+        if others.is_empty() {
+            info!(
+                "relay route: the tunnel keeps failing over {} and there is no other uplink; \
+                 the route stays",
+                held.dev
+            );
+            return Vec::new();
         }
-        info!(
-            "relay route: the tunnel keeps failing over {} and no other uplink answers the relay; \
-             the route stays",
-            held.dev
-        );
-        Vec::new()
+        let (held_answers, answers) = join(
+            self.asks(&net, relay, &held.dev),
+            join_all(
+                others
+                    .iter()
+                    .map(|(dev, src)| self.uplinks.answers(relay, dev, *src)),
+            ),
+        )
+        .await;
+        if held_answers {
+            info!(
+                "relay route: the tunnel failed twice over {} but it answers the relay; \
+                 the route stays",
+                held.dev
+            );
+            return Vec::new();
+        }
+        let Some(first) = answers.iter().position(|&answered| answered) else {
+            info!(
+                "relay route: no uplink answers the relay, {} included; the relay is likely \
+                 down and the route stays",
+                held.dev
+            );
+            return Vec::new();
+        };
+        let dev = others[first].0.clone();
+        self.suspect.remove(&dev);
+        self.mark_suspect(&held.dev);
+        for (quiet, _) in &others[..first] {
+            self.mark_suspect(quiet);
+        }
+        let reason = format!("{}: no answer from the relay", held.dev);
+        self.reconcile(&[dev], reason).await
     }
 
     /// Put the route where it belongs now. `trusted` uplinks have just
@@ -1263,7 +1295,11 @@ mod tests {
             changes[0].to_string(),
             "eth1 -> wwan0 (eth1: no answer from the relay)"
         );
-        assert_eq!(fake.probes(), ["eth2", "wwan0"], "in metric order");
+        assert_eq!(
+            fake.probes(),
+            ["eth1", "eth2", "wwan0"],
+            "the held uplink too, then the others in metric order"
+        );
         assert_eq!(
             fake.writes(),
             ["replace 174.138.114.209 via 10.180.41.232 dev wwan0 metric 0"]
@@ -1283,14 +1319,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_no_other_uplink_answering_the_route_stays() {
+    async fn a_relay_outage_moves_nothing_and_marks_nothing_suspect() {
         let fake = Fake::new(travel_router());
         let mut owner = settled(&fake).await;
+        // The relay is down: no uplink reaches it.
         fake.kill("eth1");
         fake.kill("wwan0");
+        fake.tunnel_on(None);
         owner.on_signal(failed(ETH1)).await;
         assert!(owner.on_signal(failed(ETH1)).await.is_empty());
-        assert_eq!(fake.probes(), ["wwan0"]);
+        assert_eq!(fake.probes(), ["eth1", "wwan0"], "one round, both asked");
         assert!(fake.writes().is_empty());
         let report = owner.report(RelayRouteMode::FollowDefault);
         assert_eq!(report.dev.as_deref(), Some("eth1"));
@@ -1303,7 +1341,52 @@ mod tests {
         owner.on_signal(failed(ETH1)).await;
         assert!(fake.probes().is_empty());
         owner.on_signal(failed(ETH1)).await;
-        assert_eq!(fake.probes(), ["wwan0"]);
+        assert_eq!(fake.probes(), ["eth1", "wwan0"]);
+
+        // The relay is back: the tunnel registers over the wire, as before.
+        fake.revive("eth1");
+        fake.revive("wwan0");
+        fake.tunnel_on(Some("eth1"));
+        assert!(owner.on_signal(registered(ETH1)).await.is_empty());
+        assert!(fake.writes().is_empty());
+        assert!(owner
+            .report(RelayRouteMode::FollowDefault)
+            .suspect
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_held_uplink_that_answers_keeps_the_route_even_when_another_answers_too() {
+        // The relay came back while the round ran, or the failures were the
+        // relay's own: the wire answers, and so does LTE.
+        let fake = Fake::new(travel_router());
+        let mut owner = settled(&fake).await;
+        fake.tunnel_on(None);
+        owner.on_signal(failed(ETH1)).await;
+        assert!(owner.on_signal(failed(ETH1)).await.is_empty());
+        assert_eq!(fake.probes(), ["eth1", "wwan0"]);
+        assert!(fake.writes().is_empty());
+        let report = owner.report(RelayRouteMode::FollowDefault);
+        assert_eq!(report.dev.as_deref(), Some("eth1"));
+        assert!(report.suspect.is_empty());
+        assert!(owner.next_probe().is_none());
+    }
+
+    #[tokio::test]
+    async fn with_a_single_uplink_nothing_is_asked() {
+        let mut net = travel_router();
+        net.default_routes.retain(|r| r.dev == "eth1");
+        net.interfaces[1].default_metric = None;
+        let fake = Fake::new(net);
+        let mut owner = settled(&fake).await;
+        fake.kill("eth1");
+        owner.on_signal(failed(ETH1)).await;
+        assert!(owner.on_signal(failed(ETH1)).await.is_empty());
+        assert!(fake.probes().is_empty());
+        assert!(owner
+            .report(RelayRouteMode::FollowDefault)
+            .suspect
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1417,20 +1500,23 @@ mod tests {
         let mut owner = failed_over(&fake).await;
         // Now LTE fails too, while the wire still does not answer.
         fake.tunnel_on(None);
+        fake.kill("wwan0");
         for _ in 0..3 {
             owner.on_signal(failed(LTE)).await;
             owner.on_signal(failed(LTE)).await;
         }
-        assert_eq!(fake.probes(), ["eth1"; 3]);
+        assert_eq!(fake.probes(), ["wwan0", "eth1"].repeat(3));
         assert!(fake.writes().is_empty());
+        let report = owner.report(RelayRouteMode::FollowDefault);
+        assert_eq!(report.dev.as_deref(), Some("wwan0"));
         assert_eq!(
-            owner.report(RelayRouteMode::FollowDefault).dev.as_deref(),
-            Some("wwan0")
+            report.suspect,
+            ["eth1"],
+            "and LTE is not suspect: nothing answered"
         );
 
         // When the wire answers, LTE failing twice sends the route back.
         fake.revive("eth1");
-        fake.kill("wwan0");
         owner.on_signal(failed(LTE)).await;
         let changes = owner.on_signal(failed(LTE)).await;
         assert_eq!(
