@@ -208,10 +208,11 @@ fallback. The route stays when sctl exits, because WireGuard uses it too.
   failures before any registration.
 - **Coming back.** A suspect uplink is asked again at once when the kernel
   reports a change on it (link, address or default route: a replug, a new
-  DHCP lease). Otherwise, and only while it is suspect, it is probed on its
-  own schedule, 2, 5 and 10 minutes after it became suspect and then every
-  15 minutes, and it gets the route back after two good probes in a row.
-  With nothing suspect, no timer runs.
+  DHCP lease), and is no longer suspect as soon as the tunnel registers
+  with the relay over it. Otherwise, and only while it is suspect, it is
+  probed on its own schedule, 2, 5 and 10 minutes after it became suspect
+  and then every 15 minutes, and it gets the route back after two good
+  probes in a row. With nothing suspect, no timer runs.
 - **Flapping.** An uplink that fails again within 10 minutes of getting the
   route back waits twice as long before each probe as it did last time,
   never more than an hour: after one relapse it is asked after 4, 10 and 20

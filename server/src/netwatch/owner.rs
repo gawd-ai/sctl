@@ -467,8 +467,15 @@ impl<U: Uplinks> Owner<U> {
                 if self.on_held(local) {
                     self.failures = 0;
                 }
-                self.reconcile(&[], "lowest-metric default route".into())
-                    .await
+                // A registration proves its uplink reaches the relay better
+                // than any probe: it is no longer suspect.
+                let over = self.uplink_with(local);
+                let mut reason = "lowest-metric default route".to_string();
+                if let Some(dev) = over.as_ref().filter(|dev| self.suspect.contains_key(*dev)) {
+                    self.suspect.remove(dev);
+                    reason = format!("the tunnel reached the relay over {dev}");
+                }
+                self.reconcile(over.as_slice(), reason).await
             }
             TunnelSignal::Failed { from, relay } => {
                 // A restarted owner hears no registration while the uplink
@@ -554,6 +561,21 @@ impl<U: Uplinks> Owner<U> {
         suspect.probes += 1;
         suspect.due = Instant::now() + return_wait(&self.schedule, suspect.probes, stretch);
         suspect.good >= PROBES_TO_RETURN
+    }
+
+    /// The uplink holding `addr`: one with a default route whose address it
+    /// is.
+    fn uplink_with(&self, addr: Ipv4Addr) -> Option<String> {
+        let net = self.net.as_ref()?;
+        net.default_routes
+            .iter()
+            .map(|r| r.dev.as_str())
+            .find(|dev| {
+                net.interface(dev)
+                    .and_then(|i| i.ipv4)
+                    .is_some_and(|cidr| cidr.addr == addr)
+            })
+            .map(ToString::to_string)
     }
 
     /// Whether `addr` is the held uplink's address.
@@ -1781,6 +1803,50 @@ mod tests {
         }
         assert_eq!(fake.probes(), ["eth1"; 3]);
         assert!(fake.writes().is_empty());
+        assert_eq!(
+            owner.report(RelayRouteMode::FollowDefault).suspect,
+            ["eth1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_registration_over_a_suspect_uplink_clears_it() {
+        let fake = Fake::new(travel_router());
+        let mut owner = failed_over(&fake).await;
+        assert_eq!(
+            owner.report(RelayRouteMode::FollowDefault).suspect,
+            ["eth1"]
+        );
+        // The tunnel reaches the relay over the wire, before any probe did.
+        fake.revive("eth1");
+        fake.tunnel_on(Some("eth1"));
+        let changes = owner.on_signal(registered(ETH1)).await;
+        assert_eq!(
+            changes,
+            moved(
+                Some("wwan0"),
+                Some("eth1"),
+                "the tunnel reached the relay over eth1"
+            )
+        );
+        assert!(fake.probes().is_empty(), "the registration is the proof");
+        assert_eq!(
+            fake.writes(),
+            ["replace 174.138.114.209 via 10.42.0.1 dev eth1 metric 0"]
+        );
+        assert!(owner
+            .report(RelayRouteMode::FollowDefault)
+            .suspect
+            .is_empty());
+        assert!(owner.next_probe().is_none(), "and its timer is gone");
+    }
+
+    #[tokio::test]
+    async fn a_registration_over_another_uplink_leaves_a_suspect_alone() {
+        let fake = Fake::new(travel_router());
+        let mut owner = failed_over(&fake).await;
+        assert!(owner.on_signal(registered(LTE)).await.is_empty());
+        assert!(fake.probes().is_empty());
         assert_eq!(
             owner.report(RelayRouteMode::FollowDefault).suspect,
             ["eth1"]
