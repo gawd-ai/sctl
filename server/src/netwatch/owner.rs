@@ -94,8 +94,11 @@ pub enum TunnelSignal {
     /// An attempt or a connection failed the way a dead path fails: a dial
     /// nothing answered, a handshake or registration that broke or stalled, a
     /// pong timeout, a read or write error. `from` is the local address it
-    /// left from, when known.
-    Failed { from: Option<Ipv4Addr> },
+    /// left from and `relay` the address it dialed, when known.
+    Failed {
+        from: Option<Ipv4Addr>,
+        relay: Option<SocketAddrV4>,
+    },
 }
 
 /// `tunnel.relay_route` in `/api/health`.
@@ -352,18 +355,39 @@ impl<U: Uplinks> Owner<U> {
                 self.reconcile(&[], "lowest-metric default route".into())
                     .await
             }
-            TunnelSignal::Failed { from } => {
+            TunnelSignal::Failed { from, relay } => {
+                // A restarted owner hears no registration while the uplink
+                // its earlier run chose is dead, but that run's route names
+                // the relay: failing to reach it there counts.
+                let mut changes = Vec::new();
+                if let Some(relay) =
+                    relay.filter(|r| self.relay.is_none() && self.has_own_route_to(*r.ip()))
+                {
+                    self.relay = Some(relay);
+                    changes = self
+                        .reconcile(&[], "lowest-metric default route".into())
+                        .await;
+                }
                 if !from.is_some_and(|from| self.on_held(from)) {
-                    return Vec::new();
+                    return changes;
                 }
                 self.failures += 1;
                 if self.failures < FAILURES_TO_FAIL_OVER {
-                    return Vec::new();
+                    return changes;
                 }
                 self.failures = 0;
-                self.fail_over().await
+                changes.extend(self.fail_over().await);
+                changes
             }
         }
+    }
+
+    /// Whether sctl's own route to `ip` is in place, as an earlier run left it.
+    fn has_own_route_to(&self, ip: Ipv4Addr) -> bool {
+        self.net.as_ref().is_some_and(|net| {
+            net.host_routes_to(ip)
+                .any(|r| r.metric == 0 && r.protocol == RTPROT_SCTL)
+        })
     }
 
     /// Ask every suspect uplink once; one that answered twice in a row gets
@@ -913,7 +937,10 @@ mod tests {
     }
 
     fn failed(from: Ipv4Addr) -> TunnelSignal {
-        TunnelSignal::Failed { from: Some(from) }
+        TunnelSignal::Failed {
+            from: Some(from),
+            relay: Some(RELAY),
+        }
     }
 
     fn moved(from: Option<&str>, to: Option<&str>, reason: &str) -> Vec<Change> {
@@ -1018,8 +1045,20 @@ mod tests {
         assert!(owner.on_net(fake.state()).await.is_empty());
         assert!(fake.writes().is_empty());
         assert!(fake.probes().is_empty());
-        let empty = owner.on_signal(TunnelSignal::Failed { from: None }).await;
+        let empty = owner
+            .on_signal(TunnelSignal::Failed {
+                from: None,
+                relay: None,
+            })
+            .await;
         assert!(empty.is_empty());
+        // A failed dial names the relay, but sctl holds no route to it: the
+        // relay is named by a registration.
+        for _ in 0..3 {
+            assert!(owner.on_signal(failed(ETH1)).await.is_empty());
+        }
+        assert!(fake.writes().is_empty());
+        assert!(fake.probes().is_empty());
     }
 
     #[tokio::test]
@@ -1112,6 +1151,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_restarted_owner_fails_over_from_the_route_it_left_on_a_dead_uplink() {
+        // The earlier run's route holds the relay on eth1, whose internet
+        // died, so this run's tunnel never registers.
+        let mut net = travel_router();
+        net.host_routes.push(host("eth1", ETH1_GW, 0, RTPROT_SCTL));
+        let fake = Fake::new(net);
+        fake.kill("eth1");
+        let mut owner = Owner::new(fake.clone(), schedule());
+        owner.on_net(fake.state()).await;
+        assert!(owner.on_signal(failed(ETH1)).await.is_empty());
+        assert!(fake.writes().is_empty(), "the route is adopted as it is");
+        assert_eq!(
+            owner.report(RelayRouteMode::FollowDefault).dev.as_deref(),
+            Some("eth1")
+        );
+        let changes = owner.on_signal(failed(ETH1)).await;
+        assert_eq!(
+            changes,
+            moved(
+                Some("eth1"),
+                Some("wwan0"),
+                "eth1: no answer from the relay"
+            )
+        );
+        assert_eq!(fake.ours(), [host("wwan0", LTE_GW, 0, RTPROT_SCTL)]);
+    }
+
+    #[tokio::test]
     async fn a_route_someone_else_installed_at_metric_0_is_left_alone() {
         let mut net = travel_router();
         // A hand-added pin, `ip route add` (protocol boot).
@@ -1162,7 +1229,10 @@ mod tests {
         for _ in 0..4 {
             assert!(owner.on_signal(failed(LTE)).await.is_empty());
             assert!(owner
-                .on_signal(TunnelSignal::Failed { from: None })
+                .on_signal(TunnelSignal::Failed {
+                    from: None,
+                    relay: Some(RELAY),
+                })
                 .await
                 .is_empty());
         }

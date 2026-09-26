@@ -202,7 +202,10 @@ async fn tunnel(route: Arc<RelayRoute>, stats: Arc<TunnelStats>) {
         let from = source::source_for(RELAY).ok();
         let dialed = tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(RELAY)).await;
         let Ok(Ok(mut stream)) = dialed else {
-            route.signal(TunnelSignal::Failed { from });
+            route.signal(TunnelSignal::Failed {
+                from,
+                relay: Some(RELAY),
+            });
             tokio::time::sleep(REDIAL).await;
             continue;
         };
@@ -248,7 +251,10 @@ async fn tunnel(route: Arc<RelayRoute>, stats: Arc<TunnelStats>) {
         stats.connected.store(false, Ordering::Relaxed);
         stats.set_path(None);
         if failed {
-            route.signal(TunnelSignal::Failed { from: Some(local) });
+            route.signal(TunnelSignal::Failed {
+                from: Some(local),
+                relay: Some(RELAY),
+            });
             tokio::time::sleep(REDIAL).await;
         }
     }

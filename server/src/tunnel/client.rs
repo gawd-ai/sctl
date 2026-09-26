@@ -29,8 +29,9 @@ use tracing::{error, info, warn};
 
 use crate::activity::{self, ActivityType, CachedExecResult};
 use crate::atomic::AtomicU64;
-use crate::config::TunnelConfig;
+use crate::config::{RelayRouteMode, TunnelConfig};
 use crate::netwatch::owner::TunnelSignal;
+use crate::netwatch::route::RTPROT_SCTL;
 use crate::netwatch::{self, source, NetWatch};
 use crate::sessions::buffer::{OutputBuffer, OutputEntry};
 use crate::state::{TunnelEventType, TunnelPath};
@@ -170,6 +171,13 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
     // Where the relay was last reached, and when the tunnel last re-homed.
     let mut relay: Option<SocketAddrV4> = None;
     let mut last_rehome: Option<Instant> = None;
+    // With relay_route on, the relay's known address stands in for its name
+    // when the name does not resolve.
+    let owns_route = state
+        .relay_route
+        .as_ref()
+        .is_some_and(|route| route.mode() != RelayRouteMode::Off);
+    let relay_port = url_host_port(relay_url).1;
     // A loop restarted after a panic starts with no connection.
     state.tunnel_stats.set_path(None);
 
@@ -184,16 +192,26 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
             .await;
         let mut escalate_backoff = false;
         let connect_start = Instant::now();
+        // Where this attempt goes as far as is known before it runs: where
+        // the relay was last reached or, with relay_route on and after a
+        // restart, where the route the earlier run left points.
+        let known = relay.or_else(|| {
+            owns_route
+                .then(|| own_relay_route(net.as_ref()))
+                .flatten()
+                .map(|ip| SocketAddrV4::new(ip, relay_port))
+        });
         // The source this attempt leaves from, for when it fails before it
         // has a connection to take it from.
-        let dialed_from = relay
+        let dialed_from = known
             .filter(|_| net.is_some())
             .and_then(|relay| source::source_for(relay).ok());
+        let fallback = known.filter(|_| owns_route).map(|relay| *relay.ip());
         state
             .tunnel_stats
             .reconnecting
             .store(true, Ordering::Relaxed);
-        let result = connect_and_run(&state, &config, relay_url, &mut net).await;
+        let result = connect_and_run(&state, &config, relay_url, &mut net, fallback).await;
         state
             .tunnel_stats
             .reconnecting
@@ -209,20 +227,23 @@ async fn tunnel_client_loop(state: AppState, config: TunnelConfig) {
         );
         // The connection is gone; keep where the relay was and which address
         // the attempt left from.
-        let from = match state.tunnel_stats.set_path(None) {
+        let (from, dialed) = match state.tunnel_stats.set_path(None) {
             Some(TunnelPath {
                 local: SocketAddr::V4(local),
                 remote: SocketAddr::V4(remote),
                 ..
             }) => {
                 relay = Some(remote);
-                Some(*local.ip())
+                (Some(*local.ip()), Some(remote))
             }
-            _ => dialed_from,
+            _ => (dialed_from, known),
         };
         if path_failed {
             if let Some(route) = &state.relay_route {
-                route.signal(TunnelSignal::Failed { from });
+                route.signal(TunnelSignal::Failed {
+                    from,
+                    relay: dialed,
+                });
             }
         }
         let class = match result {
@@ -669,47 +690,33 @@ fn set_tcp_keepalive(stream: &TcpStream, idle: u32, interval: u32, count: u32) {
 /// avoid the delay.
 ///
 /// A resolved relay that no address answers is a [`ConnectError::Path`]; a
-/// failed lookup or an unusable `bind_address` is not.
+/// failed lookup or an unusable `bind_address` is not. With `fallback`, the
+/// relay's known address, a failed lookup dials that address instead (see
+/// [`dial_addresses`]).
 async fn connect_tcp_ipv4_preferred(
     url: &str,
     bind_address: Option<&str>,
+    fallback: Option<Ipv4Addr>,
 ) -> Result<TcpStream, ConnectError> {
-    // Parse host:port from wss:// or ws:// URL
-    let without_scheme = url
-        .strip_prefix("wss://")
-        .or_else(|| url.strip_prefix("ws://"))
-        .unwrap_or(url);
-    let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
-    let (host, port) = if let Some(colon) = authority.rfind(':') {
-        let port_str = &authority[colon + 1..];
-        if let Ok(p) = port_str.parse::<u16>() {
-            (&authority[..colon], p)
-        } else {
-            (authority, if url.starts_with("wss://") { 443 } else { 80 })
-        }
-    } else {
-        (authority, if url.starts_with("wss://") { 443 } else { 80 })
-    };
+    let (host, port) = url_host_port(url);
     let host_port = format!("{host}:{port}");
 
     // Resolve with timeout — DNS can hang on broken resolvers
-    let mut addrs: Vec<SocketAddr> =
-        tokio::time::timeout(Duration::from_secs(10), tokio::net::lookup_host(&host_port))
+    let lookup =
+        match tokio::time::timeout(Duration::from_secs(10), tokio::net::lookup_host(&host_port))
             .await
-            .map_err(|_| {
-                ConnectError::Transient(format!("DNS lookup timed out (10s) for {host}").into())
-            })?
-            .map_err(|e| ConnectError::Transient(e.into()))?
-            .collect();
-
-    // Sort: IPv4 first, then IPv6
-    addrs.sort_by_key(|a| i32::from(!a.is_ipv4()));
-
-    if addrs.is_empty() {
-        return Err(ConnectError::Transient(
-            format!("DNS resolution failed for {host}").into(),
-        ));
-    }
+        {
+            Ok(Ok(found)) => Ok(found.collect()),
+            Ok(Err(e)) => Err(ConnectError::Transient(e.into())),
+            Err(_) => Err(ConnectError::Transient(
+                format!("DNS lookup timed out (10s) for {host}").into(),
+            )),
+        };
+    let addrs = dial_addresses(
+        lookup,
+        host,
+        fallback.map(|ip| SocketAddr::from((ip, port))),
+    )?;
 
     // Resolve bind address (accepts IP or interface name like "wwan0")
     // We track the interface name separately for SO_BINDTODEVICE — bind() alone
@@ -818,6 +825,66 @@ async fn connect_tcp_ipv4_preferred(
     Err(ConnectError::Path(
         last_err.unwrap_or_else(|| "all addresses failed".into()),
     ))
+}
+
+/// The host and port of a `ws://` or `wss://` URL, the port defaulting to
+/// 443 for `wss://` and 80 otherwise.
+fn url_host_port(url: &str) -> (&str, u16) {
+    let without_scheme = url
+        .strip_prefix("wss://")
+        .or_else(|| url.strip_prefix("ws://"))
+        .unwrap_or(url);
+    let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let default_port = if url.starts_with("wss://") { 443 } else { 80 };
+    match authority.rfind(':') {
+        Some(colon) => match authority[colon + 1..].parse::<u16>() {
+            Ok(port) => (&authority[..colon], port),
+            Err(_) => (authority, default_port),
+        },
+        None => (authority, default_port),
+    }
+}
+
+/// The addresses to dial, IPv4 first: what the lookup found or, when it found
+/// nothing, `fallback`, the relay's known address. The resolver's upstream is
+/// usually reached through the same uplink as the relay, so when that uplink
+/// dies the name stops resolving too; dialing the known address is what then
+/// fails as a path failure the relay route owner counts, and what reaches the
+/// relay once the route has moved.
+fn dial_addresses(
+    lookup: Result<Vec<SocketAddr>, ConnectError>,
+    host: &str,
+    fallback: Option<SocketAddr>,
+) -> Result<Vec<SocketAddr>, ConnectError> {
+    let resolved = lookup.and_then(|mut addrs| {
+        // Sort: IPv4 first, then IPv6
+        addrs.sort_by_key(|a| i32::from(!a.is_ipv4()));
+        if addrs.is_empty() {
+            Err(ConnectError::Transient(
+                format!("DNS resolution failed for {host}").into(),
+            ))
+        } else {
+            Ok(addrs)
+        }
+    });
+    match (resolved, fallback) {
+        (Err(e), Some(addr)) => {
+            warn!("Tunnel: {e}; dialing the relay's known address {addr}");
+            Ok(vec![addr])
+        }
+        (resolved, _) => resolved,
+    }
+}
+
+/// Where sctl's own route to the relay points (`[tunnel] relay_route`): the
+/// relay's address as an earlier run of the agent reached it.
+fn own_relay_route(net: Option<&NetWatch>) -> Option<Ipv4Addr> {
+    let state = net?.borrow().clone()?;
+    state
+        .host_routes
+        .iter()
+        .find(|r| r.metric == 0 && r.protocol == RTPROT_SCTL)
+        .map(|r| r.dst)
 }
 
 fn tunnel_url_host(url: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -1004,12 +1071,14 @@ impl Drop for CleanupGuard {
 /// A single connection attempt: connect, register, handle messages until
 /// disconnect. With `net`, a network change that moves the kernel's route to
 /// the relay away from the tunnel's address ends it with
-/// [`DisconnectReason::Rehome`].
+/// [`DisconnectReason::Rehome`]. `fallback` is dialed when the relay's name
+/// does not resolve.
 async fn connect_and_run(
     state: &AppState,
     config: &TunnelConfig,
     relay_url: &str,
     net: &mut Option<NetWatch>,
+    fallback: Option<Ipv4Addr>,
 ) -> Result<DisconnectReason, ConnectError> {
     // The key's real home is the Authorization header (added at the WS
     // handshake below). It ALSO still rides the query because a payload-#1
@@ -1024,7 +1093,8 @@ async fn connect_and_run(
     let connect_start = Instant::now();
 
     // DNS + TCP with IPv4 preference (avoids long IPv6 timeouts on LTE/CGNAT)
-    let tcp_stream = connect_tcp_ipv4_preferred(&url, config.bind_address.as_deref()).await?;
+    let tcp_stream =
+        connect_tcp_ipv4_preferred(&url, config.bind_address.as_deref(), fallback).await?;
     let tcp_elapsed = connect_start.elapsed();
     let path = tunnel_path(&tcp_stream);
     if let Some(ref p) = path {
@@ -4568,6 +4638,137 @@ mod tests {
     fn parse_sha256_pin_rejects_bad_input() {
         assert!(parse_sha256_pin("abc").is_err());
         assert!(parse_sha256_pin(&"g".repeat(64)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod dns_fallback_tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+
+    use super::{
+        connect_tcp_ipv4_preferred, dial_addresses, own_relay_route, url_host_port, ConnectError,
+    };
+    use crate::netwatch::route::RTPROT_SCTL;
+    use crate::netwatch::{self, HostRoute, NetState};
+
+    fn transient(msg: &str) -> ConnectError {
+        ConnectError::Transient(msg.to_string().into())
+    }
+
+    fn dialed(result: Result<Vec<SocketAddr>, ConnectError>) -> Vec<SocketAddr> {
+        result.unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn message(result: Result<Vec<SocketAddr>, ConnectError>) -> String {
+        match result {
+            Err(ConnectError::Transient(e)) => e.to_string(),
+            Err(other) => panic!("not transient: {other}"),
+            Ok(addrs) => panic!("resolved: {addrs:?}"),
+        }
+    }
+
+    #[test]
+    fn url_host_port_reads_the_authority_with_its_default_port() {
+        assert_eq!(
+            url_host_port("wss://relay-001.netage.ai/api/tunnel/register?token=k"),
+            ("relay-001.netage.ai", 443)
+        );
+        assert_eq!(
+            url_host_port("ws://10.0.0.1:1337/api/tunnel/register"),
+            ("10.0.0.1", 1337)
+        );
+        assert_eq!(url_host_port("ws://relay"), ("relay", 80));
+        assert_eq!(url_host_port("wss://[::1]:8443/x"), ("[::1]", 8443));
+    }
+
+    #[test]
+    fn a_lookup_that_found_addresses_is_dialed_ipv4_first() {
+        let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let v4: SocketAddr = "203.0.113.7:443".parse().unwrap();
+        let fallback: SocketAddr = "174.138.114.209:443".parse().unwrap();
+        let addrs = dialed(dial_addresses(Ok(vec![v6, v4]), "relay", Some(fallback)));
+        assert_eq!(addrs, [v4, v6], "the fallback is only for a failed lookup");
+    }
+
+    #[test]
+    fn without_a_known_address_a_failed_lookup_stays_transient() {
+        assert_eq!(
+            message(dial_addresses(
+                Err(transient("DNS lookup timed out (10s) for relay")),
+                "relay",
+                None
+            )),
+            "DNS lookup timed out (10s) for relay"
+        );
+        assert_eq!(
+            message(dial_addresses(Ok(Vec::new()), "relay", None)),
+            "DNS resolution failed for relay"
+        );
+    }
+
+    #[test]
+    fn a_failed_lookup_dials_the_known_address() {
+        let fallback: SocketAddr = "174.138.114.209:443".parse().unwrap();
+        for lookup in [Err(transient("no such host")), Ok(Vec::new())] {
+            assert_eq!(
+                dialed(dial_addresses(lookup, "relay", Some(fallback))),
+                [fallback]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_name_that_does_not_resolve_reaches_the_relay_by_its_known_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // An empty host fails the lookup without asking any resolver.
+        let url = format!("ws://:{port}/api/tunnel/register");
+        match connect_tcp_ipv4_preferred(&url, None, None).await {
+            Err(ConnectError::Transient(_)) => {}
+            Err(other) => panic!("a failed lookup is not a path failure: {other}"),
+            Ok(_) => panic!("an empty host resolved"),
+        }
+        let stream = connect_tcp_ipv4_preferred(&url, None, Some(Ipv4Addr::LOCALHOST))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(stream.peer_addr().unwrap().port(), port);
+
+        // Nothing answers at the known address: the path failed.
+        drop(listener);
+        match connect_tcp_ipv4_preferred(&url, None, Some(Ipv4Addr::LOCALHOST)).await {
+            Err(ConnectError::Path(_)) => {}
+            Err(other) => panic!("not a path failure: {other}"),
+            Ok(_) => panic!("connected to a closed port"),
+        }
+    }
+
+    #[test]
+    fn the_known_address_after_a_restart_is_sctls_own_route() {
+        let relay = Ipv4Addr::new(174, 138, 114, 209);
+        let host = |metric, protocol| HostRoute {
+            dst: relay,
+            dev: "eth1".into(),
+            via: Some(Ipv4Addr::new(10, 42, 0, 1)),
+            metric,
+            protocol,
+        };
+        let (tx, rx) = netwatch::channel();
+        assert_eq!(own_relay_route(None), None);
+        assert_eq!(own_relay_route(Some(&rx)), None, "nothing published yet");
+        // netifd's pin and a hand-added one are not sctl's.
+        tx.send(Some(Arc::new(NetState {
+            host_routes: vec![host(40, 4), host(0, 3)],
+            ..NetState::default()
+        })))
+        .unwrap();
+        assert_eq!(own_relay_route(Some(&rx)), None);
+        tx.send(Some(Arc::new(NetState {
+            host_routes: vec![host(40, 4), host(0, RTPROT_SCTL)],
+            ..NetState::default()
+        })))
+        .unwrap();
+        assert_eq!(own_relay_route(Some(&rx)), Some(relay));
     }
 }
 

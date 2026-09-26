@@ -189,6 +189,13 @@ fallback. The route stays when sctl exits, because WireGuard uses it too.
   the uplink the route uses, every other uplink holding a default route is
   asked in metric order, and the route moves to the first that answers. The
   tunnel then follows the route (see the `rehome` event in the HTTP API).
+- **When the relay's name stops resolving.** The resolver's upstream servers
+  are usually reached through the same dead uplink, so the tunnel dials the
+  relay's known address when a lookup fails: where it last reached the relay
+  or, after sctl restarts, where sctl's route points. That dial failing
+  counts as a failure of the path, and it reaches the relay once the route
+  has moved. A restarted sctl keeps the route it finds and counts those
+  failures before any registration.
 - **Coming back.** A suspect uplink is asked again at once when the kernel
   reports a change on it (link, address or default route: a replug, a new
   DHCP lease). Otherwise, and only while an uplink is suspect, it is probed
