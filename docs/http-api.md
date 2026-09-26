@@ -1118,7 +1118,7 @@ one), then `replay.done`, then live frames:
 - `serial` is always the one the relay registered, never a value from the
   device's payload.
 - The replay can repeat a frame that also arrives live; deduplicate by
-  `(connection_id, state.boot, state.seq)` for `net.state`.
+  `(relay_epoch, connection_id, state.boot, state.seq)` for `net.state`: connection ids start at 1 again when the relay restarts, so `relay_epoch` from the `hello` frame is part of the key.
 - A subscriber that falls more than 1024 frames behind gets
   `{"type": "resync"}` followed by a fresh replay and `replay.done`, and
   should rebuild its view from it.
