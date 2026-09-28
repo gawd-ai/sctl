@@ -1794,11 +1794,15 @@ do_device_deploy_watchdog() {
 
 # Wait for device to be reachable via health endpoint.
 # Returns 0 on success, 1 on timeout.
-# Usage: wait_for_device <url> <timeout_secs> [quiet]
+# Usage: wait_for_device <url> <timeout_secs> [quiet] [api_key]
+# Through a relay, a device's /api/health needs its key (a relay answers 401
+# without it), so every caller that has one passes it.
 wait_for_device() {
-    local url="$1" timeout_secs="$2" quiet="${3:-}"
+    local url="$1" timeout_secs="$2" quiet="${3:-}" api_key="${4:-}"
+    local auth=()
+    [[ -n "$api_key" ]] && auth=(-H "Authorization: Bearer $api_key")
     for i in $(seq 1 "$timeout_secs"); do
-        if curl -sf --connect-timeout 3 --max-time 5 "$url/api/health" >/dev/null 2>&1; then
+        if curl -sf --connect-timeout 3 --max-time 5 ${auth[@]+"${auth[@]}"} "$url/api/health" >/dev/null 2>&1; then
             [[ -z "$quiet" ]] && log "Device reachable (waited ${i}s)"
             return 0
         fi
@@ -1820,7 +1824,7 @@ resilient_stp_init() {
     local max_attempts=10
     for attempt in $(seq 1 "$max_attempts"); do
         # Wait for device
-        if ! wait_for_device "$url" 360; then
+        if ! wait_for_device "$url" 360 "" "$api_key"; then
             err "Device not reachable (attempt $attempt/$max_attempts)"
             continue
         fi
@@ -1853,7 +1857,7 @@ remote_exec_json() {
     local max_time="${6:-8}"
     local resp=""
     for attempt in $(seq 1 "$attempts"); do
-        if ! wait_for_device "$url" 360 quiet; then
+        if ! wait_for_device "$url" 360 quiet "$api_key"; then
             return 1
         fi
         resp=$(curl -sf --max-time "$max_time" -X POST "$url/api/exec" \
@@ -1991,7 +1995,7 @@ upload_comms_provider_remote() {
 
         # Connection dropped — wait for next window, resume if paused, retry same chunk
         printf "\n  plugin chunk %d failed, waiting for reconnection... " "$h_idx"
-        if ! wait_for_device "$url" 360 quiet; then
+        if ! wait_for_device "$url" 360 quiet "$api_key"; then
             echo ""
             warn "Device unreachable during plugin upload; continuing without plugin"
             return 0
@@ -2008,7 +2012,7 @@ upload_comms_provider_remote() {
     # Wait for verification (best-effort)
     local h_verify="" h_attempts=0
     while [[ "$h_verify" != "complete" && $h_attempts -lt 10 ]]; do
-        wait_for_device "$url" 360 quiet || break
+        wait_for_device "$url" 360 quiet "$api_key" || break
         local _i
         for _i in $(seq 1 15); do
             h_verify=$(curl -sf --max-time 5 "$url/api/stp/status/$h_xfer" \
@@ -2139,7 +2143,7 @@ stp_upload_resilient() {
         if [[ "$phase" == "paused" ]]; then
             echo ""
             warn "Transfer paused at chunk count ${chunks_done:-?}, resuming..."
-            if wait_for_device "$url" 360 quiet; then
+            if wait_for_device "$url" 360 quiet "$api_key"; then
                 local resume_resp
                 resume_resp=$(stp_resume_transfer "$url" "$api_key" "$xfer_id") || true
                 if [[ -n "$resume_resp" ]]; then
@@ -2167,7 +2171,7 @@ stp_upload_resilient() {
         # Connection dropped: wait for next window and retry same chunk
         printf "\n  chunk %d failed, waiting for reconnection... " "$idx"
         windows_used=$((windows_used + 1))
-        if ! wait_for_device "$url" 360 quiet; then
+        if ! wait_for_device "$url" 360 quiet "$api_key"; then
             echo ""
             err "Device not reachable after 120s, aborting"
             exit 1
@@ -2188,7 +2192,7 @@ stp_upload_resilient() {
     log "Waiting for transfer verification..."
     local phase="" verify_attempts=0
     while [[ "$phase" != "complete" && $verify_attempts -lt 10 ]]; do
-        if ! wait_for_device "$url" 360 quiet; then
+        if ! wait_for_device "$url" 360 quiet "$api_key"; then
             err "Device not reachable for verification"
             exit 1
         fi
@@ -2331,7 +2335,7 @@ do_device_upgrade_remote() {
     # Step 6: Ensure watchdog is deployed (wait for window)
     log "Ensuring watchdog is deployed..."
     for attempt in $(seq 1 3); do
-        if ! wait_for_device "$url" 360 quiet; then
+        if ! wait_for_device "$url" 360 quiet "$api_key"; then
             err "Device not reachable"
             exit 1
         fi
@@ -2353,7 +2357,7 @@ do_device_upgrade_remote() {
     log "Swapping binary and restarting sctl..."
     local swap_ok=false
     for attempt in $(seq 1 5); do
-        if ! wait_for_device "$url" 360 quiet; then
+        if ! wait_for_device "$url" 360 quiet "$api_key"; then
             err "Device not reachable for swap"
             exit 1
         fi
@@ -2382,7 +2386,7 @@ do_device_upgrade_remote() {
     for i in $(seq 1 120); do
         sleep 1
         local health_resp
-        health_resp=$(curl -sf --connect-timeout 3 --max-time 5 "$url/api/health" 2>/dev/null) || continue
+        health_resp=$(curl -sf --connect-timeout 3 --max-time 5 -H "Authorization: Bearer $api_key" "$url/api/health" 2>/dev/null) || continue
         version=$(echo "$health_resp" | jq -r '.version // empty' 2>/dev/null)
         [[ -n "$version" ]] || continue
 
@@ -2454,7 +2458,7 @@ XE300_LAYOUT_PROBE="if [ -f /usr/local/lib/sctl/sctl-server-mips_24kc.gz ] && [ 
 remote_put_file() {
     local url="$1" api_key="$2" file="$3" remote_path="$4" mode="$5"
     for attempt in 1 2 3 4 5; do
-        wait_for_device "$url" 360 quiet || return 1
+        wait_for_device "$url" 360 quiet "$api_key" || return 1
         if jq -n --rawfile content "$file" --arg path "$remote_path" --arg mode "$mode" \
                 '{path: $path, content: $content, mode: $mode, create_dirs: true}' |
             curl -sf --max-time 15 -X PUT "$url/api/files" \
@@ -2640,7 +2644,7 @@ do_device_upgrade_remote_xe300() {
     esac
 
     local health running installed
-    health=$(curl -sf --connect-timeout 3 --max-time 8 "$url/api/health" 2>/dev/null) || true
+    health=$(curl -sf --connect-timeout 3 --max-time 8 -H "Authorization: Bearer $api_key" "$url/api/health" 2>/dev/null) || true
     running=$(echo "$health" | jq -r '.version // empty' 2>/dev/null)
     installed=$(remote_exec_stdout_trimmed "$url" "$api_key" "sha256sum /usr/local/lib/sctl/sctl-server-mips_24kc.gz | cut -d\" \" -f1" 5000 5 8) || true
     if [[ "$running" != "$version" || "$installed" != "$server_hash" ]]; then
