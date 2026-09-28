@@ -2594,7 +2594,7 @@ do_device_upgrade_remote_xe300() {
     log "Handing the swap to $d/upgrade.sh (one restart; it rolls back unless healthy)..."
     local launch
     launch=$(remote_exec_stdout_trimmed "$url" "$api_key" \
-        'd='"$d"'; if [ -f $d/state ]; then cat $d/state; elif start-stop-daemon -S -b -o -m -p $d/pid -x /bin/sh -- $d/upgrade.sh '"$version $relay_route"' </dev/null >/dev/null 2>&1; then echo launched; else echo launch_failed; fi' \
+        'd='"$d"'; if [ -f $d/state ]; then cat $d/state; elif start-stop-daemon -S -b -m -p $d/pid -x /bin/sh -- $d/upgrade.sh '"$version $relay_route"' </dev/null >/dev/null 2>&1; then echo launched; else echo launch_failed; fi' \
         5000 3 8) || true
     case "$launch" in
         launch_failed)
