@@ -82,6 +82,14 @@ again, it changes nothing. The agent names any uplink still strict in
 
 ### Remote upgrade: `rundev.sh device upgrade-remote`
 
+From 0.6.7 a unit upgrades itself (`docs/upgrade.md`): the fleet asks it for a
+version its relay serves, and the agent fetches the signed bundle, verifies it,
+stages it, swaps the payloads through `sctl upgrade-apply` (the `gz-tmp` layout
+named in `/etc/sctl/install.json`, which `install.sh` and `upgrade.sh` both
+write), restarts once, and rolls back unless healthy. The path below is the
+hand path: the last one a unit needs (it writes `install.json`), and bring-up on
+a bench unit afterwards.
+
 `rundev.sh device upgrade-remote <name>` upgrades a unit through the relay, with no
 SSH. It asks the device how sctl is installed, and when it finds this layout
 (`/usr/local/lib/sctl/sctl-server-mips_24kc.gz` under a procd init) it:
