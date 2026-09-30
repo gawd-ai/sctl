@@ -83,6 +83,10 @@ pub struct Interface {
     pub operstate: &'static str,
     /// `IFLA_CARRIER`; None on kernels before 3.4, which do not send it.
     pub carrier: Option<bool>,
+    /// The bridge (or bond) this interface is a port of, by name; None when
+    /// it is not enslaved or its master is not in the same dump. Enslaving
+    /// a port counts as a change.
+    pub master: Option<String>,
     /// The first (primary) IPv4 address.
     pub ipv4: Option<Ipv4Cidr>,
     /// Lowest metric among the default routes through this interface.
@@ -202,6 +206,10 @@ impl NetState {
                 index: l.index,
                 operstate: operstate_name(l.operstate),
                 carrier: l.carrier,
+                master: l
+                    .master
+                    .and_then(|m| names.get(&m))
+                    .map(|name| (*name).to_string()),
                 ipv4: first_addr.get(&l.index).map(|a| Ipv4Cidr {
                     addr: a.local,
                     prefix: a.prefix,
@@ -429,15 +437,25 @@ fn drain(events: &NlSocket, buf: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::netlink::tests::{addr_message, link_message, route_message, with_rtm_flags};
+    use super::netlink::tests::{
+        addr_message, enslaved, link_message, route_message, with_rtm_flags,
+    };
     use super::netlink::{Messages, IFA_F_SECONDARY};
     use super::*;
 
-    /// A travel router: wired WAN at metric 10, LTE at 40, a bridge, and
-    /// netifd's relay pin on LTE, as three dumps in the given byte order.
+    /// A travel router: wired WAN at metric 10, LTE at 40, a bridge with one
+    /// port, and netifd's relay pin on LTE, as three dumps in the given byte
+    /// order.
     fn fixture_dumps(order: Order) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let mut links = link_message(order, 1, 0x49, "lo", 0, Some(1));
         links.extend(link_message(order, 3, 0x1_1043, "eth1", 6, Some(1)));
+        // The port is dumped before its bridge (index 5): resolving the
+        // master's name never depends on dump order.
+        links.extend(enslaved(
+            order,
+            link_message(order, 4, 0x1_1043, "eth0", 6, Some(1)),
+            5,
+        ));
         links.extend(link_message(order, 5, 0x1_1043, "br-lan", 6, Some(1)));
         links.extend(link_message(order, 7, 0x1_10d1, "wwan0", 0, None));
         let mut addrs = addr_message(order, 1, [127, 0, 0, 1], 8, 0);
@@ -500,14 +518,30 @@ mod tests {
         let names: Vec<&str> = little.interfaces.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(
             names,
-            ["br-lan", "eth1", "wwan0"],
+            ["br-lan", "eth0", "eth1", "wwan0"],
             "loopback is left out, names sorted"
+        );
+
+        let eth0 = little.interface("eth0").unwrap();
+        assert_eq!(
+            eth0.master.as_deref(),
+            Some("br-lan"),
+            "the port names its bridge, resolved from the same dump"
+        );
+        assert_eq!(eth0.default_metric, None);
+        assert!(
+            little
+                .interfaces
+                .iter()
+                .all(|i| i.name == "eth0" || i.master.is_none()),
+            "only the port is enslaved"
         );
 
         let eth1 = little.interface("eth1").unwrap();
         assert_eq!(eth1.index, 3);
         assert_eq!(eth1.operstate, "up");
         assert_eq!(eth1.carrier, Some(true));
+        assert_eq!(eth1.master, None);
         assert_eq!(
             eth1.ipv4.unwrap().to_string(),
             "10.42.0.7/24",
@@ -660,6 +694,32 @@ mod tests {
         let mut carrier_lost = a.clone();
         carrier_lost.interfaces[1].carrier = Some(false);
         assert!(!a.same_network(&carrier_lost));
+
+        let mut released = a.clone();
+        assert_eq!(released.interfaces[1].name, "eth0");
+        released.interfaces[1].master = None;
+        assert!(
+            !a.same_network(&released),
+            "a port leaving its bridge is a change"
+        );
+    }
+
+    #[test]
+    fn a_master_missing_from_the_dump_is_unknown() {
+        for order in [Order::Little, Order::Big] {
+            // A port whose bridge the dump does not list: the port is kept,
+            // its master unresolved rather than invented.
+            let (_, addrs, routes) = fixture_dumps(order);
+            let mut links = link_message(order, 3, 0x1_1043, "eth1", 6, Some(1));
+            links.extend(enslaved(
+                order,
+                link_message(order, 4, 0x1_1043, "eth0", 6, Some(1)),
+                99,
+            ));
+            let state = state_from(order, &(links, addrs, routes));
+            let eth0 = state.interface("eth0").unwrap();
+            assert_eq!(eth0.master, None, "{order:?}");
+        }
     }
 
     #[test]
@@ -706,9 +766,13 @@ mod tests {
     fn serialized_state_names_addresses_and_skips_the_index() {
         let state = state_from(Order::NATIVE, &fixture_dumps(Order::NATIVE));
         let json = serde_json::to_value(&state).unwrap();
-        let eth1 = &json["interfaces"][1];
+        let eth0 = &json["interfaces"][1];
+        assert_eq!(eth0["name"], "eth0");
+        assert_eq!(eth0["master"], "br-lan");
+        let eth1 = &json["interfaces"][2];
         assert_eq!(eth1["name"], "eth1");
         assert_eq!(eth1["ipv4"], "10.42.0.7/24");
+        assert_eq!(eth1["master"], serde_json::Value::Null);
         assert!(eth1.get("index").is_none());
         assert_eq!(json["host_routes"][0]["via"], "10.180.41.232");
     }
@@ -772,6 +836,12 @@ mod tests {
         for iface in &state.interfaces {
             assert!(!iface.name.is_empty());
             assert_ne!(iface.name, "lo");
+            // sysfs shows the same enslavement: `master` is a symlink to
+            // the bridge's own directory.
+            let sysfs = std::fs::read_link(format!("/sys/class/net/{}/master", iface.name))
+                .ok()
+                .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()));
+            assert_eq!(iface.master, sysfs, "{} master", iface.name);
         }
         for route in &state.default_routes {
             assert!(

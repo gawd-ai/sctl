@@ -14,7 +14,7 @@
 //! | `load_average` | `/proc/loadavg`                                     |
 //! | `memory`       | `/proc/meminfo`                                     |
 //! | `disk`         | `statvfs("/")` syscall                              |
-//! | `interfaces`   | `ip -j addr show` (fallback: `/proc/net/dev` + sysfs) |
+//! | `interfaces`   | `/proc/net/dev` + sysfs (`master`, `bridge`), `getifaddrs` for addresses |
 
 use axum::{
     extract::{Query, State},
@@ -363,12 +363,15 @@ async fn collect_interfaces(req_id: &str, include_addresses: bool) -> Vec<Value>
 
         let mac = read_sys_file(&format!("/sys/class/net/{name}/address"));
         let operstate = read_sys_file(&format!("/sys/class/net/{name}/operstate"));
+        let sysfs = std::path::Path::new("/sys/class/net").join(&name);
 
         interfaces.push(json!({
             "name": name,
             "state": operstate.trim().to_uppercase(),
             "mac": mac.trim(),
             "addresses": Value::Array(vec![]),
+            "master": master_of(&sysfs),
+            "bridge": sysfs.join("bridge").exists(),
         }));
     }
 
@@ -413,6 +416,16 @@ async fn collect_interfaces(req_id: &str, include_addresses: bool) -> Vec<Value>
     );
 
     interfaces
+}
+
+/// The bridge (or bond) the interface at `sysfs` is a port of: its
+/// `master` entry is a symlink to the master's own directory. None when it
+/// is not enslaved.
+fn master_of(sysfs: &std::path::Path) -> Option<String> {
+    std::fs::read_link(sysfs.join("master"))
+        .ok()?
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
 }
 
 /// Enumerate interface addresses without spawning external commands.
@@ -677,7 +690,7 @@ fn disks_from_mounts(mounts: &str, usage_of: &dyn Fn(&str) -> Value) -> Vec<Valu
 
 #[cfg(test)]
 mod disk_tests {
-    use super::disks_from_mounts;
+    use super::{disks_from_mounts, master_of};
     use serde_json::{json, Value};
 
     /// Real `/proc/mounts` from WE826-F85E3CD01310, the device whose duplicate
@@ -714,6 +727,19 @@ devpts /dev/pts devpts rw,nosuid,noexec,noatime,mode=600 0 0
             .iter()
             .filter_map(|d| d.get("mount").and_then(Value::as_str))
             .collect()
+    }
+
+    #[test]
+    fn master_of_names_the_bridge_a_port_belongs_to() {
+        let root = std::env::temp_dir().join(format!("sctl-info-master-{}", std::process::id()));
+        let port = root.join("lan1");
+        std::fs::create_dir_all(&port).unwrap();
+        // sysfs links a port's `master` to the bridge's own directory.
+        std::os::unix::fs::symlink("../br-lan", port.join("master")).unwrap();
+        assert_eq!(master_of(&port).as_deref(), Some("br-lan"));
+        assert_eq!(master_of(&root.join("br-lan")), None, "no master entry");
+        assert_eq!(master_of(&root.join("absent")), None, "no such interface");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

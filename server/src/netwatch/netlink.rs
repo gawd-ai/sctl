@@ -12,7 +12,8 @@
 //! pass both orders to prove the big-endian reading on a little-endian host.
 //!
 //! Only attributes that Linux 2.6 already had are required, so a 3.3.8 kernel
-//! works. `IFLA_CARRIER` is newer and optional.
+//! works. `IFLA_CARRIER` is newer and optional; `IFLA_MASTER` is as old as
+//! bridging and present only on an enslaved link.
 
 use std::io;
 use std::net::Ipv4Addr;
@@ -48,6 +49,7 @@ pub(crate) const RTMGRP_IPV4_IFADDR: u32 = 0x10;
 pub(crate) const RTMGRP_IPV4_ROUTE: u32 = 0x40;
 
 pub(crate) const IFLA_IFNAME: u16 = 3;
+pub(crate) const IFLA_MASTER: u16 = 10;
 pub(crate) const IFLA_OPERSTATE: u16 = 16;
 pub(crate) const IFLA_CARRIER: u16 = 33;
 pub(crate) const IFA_ADDRESS: u16 = 1;
@@ -298,6 +300,9 @@ pub(crate) struct Link {
     pub operstate: u8,
     /// `IFLA_CARRIER`, which kernels before 3.4 do not send.
     pub carrier: Option<bool>,
+    /// `IFLA_MASTER`: the index of the bridge or bond this link is a port
+    /// of; absent when it is not enslaved.
+    pub master: Option<u32>,
 }
 
 pub(crate) fn parse_link(payload: &[u8], order: Order) -> Option<Link> {
@@ -308,12 +313,14 @@ pub(crate) fn parse_link(payload: &[u8], order: Order) -> Option<Link> {
         name: String::new(),
         operstate: 0,
         carrier: None,
+        master: None,
     };
     for (attr, data) in Attrs::new(body, order) {
         match attr {
             IFLA_IFNAME => link.name = c_string(data),
             IFLA_OPERSTATE => link.operstate = data.first().copied().unwrap_or(0),
             IFLA_CARRIER => link.carrier = data.first().map(|&c| c != 0),
+            IFLA_MASTER => link.master = order.u32_at(data, 0),
             _ => {}
         }
     }
@@ -844,6 +851,16 @@ pub(crate) mod tests {
         message(order, RTM_NEWROUTE, 2, 7, &body)
     }
 
+    /// `message`, one link message, with an IFLA_MASTER naming `master`
+    /// appended after the other attributes, as the kernel lists it for a
+    /// bridge port; the header's length grows with it.
+    pub(crate) fn enslaved(order: Order, mut message: Vec<u8>, master: u32) -> Vec<u8> {
+        message.extend(attr(order, IFLA_MASTER, &u32b(order, master)));
+        let len = message.len() as u32;
+        message[..4].copy_from_slice(&u32b(order, len));
+        message
+    }
+
     /// `message`, one route message, with its `rtm_flags` set to `flags`.
     pub(crate) fn with_rtm_flags(order: Order, mut message: Vec<u8>, flags: u32) -> Vec<u8> {
         let at = NLMSG_HDRLEN + 8;
@@ -898,6 +915,7 @@ pub(crate) mod tests {
             i64::from(libc::RTMGRP_IPV4_ROUTE)
         );
         assert_eq!(IFLA_IFNAME, libc::IFLA_IFNAME);
+        assert_eq!(IFLA_MASTER, libc::IFLA_MASTER);
         assert_eq!(IFLA_OPERSTATE, libc::IFLA_OPERSTATE);
         assert_eq!(IFLA_CARRIER, libc::IFLA_CARRIER);
         assert_eq!(IFA_ADDRESS, libc::IFA_ADDRESS);
@@ -988,6 +1006,7 @@ pub(crate) mod tests {
                     name: "eth1".into(),
                     operstate: 6,
                     carrier: Some(true),
+                    master: None,
                 },
                 "{order:?}"
             );
@@ -1074,6 +1093,26 @@ pub(crate) mod tests {
             let parsed = parse_link(message.payload, order).unwrap();
             assert_eq!(parsed.carrier, None);
             assert_eq!(parsed.operstate, 2);
+            assert_eq!(parsed.master, None, "not enslaved");
+        }
+    }
+
+    #[test]
+    fn an_enslaved_link_reads_its_master_index_in_both_byte_orders() {
+        // A bridge port: `eth0.2 master br-lan`, br-lan being index 0x0102_0304
+        // so a swapped read would show.
+        for order in ORDERS {
+            let port = enslaved(
+                order,
+                link_message(order, 2, 0x1_1043, "eth0.2", 6, Some(1)),
+                0x0102_0304,
+            );
+            let message = Messages::new(&port, order).next().unwrap();
+            assert_eq!(message.payload.len() + NLMSG_HDRLEN, port.len());
+            let parsed = parse_link(message.payload, order).unwrap();
+            assert_eq!(parsed.master, Some(0x0102_0304), "{order:?}");
+            assert_eq!(parsed.name, "eth0.2");
+            assert_eq!(parsed.carrier, Some(true));
         }
     }
 
