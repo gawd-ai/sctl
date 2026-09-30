@@ -334,11 +334,13 @@ pub async fn delete_config(
         handle.abort();
     }
 
-    // Clear config and results
+    // Clear config and results; an empty result set is a change to push.
     guard.config = None;
     guard.results.targets.clear();
     guard.results.config_version = 0;
+    guard.results.ts = super::now_iso();
     guard.recovery_tracker.clear();
+    guard.changed();
 
     // Remove persisted config
     let _ = std::fs::remove_file(&guard.config_path);

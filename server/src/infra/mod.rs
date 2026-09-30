@@ -2,7 +2,7 @@
 //!
 //! This module is **opt-in**: it activates only when a monitoring config is
 //! pushed via `POST /api/infra/config`. Until then, `GET /api/infra/results`
-//! returns `{"status":"unconfigured"}`.
+//! returns empty results: `config_version: 0` and no targets.
 //!
 //! ## Architecture
 //!
@@ -13,7 +13,10 @@
 //! → DOWN). Recovery actions execute locally on the BPI when a target
 //! transitions to DOWN.
 //!
-//! Results are served via `GET /api/infra/results` for external health polling.
+//! Results are served via `GET /api/infra/results` for external health polling,
+//! and pushed over the tunnel as `infra.state` (see `tunnel::infra_state`)
+//! whenever a target's status changes or a config is applied: [`InfraState::changed`]
+//! is the signal, [`InfraState::watch_changes`] the way to wait on it.
 
 pub mod checks;
 pub mod discovery;
@@ -26,6 +29,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::watch;
 use tracing::warn;
 
 // ─── Config types (pushed from fleet server, persisted to disk) ──────
@@ -302,6 +306,9 @@ pub struct InfraState {
     pub sessions: HashMap<String, String>,
     /// Recent structured readings per target id (ring, newest last).
     pub data_history: HashMap<String, VecDeque<DataSample>>,
+    /// Bumped by [`Self::changed`]: a target's status changed or a config
+    /// was applied. What the tunnel's `infra.state` forwarder waits on.
+    changes: watch::Sender<u64>,
 }
 
 const MAX_RECOVERY_LOG: usize = 50;
@@ -330,7 +337,21 @@ impl InfraState {
             secrets_path: Path::new(state_dir).join("infra-secrets.json"),
             sessions: HashMap::new(),
             data_history: HashMap::new(),
+            changes: watch::channel(0).0,
         }
+    }
+
+    /// Say the results changed in a way worth pushing: a target's status
+    /// (not its latency or its counters alone), or the config. Every
+    /// receiver from [`Self::watch_changes`] wakes.
+    pub fn changed(&self) {
+        self.changes.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// A receiver that wakes on every [`Self::changed`]; its value is how
+    /// many times the results changed since startup.
+    pub fn watch_changes(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
     }
 
     /// Load the credentials file (called at startup). Missing is normal.
@@ -423,6 +444,7 @@ impl InfraState {
         }
         self.results.config_version = cfg.version;
         self.results.ts = now;
+        self.changed();
     }
 
     /// Persist config to disk (atomic write via tmp + rename).

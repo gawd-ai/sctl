@@ -222,6 +222,9 @@ pub async fn apply_result(
         if !result.ok {
             warn!("Target {} ({}): {}", target.id, target.name, result.detail);
         }
+        // The push rides status changes only: a check that leaves the
+        // status alone (a latency reading, a counter) is not one.
+        state.changed();
     }
 }
 
@@ -450,6 +453,42 @@ mod tests {
             ring.back().unwrap().data["i"],
             super::super::MAX_DATA_HISTORY as i64 + 4
         );
+    }
+
+    #[tokio::test]
+    async fn a_status_change_signals_the_push_a_latency_reading_does_not() {
+        let mut state = InfraState::new("/tmp/sctl-infra-test");
+        let mut changes = state.watch_changes();
+        let t = target(CheckSpec::Ping {
+            host: "10.0.0.1".into(),
+            timeout_ms: None,
+        });
+        let ok = |ms: u64| CheckResult {
+            ok: true,
+            latency_ms: Some(ms),
+            detail: format!("PING OK {ms}ms"),
+            ..CheckResult::default()
+        };
+
+        // unknown -> up
+        apply_result(&mut state, &t, ok(3), 1, 1_000).await;
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+
+        // up stays up: a new latency, a new counter, a new last_check
+        apply_result(&mut state, &t, ok(9), 1, 1_060).await;
+        assert!(!changes.has_changed().unwrap(), "not a status change");
+
+        // up -> degraded
+        apply_result(
+            &mut state,
+            &t,
+            CheckResult::failed("PING TIMEOUT"),
+            1,
+            1_120,
+        )
+        .await;
+        assert!(changes.has_changed().unwrap());
     }
 
     #[test]

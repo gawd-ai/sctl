@@ -11,6 +11,7 @@ use serde_json::Value;
 
 pub mod client;
 pub mod history;
+pub mod infra_state;
 pub mod net_state;
 pub mod relay;
 

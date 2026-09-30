@@ -11,7 +11,9 @@
 //! {"type": "net.state", "v": 1, "boot": 1790000000000, "seq": 4,
 //!  "ts": "2026-09-26T12:00:00Z",
 //!  "interfaces": [{"name": "eth1", "operstate": "up", "carrier": true,
-//!                  "metric": 10, "ip": "10.42.0.7/24"}],
+//!                  "metric": 10, "ip": "10.42.0.7/24"},
+//!                 {"name": "lan1", "operstate": "up", "carrier": true,
+//!                  "metric": null, "ip": null, "master": "br-lan"}],
 //!  "default_routes": [{"dev": "eth1", "via": "10.42.0.1", "metric": 10}],
 //!  "relay_route": {"ip": "174.138.114.209", "dev": "eth1", "via": "10.42.0.1", "src": "10.42.0.7"},
 //!  "tunnel": {"dev": "eth1", "local": "10.42.0.7", "remote": "174.138.114.209"},
@@ -19,9 +21,11 @@
 //!  "truncated": false}
 //! ```
 //!
-//! `relay_route` and each of `wg_routes` is the kernel's route to that
-//! address, what `ip route get` says. The WireGuard endpoints are read from
-//! the kernel over generic netlink, as `wg show wg0 endpoints` reads them.
+//! An interface that is a bridge (or bond) port names its master in
+//! `master`; the key is absent otherwise. `relay_route` and each of
+//! `wg_routes` is the kernel's route to that address, what `ip route get`
+//! says. The WireGuard endpoints are read from the kernel over generic
+//! netlink, as `wg show wg0 endpoints` reads them.
 //! Caps keep a message far below the 16 KiB the relay accepts: 32 interfaces
 //! (those with a default route first, then those with an address), 16
 //! default routes, 8 WireGuard routes and 15-byte names, with `truncated`
@@ -101,6 +105,10 @@ pub struct InterfaceEntry {
     /// The lowest metric among the main-table default routes on this interface.
     pub metric: Option<u32>,
     pub ip: Option<Ipv4Cidr>,
+    /// The bridge (or bond) this interface is a port of; absent when it is
+    /// not enslaved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub master: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -248,6 +256,7 @@ pub fn build(net: &NetState, lookups: Lookups, ts: String) -> NetStateMessage {
             carrier: i.carrier,
             metric: i.default_metric,
             ip: i.ipv4,
+            master: i.master.as_deref().map(|m| capped(m, &mut truncated)),
         })
         .collect();
     interfaces.sort_by(|a, b| a.name.cmp(&b.name));
@@ -388,6 +397,7 @@ mod tests {
             index: 0,
             operstate: "up",
             carrier: Some(true),
+            master: None,
             ipv4: ip.map(|octets| Ipv4Cidr {
                 addr: Ipv4Addr::from(octets),
                 prefix: 24,
@@ -403,6 +413,10 @@ mod tests {
             interfaces: vec![
                 iface("br-lan", Some([192, 168, 8, 1]), None),
                 iface("eth1", Some(eth1), Some(10)),
+                Interface {
+                    master: Some("br-lan".into()),
+                    ..iface("lan1", None, None)
+                },
                 Interface {
                     operstate: "unknown",
                     carrier: None,
@@ -472,6 +486,7 @@ mod tests {
                 "interfaces": [
                     {"name": "br-lan", "operstate": "up", "carrier": true, "metric": null, "ip": "192.168.8.1/24"},
                     {"name": "eth1", "operstate": "up", "carrier": true, "metric": 10, "ip": "10.42.0.7/24"},
+                    {"name": "lan1", "operstate": "up", "carrier": true, "metric": null, "ip": null, "master": "br-lan"},
                     {"name": "wwan0", "operstate": "unknown", "carrier": null, "metric": 40, "ip": "10.180.41.231/24"},
                 ],
                 "default_routes": [
@@ -586,6 +601,17 @@ mod tests {
         assert!(message.body.interfaces[1].name.len() <= MAX_NAME_BYTES);
         assert!(message.body.interfaces[1].name.starts_with("é-é-é"));
 
+        let mut port = iface("lan1", None, None);
+        port.master = Some("a-very-long-bridge-name".into());
+        let mut net = NetState::default();
+        net.interfaces.push(port);
+        let message = build(&net, Lookups::default(), String::new());
+        assert!(message.body.truncated, "a master name is capped too");
+        assert_eq!(
+            message.body.interfaces[0].master.as_deref(),
+            Some("a-very-long-bri")
+        );
+
         let mut truncated = false;
         assert_eq!(capped("eth0", &mut truncated), "eth0");
         assert!(!truncated, "a name that fits is not a cut");
@@ -611,6 +637,7 @@ mod tests {
             net.interfaces.push(Interface {
                 name: format!("{name}{n}"),
                 operstate: "lowerlayerdown",
+                master: Some(name.clone()),
                 ..iface("", Some([255, 255, 255, 255]), Some(u32::MAX))
             });
         }

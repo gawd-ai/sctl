@@ -37,8 +37,8 @@ use crate::sessions::buffer::{OutputBuffer, OutputEntry};
 use crate::state::{TunnelEventType, TunnelPath};
 use crate::AppState;
 
-use super::net_state;
 use super::{decode_binary_frame, encode_binary_frame};
+use super::{infra_state, net_state};
 
 /// Static heartbeat message — avoids serde allocation on every heartbeat tick.
 const PING_TEXT: &str = r#"{"type":"tunnel.ping"}"#;
@@ -1049,6 +1049,7 @@ struct CleanupGuard {
     heartbeat: tokio::task::AbortHandle,
     writer: tokio::task::AbortHandle,
     net_state: Option<tokio::task::AbortHandle>,
+    infra_state: Option<tokio::task::AbortHandle>,
     subscribers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     session_manager: crate::sessions::SessionManager,
     transfer_manager: Arc<crate::gawdxfer::manager::TransferManager>,
@@ -1064,6 +1065,9 @@ impl Drop for CleanupGuard {
         self.writer.abort();
         if let Some(net_state) = &self.net_state {
             net_state.abort();
+        }
+        if let Some(infra_state) = &self.infra_state {
+            infra_state.abort();
         }
         let subscribers = self.subscribers.clone();
         let sessions = self.session_manager.clone();
@@ -1206,9 +1210,17 @@ async fn connect_and_run(
             "serial": state.config.device.serial,
             "api_key": state.config.auth.api_key,
         });
-        // A relay that predates features ignores the field.
+        // What this device can push. A relay that predates features
+        // ignores the field.
+        let mut features = Vec::new();
         if state.netwatch.is_some() {
-            reg["features"] = json!([net_state::FEATURE]);
+            features.push(net_state::FEATURE);
+        }
+        if state.infra_state.is_some() {
+            features.push(infra_state::FEATURE);
+        }
+        if !features.is_empty() {
+            reg["features"] = json!(features);
         }
         raw_ws_sink
             .send(tokio_tungstenite::tungstenite::Message::Text(
@@ -1220,8 +1232,10 @@ async fn connect_and_run(
             .map_err(|e| ConnectError::Path(e.into()))?;
     }
 
-    // Whether the relay's ack advertises net.state (an older relay's does not).
+    // Whether the relay's ack advertises net.state and infra.state (an
+    // older relay's does not).
     let relay_takes_net_state;
+    let relay_takes_infra_state;
 
     // Wait for registration ack with timeout
     match tokio::time::timeout(Duration::from_secs(10), ws_stream.next()).await {
@@ -1232,6 +1246,7 @@ async fn connect_and_run(
                     match msg_type {
                         "tunnel.register.ack" => {
                             relay_takes_net_state = net_state::advertised(&msg);
+                            relay_takes_infra_state = infra_state::advertised(&msg);
                             let reg_elapsed = reg_start.elapsed();
                             let total = connect_start.elapsed();
                             info!(
@@ -1378,6 +1393,14 @@ async fn connect_and_run(
         },
     );
 
+    // The device's Infra results, pushed the same way: now, then whenever a
+    // target's status changes or a config is applied.
+    let infra_state_task = infra_state::spawn_forwarder(
+        relay_takes_infra_state,
+        state.infra_state.clone(),
+        ws_sink.request_tx.clone(),
+    );
+
     // Subscribe to session lifecycle broadcasts so we can forward them
     let mut broadcast_rx = state.session_events.subscribe();
 
@@ -1494,6 +1517,9 @@ async fn connect_and_run(
         heartbeat: heartbeat_task.abort_handle(),
         writer: writer_task.abort_handle(),
         net_state: net_state_task
+            .as_ref()
+            .map(tokio::task::JoinHandle::abort_handle),
+        infra_state: infra_state_task
             .as_ref()
             .map(tokio::task::JoinHandle::abort_handle),
         subscribers: subscriber_tasks.clone(),
@@ -1663,6 +1689,9 @@ async fn connect_and_run(
     heartbeat_task.abort();
     writer_task.abort();
     if let Some(task) = &net_state_task {
+        task.abort();
+    }
+    if let Some(task) = &infra_state_task {
         task.abort();
     }
     let attached_sessions: Vec<String> = {

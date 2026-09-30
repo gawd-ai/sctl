@@ -4,8 +4,9 @@
 //! 1. Listens for device WS connections at `/api/tunnel/register`
 //! 2. Exposes REST + WS proxy at `/d/{serial}/api/*`
 //! 3. Translates client requests to tunnel messages over the device WS
-//! 4. Streams device arrivals, departures and `net.state` pushes to at most
-//!    [`MAX_EVENT_SUBSCRIBERS`] subscribers at `/api/tunnel/events`
+//! 4. Streams device arrivals, departures and `net.state` and `infra.state`
+//!    pushes to at most [`MAX_EVENT_SUBSCRIBERS`] subscribers at
+//!    `/api/tunnel/events`
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -37,7 +38,7 @@ const DEVICE_QUEUE_SEND_TIMEOUT_SECS: u64 = 5;
 
 /// Features this relay advertises in `tunnel.register.ack` and in the event
 /// stream's `hello`.
-const RELAY_FEATURES: [&str; 1] = [super::net_state::FEATURE];
+const RELAY_FEATURES: [&str; 2] = [super::net_state::FEATURE, super::infra_state::FEATURE];
 /// A device's features are kept up to this many entries of this many bytes.
 const MAX_DEVICE_FEATURES: usize = 16;
 const MAX_FEATURE_BYTES: usize = 32;
@@ -117,9 +118,10 @@ pub struct RelayState {
     pub started_at_ms: u64,
 }
 
-/// The latest `net.state` a device sent on its current connection.
+/// The latest `net.state` or `infra.state` a device sent on its current
+/// connection.
 #[derive(Clone, Debug)]
-pub struct StoredNetState {
+pub struct StoredState {
     /// When the relay received it, unix ms.
     pub received_at: u64,
     /// The device's message as it sent it.
@@ -176,7 +178,9 @@ pub struct ConnectedDevice {
     pub features: Vec<String>,
     /// The latest `net.state` on this connection. Unlike GPS and LTE it is
     /// not carried over a reconnect: a new connection starts with none.
-    pub last_net_state: Arc<RwLock<Option<StoredNetState>>>,
+    pub last_net_state: Arc<RwLock<Option<StoredState>>>,
+    /// The latest `infra.state` on this connection, kept the same way.
+    pub last_infra_state: Arc<RwLock<Option<StoredState>>>,
 }
 
 /// Drain all pending requests for a device, sending error responses on each oneshot.
@@ -239,16 +243,18 @@ fn device_connected_frame(device: &ConnectedDevice, replay: bool) -> Value {
     })
 }
 
-/// `net.state` for the event stream: the device's message under `state`,
-/// named by the serial the relay registered, never one from the payload.
-fn net_state_frame(
+/// A pushed state (`net.state`, `infra.state`) for the event stream: the
+/// device's message under `state`, named by the serial the relay
+/// registered, never one from the payload.
+fn pushed_state_frame(
+    kind: &str,
     serial: &str,
     connection_id: u64,
-    stored: &StoredNetState,
+    stored: &StoredState,
     replay: bool,
 ) -> Value {
     json!({
-        "type": "net.state",
+        "type": kind,
         "serial": serial,
         "connection_id": connection_id,
         "received_at": stored.received_at,
@@ -914,6 +920,7 @@ async fn handle_device_ws(
         connected_at_ms: unix_ms(),
         features,
         last_net_state: Arc::new(RwLock::new(None)),
+        last_infra_state: Arc::new(RwLock::new(None)),
     };
 
     let pending_requests = device.pending_requests.clone();
@@ -925,6 +932,7 @@ async fn handle_device_ws(
     let last_gps_fix = device.last_gps_fix.clone();
     let last_lte_signal = device.last_lte_signal.clone();
     let last_net_state = device.last_net_state.clone();
+    let last_infra_state = device.last_infra_state.clone();
 
     // Handle duplicate serial: signal old handler to shut down, drain pending
     // REST requests, then replace. Don't notify WS clients — they were migrated above.
@@ -1353,15 +1361,28 @@ async fn handle_device_ws(
                             }
                         }
                     }
-                    // The device's network: kept for this connection, published
-                    // on the event stream and forwarded to its WS clients.
-                    "net.state" => {
-                        if text.len() > super::net_state::MAX_BYTES {
+                    // The device's network or its Infra results: kept for
+                    // this connection, published on the event stream and
+                    // forwarded to its WS clients.
+                    "net.state" | "infra.state" => {
+                        let (kind, limit, slot) = if msg_type == "net.state" {
+                            (
+                                super::net_state::FEATURE,
+                                super::net_state::MAX_BYTES,
+                                &last_net_state,
+                            )
+                        } else {
+                            (
+                                super::infra_state::FEATURE,
+                                super::infra_state::MAX_BYTES,
+                                &last_infra_state,
+                            )
+                        };
+                        if text.len() > limit {
                             warn!(
                                 serial = %serial,
                                 bytes = text.len(),
-                                "Dropped net.state over {} bytes",
-                                super::net_state::MAX_BYTES
+                                "Dropped {kind} over {limit} bytes"
                             );
                             continue;
                         }
@@ -1374,18 +1395,19 @@ async fn handle_device_ws(
                             .get(&serial)
                             .is_some_and(|d| d.connection_id == connection_id);
                         if !current {
-                            debug!(serial = %serial, connection_id, "net.state from a stale connection ignored");
+                            debug!(serial = %serial, connection_id, "{kind} from a stale connection ignored");
                             continue;
                         }
-                        let stored = StoredNetState {
+                        let stored = StoredState {
                             received_at: unix_ms(),
                             state: parsed,
                         };
-                        let frame = net_state_frame(&serial, connection_id, &stored, false);
+                        let frame =
+                            pushed_state_frame(kind, &serial, connection_id, &stored, false);
                         let payload = Arc::new(stored.state.clone());
                         // Kept before it is published: a subscriber that
                         // subscribes in between finds it in its snapshot.
-                        *last_net_state.write().await = Some(stored);
+                        *slot.write().await = Some(stored);
                         state.publish(&frame);
                         drop(devices);
                         let clients_read = clients.read().await;
@@ -1603,20 +1625,34 @@ async fn send_text(sink: &mut EventSink, text: String) -> Result<(), ()> {
 }
 
 /// Every connected device as `device.connected`, each followed by its stored
-/// `net.state`, then `replay.done`. Built under the map's read lock, sent
-/// after it is released. The caller subscribes to the bus first.
+/// `net.state` and `infra.state`, then `replay.done`. Built under the map's
+/// read lock, sent after it is released. The caller subscribes to the bus
+/// first.
 async fn replay(state: &RelayState, sink: &mut EventSink) -> Result<(), ()> {
     let frames = {
         let devices = state.devices.read().await;
         let mut connected: Vec<&ConnectedDevice> = devices.values().collect();
         connected.sort_by(|a, b| a.serial.cmp(&b.serial));
-        let mut frames = Vec::with_capacity(connected.len() * 2 + 1);
+        let mut frames = Vec::with_capacity(connected.len() * 3 + 1);
         for device in &connected {
             frames.push(device_connected_frame(device, true).to_string());
-            if let Some(stored) = device.last_net_state.read().await.as_ref() {
-                frames.push(
-                    net_state_frame(&device.serial, device.connection_id, stored, true).to_string(),
-                );
+            let pushed = [
+                ("net.state", &device.last_net_state),
+                ("infra.state", &device.last_infra_state),
+            ];
+            for (kind, slot) in pushed {
+                if let Some(stored) = slot.read().await.as_ref() {
+                    frames.push(
+                        pushed_state_frame(
+                            kind,
+                            &device.serial,
+                            device.connection_id,
+                            stored,
+                            true,
+                        )
+                        .to_string(),
+                    );
+                }
             }
         }
         frames.push(json!({"type": "replay.done", "devices": connected.len()}).to_string());

@@ -1,4 +1,5 @@
-//! The relay's `net.state` handling and its `/api/tunnel/events` stream,
+//! The relay's `net.state` and `infra.state` handling and its
+//! `/api/tunnel/events` stream,
 //! against the real router on an ephemeral port: fake devices register over
 //! WebSocket the way the tunnel client does, and fake subscribers read the
 //! stream the way netage-server does.
@@ -185,11 +186,11 @@ async fn registration_with_features_is_acked_with_the_relays() {
     let (_device, ack) = relay.device("DEV-1", json!(["net.state"])).await;
     assert_eq!(ack["type"], "tunnel.register.ack");
     assert_eq!(ack["serial"], "DEV-1");
-    assert_eq!(ack["features"], json!(["net.state"]));
+    assert_eq!(ack["features"], json!(["net.state", "infra.state"]));
 
     // An old device offers nothing and is still acked with the relay's.
     let (_old, ack) = relay.device("DEV-OLD", Value::Null).await;
-    assert_eq!(ack["features"], json!(["net.state"]));
+    assert_eq!(ack["features"], json!(["net.state", "infra.state"]));
 
     let (status, list) = relay.get(&format!("/api/tunnel/devices?token={KEY}")).await;
     assert_eq!(status, 200);
@@ -232,7 +233,7 @@ async fn the_stream_says_hello_replays_then_goes_live() {
     assert_eq!(hello["type"], "hello");
     assert_eq!(hello["relay_version"], sctl::VERSION);
     assert!(hello["relay_epoch"].as_u64().unwrap() > 1_700_000_000_000);
-    assert_eq!(hello["features"], json!(["net.state"]));
+    assert_eq!(hello["features"], json!(["net.state", "infra.state"]));
 
     let a = next(&mut sub).await;
     assert_eq!(a["type"], "device.connected");
@@ -318,6 +319,116 @@ async fn net_state_is_kept_published_forwarded_and_reset_on_a_new_connection() {
     );
     assert_eq!(frame["connection_id"], second_connection);
     assert_eq!(frame["state"], payload);
+}
+
+fn infra_state(status: &str) -> Value {
+    json!({
+        "type": "infra.state",
+        "v": 1,
+        "ts": "2026-09-30T12:00:00Z",
+        // Never believed: the frame names the registered serial.
+        "serial": "SOMEONE-ELSE",
+        "config_version": 7,
+        "targets": {
+            "t1": {
+                "status": status, "latency_ms": 3, "since": "2026-09-30T11:58:00Z",
+                "consecutive_ok": 1, "consecutive_fail": 0,
+                "last_check": "2026-09-30T12:00:00Z", "detail": "PING OK 3ms", "name": "Gateway",
+            },
+        },
+        "truncated": false,
+    })
+}
+
+#[tokio::test]
+async fn infra_state_is_kept_published_forwarded_and_replayed_after_net_state() {
+    let relay = relay().await;
+    let (mut sub, replayed) = relay.subscribe_replayed().await;
+    assert!(replayed.is_empty());
+
+    let (mut device, ack) = relay
+        .device("DEV-1", json!(["net.state", "infra.state"]))
+        .await;
+    assert_eq!(ack["features"], json!(["net.state", "infra.state"]));
+    let connected = next(&mut sub).await;
+    assert_eq!(connected["type"], "device.connected");
+    let first_connection = connected["connection_id"].as_u64().unwrap();
+
+    // A WS client of the device gets the device's own message.
+    let client_url = format!("ws://{}/d/DEV-1/api/ws?token={DEVICE_KEY}", relay.addr);
+    let mut client = connect(client_url, None).await.unwrap();
+
+    let payload = infra_state("up");
+    send(&mut device, &payload).await;
+    let frame = next(&mut sub).await;
+    assert_eq!(frame["type"], "infra.state");
+    assert_eq!(
+        frame["serial"], "DEV-1",
+        "the registered serial, not the payload's"
+    );
+    assert_eq!(frame["connection_id"], first_connection);
+    assert_eq!(frame["replay"], false);
+    assert!(frame["received_at"].as_u64().unwrap() > 1_700_000_000_000);
+    assert_eq!(frame["state"], payload);
+    assert_eq!(next(&mut client).await, payload);
+
+    // Kept, and replayed after the connection's net.state.
+    let network = net_state("10.42.0.7/24");
+    send(&mut device, &network).await;
+    assert_eq!(next(&mut sub).await["type"], "net.state");
+    let (_late, replayed) = relay.subscribe_replayed().await;
+    let kinds: Vec<&str> = replayed
+        .iter()
+        .map(|f| f["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["device.connected", "net.state", "infra.state"]);
+    assert_eq!(replayed[1]["state"], network);
+    assert_eq!(replayed[2]["replay"], true);
+    assert_eq!(replayed[2]["connection_id"], first_connection);
+    assert_eq!(replayed[2]["state"], payload);
+
+    // A newer message replaces it; the device reconnects and the new
+    // connection starts with none.
+    let payload = infra_state("down");
+    send(&mut device, &payload).await;
+    assert_eq!(next(&mut sub).await["state"], payload);
+    let (_late, replayed) = relay.subscribe_replayed().await;
+    assert_eq!(replayed[2]["state"]["targets"]["t1"]["status"], "down");
+
+    let (_again, _) = relay.device("DEV-1", json!(["infra.state"])).await;
+    let reconnected = next(&mut sub).await;
+    assert_eq!(reconnected["type"], "device.connected");
+    assert_ne!(reconnected["connection_id"], first_connection);
+    closed(&mut device).await;
+    let (_fresh, replayed) = relay.subscribe_replayed().await;
+    assert_eq!(replayed.len(), 1, "nothing carried over: {replayed:?}");
+}
+
+#[tokio::test]
+async fn an_oversize_or_unparsable_infra_state_is_dropped() {
+    let relay = relay().await;
+    let (mut device, _) = relay.device("DEV-1", json!(["infra.state"])).await;
+    let (mut sub, _) = relay.subscribe_replayed().await;
+
+    let mut oversize = infra_state("up");
+    oversize["padding"] = json!("x".repeat(16 * 1024));
+    send(&mut device, &oversize).await;
+    device
+        .send(Message::Text("{\"type\": \"infra.state\", not json".into()))
+        .await
+        .unwrap();
+    let small = infra_state("degraded");
+    send(&mut device, &small).await;
+
+    let frame = next(&mut sub).await;
+    assert_eq!(frame["type"], "infra.state");
+    assert_eq!(
+        frame["state"], small,
+        "neither the oversize nor the broken one reached the stream"
+    );
+    let (_late, replayed) = relay.subscribe_replayed().await;
+    assert_eq!(replayed.len(), 2);
+    assert_eq!(replayed[1]["state"], small);
 }
 
 #[tokio::test]
