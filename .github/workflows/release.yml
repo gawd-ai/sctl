@@ -45,12 +45,16 @@ jobs:
           - target: x86_64
             triple: x86_64-unknown-linux-musl
             plugin: false
+          # aarch64 musl cannot produce a cdylib (the plugin); no aarch64 unit
+          # runs the Quectel plugin, so this target ships the server only.
           - target: aarch64
             triple: aarch64-unknown-linux-musl
-            plugin: true
+            plugin: false
+          # armv7 musl cannot produce a cdylib either; no armv7 unit runs the
+          # plugin (the BPI in service is riscv64).
           - target: armv7
             triple: armv7-unknown-linux-musleabihf
-            plugin: true
+            plugin: false
           - target: riscv64
             triple: riscv64gc-unknown-linux-musl
             plugin: true
