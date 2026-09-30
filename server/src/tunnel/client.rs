@@ -38,7 +38,7 @@ use crate::state::{TunnelEventType, TunnelPath};
 use crate::AppState;
 
 use super::{decode_binary_frame, encode_binary_frame};
-use super::{infra_state, net_state};
+use super::{infra_state, net_state, upgrade_state};
 
 /// Static heartbeat message — avoids serde allocation on every heartbeat tick.
 const PING_TEXT: &str = r#"{"type":"tunnel.ping"}"#;
@@ -596,7 +596,7 @@ impl std::fmt::Display for DisconnectReason {
 }
 
 /// Classification of connection errors for backoff strategy.
-enum ConnectError {
+pub(crate) enum ConnectError {
     /// Registration FORBIDDEN (invalid tunnel key) — retry on the slow
     /// [`DelayClass::AuthRejected`] cadence, forever.
     AuthRejected(String),
@@ -693,7 +693,7 @@ fn set_tcp_keepalive(stream: &TcpStream, idle: u32, interval: u32, count: u32) {
 /// failed lookup or an unusable `bind_address` is not. With `fallback`, the
 /// relay's known address, a failed lookup dials that address instead (see
 /// [`dial_addresses`]).
-async fn connect_tcp_ipv4_preferred(
+pub(crate) async fn connect_tcp_ipv4_preferred(
     url: &str,
     bind_address: Option<&str>,
     fallback: Option<Ipv4Addr>,
@@ -944,7 +944,7 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-fn build_tunnel_tls_config(
+pub(crate) fn build_tunnel_tls_config(
     config: &TunnelConfig,
 ) -> Result<Arc<RustlsClientConfig>, Box<dyn std::error::Error + Send + Sync>> {
     let mut root_store = RootCertStore::empty();
@@ -1050,6 +1050,7 @@ struct CleanupGuard {
     writer: tokio::task::AbortHandle,
     net_state: Option<tokio::task::AbortHandle>,
     infra_state: Option<tokio::task::AbortHandle>,
+    upgrade_state: Option<tokio::task::AbortHandle>,
     subscribers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     session_manager: crate::sessions::SessionManager,
     transfer_manager: Arc<crate::gawdxfer::manager::TransferManager>,
@@ -1068,6 +1069,9 @@ impl Drop for CleanupGuard {
         }
         if let Some(infra_state) = &self.infra_state {
             infra_state.abort();
+        }
+        if let Some(upgrade_state) = &self.upgrade_state {
+            upgrade_state.abort();
         }
         let subscribers = self.subscribers.clone();
         let sessions = self.session_manager.clone();
@@ -1209,6 +1213,11 @@ async fn connect_and_run(
             "type": "tunnel.register",
             "serial": state.config.device.serial,
             "api_key": state.config.auth.api_key,
+            // What this device is (0.6.7+): the relay carries it on
+            // device.connected and /api/tunnel/devices.
+            "version": crate::VERSION,
+            "target": crate::upgrade::TARGET,
+            "layout": state.install.as_ref().map(|i| i.layout.as_str()),
         });
         // What this device can push. A relay that predates features
         // ignores the field.
@@ -1219,6 +1228,7 @@ async fn connect_and_run(
         if state.infra_state.is_some() {
             features.push(infra_state::FEATURE);
         }
+        features.push(upgrade_state::FEATURE);
         if !features.is_empty() {
             reg["features"] = json!(features);
         }
@@ -1236,6 +1246,7 @@ async fn connect_and_run(
     // older relay's does not).
     let relay_takes_net_state;
     let relay_takes_infra_state;
+    let relay_takes_upgrade_state;
 
     // Wait for registration ack with timeout
     match tokio::time::timeout(Duration::from_secs(10), ws_stream.next()).await {
@@ -1247,6 +1258,7 @@ async fn connect_and_run(
                         "tunnel.register.ack" => {
                             relay_takes_net_state = net_state::advertised(&msg);
                             relay_takes_infra_state = infra_state::advertised(&msg);
+                            relay_takes_upgrade_state = upgrade_state::advertised(&msg);
                             let reg_elapsed = reg_start.elapsed();
                             let total = connect_start.elapsed();
                             info!(
@@ -1401,6 +1413,15 @@ async fn connect_and_run(
         ws_sink.request_tx.clone(),
     );
 
+    // Where the device's upgrade stands, pushed the same way: now, then on
+    // every change.
+    let upgrade_state_task = upgrade_state::spawn_forwarder(
+        relay_takes_upgrade_state,
+        state.upgrade.subscribe(),
+        state.install.as_ref().map(|i| i.layout.as_str()),
+        ws_sink.request_tx.clone(),
+    );
+
     // Subscribe to session lifecycle broadcasts so we can forward them
     let mut broadcast_rx = state.session_events.subscribe();
 
@@ -1520,6 +1541,9 @@ async fn connect_and_run(
             .as_ref()
             .map(tokio::task::JoinHandle::abort_handle),
         infra_state: infra_state_task
+            .as_ref()
+            .map(tokio::task::JoinHandle::abort_handle),
+        upgrade_state: upgrade_state_task
             .as_ref()
             .map(tokio::task::JoinHandle::abort_handle),
         subscribers: subscriber_tasks.clone(),
@@ -1692,6 +1716,9 @@ async fn connect_and_run(
         task.abort();
     }
     if let Some(task) = &infra_state_task {
+        task.abort();
+    }
+    if let Some(task) = &upgrade_state_task {
         task.abort();
     }
     let attached_sessions: Vec<String> = {

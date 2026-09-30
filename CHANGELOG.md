@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 This root file is the only changelog; per-component history is recorded here
 under per-component headings. `server/CHANGELOG.md` is frozen.
 
+## [0.6.7] - 2026-09-30
+
+### sctl (server)
+- **Managed upgrades** (`docs/upgrade.md`): the agent replaces itself with a signed release its relay serves. `POST /api/upgrade {version, request_id, not_before, not_after, allow_downgrade, mirror_base}` refuses early (a hold, no `install.json`, a downgrade, a window read outside its edges, a clock not set), fetches and verifies `release.json` (ed25519 over the manifest bytes, keys embedded in the binary plus `[upgrade] trust_keys`), fetches its target's artifacts with `Range` resume and SHA-256 checks, proves the new binary prints the expected version, writes the rollback set, then hands off to a detached helper (`sctl upgrade-apply`, a copy of the running binary in its own session; a transient `systemd-run` unit on the relay) that swaps, restarts, waits for health twice with the tunnel up within 180 s, and restores the rollback set otherwise. `GET /api/upgrade` and `DELETE /api/upgrade`; `sctl upgrade <version>`, `sctl target`, `sctl install-info`.
+- **`/etc/sctl/install.json`**: the install layout (`usr-bin`, `gz-tmp`, `ramboot`, `systemd`), written by every install script and hand-upgrade path; `/api/health` gains `target`, `layout` and `upgrade`.
+- **`upgrade.state` is pushed over the tunnel**: once after the ack, then on every change; carries `running_version`, `target`, `layout` and the state (`phase`, `outcome`, `reason`, `from_version`, `to_version`, `log_tail`). `tunnel.register` carries `version`, `target` and `layout`.
+- **`[upgrade]`**: `hold` (or the file `/etc/sctl/upgrade-hold`) refuses every request; `trust_keys` adds bench keys.
+
+### sctl (relay)
+- Serves release bundles to its devices: `PUT /api/tunnel/artifacts/{version}/{file}` (operator key; the manifest and its signature first, verified against the same keys the agents embed, every file checked against the manifest as it lands), `GET /api/tunnel/artifacts` and `GET /api/tunnel/artifacts/{version}/{file}` (tunnel key; `Range`, `ETag`), `PUT .../mirror` for ramboot boot fetchers, `DELETE`. Every change publishes `artifacts.changed` on `/api/tunnel/events`; every replay opens with an `artifacts` frame.
+- Keeps the latest `upgrade.state` per connection and replays it after `infra.state`; `device.connected` and `/api/tunnel/devices` carry `version`, `target` and `layout`; advertises `upgrade.state`.
+
+### Packaging
+- `.github/workflows/release.yml`: a `v*` tag builds one artifact set per target (`x86_64`, `aarch64`, `armv7`, `riscv64` through cross; `mips_24kc` and `mipsel_24kc` through the OpenWrt device builds) with one build number, assembles the bundle (`scripts/release-bundle.sh`), signs it (`scripts/release-sign.sh`, secret `SCTL_RELEASE_SIGNING_KEY`) and publishes a GitHub release. `rundev.sh relay artifacts <user@host> <version> <dir>` uploads a bundle to a relay.
+- The relay's `install.json` (`systemd`, unit `sctl-relay`) is written by `relay setup` and `relay deploy`.
+
 ## [0.6.6] - 2026-09-30
 
 ### sctl (server)

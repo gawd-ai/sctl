@@ -73,6 +73,16 @@ pub struct AppState {
     /// The relay route owner's shared side (tunnel client mode only): the
     /// tunnel tells it how its connections go, `/api/health` reads its report.
     pub relay_route: Option<Arc<RelayRoute>>,
+    /// The upgrade state: the file both halves of an upgrade write, and
+    /// the channel the tunnel's `upgrade.state` push reads.
+    pub upgrade: Arc<crate::upgrade::state::Handle>,
+    /// How this agent is installed (`/etc/sctl/install.json`); `None` on a
+    /// box installed before 0.6.7, which cannot upgrade itself.
+    pub install: Option<Arc<crate::upgrade::install::InstallInfo>>,
+    /// Why `install` is `None` when the file exists but is unusable.
+    pub install_error: Option<String>,
+    /// The config file the server was started with, for the rollback set.
+    pub config_path: Option<String>,
 }
 
 /// Tunnel connection event types.

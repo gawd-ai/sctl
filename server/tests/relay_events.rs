@@ -4,6 +4,7 @@
 //! WebSocket the way the tunnel client does, and fake subscribers read the
 //! stream the way netage-server does.
 
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -72,7 +73,9 @@ impl Relay {
         let mut ws = self.subscribe().await;
         assert_eq!(next(&mut ws).await["type"], "hello");
         let replayed = until(&mut ws, "replay.done").await;
-        (ws, replayed)
+        // The bundle listing opens every replay; the device frames follow.
+        assert_eq!(replayed[0]["type"], "artifacts");
+        (ws, replayed.into_iter().skip(1).collect())
     }
 
     /// Register `serial` offering `features`; returns the socket and the ack.
@@ -186,11 +189,17 @@ async fn registration_with_features_is_acked_with_the_relays() {
     let (_device, ack) = relay.device("DEV-1", json!(["net.state"])).await;
     assert_eq!(ack["type"], "tunnel.register.ack");
     assert_eq!(ack["serial"], "DEV-1");
-    assert_eq!(ack["features"], json!(["net.state", "infra.state"]));
+    assert_eq!(
+        ack["features"],
+        json!(["net.state", "infra.state", "upgrade.state"])
+    );
 
     // An old device offers nothing and is still acked with the relay's.
     let (_old, ack) = relay.device("DEV-OLD", Value::Null).await;
-    assert_eq!(ack["features"], json!(["net.state", "infra.state"]));
+    assert_eq!(
+        ack["features"],
+        json!(["net.state", "infra.state", "upgrade.state"])
+    );
 
     let (status, list) = relay.get(&format!("/api/tunnel/devices?token={KEY}")).await;
     assert_eq!(status, 200);
@@ -233,7 +242,16 @@ async fn the_stream_says_hello_replays_then_goes_live() {
     assert_eq!(hello["type"], "hello");
     assert_eq!(hello["relay_version"], sctl::VERSION);
     assert!(hello["relay_epoch"].as_u64().unwrap() > 1_700_000_000_000);
-    assert_eq!(hello["features"], json!(["net.state", "infra.state"]));
+    assert_eq!(
+        hello["features"],
+        json!(["net.state", "infra.state", "upgrade.state"])
+    );
+
+    // The bundle listing opens every replay, before the devices.
+    let listing = next(&mut sub).await;
+    assert_eq!(listing["type"], "artifacts");
+    assert_eq!(listing["replay"], true);
+    assert_eq!(listing["versions"], json!([]));
 
     let a = next(&mut sub).await;
     assert_eq!(a["type"], "device.connected");
@@ -347,9 +365,15 @@ async fn infra_state_is_kept_published_forwarded_and_replayed_after_net_state() 
     assert!(replayed.is_empty());
 
     let (mut device, ack) = relay
-        .device("DEV-1", json!(["net.state", "infra.state"]))
+        .device(
+            "DEV-1",
+            json!(["net.state", "infra.state", "upgrade.state"]),
+        )
         .await;
-    assert_eq!(ack["features"], json!(["net.state", "infra.state"]));
+    assert_eq!(
+        ack["features"],
+        json!(["net.state", "infra.state", "upgrade.state"])
+    );
     let connected = next(&mut sub).await;
     assert_eq!(connected["type"], "device.connected");
     let first_connection = connected["connection_id"].as_u64().unwrap();
@@ -611,10 +635,11 @@ async fn a_subscriber_that_falls_behind_is_resynced_with_a_fresh_replay() {
     }
     assert_eq!(next(&mut sub).await, json!({"type": "resync"}));
     let replayed = until(&mut sub, "replay.done").await;
-    assert_eq!(replayed.len(), 2);
-    assert_eq!(replayed[0]["type"], "device.connected");
-    assert_eq!(replayed[0]["replay"], true);
-    assert_eq!(replayed[1]["state"], payload);
+    assert_eq!(replayed.len(), 3);
+    assert_eq!(replayed[0]["type"], "artifacts");
+    assert_eq!(replayed[1]["type"], "device.connected");
+    assert_eq!(replayed[1]["replay"], true);
+    assert_eq!(replayed[2]["state"], payload);
 
     // And it is live again.
     let (_other, _) = relay.device("DEV-2", json!([])).await;
@@ -634,4 +659,372 @@ async fn the_bus_is_shared_by_every_clone_of_the_state() {
     let other = relay.state.clone();
     other.publish(&json!({"type": "test.marker"}));
     assert_eq!(next(&mut sub).await["type"], "test.marker");
+}
+
+// ─── Artifacts: bundles the relay serves to its devices ─────────────────────
+
+const OPERATOR_KEY: &str = "operator-key-for-tests";
+
+/// A raw HTTP/1.1 request with a bearer and a body; returns the status, the
+/// headers (lowercased names) and the body bytes.
+async fn http(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    extra: &[(&str, &str)],
+    body: &[u8],
+) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: relay\r\nConnection: close\r\n");
+    if let Some(key) = bearer {
+        let _ = write!(request, "Authorization: Bearer {key}\r\n");
+    }
+    for (name, value) in extra {
+        let _ = write!(request, "{name}: {value}\r\n");
+    }
+    let _ = write!(request, "Content-Length: {}\r\n\r\n", body.len());
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let split = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("a response head");
+    let head = String::from_utf8_lossy(&response[..split]).into_owned();
+    let status: u16 = head[9..12].parse().unwrap();
+    let headers = head
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split_once(": "))
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.to_string()))
+        .collect();
+    (status, headers, response[split + 4..].to_vec())
+}
+
+fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
+}
+
+struct Signer(ring::signature::Ed25519KeyPair);
+
+impl Signer {
+    fn new() -> Self {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        Self(ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap())
+    }
+
+    fn public_key(&self) -> [u8; 32] {
+        use ring::signature::KeyPair;
+        let mut key = [0u8; 32];
+        key.copy_from_slice(self.0.public_key().as_ref());
+        key
+    }
+
+    fn sign(&self, bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        let id = sctl::upgrade::keys::key_id(&self.public_key());
+        let sig = base64::engine::general_purpose::STANDARD.encode(self.0.sign(bytes).as_ref());
+        format!("ed25519:{id}:{sig}")
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    sctl::upgrade::hex_lower(&sha2::Sha256::digest(bytes))
+}
+
+#[tokio::test]
+async fn bundles_are_verified_at_the_door_served_with_ranges_and_announced() {
+    let dir = std::env::temp_dir().join(format!("sctl-relay-artifacts-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let signer = Signer::new();
+    let mut state = RelayState::new(KEY.into(), 45, 60, Some(dir.to_str().unwrap()));
+    state.set_operator(OPERATOR_KEY.into(), vec![signer.public_key()]);
+    let app = relay_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let relay = Relay { state, addr };
+
+    let artifact = b"hello, agent".to_vec();
+    let manifest = json!({
+        "v": 1, "version": "0.6.8.1", "channel": "stable", "min_from_version": "0.6.7.0",
+        "published_at": "2026-10-01T00:00:00Z", "notes": "test release",
+        "targets": {"x86_64": {"files": [
+            {"role": "server", "name": "sctl-x86_64", "size": artifact.len(), "sha256": sha256_hex(&artifact), "gzip": false}
+        ]}}
+    })
+    .to_string();
+    let sig = signer.sign(manifest.as_bytes());
+    let bundle = "/api/tunnel/artifacts/0.6.8.1";
+
+    // A subscriber sees an empty listing first, then every change.
+    let (mut sub, _) = relay.subscribe_replayed().await;
+
+    // Files before the manifest, the tunnel key, and no key are refused.
+    let (status, _, _) = http(
+        addr,
+        "PUT",
+        &format!("{bundle}/sctl-x86_64"),
+        Some(OPERATOR_KEY),
+        &[],
+        &artifact,
+    )
+    .await;
+    assert_eq!(status, 409);
+    let (status, _, _) = http(
+        addr,
+        "PUT",
+        &format!("{bundle}/release.json"),
+        Some(KEY),
+        &[],
+        manifest.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 403);
+    let (status, _, _) = http(
+        addr,
+        "PUT",
+        &format!("{bundle}/release.json"),
+        None,
+        &[],
+        manifest.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 403);
+
+    // The manifest and its signature, in either order, make a verified bundle.
+    let (status, _, _) = http(
+        addr,
+        "PUT",
+        &format!("{bundle}/release.json"),
+        Some(OPERATOR_KEY),
+        &[],
+        manifest.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, _, body) = http(
+        addr,
+        "PUT",
+        &format!("{bundle}/release.json.sig"),
+        Some(OPERATOR_KEY),
+        &[],
+        sig.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let stored: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(stored["bundle"]["verified"], true);
+    assert_eq!(stored["bundle"]["complete"], false);
+    assert_eq!(stored["bundle"]["missing"], json!(["sctl-x86_64"]));
+    let changed = next(&mut sub).await;
+    assert_eq!(changed["type"], "artifacts.changed");
+
+    // A signature by another key is refused and the bundle stays as it was.
+    let other = Signer::new().sign(manifest.as_bytes());
+    let (status, _, _) = http(
+        addr,
+        "PUT",
+        &format!("{bundle}/release.json.sig"),
+        Some(OPERATOR_KEY),
+        &[],
+        other.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 422);
+
+    // A file that is not the manifest's is refused; the right one lands.
+    let (status, _, _) = http(
+        addr,
+        "PUT",
+        &format!("{bundle}/sctl-x86_64"),
+        Some(OPERATOR_KEY),
+        &[],
+        b"tampered",
+    )
+    .await;
+    assert_eq!(status, 422);
+    let (status, _, _) = http(
+        addr,
+        "PUT",
+        &format!("{bundle}/other-file"),
+        Some(OPERATOR_KEY),
+        &[],
+        b"x",
+    )
+    .await;
+    assert_eq!(status, 422);
+    let (status, _, body) = http(
+        addr,
+        "PUT",
+        &format!("{bundle}/sctl-x86_64"),
+        Some(OPERATOR_KEY),
+        &[],
+        &artifact,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let stored: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(stored["bundle"]["complete"], true);
+
+    // Devices read with the tunnel key, with ranges; nobody reads without a key.
+    let (status, headers, body) = http(
+        addr,
+        "GET",
+        &format!("{bundle}/sctl-x86_64"),
+        Some(KEY),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, artifact);
+    assert_eq!(header(&headers, "accept-ranges"), Some("bytes"));
+    assert_eq!(
+        header(&headers, "etag"),
+        Some(format!("\"{}\"", sha256_hex(&artifact)).as_str())
+    );
+    let (status, headers, body) = http(
+        addr,
+        "GET",
+        &format!("{bundle}/sctl-x86_64"),
+        Some(KEY),
+        &[("Range", "bytes=7-")],
+        b"",
+    )
+    .await;
+    assert_eq!(status, 206);
+    assert_eq!(body, b"agent");
+    assert_eq!(header(&headers, "content-range"), Some("bytes 7-11/12"));
+    let (status, _, _) = http(
+        addr,
+        "GET",
+        &format!("{bundle}/sctl-x86_64"),
+        Some(KEY),
+        &[("Range", "bytes=12-")],
+        b"",
+    )
+    .await;
+    assert_eq!(status, 416);
+
+    // A resume names the file it started with; another file is served whole.
+    let etag = format!("\"{}\"", sha256_hex(&artifact));
+    let (status, _, body) = http(
+        addr,
+        "GET",
+        &format!("{bundle}/sctl-x86_64"),
+        Some(KEY),
+        &[("Range", "bytes=7-"), ("If-Range", &etag)],
+        b"",
+    )
+    .await;
+    assert_eq!(status, 206);
+    assert_eq!(body, b"agent");
+    let (status, _, body) = http(
+        addr,
+        "GET",
+        &format!("{bundle}/sctl-x86_64"),
+        Some(KEY),
+        &[("Range", "bytes=7-"), ("If-Range", "\"other\"")],
+        b"",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, artifact);
+    let (status, _, _) = http(
+        addr,
+        "GET",
+        &format!("{bundle}/sctl-x86_64"),
+        None,
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(status, 403);
+    let (status, _, _) = http(addr, "GET", &format!("{bundle}/nope"), Some(KEY), &[], b"").await;
+    assert_eq!(status, 404);
+
+    // The listing, on the route and at the head of every replay.
+    let (status, _, body) = http(addr, "GET", "/api/tunnel/artifacts", Some(KEY), &[], b"").await;
+    assert_eq!(status, 200);
+    let listing: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(listing["versions"][0]["version"], "0.6.8.1");
+    assert_eq!(listing["versions"][0]["targets"], json!(["x86_64"]));
+    assert_eq!(listing["versions"][0]["complete"], true);
+    let mut late = relay.subscribe().await;
+    assert_eq!(next(&mut late).await["type"], "hello");
+    let head = next(&mut late).await;
+    assert_eq!(head["type"], "artifacts");
+    assert_eq!(head["replay"], true);
+    assert_eq!(head["versions"][0]["version"], "0.6.8.1");
+
+    // A mirror for ramboot devices, then the bundle is removed.
+    let (status, _, _) = http(
+        addr,
+        "PUT",
+        &format!("{bundle}/mirror"),
+        Some(OPERATOR_KEY),
+        &[("Content-Type", "application/json")],
+        br#"{"url":"http://mirror/0.6.8.1"}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (_, _, body) = http(addr, "GET", "/api/tunnel/artifacts", Some(KEY), &[], b"").await;
+    let listing: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(listing["versions"][0]["mirror"], "http://mirror/0.6.8.1");
+    let (status, _, _) = http(addr, "DELETE", bundle, Some(OPERATOR_KEY), &[], b"").await;
+    assert_eq!(status, 200);
+    let (_, _, body) = http(addr, "GET", "/api/tunnel/artifacts", Some(KEY), &[], b"").await;
+    let listing: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(listing["versions"], json!([]));
+    assert!(!dir.join("0.6.8.1").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_device_says_what_it_is_and_its_upgrade_state_is_kept_and_replayed() {
+    let relay = relay().await;
+    let (mut sub, _) = relay.subscribe_replayed().await;
+    let url = format!("ws://{}/api/tunnel/register?serial=DEV-7", relay.addr);
+    let mut device = connect(url, Some(KEY)).await.unwrap();
+    send(
+        &mut device,
+        &json!({"type": "tunnel.register", "api_key": DEVICE_KEY, "features": ["upgrade.state"],
+                "version": "0.6.7.431", "target": "mips_24kc", "layout": "gz-tmp"}),
+    )
+    .await;
+    let ack = next(&mut device).await;
+    assert_eq!(ack["type"], "tunnel.register.ack");
+    let connected = next(&mut sub).await;
+    assert_eq!(connected["type"], "device.connected");
+    assert_eq!(connected["version"], "0.6.7.431");
+    assert_eq!(connected["target"], "mips_24kc");
+    assert_eq!(connected["layout"], "gz-tmp");
+    let (_, list) = relay.get(&format!("/api/tunnel/devices?token={KEY}")).await;
+    assert_eq!(list["devices"][0]["version"], "0.6.7.431");
+    assert_eq!(list["devices"][0]["layout"], "gz-tmp");
+
+    let state = json!({"type": "upgrade.state", "v": 1, "ts": "2026-10-02T06:12:00Z",
+        "running_version": "0.6.7.431", "target": "mips_24kc", "layout": "gz-tmp",
+        "request_id": null, "phase": "idle", "outcome": null});
+    send(&mut device, &state).await;
+    let pushed = next(&mut sub).await;
+    assert_eq!(pushed["type"], "upgrade.state");
+    assert_eq!(pushed["serial"], "DEV-7");
+    assert_eq!(pushed["state"], state);
+    let (_, replayed) = relay.subscribe_replayed().await;
+    let kinds: Vec<&str> = replayed
+        .iter()
+        .map(|f| f["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["device.connected", "upgrade.state"]);
+    assert_eq!(replayed[1]["state"], state);
 }

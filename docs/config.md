@@ -318,3 +318,13 @@ the modem to still be present in sysfs.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `min_sustained_secs` | `600` | Minimum sustained seconds of the qualifying symptom before an automatic USB cycle is allowed. |
+
+## `[upgrade]`
+
+The box's own say over managed upgrades (`docs/upgrade.md`). The fleet
+decides when a device is asked; these keys decide whether the box listens.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `hold` | `false` | Refuse every `POST /api/upgrade` (`423 UPGRADE_HELD`) and report `not_applied` with reason `held`. The file `/etc/sctl/upgrade-hold` (first line: the reason) does the same without a config edit, for a hand at the box. |
+| `trust_keys` | `[]` | Extra release signing public keys, 64 hex characters each, trusted beside the keys embedded in the binary: a bench or a lab signing its own builds. A key that does not parse is a config error. Never set in the fleet. |

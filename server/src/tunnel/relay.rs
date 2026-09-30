@@ -38,7 +38,14 @@ const DEVICE_QUEUE_SEND_TIMEOUT_SECS: u64 = 5;
 
 /// Features this relay advertises in `tunnel.register.ack` and in the event
 /// stream's `hello`.
-const RELAY_FEATURES: [&str; 2] = [super::net_state::FEATURE, super::infra_state::FEATURE];
+const RELAY_FEATURES: [&str; 3] = [
+    super::net_state::FEATURE,
+    super::infra_state::FEATURE,
+    super::upgrade_state::FEATURE,
+];
+/// A device's `version`, `target` and `layout` in `tunnel.register` are
+/// kept up to this many bytes each.
+const MAX_IDENTITY_BYTES: usize = 64;
 /// A device's features are kept up to this many entries of this many bytes.
 const MAX_DEVICE_FEATURES: usize = 16;
 const MAX_FEATURE_BYTES: usize = 32;
@@ -116,6 +123,11 @@ pub struct RelayState {
     pub event_subscribers: Arc<AtomicUsize>,
     /// When this relay started, unix ms (`relay_epoch` in the stream's hello).
     pub started_at_ms: u64,
+    /// Release bundles this relay serves to its devices.
+    pub artifacts: Arc<super::artifacts::ArtifactStore>,
+    /// The relay's own operator `api_key`, for the artifact upload routes
+    /// (empty refuses every upload).
+    pub operator_key: String,
 }
 
 /// The latest `net.state` or `infra.state` a device sent on its current
@@ -181,6 +193,13 @@ pub struct ConnectedDevice {
     pub last_net_state: Arc<RwLock<Option<StoredState>>>,
     /// The latest `infra.state` on this connection, kept the same way.
     pub last_infra_state: Arc<RwLock<Option<StoredState>>>,
+    /// The latest `upgrade.state` on this connection, kept the same way.
+    pub last_upgrade_state: Arc<RwLock<Option<StoredState>>>,
+    /// What the device said it is in `tunnel.register` (0.6.7+): its
+    /// version, compile target and install layout.
+    pub version: Option<String>,
+    pub target: Option<String>,
+    pub layout: Option<String>,
 }
 
 /// Drain all pending requests for a device, sending error responses on each oneshot.
@@ -239,8 +258,20 @@ fn device_connected_frame(device: &ConnectedDevice, replay: bool) -> Value {
         "connected_at": device.connected_at_ms,
         "egress_ip": device.egress_ip,
         "features": device.features,
+        "version": device.version,
+        "target": device.target,
+        "layout": device.layout,
         "replay": replay,
     })
+}
+
+/// A `version`, `target` or `layout` from `tunnel.register`: a string of 1
+/// to [`MAX_IDENTITY_BYTES`] bytes, else nothing.
+fn identity_field(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .filter(|s| !s.is_empty() && s.len() <= MAX_IDENTITY_BYTES)
+        .map(ToString::to_string)
 }
 
 /// A pushed state (`net.state`, `infra.state`) for the event stream: the
@@ -314,7 +345,21 @@ impl RelayState {
             events: broadcast::channel(EVENT_BUS_CAPACITY).0,
             event_subscribers: Arc::new(AtomicUsize::new(0)),
             started_at_ms: unix_ms(),
+            artifacts: Arc::new(super::artifacts::ArtifactStore::new(
+                data_dir.map(|d| Path::new(d).join("artifacts")),
+                crate::upgrade::keys::EMBEDDED.to_vec(),
+            )),
+            operator_key: String::new(),
         }
+    }
+
+    /// The operator key the artifact upload routes accept, and the keys a
+    /// bundle's manifest may be signed with (the embedded ones plus
+    /// `[upgrade] trust_keys`). Call before the router is built.
+    pub fn set_operator(&mut self, operator_key: String, trust_keys: Vec<[u8; 32]>) {
+        self.operator_key = operator_key;
+        let root = self.artifacts.root_dir();
+        self.artifacts = Arc::new(super::artifacts::ArtifactStore::new(root, trust_keys));
     }
 
     /// Publish one frame to the event stream's subscribers. Serialized once;
@@ -573,7 +618,25 @@ pub fn relay_router(relay_state: RelayState) -> Router {
     let tunnel_admin = Router::new()
         .route("/api/tunnel/register", get(device_register_ws))
         .route("/api/tunnel/devices", get(list_devices))
-        .route("/api/tunnel/events", get(tunnel_events_ws));
+        .route("/api/tunnel/events", get(tunnel_events_ws))
+        // Release bundles served to devices (docs/upgrade.md).
+        .route("/api/tunnel/artifacts", get(super::artifacts::list))
+        .route(
+            "/api/tunnel/artifacts/{version}",
+            axum::routing::delete(super::artifacts::delete_version),
+        )
+        .route(
+            "/api/tunnel/artifacts/{version}/mirror",
+            axum::routing::put(super::artifacts::put_mirror),
+        )
+        .route(
+            "/api/tunnel/artifacts/{version}/{file}",
+            get(super::artifacts::get_file)
+                .put(super::artifacts::put_file)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    usize::try_from(super::artifacts::MAX_FILE_BYTES).unwrap_or(usize::MAX),
+                )),
+        );
 
     // Device proxy endpoints: /d/{serial}/api/*
     //
@@ -850,10 +913,13 @@ async fn handle_device_ws(
         warn!(serial = %serial, "Device disconnected before registration");
         return;
     };
-    let (api_key, features) = match serde_json::from_str::<Value>(&text) {
+    let (api_key, features, version, target, layout) = match serde_json::from_str::<Value>(&text) {
         Ok(msg) if msg["type"].as_str() == Some("tunnel.register") => (
             msg["api_key"].as_str().unwrap_or("").to_string(),
             device_features(&msg["features"]),
+            identity_field(&msg["version"]),
+            identity_field(&msg["target"]),
+            identity_field(&msg["layout"]),
         ),
         _ => {
             warn!(serial = %serial, "Device sent invalid registration");
@@ -921,6 +987,10 @@ async fn handle_device_ws(
         features,
         last_net_state: Arc::new(RwLock::new(None)),
         last_infra_state: Arc::new(RwLock::new(None)),
+        last_upgrade_state: Arc::new(RwLock::new(None)),
+        version,
+        target,
+        layout,
     };
 
     let pending_requests = device.pending_requests.clone();
@@ -933,6 +1003,7 @@ async fn handle_device_ws(
     let last_lte_signal = device.last_lte_signal.clone();
     let last_net_state = device.last_net_state.clone();
     let last_infra_state = device.last_infra_state.clone();
+    let last_upgrade_state = device.last_upgrade_state.clone();
 
     // Handle duplicate serial: signal old handler to shut down, drain pending
     // REST requests, then replace. Don't notify WS clients — they were migrated above.
@@ -1364,19 +1435,23 @@ async fn handle_device_ws(
                     // The device's network or its Infra results: kept for
                     // this connection, published on the event stream and
                     // forwarded to its WS clients.
-                    "net.state" | "infra.state" => {
-                        let (kind, limit, slot) = if msg_type == "net.state" {
-                            (
+                    "net.state" | "infra.state" | "upgrade.state" => {
+                        let (kind, limit, slot) = match msg_type {
+                            "net.state" => (
                                 super::net_state::FEATURE,
                                 super::net_state::MAX_BYTES,
                                 &last_net_state,
-                            )
-                        } else {
-                            (
+                            ),
+                            "infra.state" => (
                                 super::infra_state::FEATURE,
                                 super::infra_state::MAX_BYTES,
                                 &last_infra_state,
-                            )
+                            ),
+                            _ => (
+                                super::upgrade_state::FEATURE,
+                                super::upgrade_state::MAX_BYTES,
+                                &last_upgrade_state,
+                            ),
                         };
                         if text.len() > limit {
                             warn!(
@@ -1542,6 +1617,9 @@ async fn list_devices(
             "last_lte_signal": *d.last_lte_signal.read().await,
             "egress_ip": d.egress_ip,
             "features": d.features,
+            "version": d.version,
+            "target": d.target,
+            "layout": d.layout,
         }));
     }
 
@@ -1633,12 +1711,15 @@ async fn replay(state: &RelayState, sink: &mut EventSink) -> Result<(), ()> {
         let devices = state.devices.read().await;
         let mut connected: Vec<&ConnectedDevice> = devices.values().collect();
         connected.sort_by(|a, b| a.serial.cmp(&b.serial));
-        let mut frames = Vec::with_capacity(connected.len() * 3 + 1);
+        let mut frames = Vec::with_capacity(connected.len() * 4 + 2);
+        // What the relay holds, before who runs what.
+        frames.push(state.artifacts.frame(true).await.to_string());
         for device in &connected {
             frames.push(device_connected_frame(device, true).to_string());
             let pushed = [
                 ("net.state", &device.last_net_state),
                 ("infra.state", &device.last_infra_state),
+                ("upgrade.state", &device.last_upgrade_state),
             ];
             for (kind, slot) in pushed {
                 if let Some(stored) = slot.read().await.as_ref() {

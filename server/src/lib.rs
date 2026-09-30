@@ -33,6 +33,7 @@ pub mod sessions;
 pub mod shell;
 pub mod state;
 pub mod tunnel;
+pub mod upgrade;
 pub mod util;
 pub mod ws;
 

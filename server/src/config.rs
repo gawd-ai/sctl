@@ -83,6 +83,23 @@ pub struct Config {
     pub gps: Option<GpsConfig>,
     /// Optional LTE/cellular signal monitoring.
     pub lte: Option<LteConfig>,
+    /// Managed upgrades (`docs/upgrade.md`).
+    #[serde(default)]
+    pub upgrade: UpgradeConfig,
+}
+
+/// `[upgrade]`: the box's own say over managed upgrades.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct UpgradeConfig {
+    /// Refuse every upgrade request (`423`, reported as `held`). The file
+    /// `/etc/sctl/upgrade-hold` does the same without a config edit.
+    #[serde(default)]
+    pub hold: bool,
+    /// Extra release signing public keys (64 hex characters each) trusted
+    /// beside the embedded ones: a bench or a lab signing its own builds.
+    /// Never set in the fleet.
+    #[serde(default)]
+    pub trust_keys: Vec<String>,
 }
 
 /// External comms provider plugin.
@@ -819,6 +836,10 @@ impl Config {
             );
         }
 
+        if let Err(e) = crate::upgrade::keys::trusted(&self.upgrade.trust_keys) {
+            errors.push(e);
+        }
+
         errors
     }
 
@@ -847,6 +868,7 @@ impl Config {
                 comms: None,
                 gps: None,
                 lte: None,
+                upgrade: UpgradeConfig::default(),
             }
         };
 

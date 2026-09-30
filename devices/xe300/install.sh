@@ -232,6 +232,7 @@ cp /tmp/sctl-server-mips_24kc.gz /usr/local/lib/sctl/sctl-server-mips_24kc.gz
 cp /tmp/sctl-comms-quectel-mips_24kc.so.gz /usr/local/lib/sctl/sctl-comms-quectel-mips_24kc.so.gz
 cp /tmp/sctl.init /etc/init.d/sctl
 cp /tmp/sctl.toml /etc/sctl/sctl.toml
+printf '{"v":1,"layout":"gz-tmp","target":"mips_24kc"}\n' > /etc/sctl/install.json
 
 chmod 0644 /usr/local/lib/sctl/*.gz
 chmod 0755 /etc/init.d/sctl

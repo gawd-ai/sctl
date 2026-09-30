@@ -1,0 +1,170 @@
+# A release: on a `v*` tag, one signed artifact set per target, assembled
+# into the bundle every relay serves to its devices (docs/upgrade.md).
+#
+# Every build runs with the same SCTL_BUILD_NUMBER (the tag's commit count,
+# from a full checkout) so every artifact prints the same four-part version,
+# which is what release.json names and what the agents check after a swap.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  meta:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      build: ${{ steps.v.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: v
+        run: |
+          set -euo pipefail
+          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' server/Cargo.toml | head -n1)
+          build=$(git rev-list --count HEAD)
+          tag=${GITHUB_REF_NAME#v}
+          [ "$tag" = "$cargo_version" ] || { echo "tag $GITHUB_REF_NAME is not server/Cargo.toml's $cargo_version" >&2; exit 1; }
+          echo "version=$cargo_version.$build" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  cross:
+    name: Build (${{ matrix.target }})
+    needs: meta
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64
+            triple: x86_64-unknown-linux-musl
+            plugin: false
+          - target: aarch64
+            triple: aarch64-unknown-linux-musl
+            plugin: true
+          - target: armv7
+            triple: armv7-unknown-linux-musleabihf
+            plugin: true
+          - target: riscv64
+            triple: riscv64gc-unknown-linux-musl
+            plugin: true
+    env:
+      SCTL_BUILD_NUMBER: ${{ needs.meta.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.1" # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - run: cargo install cross --git https://github.com/cross-rs/cross
+      - run: cross build --release --target ${{ matrix.triple }} -p sctl
+      - if: matrix.plugin
+        run: cross build --release --target ${{ matrix.triple }} -p sctl-comms-quectel
+      - name: Collect
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp target/${{ matrix.triple }}/release/sctl out/sctl-${{ matrix.target }}
+          if [ "${{ matrix.plugin }}" = "true" ]; then
+            cp target/${{ matrix.triple }}/release/libsctl_comms_quectel.so out/libsctl_comms_quectel-${{ matrix.target }}.so
+          fi
+          out/sctl-${{ matrix.target }} --version 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: target-${{ matrix.target }}
+          path: out/*
+          if-no-files-found: error
+
+  openwrt:
+    name: Build (${{ matrix.device }})
+    needs: meta
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - device: we826-qwd   # mips_24kc: server, plugin, libc, libgcc (the XE300 uses the same server and plugin)
+          - device: rut241      # mipsel_24kc
+    env:
+      SCTL_BUILD_NUMBER: ${{ needs.meta.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.device }}
+      - name: Cache the OpenWrt SDK
+        uses: actions/cache@v4
+        with:
+          path: .toolchains
+          key: openwrt-sdk-${{ matrix.device }}-${{ hashFiles('devices/targets/*.sh') }}
+      - run: devices/build.sh ${{ matrix.device }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: device-${{ matrix.device }}
+          path: .artifacts/${{ matrix.device }}/*.gz
+          if-no-files-found: error
+
+  bundle:
+    name: Bundle, sign, publish
+    needs: [meta, cross, openwrt]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: in
+      - name: Assemble
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          RELEASE_NOTES: "sctl ${{ needs.meta.outputs.version }}: see CHANGELOG.md"
+          SIGNING_KEY: ${{ secrets.SCTL_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          find in -type f | sort
+          if [ -n "$SIGNING_KEY" ]; then
+            umask 077
+            printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/signing.pem"
+            export SIGNING_KEY_FILE="$RUNNER_TEMP/signing.pem"
+          fi
+          specs=()
+          for t in x86_64 aarch64 armv7 riscv64; do
+            specs+=("$t:server:in/target-$t/sctl-$t")
+            [ -f "in/target-$t/libsctl_comms_quectel-$t.so" ] && specs+=("$t:plugin:in/target-$t/libsctl_comms_quectel-$t.so")
+          done
+          specs+=("mips_24kc:server:in/device-we826-qwd/sctl-server-mips_24kc.gz:gzip")
+          specs+=("mips_24kc:plugin:in/device-we826-qwd/sctl-comms-quectel-mips_24kc.so.gz:gzip")
+          specs+=("mips_24kc:libc:in/device-we826-qwd/libc-mips_24kc.so.gz:gzip")
+          specs+=("mips_24kc:libgcc:in/device-we826-qwd/libgcc_s-mips_24kc.so.1.gz:gzip")
+          specs+=("mipsel_24kc:server:in/device-rut241/sctl-server-mipsel_24kc.gz:gzip")
+          specs+=("mipsel_24kc:plugin:in/device-rut241/sctl-comms-quectel-mipsel_24kc.so.gz:gzip")
+          scripts/release-bundle.sh release "$VERSION" "${specs[@]}"
+          cat release/release.json
+          if [ -n "${SIGNING_KEY_FILE:-}" ]; then
+            scripts/release-sign.sh verify release/release.json "$(scripts/release-sign.sh pubkey "$SIGNING_KEY_FILE" | sed -n 's/^public_key_hex=//p')"
+            rm -f "$SIGNING_KEY_FILE"
+          fi
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --title "sctl $VERSION" \
+            --notes "Signed release bundle $VERSION. Upload to a relay with \`rundev.sh relay artifacts <user@host> $VERSION <dir>\` (docs/upgrade.md)."

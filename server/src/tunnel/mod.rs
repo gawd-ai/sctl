@@ -9,11 +9,13 @@
 
 use serde_json::Value;
 
+pub mod artifacts;
 pub mod client;
 pub mod history;
 pub mod infra_state;
 pub mod net_state;
 pub mod relay;
+pub mod upgrade_state;
 
 /// A message that can be sent to a device over the tunnel WS.
 /// Text for JSON, Binary for file transfer frames.

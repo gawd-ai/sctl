@@ -97,6 +97,21 @@ QUECTEL_DRIVER_LIB_NAME="libsctl_comms_quectel.so"
 COMMS_REMOTE_DIR="/usr/lib/sctl/comms"
 
 # Architecture → cross-compile target mapping
+# The target name release.json keys artifacts by (docs/upgrade.md), per arch.
+declare -A ARCH_UPGRADE_TARGET=(
+    [riscv64]=riscv64
+    [mipsel]=mipsel_24kc
+    [armv7l]=armv7
+    [aarch64]=aarch64
+    [x86_64]=x86_64
+)
+
+# The usr-bin layout's install.json for an arch (docs/upgrade.md).
+install_json_usr_bin() {
+    local arch=$1
+    printf '{"v":1,"layout":"usr-bin","target":"%s"}' "${ARCH_UPGRADE_TARGET[$arch]:-unknown}"
+}
+
 declare -A ARCH_TARGET=(
     [riscv64]=riscv64gc-unknown-linux-musl
     [mipsel]=mipsel-unknown-linux-musl
@@ -1513,6 +1528,10 @@ do_device_deploy() {
     ssh $ssh_opts "root@$host" "sed -i 's/\r//' /etc/init.d/sctl && chmod +x /etc/init.d/sctl && /etc/init.d/sctl enable"
     ok "Init script installed and enabled"
 
+    # The install layout: from here on the agent can upgrade itself.
+    ssh $ssh_opts "root@$host" "mkdir -p /etc/sctl && printf '%s\n' '$(install_json_usr_bin "$arch")' > /etc/sctl/install.json"
+    ok "install.json written (usr-bin)"
+
     echo ""
     ok "Deploy complete for '$name' ($host)"
     echo ""
@@ -1578,6 +1597,7 @@ do_device_upgrade() {
     log "Uploading new binary..."
     scp $ssh_opts "$bin_path" "root@$host:/usr/bin/sctl"
     upload_comms_provider "$comms_provider" "$arch" "$host" "$ssh_opts"
+    ssh $ssh_opts "root@$host" "mkdir -p /etc/sctl && printf '%s\n' '$(install_json_usr_bin "$arch")' > /etc/sctl/install.json"
 
     log "Starting sctl on $host..."
     ssh $ssh_opts "root@$host" "/etc/init.d/sctl start"
@@ -2361,6 +2381,16 @@ do_device_upgrade_remote() {
             err "Device not reachable for swap"
             exit 1
         fi
+        # The install layout (docs/upgrade.md), so this is the last hand upgrade.
+        local install_json_file
+        install_json_file=$(mktemp)
+        printf '%s\n' "$(install_json_usr_bin "$arch")" > "$install_json_file"
+        if remote_put_file "$url" "$api_key" "$install_json_file" /etc/sctl/install.json 0644; then
+            ok "install.json written (usr-bin)"
+        else
+            warn "could not write /etc/sctl/install.json; the unit will not upgrade itself"
+        fi
+        rm -f "$install_json_file"
         local swap_out
         swap_out=$(remote_exec_stdout_trimmed "$url" "$api_key" \
             "sh -c 'set -e; if [ ! -x /usr/bin/sctl.rollback ]; then cp /usr/bin/sctl /usr/bin/sctl.rollback; fi; cp /tmp/sctl-upgrade /usr/bin/sctl; chmod +x /usr/bin/sctl; sync; echo swap_ok; (sleep 1; kill \$(pgrep -f \"[s]ctl serve\") 2>/dev/null || true) >/dev/null 2>&1 &'" \
@@ -3412,6 +3442,8 @@ EOF
     ssh $ssh_opts "$remote" "mkdir -p /etc/sctl /var/lib/sctl"
     echo "$relay_toml" | ssh $ssh_opts "$remote" "cat > $RELAY_REMOTE_CONFIG"
     ok "Config uploaded"
+    ssh $ssh_opts "$remote" "printf '%s\n' '"'{"v":1,"layout":"systemd","target":"x86_64","unit":"sctl-relay","files":{"server":"/usr/local/bin/sctl"},"health_url":"http://127.0.0.1:8443/api/health","rollback_dir":"/var/lib/sctl/rollback"}'"' > /etc/sctl/install.json"
+    ok "install.json written (systemd)"
 
     # Upload systemd service
     log "Installing systemd service..."
@@ -3564,6 +3596,7 @@ do_relay_deploy() {
     scp $ssh_opts "$RELAY_X86_BIN" "$remote:$RELAY_REMOTE_BIN"
     ssh $ssh_opts "$remote" "chmod +x $RELAY_REMOTE_BIN"
     scp $ssh_opts "$SCTL_DIR/files/sctl-relay.service" "$remote:/etc/systemd/system/sctl-relay.service"
+    ssh $ssh_opts "$remote" "printf '%s\n' '"'{"v":1,"layout":"systemd","target":"x86_64","unit":"sctl-relay","files":{"server":"/usr/local/bin/sctl"},"health_url":"http://127.0.0.1:8443/api/health","rollback_dir":"/var/lib/sctl/rollback"}'"' > /etc/sctl/install.json"
     ssh $ssh_opts "$remote" "systemctl daemon-reload && systemctl start sctl-relay"
     ok "Binary + service deployed"
 
@@ -3676,6 +3709,60 @@ do_relay_upgrade() {
         warn "Relay healthy but uptime=${uptime_secs}s — old process may not have been replaced"
         warn "Check: ssh $remote journalctl -u sctl-relay -n 50"
     fi
+}
+
+# Upload a release bundle (docs/upgrade.md) to a relay: the manifest and its
+# signature first, then every other file, each through the relay's own
+# artifact route on loopback, with the operator key read on the relay side
+# so it never travels. `list` and `delete` are the other two verbs.
+#
+#   ./rundev.sh relay artifacts <user@host> <version> <bundle dir>
+#   ./rundev.sh relay artifacts <user@host> list
+#   ./rundev.sh relay artifacts <user@host> delete <version>
+do_relay_artifacts() {
+    local remote="${1:-}" verb="${2:-}" arg="${3:-}"
+    if [[ -z "$remote" || -z "$verb" ]]; then
+        err "Usage: $0 relay artifacts <user@host> <version> <bundle dir>"
+        err "       $0 relay artifacts <user@host> list"
+        err "       $0 relay artifacts <user@host> delete <version>"
+        exit 1
+    fi
+    local ssh_opts="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+    # The relay's operator key, read where it lives.
+    local key_expr="\$(sed -n 's/^api_key *= *\"\(.*\)\"/\1/p' $RELAY_REMOTE_CONFIG | head -n1)"
+    local base="http://127.0.0.1:8443/api/tunnel/artifacts"
+    case "$verb" in
+        list)
+            ssh $ssh_opts "$remote" "curl -sS -H \"Authorization: Bearer $key_expr\" $base" | jq .
+            ;;
+        delete)
+            [[ -n "$arg" ]] || { err "delete needs a version"; exit 1; }
+            ssh $ssh_opts "$remote" "curl -sS -X DELETE -H \"Authorization: Bearer $key_expr\" $base/$arg" | jq .
+            ;;
+        *)
+            local version="$verb" dir="$arg"
+            [[ -d "$dir" ]] || { err "no bundle directory: $dir"; exit 1; }
+            [[ -f "$dir/release.json" && -f "$dir/release.json.sig" ]] || { err "$dir has no release.json + release.json.sig"; exit 1; }
+            local files=("release.json" "release.json.sig")
+            local f
+            for f in "$dir"/*; do
+                f=$(basename "$f")
+                [[ "$f" == "release.json" || "$f" == "release.json.sig" ]] && continue
+                files+=("$f")
+            done
+            for f in "${files[@]}"; do
+                log "Uploading $f..."
+                local out
+                out=$(ssh $ssh_opts "$remote" "curl -sS -X PUT -H \"Authorization: Bearer $key_expr\" --data-binary @- $base/$version/$f" < "$dir/$f")
+                if [[ "$(printf '%s' "$out" | jq -r '.stored // empty' 2>/dev/null)" != "$f" ]]; then
+                    err "upload of $f refused: $out"
+                    exit 1
+                fi
+            done
+            ok "Bundle $version on $remote:"
+            ssh $ssh_opts "$remote" "curl -sS -H \"Authorization: Bearer $key_expr\" $base" | jq ".versions[] | select(.version == \"$version\")"
+            ;;
+    esac
 }
 
 do_relay_status() {
@@ -4075,6 +4162,7 @@ case "${1:-setup}" in
             upgrade) do_relay_upgrade "${3:-}" ;;
             status)  do_relay_status "${3:-}" ;;
             sctlin)  do_relay_sctlin "${3:-}" ;;
+            artifacts) do_relay_artifacts "${3:-}" "${4:-}" "${5:-}" ;;
             *)
                 echo "Usage: $0 relay <command> [user@host]"
                 echo ""
@@ -4145,6 +4233,8 @@ case "${1:-setup}" in
         echo "  relay upgrade [user@host]   binary-only upgrade"
         echo "  relay status [user@host]    health check + connected devices"
         echo "  relay sctlin [user@host]    deploy sctlin web UI to relay"
+        echo "  relay artifacts <user@host> <version> <dir>   upload a release bundle (docs/upgrade.md)"
+        echo "  relay artifacts <user@host> list|delete <ver> list or remove bundles"
         echo ""
         echo "Playbook library:"
         echo "  playbook ls                              list playbooks in library"

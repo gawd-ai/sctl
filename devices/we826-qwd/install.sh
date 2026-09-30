@@ -304,7 +304,7 @@ payload_kb=$(du -k "$COMMON_DIR/sctl-ramboot.init" "$COMMON_DIR/sctl-ramboot.sh"
 # shellcheck disable=SC2086
 avail_kb=$($SSH $SSH_OPTS "$HOST" "df -k /overlay | awk 'NR==2 {print \$4}'")
 # shellcheck disable=SC2086
-existing_kb=$($SSH $SSH_OPTS "$HOST" "du -k /etc/init.d/sctl /etc/sctl/ramboot.sh /etc/sctl/ramboot.conf /etc/sctl/sctl.toml /etc/init.d/netage-wanpref /etc/sctl/wanpref.conf 2>/dev/null | awk '{s += \$1} END {print s + 0}'")
+existing_kb=$($SSH $SSH_OPTS "$HOST" "du -k /etc/init.d/sctl /etc/sctl/ramboot.sh /etc/sctl/ramboot.conf /etc/sctl/sctl.toml /etc/sctl/install.json /etc/init.d/netage-wanpref /etc/sctl/wanpref.conf 2>/dev/null | awk '{s += \$1} END {print s + 0}'")
 effective_avail_kb=$((avail_kb + existing_kb))
 required_kb=$((payload_kb + MIN_MARGIN_KB))
 
@@ -346,6 +346,7 @@ cp /tmp/sctl.init /etc/init.d/sctl
 cp /tmp/ramboot.sh /etc/sctl/ramboot.sh
 cp /tmp/ramboot.conf /etc/sctl/ramboot.conf
 cp /tmp/sctl.toml /etc/sctl/sctl.toml
+printf '{"v":1,"layout":"ramboot","target":"mips_24kc"}\n' > /etc/sctl/install.json
 cp /tmp/wanpref.init /etc/init.d/netage-wanpref
 cp /tmp/wanpref.conf /etc/sctl/wanpref.conf
 

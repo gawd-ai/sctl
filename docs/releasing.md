@@ -214,3 +214,30 @@ in production):
 6. **Tag at deploy.** Tag (`v0.6.0`) the exact commit the deployed
    artifacts were built from, when they are live — not when the branch
    merges. The tag is the statement "this is what production runs".
+
+## Managed upgrades (0.6.7+)
+
+From 0.6.7 a release is a **signed bundle** built by CI on the tag
+(`.github/workflows/release.yml`): one artifact set per target, one
+`release.json` naming every file's SHA-256, signed with the key in the
+`SCTL_RELEASE_SIGNING_KEY` secret (`scripts/release-sign.sh`). The bundle is
+uploaded to each relay (`./rundev.sh relay artifacts <user@host> <version>
+<dir>`) and devices upgrade themselves when the fleet asks
+(`POST /api/upgrade`), rolling back on their own when the new agent does not
+answer health. `docs/upgrade.md` is the contract.
+
+The paths above (`device upgrade`, `device upgrade-remote`, `relay upgrade`)
+remain for a unit that runs an agent older than 0.6.7 or has no
+`/etc/sctl/install.json`; each of them now writes that file, so the last
+hand upgrade leaves a unit that upgrades itself from then on. `sctl upgrade
+<version>` from a shell on the box does what the fleet does, for a bench.
+
+Release checklist additions:
+1. The tag must equal `server/Cargo.toml`'s version (`v0.6.7` for `0.6.7`);
+   the workflow refuses otherwise. Fetch before tagging.
+2. Wait for the `Release` workflow; download the bundle from the GitHub
+   release, or `scripts/release-bundle.sh` a bench bundle from local
+   artifacts (unsigned unless `SIGNING_KEY_FILE` is set; a bench signs with
+   its own key and lists it in `[upgrade] trust_keys`).
+3. `./rundev.sh relay artifacts <user@host> <version> <dir>` on every relay,
+   then the fleet's rollout.

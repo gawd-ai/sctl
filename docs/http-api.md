@@ -962,6 +962,61 @@ detach and keep buffering output for later re-attach.
 
 ---
 
+## Managed upgrades
+
+The agent replaces itself with a signed release its relay serves, restarts,
+proves the new agent healthy and rolls back on its own when it is not.
+`docs/upgrade.md` is the contract; these are the device's three routes.
+**Auth: API key Bearer.** Reachable through the relay like any device route,
+which is how the fleet asks.
+
+### `POST /api/upgrade`
+
+Ask the device to upgrade. Body:
+
+```json
+{"version": "0.6.8.440",
+ "request_id": "rollout-7f3a/ring-1",
+ "manifest_url": "https://relay.example/api/tunnel/artifacts/0.6.8.440/release.json",
+ "not_before": "2026-10-02T06:00:00Z",
+ "not_after": "2026-10-02T09:00:00Z",
+ "allow_downgrade": false,
+ "mirror_base": "http://host/artifacts/0.6.8.440"}
+```
+
+`version` is required. `manifest_url` defaults to the device's own relay
+(`https://<host of tunnel.url>/api/tunnel/artifacts/<version>/release.json`);
+the artifacts are fetched from the manifest's directory with the tunnel key.
+`not_before` and `not_after` are the window the requester means: read
+outside it, the request is refused and nothing happens. `mirror_base` is for
+the ramboot layout only.
+
+Responses: `202` `{accepted: true, state}` (staging started; the outcome
+arrives as [`upgrade.state`](#upgradestate-where-the-devices-upgrade-stands)),
+`200` `{accepted: false, state, running_version}` (already at that version).
+
+Errors: `409` `UPGRADE_IN_FLIGHT` (one is in progress; `detail.state` says
+which), `423` `UPGRADE_HELD` (`[upgrade] hold` or `/etc/sctl/upgrade-hold`),
+`422` `UPGRADE_REFUSED` with `detail.reason` one of `window_passed`,
+`no_clock`, `downgrade`, `no_install_json`, `no_mirror`, `manifest_invalid`
+(the version does not parse), `500` `UPGRADE_CONFIG` (a `trust_keys` entry
+does not parse).
+
+### `GET /api/upgrade`
+
+Where the device stands. Response `200`: `{state, running_version, target,
+layout, install, install_error, hold}`. `state` is the `upgrade.state` body
+(`phase`, `outcome`, `reason`, `from_version`, `to_version`, `log_tail`, ...);
+`install` is `install.json` with the layout's defaults applied; `layout` is
+`null` on a device installed before 0.6.7.
+
+### `DELETE /api/upgrade`
+
+Clear a finished state (for a person at the box; the fleet does not need
+it). Response `200`: as `GET`. Error: `409` `UPGRADE_IN_FLIGHT`.
+
+---
+
 ## Tunnel relay
 
 With `[tunnel] relay = true`, the same binary also acts as the fleet relay:
@@ -1133,8 +1188,9 @@ via `?token=` query parameter** (`403` plain-text on mismatch).
 Response `200`: `{devices: [{serial, clients, client_count,
 last_heartbeat_ago_ms, pending_requests_count, session_subscriptions,
 connected_since_ms, dropped_messages, last_gps_fix, last_lte_signal,
-egress_ip, features}]}`. `features` is what the device offered at
-registration.
+egress_ip, features, version, target, layout}]}`. `features` is what the
+device offered at registration; `version`, `target` and `layout` are what a
+0.6.7+ device said it is (`null` from an older agent).
 
 ### `GET /api/tunnel/events`
 
@@ -1144,13 +1200,14 @@ targets report, pushed as it changes. **Auth: relay `tunnel_key` as `Authorizati
 `?token=` query is never read. Failures before upgrade (plain text): `403`
 on a missing or wrong key, `429` when 8 subscribers are already connected.
 
-On connect the relay sends `hello`, then replays every connected device
-(its `device.connected`, followed by its latest `net.state` and its latest
-`infra.state`, those it has, in that order), then `replay.done`, then live
+On connect the relay sends `hello`, then an `artifacts` frame (the release
+bundles it holds, see below), then replays every connected device (its
+`device.connected`, followed by its latest `net.state`, `infra.state` and
+`upgrade.state`, those it has, in that order), then `replay.done`, then live
 frames:
 
 ```json
-{"type": "hello", "relay_version": "0.6.5.820", "relay_epoch": 1790000000000, "features": ["net.state", "infra.state"]}
+{"type": "hello", "relay_version": "0.6.7.440", "relay_epoch": 1790000000000, "features": ["net.state", "infra.state", "upgrade.state"]}
 {"type": "device.connected", "serial": "XE300-1", "connection_id": 17, "connected_at": 1790000123456, "egress_ip": "203.0.113.7", "features": ["net.state", "infra.state"], "replay": true}
 {"type": "net.state", "serial": "XE300-1", "connection_id": 17, "received_at": 1790000123789, "state": {"type": "net.state", "v": 1, "...": "..."}, "replay": true}
 {"type": "infra.state", "serial": "XE300-1", "connection_id": 17, "received_at": 1790000123801, "state": {"type": "infra.state", "v": 1, "config_version": 7, "...": "..."}, "replay": true}
@@ -1227,3 +1284,56 @@ Response `200` (ChunkAck): `{transfer_id, chunk_index, ok, error?}`.
 
 Errors: device STP errors pass through, plus the standard relay failure
 modes.
+
+### Release bundles
+
+The relay holds release bundles under `<data_dir>/artifacts/<version>/` and
+serves them to its own devices (`docs/upgrade.md`, "Artifacts on the relay").
+A bundle is accepted in order: `release.json` and `release.json.sig` first,
+verified against the keys the agents embed (plus `[upgrade] trust_keys`),
+then the files the manifest names, each checked against its SHA-256 as it
+lands. Every change publishes `artifacts.changed` on
+[`GET /api/tunnel/events`](#get-apitunnelevents), and every replay opens with
+the same listing as `{"type": "artifacts", "versions": [...], "replay": true}`.
+
+### `GET /api/tunnel/artifacts`
+
+List the bundles. **Auth: `tunnel_key` or the relay's operator `api_key`, as
+`Authorization: Bearer`.** Response `200`: `{enabled, versions: [{version,
+verified, complete, channel, targets, published_at, min_from_version, notes,
+files, missing, mirror}]}`, newest version first. `enabled` is `false` on a
+relay with no `data_dir`.
+
+### `PUT /api/tunnel/artifacts/{version}/{file}`
+
+Store one file of a bundle; the body is the file. **Auth: operator
+`api_key` as Bearer** (`403` otherwise). Response `200`: `{stored, bytes,
+bundle}`.
+
+Errors: `409` `MANIFEST_FIRST` (a file before a verified manifest), `422`
+`MANIFEST_INVALID`, `VERSION_MISMATCH` (the manifest's version is not the
+path's), `MANIFEST_BAD_SIGNATURE`, `MANIFEST_UNSIGNED`, `NOT_IN_MANIFEST`,
+`SHA256_MISMATCH` (the file is removed), `413` `TOO_LARGE`, `503`
+`NO_DATA_DIR`.
+
+### `PUT /api/tunnel/artifacts/{version}/mirror`
+
+Set where a ramboot device's boot fetcher (busybox curl, no modern TLS) can
+fetch the same files over plain HTTP: body `{"url": "http://host/path"}`,
+an empty `url` clears it. **Auth: operator `api_key`.** Response `200`:
+`{version, mirror}`. Errors: `400` `INVALID_URL`, `404` `NOT_FOUND`.
+
+### `GET /api/tunnel/artifacts/{version}/{file}`
+
+Serve a bundle file. **Auth: `tunnel_key` (every device holds it) or the
+operator `api_key`, as Bearer.** Response `200` with `Content-Length`,
+`ETag` (the manifest's sha256), `Accept-Ranges: bytes`; a `Range: bytes=a-b`
+request answers `206` with `Content-Range`, an unsatisfiable one `416`. A
+download dropped on LTE resumes from where it stopped.
+
+Errors: `404` `NOT_FOUND` (no such bundle or file).
+
+### `DELETE /api/tunnel/artifacts/{version}`
+
+Remove a bundle. **Auth: operator `api_key`.** Response `200`: `{removed}`.
+Errors: `404` `NOT_FOUND`.

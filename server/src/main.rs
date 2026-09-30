@@ -60,6 +60,24 @@ enum Command {
     Supervise {
         config: Option<String>,
     },
+    /// `sctl upgrade <version>`: what `POST /api/upgrade` does, from a shell.
+    Upgrade {
+        config: Option<String>,
+        version: String,
+        manifest_url: Option<String>,
+        allow_downgrade: bool,
+        mirror_base: Option<String>,
+    },
+    /// `sctl upgrade-apply --stage <dir>`: the detached helper.
+    UpgradeApply {
+        stage: String,
+    },
+    /// `sctl target`: the compile target.
+    PrintTarget,
+    /// `sctl install-info`: `install.json` with defaults applied.
+    InstallInfo {
+        config: Option<String>,
+    },
     PrintHelp(&'static str),
     PrintVersion,
 }
@@ -81,6 +99,50 @@ async fn main() {
         Command::Serve { config, skip_lock } => {
             run_server(config.as_deref(), skip_lock).await;
         }
+        Command::Upgrade {
+            config,
+            version,
+            manifest_url,
+            allow_downgrade,
+            mirror_base,
+        } => {
+            let code = run_upgrade_cli(
+                config.as_deref(),
+                version,
+                manifest_url,
+                allow_downgrade,
+                mirror_base,
+            )
+            .await;
+            std::process::exit(code);
+        }
+        Command::UpgradeApply { stage } => {
+            std::process::exit(sctl::upgrade::apply::main(&stage));
+        }
+        Command::PrintTarget => {
+            println!("{}", sctl::upgrade::TARGET);
+        }
+        Command::InstallInfo { config } => {
+            let config = Config::load(config.as_deref());
+            match load_install_info() {
+                (Some(info), _) => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&info.report(&config.server.listen))
+                        .unwrap_or_default()
+                ),
+                (None, Some(error)) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+                (None, None) => {
+                    eprintln!(
+                        "no {}: this device was installed before 0.6.7",
+                        install_json_path().display()
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
         Command::PrintHelp(help) => {
             println!("{help}");
         }
@@ -88,6 +150,118 @@ async fn main() {
             println!("sctl {VERSION}");
         }
     }
+}
+
+/// Where `install.json` is: `SCTL_INSTALL_JSON` for a bench, else the default.
+fn install_json_path() -> std::path::PathBuf {
+    std::env::var("SCTL_INSTALL_JSON").map_or_else(
+        |_| std::path::PathBuf::from(sctl::upgrade::install::DEFAULT_PATH),
+        std::path::PathBuf::from,
+    )
+}
+
+/// `(info, error)`: the file parsed, or why it could not be (absent is
+/// neither).
+fn load_install_info() -> (Option<sctl::upgrade::install::InstallInfo>, Option<String>) {
+    match sctl::upgrade::install::InstallInfo::load(&install_json_path(), sctl::upgrade::TARGET) {
+        Ok(info) => (info, None),
+        Err(e) => (None, Some(e)),
+    }
+}
+
+/// `sctl upgrade`: stage and hand off the way the route does, then wait for
+/// the helper's outcome so the shell sees it. Exit 0 on `ok`, 1 otherwise.
+async fn run_upgrade_cli(
+    config_path: Option<&str>,
+    version: String,
+    manifest_url: Option<String>,
+    allow_downgrade: bool,
+    mirror_base: Option<String>,
+) -> i32 {
+    use sctl::upgrade::state::{Handle, Outcome, Phase, UpgradeState};
+    let config = Config::load(config_path);
+    init_logging(&std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()));
+    let (install, install_error) = load_install_info();
+    if let Some(e) = install_error {
+        eprintln!("{e}");
+        return 1;
+    }
+    let trust_keys = match sctl::upgrade::keys::trusted(&config.upgrade.trust_keys) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let ctx = sctl::upgrade::stage::Context {
+        state_dir: config.server.state_dir().to_string(),
+        listen: config.server.listen.clone(),
+        install,
+        tunnel: config.tunnel.clone(),
+        trust_keys,
+        config_path: config_path.map(ToString::to_string),
+        hold: config.upgrade.hold,
+        hold_file: std::path::PathBuf::from(sctl::upgrade::install::HOLD_PATH),
+        running_version: VERSION.to_string(),
+    };
+    let req = sctl::upgrade::stage::Request {
+        version: version.clone(),
+        request_id: Some(format!("cli-{}", std::process::id())),
+        manifest_url,
+        not_before: None,
+        not_after: None,
+        allow_downgrade,
+        mirror_base,
+    };
+    if let Err(refusal) = sctl::upgrade::stage::refuse_early(&ctx, &req) {
+        eprintln!("refused: {refusal}");
+        return 1;
+    }
+    let handle = Arc::new(Handle::open(&ctx.state_dir));
+    if handle.current().in_flight() {
+        eprintln!("an upgrade is in flight: {:?}", handle.current());
+        return 1;
+    }
+    handle.set(UpgradeState::staging(
+        req.request_id.clone(),
+        VERSION,
+        &version,
+    ));
+    sctl::upgrade::stage::run(ctx, req, handle.clone()).await;
+    let state = handle.current();
+    if state.phase == Phase::Done {
+        eprintln!(
+            "not applied: {:?}: {}",
+            state.reason,
+            state.detail.unwrap_or_default()
+        );
+        return 1;
+    }
+    eprintln!("handed off to the helper; waiting for its outcome (the service restarts now)");
+    // The helper writes the state file; watch it the way the server does.
+    let path = handle.path().to_path_buf();
+    let watched = tokio::time::timeout(std::time::Duration::from_secs(500), async {
+        loop {
+            if let Some(state) = sctl::upgrade::state::load(&path) {
+                if state.phase == Phase::Done {
+                    return state;
+                }
+            }
+            // A file written by another process: no channel wakes us, so a
+            // short sleep between reads is the only clock here, on a CLI.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    })
+    .await;
+    let Ok(state) = watched else {
+        eprintln!("no outcome after 500s; see the stage log");
+        return 1;
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&state).unwrap_or_default()
+    );
+    i32::from(state.outcome != Some(Outcome::Ok))
 }
 
 fn parse_cli<I>(args: I) -> Result<Command, String>
@@ -110,6 +284,7 @@ where
             match args[1].as_str() {
                 "serve" => Ok(Command::PrintHelp(serve_help())),
                 "supervise" => Ok(Command::PrintHelp(supervise_help())),
+                "upgrade" => Ok(Command::PrintHelp(upgrade_help())),
                 other => Err(format!("unknown help topic '{other}'")),
             }
         }
@@ -122,8 +297,92 @@ where
             args.remove(0);
             parse_supervise_args(args)
         }
+        "upgrade" => {
+            args.remove(0);
+            parse_upgrade_args(args)
+        }
+        "upgrade-apply" => {
+            args.remove(0);
+            let mut stage = None;
+            let mut iter = args.into_iter();
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "--stage" => stage = Some(next_arg(&mut iter, "--stage")?),
+                    other if other.starts_with("--stage=") => {
+                        stage = Some(other["--stage=".len()..].to_string());
+                    }
+                    other => return Err(format!("unknown upgrade-apply argument '{other}'")),
+                }
+            }
+            stage
+                .map(|stage| Command::UpgradeApply { stage })
+                .ok_or_else(|| "upgrade-apply needs --stage <dir>".to_string())
+        }
+        "target" => Ok(Command::PrintTarget),
+        "install-info" => {
+            args.remove(0);
+            let mut config = None;
+            let mut iter = args.into_iter();
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "--config" => config = Some(next_arg(&mut iter, "--config")?),
+                    other if other.starts_with("--config=") => {
+                        config = Some(other["--config=".len()..].to_string());
+                    }
+                    other => return Err(format!("unknown install-info argument '{other}'")),
+                }
+            }
+            Ok(Command::InstallInfo { config })
+        }
         _ => parse_serve_args(args),
     }
+}
+
+fn parse_upgrade_args(args: Vec<String>) -> Result<Command, String> {
+    let mut config = None;
+    let mut version = None;
+    let mut manifest_url = None;
+    let mut allow_downgrade = false;
+    let mut mirror_base = None;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(Command::PrintHelp(upgrade_help())),
+            "--config" => config = Some(next_arg(&mut iter, "--config")?),
+            "--manifest" => manifest_url = Some(next_arg(&mut iter, "--manifest")?),
+            "--mirror" => mirror_base = Some(next_arg(&mut iter, "--mirror")?),
+            "--allow-downgrade" => allow_downgrade = true,
+            other if other.starts_with("--config=") => {
+                config = Some(other["--config=".len()..].to_string());
+            }
+            other if other.starts_with("--manifest=") => {
+                manifest_url = Some(other["--manifest=".len()..].to_string());
+            }
+            other if other.starts_with("--mirror=") => {
+                mirror_base = Some(other["--mirror=".len()..].to_string());
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown upgrade argument '{other}'"))
+            }
+            other if version.is_none() => version = Some(other.to_string()),
+            other => return Err(format!("unexpected upgrade argument '{other}'")),
+        }
+    }
+    let version = version.ok_or_else(|| "upgrade needs a version".to_string())?;
+    Ok(Command::Upgrade {
+        config,
+        version,
+        manifest_url,
+        allow_downgrade,
+        mirror_base,
+    })
+}
+
+fn upgrade_help() -> &'static str {
+    "Upgrade this agent to a signed release its relay serves (docs/upgrade.md)\n\n\
+Usage: sctl upgrade <VERSION> [OPTIONS]\n\n\
+Options:\n      --config <PATH>     Path to TOML config file\n      --manifest <URL>    release.json to use instead of the relay's\n      --mirror <URL>      Where a ramboot device's boot fetcher gets the files\n      --allow-downgrade   Accept a version below the running one\n  -h, --help              Print help\n\n\
+Related:\n  sctl target          Print the compile target\n  sctl install-info    Print install.json with defaults applied\n  sctl upgrade-apply --stage <DIR>   The detached helper (never run by hand)"
 }
 
 fn parse_serve_args(args: Vec<String>) -> Result<Command, String> {
@@ -171,7 +430,7 @@ where
 fn main_help() -> &'static str {
     "Remote shell control service for Linux devices\n\n\
 Usage: sctl [COMMAND] [OPTIONS]\n\n\
-Commands:\n  serve      Run the HTTP/WS server (default when no subcommand is given)\n  supervise  Start and monitor the server process\n  help       Print this message or the help for a command\n\n\
+Commands:\n  serve      Run the HTTP/WS server (default when no subcommand is given)\n  supervise  Start and monitor the server process\n  upgrade    Upgrade this agent to a signed release (see `help upgrade`)\n  help       Print this message or the help for a command\n\n\
 Options:\n  -h, --help     Print help\n  -V, --version  Print version"
 }
 
@@ -516,6 +775,34 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
             ))
         });
 
+    // How this box is installed, and where its last upgrade stands.
+    let (install, install_error) = load_install_info();
+    if let Some(e) = &install_error {
+        warn!("upgrade: {e}; this device cannot upgrade itself until install.json is fixed");
+    }
+    match &install {
+        Some(i) => info!(
+            layout = i.layout.as_str(),
+            target = sctl::upgrade::TARGET,
+            "Install layout"
+        ),
+        None if install_error.is_none() => info!(
+            "No {}: installed before 0.6.7, upgrades by hand only",
+            install_json_path().display()
+        ),
+        None => {}
+    }
+    let upgrade = Arc::new(sctl::upgrade::state::Handle::open(
+        config.server.state_dir(),
+    ));
+    let upgrade_stage_dir = sctl::upgrade::state::upgrade_dir(config.server.state_dir())
+        .join("stage")
+        .join(upgrade.current().to_version.unwrap_or_default());
+    let helper_working = sctl::upgrade::watch::reconcile(&upgrade, &upgrade_stage_dir, VERSION);
+    if helper_working {
+        tokio::spawn(sctl::upgrade::watch::watch_until_done(upgrade.clone()));
+    }
+
     let mut state = AppState {
         session_manager,
         config: Arc::new(config),
@@ -536,6 +823,10 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         api_router: Arc::new(std::sync::OnceLock::new()),
         netwatch: net_rx,
         relay_route,
+        upgrade,
+        install: install.map(Arc::new),
+        install_error,
+        config_path: config_path.map(ToString::to_string),
     };
 
     // Build router
@@ -633,6 +924,12 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
             "/api/infra/discover/subnets",
             get(infra::routes::discover_subnets),
         )
+        .route(
+            "/api/upgrade",
+            get(sctl::upgrade::routes::get_upgrade)
+                .post(sctl::upgrade::routes::post_upgrade)
+                .delete(sctl::upgrade::routes::delete_upgrade),
+        )
         .layer(middleware::from_fn(sctl::auth::require_api_key));
 
     let ws_route = Router::new().route("/api/ws", get(ws::ws_upgrade));
@@ -662,11 +959,15 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     if let Some(ref tc) = tunnel_config {
         if tc.relay {
             info!("Tunnel relay mode enabled");
-            let relay_state = tunnel::relay::RelayState::new(
+            let mut relay_state = tunnel::relay::RelayState::new(
                 tc.tunnel_key.clone(),
                 tc.heartbeat_timeout_secs,
                 tc.tunnel_proxy_timeout_secs,
                 Some(&data_dir),
+            );
+            relay_state.set_operator(
+                state.config.auth.api_key.clone(),
+                sctl::upgrade::keys::trusted(&state.config.upgrade.trust_keys).unwrap_or_default(),
             );
             state.relay_history = Some(relay_state.history.clone());
             state.device_snapshots = Some(relay_state.device_snapshots.clone());

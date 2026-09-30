@@ -139,6 +139,13 @@ level = "info"
 # startup_timeout_secs = 15
 # request_timeout_secs = 20
 
+# [upgrade]
+# Managed upgrades (docs/upgrade.md): the box's own say over them.
+# hold = false                     # Refuse every upgrade request (423, reported as held);
+#                                  # the file /etc/sctl/upgrade-hold does the same without an edit.
+# trust_keys = []                  # Extra release signing public keys (64 hex characters each)
+#                                  # for a bench signing its own builds; never set in the fleet.
+
 # [gps]
 # GPS/location tracking through the active comms provider.
 # device = "/dev/ttyUSB2"          # Optional AT-port hint; [comms].device wins; autodetect preferred

@@ -93,6 +93,7 @@ cp /tmp/sctl-server-mipsel_24kc.gz /usr/local/lib/sctl/sctl-server-mipsel_24kc.g
 cp /tmp/sctl-comms-quectel-mipsel_24kc.so.gz /usr/local/lib/sctl/sctl-comms-quectel-mipsel_24kc.so.gz
 cp /tmp/sctl.init /etc/init.d/sctl
 cp /tmp/sctl.toml /etc/sctl/sctl.toml
+printf '{"v":1,"layout":"gz-tmp","target":"mipsel_24kc"}\n' > /etc/sctl/install.json
 
 chmod 0644 /usr/local/lib/sctl/*.gz
 chmod 0755 /etc/init.d/sctl
