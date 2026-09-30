@@ -121,7 +121,8 @@ Response `200`:
 - `tunnel.relay_route`: the host route sctl keeps to the relay
   (`[tunnel] relay_route` in the configuration reference),
   `{"mode": "follow_default", "dev": "eth1", "via": "10.42.0.1", "suspect": [], "rp_filter_strict": []}`.
-  `mode` is `off` or `follow_default`; `dev` and `via` are `null` while sctl
+  `mode` is `off`, `follow_default` or `prefer` (then `prefer` lists the uplinks
+  in order); `dev` and `via` are `null` while sctl
   holds no route (always with `off`); `suspect` lists the uplinks that did
   not answer the relay and are waiting to be asked again. `rp_filter_strict`
   lists the uplinks sctl may probe whose reverse-path filtering is strict
@@ -155,8 +156,10 @@ Response `200` — an object containing only the requested groups:
 - `core` — `serial`, `hostname`, `kernel`, `system_uptime_secs`,
   `cpu_model`, `load_average`, `memory` (`total_bytes`, `available_bytes`,
   `used_bytes`), `safe_mode` (`{active, flag?}`).
-- `interfaces` — array of network interfaces (with IP addresses unless
-  `include_interface_addresses_in_info` is off).
+- `interfaces` — array of network interfaces: `name`, `state`, `mac`, `addresses`
+  (IP addresses unless `include_interface_addresses_in_info` is off), `master`
+  (the bridge the interface is a port of, read from sysfs; `null` otherwise) and
+  `bridge` (`true` when the interface is itself a bridge)
 - `disk` — `disk` (root filesystem `total_bytes`/`used_bytes`, kept for
   back-compat) plus `disks` (all mounted storages).
 - `tunnel` — `{connected, relay_url, reconnects}` (tunnel-client mode only;
@@ -762,7 +765,11 @@ recovery_log: [...]}`. Each result carries `status`, `latency_ms`, `since`,
 for `http_api` targets, `http_status` and `data` (the profile's structured
 snapshot; after a failed check the last good snapshot stays, with the
 status and counters saying it is old). When the subsystem is unavailable
-this returns an empty result set (`config_version: 0`), not an error.
+or holds no config this returns an empty result set (`config_version: 0`),
+not an error. The same per-target fields minus `data` are pushed over the
+tunnel as [`infra.state`](#infrastate-the-devices-infra-results) whenever
+a status changes, so a collector on the relay's event stream need not poll
+this route.
 
 ### `GET /api/infra/history/{target_id}`
 
@@ -1010,8 +1017,9 @@ Query parameters: `serial` (required; 1–64 chars of `[A-Za-z0-9._-]`,
 `400` plain-text on bad format). `403` plain-text on a bad tunnel key.
 
 After the upgrade, the device sends `{"type": "tunnel.register",
-"api_key": "<its API key>", "features": ["net.state"]}` and receives
-`{"type": "tunnel.register.ack", "serial": "...", "features": ["net.state"]}`.
+"api_key": "<its API key>", "features": ["net.state", "infra.state"]}` and
+receives `{"type": "tunnel.register.ack", "serial": "...", "features":
+["net.state", "infra.state"]}`.
 The registered key is what `/d/{serial}/api/*` clients must present.
 Re-registration with the same serial evicts the stale connection (pending
 requests drain as `DEVICE_RECONNECTING`); existing relay WS clients are
@@ -1020,8 +1028,8 @@ preserved across the reconnect. Devices missing heartbeats for
 
 `features` is optional on both sides, and a peer that predates it ignores
 it. The relay keeps up to 16 of the device's entries of at most 32 bytes
-each and drops anything else. A device sends `net.state` only when the ack
-advertises it.
+each and drops anything else. A device sends `net.state` and `infra.state`
+only when the ack advertises each.
 
 #### `net.state`: the device's network
 
@@ -1055,7 +1063,8 @@ the last one sent on that connection, at most one per second:
   is the sysfs word (`up`, `down`, `lowerlayerdown`, `dormant`, `testing`,
   `notpresent`, `unknown`); `carrier` is `null` on kernels that do not
   report it; `metric` is the lowest main-table IPv4 default-route metric on
-  the interface; `ip` is its primary IPv4 address.
+  the interface; `ip` is its primary IPv4 address; `master` names the bridge
+  (or bond) the interface is a port of and is absent when it is not enslaved.
 - `default_routes`: main-table IPv4 default routes, lowest metric first.
 - `relay_route`: the kernel's route to the relay the tunnel is connected to,
   what `ip route get` says (`null` when there is none). `tunnel`: the live
@@ -1073,6 +1082,49 @@ connection starts with none), publishes it on
 device's `GET /d/{serial}/api/ws` clients. `GET /api/net` answers with the
 same message on demand.
 
+#### `infra.state`: the device's Infra results
+
+A device whose relay advertises `infra.state` sends this text frame right
+after the ack, then whenever a target's status changes or a monitoring
+config is applied or removed, if the content differs from the last one
+sent on that connection, at most one per second. A check that leaves the
+status alone (a latency reading, a counter) sends nothing. A collector
+that reads the stream can stop polling `GET /api/infra/results`.
+
+```json
+{
+  "type": "infra.state", "v": 1, "ts": "2026-09-30T12:00:00Z",
+  "config_version": 7,
+  "targets": {
+    "6f0b2c4e-9d3a-4c1f-8e2b-1a2b3c4d5e6f": {
+      "status": "up", "latency_ms": 40, "since": "2026-09-30T11:58:00Z",
+      "consecutive_ok": 3, "consecutive_fail": 0,
+      "last_check": "2026-09-30T12:00:00Z", "detail": "API OK",
+      "name": "Peplink MAX BR1", "http_status": 200
+    }
+  },
+  "truncated": false
+}
+```
+
+- `config_version` is the config the results reflect, `0` when the device
+  holds none (then `targets` is empty). `ts` is the device's clock.
+- `targets`, sorted by id: each entry carries what
+  [`GET /api/infra/results`](#get-apiinfraresults) carries minus `data`:
+  `status` (`unknown`, `up`, `degraded`, `down`), `latency_ms`, `since`,
+  `consecutive_ok`, `consecutive_fail`, `last_check` (empty before the
+  first check), `detail` (the first 160 characters), `name`, and
+  `http_status` when the check speaks HTTP. No recovery log.
+- Cap: the relay drops an `infra.state` over 16 KiB, so a message that
+  would exceed it loses every `detail` first, then every `name`, then the
+  tail of the target list (the first N by id are kept), and `truncated` is
+  `true`.
+
+The relay keeps the latest `infra.state` of each connection the way it
+keeps `net.state`, publishes it on
+[`GET /api/tunnel/events`](#get-apitunnelevents), and forwards it to the
+device's `GET /d/{serial}/api/ws` clients.
+
 ### `GET /api/tunnel/devices`
 
 List devices currently connected to the relay. **Auth: relay `tunnel_key`
@@ -1087,19 +1139,21 @@ registration.
 ### `GET /api/tunnel/events`
 
 The relay's device event stream, a WebSocket of JSON text frames: which
-devices are connected and what their network looks like, pushed as it
-changes. **Auth: relay `tunnel_key` as `Authorization: Bearer` only**; a
+devices are connected, what their network looks like and what their Infra
+targets report, pushed as it changes. **Auth: relay `tunnel_key` as `Authorization: Bearer` only**; a
 `?token=` query is never read. Failures before upgrade (plain text): `403`
 on a missing or wrong key, `429` when 8 subscribers are already connected.
 
 On connect the relay sends `hello`, then replays every connected device
-(its `device.connected`, followed by its latest `net.state` if it has
-one), then `replay.done`, then live frames:
+(its `device.connected`, followed by its latest `net.state` and its latest
+`infra.state`, those it has, in that order), then `replay.done`, then live
+frames:
 
 ```json
-{"type": "hello", "relay_version": "0.6.4.812", "relay_epoch": 1790000000000, "features": ["net.state"]}
-{"type": "device.connected", "serial": "XE300-1", "connection_id": 17, "connected_at": 1790000123456, "egress_ip": "203.0.113.7", "features": ["net.state"], "replay": true}
+{"type": "hello", "relay_version": "0.6.5.820", "relay_epoch": 1790000000000, "features": ["net.state", "infra.state"]}
+{"type": "device.connected", "serial": "XE300-1", "connection_id": 17, "connected_at": 1790000123456, "egress_ip": "203.0.113.7", "features": ["net.state", "infra.state"], "replay": true}
 {"type": "net.state", "serial": "XE300-1", "connection_id": 17, "received_at": 1790000123789, "state": {"type": "net.state", "v": 1, "...": "..."}, "replay": true}
+{"type": "infra.state", "serial": "XE300-1", "connection_id": 17, "received_at": 1790000123801, "state": {"type": "infra.state", "v": 1, "config_version": 7, "...": "..."}, "replay": true}
 {"type": "replay.done", "devices": 1}
 {"type": "device.disconnected", "serial": "XE300-1", "connection_id": 17, "reason": "ws_close", "replay": false}
 ```
@@ -1108,17 +1162,21 @@ one), then `replay.done`, then live frames:
   `received_at` are relay times, all unix ms. `egress_ip` is `null` when no
   forwarding header named it.
 - Live frames carry `"replay": false`: `device.connected` when a device
-  registers, `net.state` when it sends one (`state` is the device's message
-  as sent), and `device.disconnected` when a connection ends. `reason` is
+  registers, `net.state` and `infra.state` when it sends one (`state` is
+  the device's message as sent), and `device.disconnected` when a
+  connection ends. `reason` is
   `ws_close`, `writer_failed`, `write_path_dead`, `heartbeat_timeout`,
   `send_failed` or `relay_shutdown`. A connection replaced by a newer one
   for the same serial gets no `device.disconnected`: the new
-  `device.connected` supersedes it. No `net.state` for a connection follows
-  its `device.disconnected`.
+  `device.connected` supersedes it. No `net.state` or `infra.state` for a
+  connection follows its `device.disconnected`.
 - `serial` is always the one the relay registered, never a value from the
   device's payload.
 - The replay can repeat a frame that also arrives live; deduplicate by
-  `(relay_epoch, connection_id, state.boot, state.seq)` for `net.state`: connection ids start at 1 again when the relay restarts, so `relay_epoch` from the `hello` frame is part of the key.
+  `(relay_epoch, connection_id, state.boot, state.seq)` for `net.state` and
+  by `(relay_epoch, connection_id, state.ts, state.config_version)` for
+  `infra.state`: connection ids start at 1 again when the relay restarts, so
+  `relay_epoch` from the `hello` frame is part of the key.
 - A subscriber that falls more than 1024 frames behind gets
   `{"type": "resync"}` followed by a fresh replay and `replay.done`, and
   should rebuild its view from it.
@@ -1142,8 +1200,8 @@ device's clients, and additionally delivers relay-only messages:
 `tunnel.device_disconnected`, `tunnel.relay_shutdown`, and `session.gap`
 (`{reason: "backpressure"}`) when output had to be dropped for a slow
 client. Device telemetry broadcasts (`gps.fix`, `lte.signal`,
-`lte.watchdog`, `net.state`) are relay-internal state feeds and are not part
-of the stable client contract.
+`lte.watchdog`, `net.state`, `infra.state`) are relay-internal state feeds
+and are not part of the stable client contract.
 
 ### `GET /d/{serial}/api/stp/chunk/{xfer}/{idx}`
 

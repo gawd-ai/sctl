@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 This root file is the only changelog; per-component history is recorded here
 under per-component headings. `server/CHANGELOG.md` is frozen.
 
+## [0.6.6] - 2026-09-30
+
+### sctl (server)
+
+- **`relay_route = "prefer"`**: a third mode names the uplinks to prefer in order (`relay_route_prefer = ["eth0", "usb0"]`), whatever their route metrics. The first listed interface that holds a default route and is not suspect gets the relay route; the probe and suspect machinery are unchanged, so the wire still falls back to LTE when it cannot reach the relay, and returns. For units whose LTE holds the lower metric (the WE826 behind quectel-CM, the BPI behind mwan3), where `follow_default` would keep the relay on the SIM. `/api/health` `tunnel.relay_route.prefer` lists it; the netns test has a prefer leg.
+- **Bridge membership is reported**: netwatch reads `IFLA_MASTER`, `net.state` interfaces carry `master` (the bridge a port belongs to), and `/api/info` interfaces carry `master` and `bridge`. A fleet server that reads them no longer runs `brctl show` on every device.
+- **`infra.state` is pushed over the tunnel**: the device sends its Infra results (status, latency, since, counters, a short detail, name, http_status per target; no data blobs) after the register ack and whenever a target's status changes or a config is applied or removed, at most one per second, capped at 16 KiB (details go first, then names, then the tail of the id-sorted list, `truncated: true`). Negotiated with `features: ["net.state", "infra.state"]`. A fleet server that reads it no longer pulls `GET /api/infra/results` from every device.
+
+### sctl (relay)
+
+- Keeps the latest `infra.state` per connection, forwards it to the device's WS clients and publishes it on `/api/tunnel/events` (replayed after `device.connected` and `net.state`; dedup key `(relay_epoch, connection_id, state.ts, state.config_version)`). `RELAY_FEATURES` advertises it.
+
+### Packaging
+
+- **WE826**: `install.sh` no longer pins the tunnel to `usb0` by default; it writes `relay_route = "prefer"` with `relay_route_prefer = ["eth0", "usb0"]` (env `RELAY_ROUTE_PREFER`). `TUNNEL_BIND_ADDRESS` still pins a unit that must be pinned and turns `relay_route` off. `netage-wanpref` keeps the default route for passenger traffic; the pin is no longer load-bearing. `devices/we826-qwd/tests/install-test.sh` covers the block written.
+
+### Fixed
+
+- The `infra` module doc said an unconfigured device answers `{"status":"unconfigured"}`; it answers empty results with `config_version: 0`, and the doc says so.
+
 ## [0.6.5] - 2026-09-26
 
 ### sctl (server)
