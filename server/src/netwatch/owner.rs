@@ -1,13 +1,16 @@
 //! One owner for the host route to the relay (`[tunnel] relay_route`).
 //!
-//! With `relay_route = "follow_default"` the agent keeps one route,
-//! `relay/32 via <gw> dev <uplink> metric 0 proto 83`, where `relay` is the
+//! With `relay_route = "follow_default"` or `"prefer"` the agent keeps one
+//! route, `relay/32 via <gw> dev <uplink> metric 0 proto 83`, where `relay` is the
 //! address the tunnel connected to. At metric 0 it outranks the pin netifd
 //! installs for the WireGuard endpoint (the same address) without touching
 //! it. It stays in place when the agent exits, since WireGuard uses it too.
 //!
 //! The uplink is the lowest-metric default route whose interface is not
-//! suspect ([`choose`]): netifd's metrics already rank the wire above LTE. It
+//! suspect ([`choose`]): netifd's metrics already rank the wire above LTE.
+//! Where they do not (the WE826 and the BPI put LTE at the lower metric),
+//! `relay_route = "prefer"` names the uplinks to take first, in order,
+//! whatever their metrics; the unlisted ones follow by metric. The uplink
 //! is chosen again on every network change netwatch publishes and after every
 //! registration. The route only moves to an uplink that answers the relay,
 //! unless the tunnel is registered over it already. Asking is a [`Probe`]
@@ -21,7 +24,7 @@
 //! pong timeout, a read or write error), that uplink and every other one
 //! with a default route are asked in the same round. The route moves only
 //! when its own uplink does not answer while another does, to the first of
-//! those in metric order. The failing uplink, and any ranked above the one
+//! those in that same order. The failing uplink, and any ranked above the one
 //! that answered, become suspect. When every uplink fails, the relay itself
 //! is down: nothing moves and nothing becomes suspect.
 //!
@@ -188,6 +191,10 @@ pub enum TunnelSignal {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Report {
     pub mode: RelayRouteMode,
+    /// The uplinks preferred in order (`relay_route = "prefer"`); shown only
+    /// when set.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prefer: Vec<String>,
     /// The uplink sctl's route to the relay goes through; None while sctl
     /// holds no route.
     pub dev: Option<String>,
@@ -235,6 +242,8 @@ fn read_rp_filter(name: &str) -> Option<u8> {
 /// tunnel client, whatever the mode.
 pub struct RelayRoute {
     mode: RelayRouteMode,
+    /// `[tunnel] relay_route_prefer`: empty unless the mode is `prefer`.
+    prefer: Vec<String>,
     tx: mpsc::Sender<TunnelSignal>,
     /// Held by the running owner; a restarted one takes it back.
     rx: tokio::sync::Mutex<mpsc::Receiver<TunnelSignal>>,
@@ -242,14 +251,16 @@ pub struct RelayRoute {
 }
 
 impl RelayRoute {
-    pub fn new(mode: RelayRouteMode) -> Self {
+    pub fn new(mode: RelayRouteMode, prefer: Vec<String>) -> Self {
         let (tx, rx) = mpsc::channel(SIGNAL_QUEUE);
         Self {
             mode,
+            prefer: prefer.clone(),
             tx,
             rx: tokio::sync::Mutex::new(rx),
             report: std::sync::Mutex::new(Report {
                 mode,
+                prefer,
                 dev: None,
                 via: None,
                 suspect: Vec::new(),
@@ -261,6 +272,11 @@ impl RelayRoute {
 
     pub fn mode(&self) -> RelayRouteMode {
         self.mode
+    }
+
+    /// The uplinks preferred in order; empty unless the mode is `prefer`.
+    pub fn prefer(&self) -> &[String] {
+        &self.prefer
     }
 
     /// Tell the owner how the tunnel is doing. Never waits: with the mode
@@ -292,14 +308,33 @@ impl RelayRoute {
     }
 }
 
-/// The uplink for the relay route: the lowest-metric default route whose
-/// interface is not suspect. Ties go to the interface that sorts first, as in
-/// [`NetState::lowest_default`].
-pub fn choose(net: &NetState, suspect: impl Fn(&str) -> bool) -> Option<&DefaultRoute> {
-    net.default_routes
+/// The uplink for the relay route. The first of `prefer` that holds a
+/// default route and is not suspect wins, whatever its metric (its lowest
+/// default route when it holds several); when none of them does, the
+/// lowest-metric default route among the unlisted interfaces that are not
+/// suspect. Ties go to the interface that sorts first, as in
+/// [`NetState::lowest_default`]. A suspect uplink is never chosen, listed or
+/// not. With `prefer` empty this is the lowest-metric rule alone.
+pub fn choose<'a>(
+    net: &'a NetState,
+    prefer: &[String],
+    suspect: impl Fn(&str) -> bool,
+) -> Option<&'a DefaultRoute> {
+    let lowest = |routes: &mut dyn Iterator<Item = &'a DefaultRoute>| {
+        routes.min_by(|a, b| (a.metric, &a.dev).cmp(&(b.metric, &b.dev)))
+    };
+    prefer
         .iter()
-        .filter(|r| !suspect(&r.dev))
-        .min_by(|a, b| (a.metric, &a.dev).cmp(&(b.metric, &b.dev)))
+        .filter(|dev| !suspect(dev))
+        .find_map(|dev| lowest(&mut net.default_routes.iter().filter(|r| r.dev == **dev)))
+        .or_else(|| {
+            lowest(
+                &mut net
+                    .default_routes
+                    .iter()
+                    .filter(|r| !prefer.contains(&r.dev) && !suspect(&r.dev)),
+            )
+        })
 }
 
 /// Whether going from `old` to `new` changed interface `dev` itself: its
@@ -316,11 +351,13 @@ fn touched(old: &NetState, new: &NetState, dev: &str) -> bool {
     old.interface(dev) != new.interface(dev) || defaults(old) != defaults(new)
 }
 
-/// Every uplink but `except` with a default route and an address, lowest
-/// metric first, in [`choose`]'s order.
-fn candidates(net: &NetState, except: &str) -> Vec<(String, Ipv4Addr)> {
+/// Every uplink but `except` with a default route and an address, in
+/// [`choose`]'s order: the `prefer` list first, in its order, then the rest
+/// lowest metric first.
+fn candidates(net: &NetState, prefer: &[String], except: &str) -> Vec<(String, Ipv4Addr)> {
+    let rank = |dev: &str| prefer.iter().position(|p| p == dev).unwrap_or(prefer.len());
     let mut routes: Vec<&DefaultRoute> = net.default_routes.iter().collect();
-    routes.sort_by(|a, b| (a.metric, &a.dev).cmp(&(b.metric, &b.dev)));
+    routes.sort_by(|a, b| (rank(&a.dev), a.metric, &a.dev).cmp(&(rank(&b.dev), b.metric, &b.dev)));
     let mut out: Vec<(String, Ipv4Addr)> = Vec::new();
     for r in routes {
         if r.dev == except || out.iter().any(|(dev, _)| *dev == r.dev) {
@@ -430,6 +467,8 @@ fn return_wait(schedule: &[Duration], probes: usize, stretch: u32) -> Duration {
 pub(crate) struct Owner<U> {
     uplinks: U,
     schedule: Vec<Duration>,
+    /// The uplinks to take first, in order (`relay_route_prefer`).
+    prefer: Vec<String>,
     relay: Option<SocketAddrV4>,
     net: Option<Arc<NetState>>,
     /// sctl's route as sctl last wrote it (or found it, once, at start).
@@ -447,10 +486,11 @@ pub(crate) struct Owner<U> {
 }
 
 impl<U: Uplinks> Owner<U> {
-    pub(crate) fn new(uplinks: U, schedule: Vec<Duration>) -> Self {
+    pub(crate) fn new(uplinks: U, schedule: Vec<Duration>, prefer: Vec<String>) -> Self {
         Self {
             uplinks,
             schedule,
+            prefer,
             relay: None,
             net: None,
             held: None,
@@ -472,6 +512,7 @@ impl<U: Uplinks> Owner<U> {
         }
         Report {
             mode,
+            prefer: self.prefer.clone(),
             dev: self.held.as_ref().map(|h| h.dev.clone()),
             via: self.held.as_ref().and_then(|h| h.via),
             suspect: self.suspect.keys().cloned().collect(),
@@ -486,9 +527,18 @@ impl<U: Uplinks> Owner<U> {
         self.suspect.values().map(|s| s.due).min()
     }
 
+    /// Why the route goes where [`choose`] puts it when nothing else says.
+    fn default_reason(&self) -> String {
+        if self.prefer.is_empty() {
+            "lowest-metric default route".to_string()
+        } else {
+            "preferred uplink".to_string()
+        }
+    }
+
     /// A new network state.
     pub(crate) async fn on_net(&mut self, net: Arc<NetState>) -> Vec<Change> {
-        let mut reason = "lowest-metric default route".to_string();
+        let mut reason = self.default_reason();
         if let Some(old) = self.net.take() {
             let back: Vec<String> = self
                 .suspect
@@ -521,7 +571,7 @@ impl<U: Uplinks> Owner<U> {
                 // A registration proves its uplink reaches the relay better
                 // than any probe: it is no longer suspect.
                 let over = self.uplink_with(local);
-                let mut reason = "lowest-metric default route".to_string();
+                let mut reason = self.default_reason();
                 if let Some(dev) = over.as_ref().filter(|dev| self.suspect.contains_key(*dev)) {
                     self.suspect.remove(dev);
                     reason = format!("the tunnel reached the relay over {dev}");
@@ -537,9 +587,8 @@ impl<U: Uplinks> Owner<U> {
                     relay.filter(|r| self.relay.is_none() && self.has_own_route_to(*r.ip()))
                 {
                     self.relay = Some(relay);
-                    changes = self
-                        .reconcile(&[], "lowest-metric default route".into())
-                        .await;
+                    let reason = self.default_reason();
+                    changes = self.reconcile(&[], reason).await;
                 }
                 if !from.is_some_and(|from| self.on_held(from)) {
                     return changes;
@@ -654,14 +703,15 @@ impl<U: Uplinks> Owner<U> {
     /// metric order. When the held uplink answers, the failures were the
     /// relay's, not the path's; when nothing answers, the relay itself is
     /// most likely down. Either way nothing moves and nothing becomes
-    /// suspect, so a relay outage never sends a unit to LTE.
+    /// suspect, so a relay outage never sends a unit to LTE. With
+    /// `relay_route_prefer` set, the listed uplinks come first, in order.
     async fn fail_over(&mut self) -> Vec<Change> {
         let (Some(net), Some(relay), Some(held)) =
             (self.net.clone(), self.relay, self.held.clone())
         else {
             return Vec::new();
         };
-        let others = candidates(&net, &held.dev);
+        let others = candidates(&net, &self.prefer, &held.dev);
         if others.is_empty() {
             info!(
                 "relay route: the tunnel keeps failing over {} and there is no other uplink; \
@@ -746,7 +796,9 @@ impl<U: Uplinks> Owner<U> {
 
         // The best uplink that is not suspect and answers.
         let want = loop {
-            let Some(want) = choose(&net, |dev| self.suspect.contains_key(dev)).cloned() else {
+            let Some(want) =
+                choose(&net, &self.prefer, |dev| self.suspect.contains_key(dev)).cloned()
+            else {
                 break None;
             };
             let proven = self.held.as_ref().is_some_and(|h| h.dev == want.dev)
@@ -993,8 +1045,17 @@ pub async fn run(
             timing,
         },
         schedule,
+        handle.prefer().to_vec(),
     );
-    info!("relay route: keeping the relay's route on the best uplink that answers it");
+    if handle.prefer().is_empty() {
+        info!("relay route: keeping the relay's route on the best uplink that answers it");
+    } else {
+        info!(
+            "relay route: keeping the relay's route on the first of {} that answers it, \
+             then the best of the rest",
+            handle.prefer().join(", ")
+        );
+    }
     // Uplinks with strict reverse-path filtering, as last logged.
     let mut strict: Vec<String> = Vec::new();
     loop {
@@ -1053,6 +1114,7 @@ mod tests {
             carrier: Some(true),
             ipv4: Some(Ipv4Cidr { addr, prefix: 24 }),
             default_metric: metric,
+            master: None,
         }
     }
 
@@ -1237,7 +1299,7 @@ mod tests {
 
     /// An owner that has installed its route on eth1, with the tunnel there.
     async fn settled(fake: &Arc<Fake>) -> Owner<Arc<Fake>> {
-        let mut owner = Owner::new(fake.clone(), schedule());
+        let mut owner = Owner::new(fake.clone(), schedule(), Vec::new());
         fake.tunnel_on(Some("eth1"));
         owner.on_net(fake.state()).await;
         owner.on_signal(registered(ETH1)).await;
@@ -1285,10 +1347,10 @@ mod tests {
     #[test]
     fn choose_takes_the_lowest_metric_uplink_that_is_not_suspect() {
         let net = travel_router();
-        assert_eq!(choose(&net, |_| false).unwrap().dev, "eth1");
-        assert_eq!(choose(&net, |d| d == "eth1").unwrap().dev, "wwan0");
-        assert!(choose(&net, |_| true).is_none());
-        assert!(choose(&NetState::default(), |_| false).is_none());
+        assert_eq!(choose(&net, &[], |_| false).unwrap().dev, "eth1");
+        assert_eq!(choose(&net, &[], |d| d == "eth1").unwrap().dev, "wwan0");
+        assert!(choose(&net, &[], |_| true).is_none());
+        assert!(choose(&NetState::default(), &[], |_| false).is_none());
     }
 
     #[test]
@@ -1299,9 +1361,154 @@ mod tests {
             default("eth1", ETH1_GW, 10),
             default("eth0", ETH1_GW, 20),
         ];
-        assert_eq!(choose(&net, |_| false).unwrap().dev, "eth1");
-        assert_eq!(choose(&net, |d| d == "eth1").unwrap().dev, "wwan0");
-        assert_eq!(choose(&net, |d| d != "eth0").unwrap().dev, "eth0");
+        assert_eq!(choose(&net, &[], |_| false).unwrap().dev, "eth1");
+        assert_eq!(choose(&net, &[], |d| d == "eth1").unwrap().dev, "wwan0");
+        assert_eq!(choose(&net, &[], |d| d != "eth0").unwrap().dev, "eth0");
+    }
+
+    /// A WE826: LTE at metric 0 (quectel-CM's route) and 5, the wire at 3.
+    fn we826() -> NetState {
+        NetState {
+            boot: 1,
+            seq: 1,
+            interfaces: vec![
+                iface("eth0", 2, ETH1, Some(3)),
+                iface("usb0", 5, LTE, Some(0)),
+                iface("eth1", 3, ETH2, Some(50)),
+            ],
+            default_routes: vec![
+                default("usb0", LTE_GW, 0),
+                default("eth0", ETH1_GW, 3),
+                default("usb0", LTE_GW, 5),
+                default("eth1", ETH1_GW, 50),
+            ],
+            host_routes: vec![],
+        }
+    }
+
+    fn prefer(devs: &[&str]) -> Vec<String> {
+        devs.iter().map(|d| (*d).to_string()).collect()
+    }
+
+    #[test]
+    fn choose_takes_the_first_listed_uplink_whatever_its_metric() {
+        let net = we826();
+        let chosen = choose(&net, &prefer(&["eth0", "usb0"]), |_| false).unwrap();
+        assert_eq!((chosen.dev.as_str(), chosen.metric), ("eth0", 3));
+        // A listed uplink with several default routes: its lowest.
+        let chosen = choose(&net, &prefer(&["usb0", "eth0"]), |_| false).unwrap();
+        assert_eq!((chosen.dev.as_str(), chosen.metric), ("usb0", 0));
+        // Listed, but without a default route: the next listed one.
+        let chosen = choose(&net, &prefer(&["wlan0", "eth1", "eth0"]), |_| false).unwrap();
+        assert_eq!(chosen.dev, "eth1");
+    }
+
+    #[test]
+    fn choose_skips_a_listed_suspect_for_the_next_listed() {
+        let net = we826();
+        let list = prefer(&["eth0", "usb0"]);
+        assert_eq!(choose(&net, &list, |d| d == "eth0").unwrap().dev, "usb0");
+        // Every listed one suspect: the unlisted rest by metric, never a
+        // listed suspect.
+        assert_eq!(
+            choose(&net, &list, |d| d == "eth0" || d == "usb0")
+                .unwrap()
+                .dev,
+            "eth1"
+        );
+        assert!(choose(&net, &list, |_| true).is_none());
+    }
+
+    #[test]
+    fn choose_falls_back_to_the_unlisted_by_metric() {
+        let mut net = we826();
+        net.default_routes.retain(|r| r.dev != "eth0");
+        let list = prefer(&["eth0"]);
+        assert_eq!(choose(&net, &list, |_| false).unwrap().dev, "usb0");
+        assert_eq!(choose(&net, &list, |d| d == "usb0").unwrap().dev, "eth1");
+        assert!(choose(&NetState::default(), &list, |_| false).is_none());
+    }
+
+    #[test]
+    fn choose_with_an_empty_list_is_the_lowest_metric_rule() {
+        let net = we826();
+        for (suspect, want) in [
+            (Vec::new(), Some("usb0")),
+            (vec!["usb0"], Some("eth0")),
+            (vec!["usb0", "eth0"], Some("eth1")),
+            (vec!["usb0", "eth0", "eth1"], None),
+        ] {
+            let by_metric = choose(&net, &[], |d| suspect.contains(&d)).map(|r| r.dev.as_str());
+            assert_eq!(by_metric, want, "{suspect:?}");
+        }
+        let travel = travel_router();
+        assert_eq!(choose(&travel, &[], |_| false).unwrap().dev, "eth1");
+    }
+
+    #[test]
+    fn candidates_follow_the_list_then_the_metric() {
+        let net = we826();
+        let names = |list: &[&str], except: &str| -> Vec<String> {
+            candidates(&net, &prefer(list), except)
+                .into_iter()
+                .map(|(dev, _)| dev)
+                .collect()
+        };
+        assert_eq!(names(&[], "none"), ["usb0", "eth0", "eth1"]);
+        assert_eq!(names(&["eth0", "usb0"], "none"), ["eth0", "usb0", "eth1"]);
+        assert_eq!(names(&["eth1"], "eth1"), ["usb0", "eth0"]);
+        assert_eq!(names(&["eth0", "usb0"], "eth0"), ["usb0", "eth1"]);
+    }
+
+    /// An owner on a WE826 that prefers the wire: the route lands there,
+    /// LTE's metric 0 notwithstanding, and the tunnel follows it.
+    #[tokio::test]
+    async fn a_preferred_wire_holds_the_route_over_a_lower_metric_lte() {
+        let fake = Fake::new(we826());
+        let mut owner = Owner::new(fake.clone(), schedule(), prefer(&["eth0", "usb0"]));
+        fake.tunnel_on(Some("usb0"));
+        owner.on_net(fake.state()).await;
+        assert_eq!(
+            owner.on_signal(registered(LTE)).await,
+            moved(None, Some("eth0"), "preferred uplink")
+        );
+        assert_eq!(
+            fake.probes(),
+            ["eth0"],
+            "the wire is asked before the route moves"
+        );
+        assert_eq!(
+            fake.writes(),
+            [format!(
+                "replace {} via {ETH1_GW} dev eth0 metric 0",
+                RELAY.ip()
+            )]
+        );
+        let report = owner.report(RelayRouteMode::Prefer);
+        assert_eq!(report.prefer, ["eth0", "usb0"]);
+        assert_eq!(report.dev.as_deref(), Some("eth0"));
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["prefer"],
+            serde_json::json!(["eth0", "usb0"])
+        );
+
+        // The wire's internet dies: LTE, listed next, takes over; the wire
+        // returns when it answers again.
+        fake.kill("eth0");
+        fake.tunnel_on(None);
+        owner.on_signal(failed(ETH1)).await;
+        assert_eq!(
+            owner.on_signal(failed(ETH1)).await,
+            moved(Some("eth0"), Some("usb0"), "eth0: no answer from the relay")
+        );
+        assert_eq!(owner.report(RelayRouteMode::Prefer).suspect, ["eth0"]);
+        fake.revive("eth0");
+        fake.tunnel_on(Some("usb0"));
+        next_round(&mut owner).await;
+        assert_eq!(
+            next_round(&mut owner).await,
+            moved(Some("usb0"), Some("eth0"), "eth0 answers the relay again")
+        );
     }
 
     #[test]
@@ -1337,7 +1544,7 @@ mod tests {
     #[tokio::test]
     async fn nothing_is_written_before_the_tunnel_names_the_relay() {
         let fake = Fake::new(travel_router());
-        let mut owner = Owner::new(fake.clone(), schedule());
+        let mut owner = Owner::new(fake.clone(), schedule(), Vec::new());
         assert!(owner.on_net(fake.state()).await.is_empty());
         assert!(fake.writes().is_empty());
         assert!(fake.probes().is_empty());
@@ -1360,7 +1567,7 @@ mod tests {
     #[tokio::test]
     async fn the_first_registration_puts_the_route_on_the_lowest_metric_uplink() {
         let fake = Fake::new(travel_router());
-        let mut owner = Owner::new(fake.clone(), schedule());
+        let mut owner = Owner::new(fake.clone(), schedule(), Vec::new());
         owner.on_net(fake.state()).await;
         // The tunnel came up over netifd's pin on LTE.
         fake.tunnel_on(Some("wwan0"));
@@ -1412,7 +1619,7 @@ mod tests {
         net.default_routes[0].gw = Some(Ipv4Addr::new(10, 9, 9, 1));
         net.default_routes[0].onlink = true;
         let fake = Fake::new(net);
-        let mut owner = Owner::new(fake.clone(), schedule());
+        let mut owner = Owner::new(fake.clone(), schedule(), Vec::new());
         fake.tunnel_on(Some("eth1"));
         owner.on_net(fake.state()).await;
         owner.on_signal(registered(ETH1)).await;
@@ -1434,7 +1641,7 @@ mod tests {
     #[tokio::test]
     async fn a_tunnel_already_on_the_best_uplink_is_not_probed() {
         let fake = Fake::new(travel_router());
-        let mut owner = Owner::new(fake.clone(), schedule());
+        let mut owner = Owner::new(fake.clone(), schedule(), Vec::new());
         fake.tunnel_on(Some("eth1"));
         owner.on_net(fake.state()).await;
         owner.on_signal(registered(ETH1)).await;
@@ -1446,7 +1653,7 @@ mod tests {
     async fn a_wire_that_does_not_answer_is_not_given_the_route() {
         let fake = Fake::new(travel_router());
         fake.kill("eth1");
-        let mut owner = Owner::new(fake.clone(), schedule());
+        let mut owner = Owner::new(fake.clone(), schedule(), Vec::new());
         fake.tunnel_on(Some("wwan0"));
         owner.on_net(fake.state()).await;
         let changes = owner.on_signal(registered(LTE)).await;
@@ -1468,7 +1675,7 @@ mod tests {
         let mut net = travel_router();
         net.host_routes.push(host("eth1", ETH1_GW, 0, RTPROT_SCTL));
         let fake = Fake::new(net);
-        let mut owner = Owner::new(fake.clone(), schedule());
+        let mut owner = Owner::new(fake.clone(), schedule(), Vec::new());
         owner.on_net(fake.state()).await;
         assert!(owner.on_signal(registered(ETH1)).await.is_empty());
         assert!(fake.writes().is_empty());
@@ -1487,7 +1694,7 @@ mod tests {
         net.host_routes.push(host("eth1", ETH1_GW, 0, RTPROT_SCTL));
         let fake = Fake::new(net);
         fake.kill("eth1");
-        let mut owner = Owner::new(fake.clone(), schedule());
+        let mut owner = Owner::new(fake.clone(), schedule(), Vec::new());
         owner.on_net(fake.state()).await;
         assert!(owner.on_signal(failed(ETH1)).await.is_empty());
         assert!(fake.writes().is_empty(), "the route is adopted as it is");
@@ -1513,7 +1720,7 @@ mod tests {
         // A hand-added pin, `ip route add` (protocol boot).
         net.host_routes.push(host("eth1", ETH1_GW, 0, 3));
         let fake = Fake::new(net);
-        let mut owner = Owner::new(fake.clone(), schedule());
+        let mut owner = Owner::new(fake.clone(), schedule(), Vec::new());
         owner.on_net(fake.state()).await;
         let changes = owner.on_signal(registered(ETH1)).await;
         assert_eq!(changes.len(), 1);
@@ -1842,7 +2049,7 @@ mod tests {
         let fake = Fake::new(net);
         // eth1 is dead from the start: the route goes to eth2.
         fake.kill("eth1");
-        let mut owner = Owner::new(fake.clone(), schedule());
+        let mut owner = Owner::new(fake.clone(), schedule(), Vec::new());
         fake.tunnel_on(Some("wwan0"));
         owner.on_net(fake.state()).await;
         owner.on_signal(registered(LTE)).await;
@@ -2104,7 +2311,7 @@ mod tests {
         let fake = Fake::new(travel_router());
         fake.tunnel_on(Some("eth1"));
         let refusing = Arc::new(Refusing(fake.clone(), Mutex::new(true)));
-        let mut owner = Owner::new(refusing.clone(), schedule());
+        let mut owner = Owner::new(refusing.clone(), schedule(), Vec::new());
         owner.on_net(fake.state()).await;
         assert!(owner.on_signal(registered(ETH1)).await.is_empty());
         assert_eq!(owner.report(RelayRouteMode::FollowDefault).dev, None);
@@ -2156,7 +2363,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_owner_that_is_off_drops_signals_and_reports_off() {
-        let off = RelayRoute::new(RelayRouteMode::Off);
+        let off = RelayRoute::new(RelayRouteMode::Off, Vec::new());
         off.signal(registered(ETH1));
         assert!(off.rx.lock().await.try_recv().is_err());
         assert_eq!(
@@ -2170,9 +2377,15 @@ mod tests {
             })
         );
 
-        let on = RelayRoute::new(RelayRouteMode::FollowDefault);
+        let on = RelayRoute::new(RelayRouteMode::FollowDefault, Vec::new());
         on.signal(registered(ETH1));
         assert_eq!(on.rx.lock().await.try_recv().unwrap(), registered(ETH1));
+
+        let prefers = RelayRoute::new(RelayRouteMode::Prefer, prefer(&["eth0", "usb0"]));
+        assert_eq!(prefers.prefer(), ["eth0", "usb0"]);
+        let report = serde_json::to_value(prefers.report()).unwrap();
+        assert_eq!(report["mode"], "prefer");
+        assert_eq!(report["prefer"], serde_json::json!(["eth0", "usb0"]));
     }
 
     /// The probe against real sockets on loopback: `lo` stands in for an

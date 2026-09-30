@@ -26,9 +26,16 @@ Environment:
   TUNNEL_URL            Optional. Relay tunnel endpoint, e.g.
                         wss://relay-001.example/api/tunnel/register
   TUNNEL_KEY            Optional. Relay tunnel registration key. Required with TUNNEL_URL.
-  TUNNEL_BIND_ADDRESS   Default: usb0. Interface the tunnel is pinned to. Use the
-                        INTERFACE NAME, not an IP — sctl only applies SO_BINDTODEVICE
-                        when the value fails to parse as an IP address.
+  RELAY_ROUTE_PREFER    Default: eth0,usb0. Comma-separated interfaces sctl prefers
+                        for its route to the relay, in order, whatever their metrics
+                        (relay_route = "prefer"). The wire first: the relay rides it
+                        while it answers, and falls back to LTE when it does not.
+                        Empty writes relay_route = "off" (the tunnel follows the
+                        default route). Ignored when TUNNEL_BIND_ADDRESS is set.
+  TUNNEL_BIND_ADDRESS   Default: empty. Set to pin the tunnel to one interface for
+                        good; that turns relay_route off, since the two conflict.
+                        Use the INTERFACE NAME, not an IP: sctl only applies
+                        SO_BINDTODEVICE when the value fails to parse as an IP.
                         NOTE: if TUNNEL_URL/TUNNEL_KEY are omitted and the target
                         already has a [tunnel] block, it is PRESERVED verbatim.
   MIN_TMP_KB            Default: 24576
@@ -103,7 +110,8 @@ SERIAL=${SERIAL:-WE826-Q-WD}
 LTE_INTERFACE=${LTE_INTERFACE:-usb0}
 TUNNEL_URL=${TUNNEL_URL:-}
 TUNNEL_KEY=${TUNNEL_KEY:-}
-TUNNEL_BIND_ADDRESS=${TUNNEL_BIND_ADDRESS:-usb0}
+TUNNEL_BIND_ADDRESS=${TUNNEL_BIND_ADDRESS:-}
+RELAY_ROUTE_PREFER=${RELAY_ROUTE_PREFER-eth0,usb0}
 SERVER_GZIP=${SERVER_GZIP:-1}
 PLUGIN_GZIP=${PLUGIN_GZIP:-1}
 MUSL_LIBC_GZIP=${MUSL_LIBC_GZIP:-1}
@@ -146,6 +154,28 @@ sed_repl_escape() {
 shell_quote() {
     printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
+
+# "eth0,usb0" -> `["eth0", "usb0"]`, refusing an empty or blank-bearing name so a
+# typo cannot produce a config sctl refuses to start with.
+toml_iface_list() {
+    local out="" name names
+    IFS=',' read -r -a names <<< "$1"
+    for name in "${names[@]}"; do
+        if [[ -z "$name" || "$name" =~ [[:space:]] || ${#name} -gt 15 ]]; then
+            echo "RELAY_ROUTE_PREFER entry '$name' is not an interface name (1-15 chars, no whitespace)" >&2
+            return 1
+        fi
+        out+="${out:+, }\"$(toml_escape "$name")\""
+    done
+    printf '[%s]' "$out"
+}
+
+# Checked up front, before anything is written or copied: a refused list must
+# stop the install, not reach the device as an empty `relay_route_prefer`.
+RELAY_ROUTE_PREFER_TOML=""
+if [[ -z "$TUNNEL_BIND_ADDRESS" && -n "$RELAY_ROUTE_PREFER" ]]; then
+    RELAY_ROUTE_PREFER_TOML=$(toml_iface_list "$RELAY_ROUTE_PREFER") || exit 1
+fi
 
 write_kv() {
     local key=$1
@@ -190,17 +220,35 @@ if [[ -n "$TUNNEL_URL" || -n "$TUNNEL_KEY" ]]; then
             printf '# literal here would only set the source address, leaving tunnel egress\n'
             printf '# at the mercy of the default route. A pin on the cellular interface\n'
             printf '# puts the WHOLE management plane on the metered link (RUT241, 2026-09-15:\n'
-            printf '# 50 MB/day of LTE with a healthy wired WAN). Pin the wired side, or\n'
-            printf '# leave it unpinned so the tunnel fails over by route metric.\n'
+            printf '# 50 MB/day of LTE with a healthy wired WAN). A pin and relay_route\n'
+            printf '# conflict, so the pin turns relay_route off: the tunnel never moves.\n'
             printf 'bind_address = "%s"\n' "$(toml_escape "$TUNNEL_BIND_ADDRESS")"
+            printf 'relay_route = "off"\n'
+        elif [[ -n "$RELAY_ROUTE_PREFER" ]]; then
+            printf '# sctl keeps its own /32 to the relay on the first of these uplinks that\n'
+            printf '# answers the relay, in this order, whatever their metrics: the vendor\n'
+            printf '# dial script puts LTE at metric 0, so following the default route would\n'
+            printf '# keep the management plane on the SIM. The relay falls back to LTE when\n'
+            printf '# the wire cannot reach it, and returns when it can (docs/config.md).\n'
+            printf 'relay_route = "prefer"\n'
+            printf 'relay_route_prefer = %s\n' "$RELAY_ROUTE_PREFER_TOML"
+        else
+            printf '# Unpinned and unmanaged: the tunnel follows the default route.\n'
+            printf 'relay_route = "off"\n'
         fi
         printf 'reconnect_delay_secs = 2\n'
         printf 'reconnect_max_delay_secs = 30\n'
         printf 'heartbeat_interval_secs = 10\n'
         printf 'heartbeat_timeout_secs = 45\n'
     } >> "$tmpdir/sctl.toml"
-    printf 'tunnel:             configured from env (bind_address=%s)\n' \
-        "${TUNNEL_BIND_ADDRESS:-<unpinned, follows routing>}"
+    if [[ -n "$TUNNEL_BIND_ADDRESS" ]]; then
+        tunnel_how="pinned to $TUNNEL_BIND_ADDRESS, relay_route off"
+    elif [[ -n "$RELAY_ROUTE_PREFER" ]]; then
+        tunnel_how="relay_route prefer $RELAY_ROUTE_PREFER_TOML"
+    else
+        tunnel_how="unpinned, follows routing"
+    fi
+    printf 'tunnel:             configured from env (%s)\n' "$tunnel_how"
 else
     # shellcheck disable=SC2086
     existing_tunnel=$($SSH $SSH_OPTS "$HOST" \

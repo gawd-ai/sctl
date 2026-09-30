@@ -158,7 +158,8 @@ disable tunneling. Two mutually exclusive modes:
 | `heartbeat_timeout_secs` | `45` | Seconds without a heartbeat before the relay declares a device dead (relay mode). |
 | `tunnel_proxy_timeout_secs` | `60` | Default proxy request timeout (relay mode); the source of relay `504 TIMEOUT` errors. |
 | `bind_address` | *(none)* | Local address **or interface name** to bind outbound tunnel connections to (client mode). Interface names are resolved to their current IPv4 on each connect attempt (survives DHCP/carrier changes) and get `SO_BINDTODEVICE`; an IP literal sets only the source address and does **not** pin egress to the interface. Either way the tunnel stays where it is bound and does not follow the kernel's route changes. |
-| `relay_route` | `"off"` | Who keeps the host route to the relay (client mode). `"off"` leaves it to the system. `"follow_default"` makes sctl keep one route to the relay on the best uplink that reaches it; see below. Refused together with `bind_address`. |
+| `relay_route` | `"off"` | Who keeps the host route to the relay (client mode). `"off"` leaves it to the system. `"follow_default"` makes sctl keep one route to the relay on the lowest-metric uplink that reaches it. `"prefer"` does the same with the uplinks in `relay_route_prefer` taken first, in that order, whatever their metrics; see below. Refused together with `bind_address`. |
+| `relay_route_prefer` | `[]` | With `relay_route = "prefer"` only: the interfaces to prefer for the relay route, in order, e.g. `["eth0", "usb0"]`. Required, non-empty and distinct with `"prefer"`; refused with any other mode. |
 | `tls_ca_file` | *(none)* | PEM file with additional root CAs for `wss://` client connections. Public webpki roots stay enabled. |
 | `tls_server_cert_sha256` | *(none)* | SHA-256 pin (lowercase hex or colon-separated) for the relay's leaf certificate DER; checked after normal rustls validation. |
 
@@ -169,7 +170,7 @@ removes a route that netifd, DHCP or an operator added.
 
 ### `relay_route`
 
-With `relay_route = "follow_default"`, sctl owns one route:
+With `relay_route = "follow_default"` or `"prefer"`, sctl owns one route:
 `<relay>/32 via <gw> dev <uplink> metric 0 proto 83`, where `<relay>` is the
 address the tunnel connected to, and `<gw>` the gateway of the uplink's
 default route. When that default route declares its gateway `onlink` (a
@@ -178,10 +179,23 @@ refuses it otherwise. At metric 0 it outranks the pin netifd adds for the
 WireGuard endpoint (the same address), which is left in place as the
 fallback. The route stays when sctl exits, because WireGuard uses it too.
 
-- **Which uplink.** The lowest-metric default route whose interface is not
-  suspect. netifd's metrics already rank the wire above LTE. The choice is
-  made again on every network change the kernel reports (after a quiet
-  second) and after every registration with the relay.
+- **Which uplink.** With `follow_default`, the lowest-metric default route
+  whose interface is not suspect: netifd's metrics already rank the wire
+  above LTE. With `prefer`, the first interface in `relay_route_prefer` that
+  holds a default route and is not suspect, whatever its metric; when none of
+  the listed ones does, the lowest-metric rule over the unlisted ones. A
+  suspect uplink is never chosen, listed or not. The choice is made again on
+  every network change the kernel reports (after a quiet second) and after
+  every registration with the relay.
+- **When the metrics are wrong.** On the WE826 the vendor's dial script
+  installs LTE's default route at metric 0 on every dial, and the BPI keeps
+  LTE at the lower metric too, so `follow_default` would keep the relay on
+  the SIM while a wire is up. `relay_route = "prefer"` with
+  `relay_route_prefer = ["eth0", "usb0"]` names the wire first: the relay
+  rides the wire while the wire reaches the relay, and the probe and suspect
+  machinery below still moves it to LTE when the wire cannot, and back when
+  it can again. Whatever the default route does for passenger traffic is not
+  sctl's business; only the relay's `/32` moves.
 - **Only an uplink that answers.** Before the route moves to an uplink the
   tunnel is not already on, sctl probes the relay over that interface
   alone (`SO_BINDTODEVICE`, as `bind_address` does). Over `wss://` the probe
@@ -196,8 +210,9 @@ fallback. The route stays when sctl exits, because WireGuard uses it too.
   the uplink the route uses, that uplink and every other one holding a
   default route are asked in the same round, all at once. The route moves
   only when its own uplink does not answer while another does, to the first
-  of those in metric order, and the tunnel then follows the route (see the
-  `rehome` event in the HTTP API).
+  of those in the same order (the `relay_route_prefer` list, then metric),
+  and the tunnel then follows the route (see the `rehome` event in the HTTP
+  API).
 - **The relay is down.** Then no uplink answers, the route's own included,
   so nothing moves and nothing becomes suspect: a relay restart never sends
   a unit to LTE. When the route's own uplink answers, the failures were the
@@ -225,13 +240,13 @@ fallback. The route stays when sctl exits, because WireGuard uses it too.
   not install (a hand-added pin, an older hotplug) is never replaced: sctl
   leaves the relay to it, records a `relay_route` event saying so, and takes
   over once that route is gone.
-- **Reporting.** `/api/health` shows `tunnel.relay_route`, and every move is
-  a `relay_route` tunnel event such as
-  `eth1 -> wwan0 (eth1: no answer from the relay)`.
+- **Reporting.** `/api/health` shows `tunnel.relay_route` (with the
+  `prefer` list when one is set), and every move is a `relay_route` tunnel
+  event such as `eth1 -> wwan0 (eth1: no answer from the relay)`.
 
 It is opt-in because some units route the relay on purpose: the BPI units
-keep it on LTE for out-of-band access, and the WE826 pins the tunnel with
-`bind_address`.
+keep it on LTE for out-of-band access, and a WE826 that must stay on one
+uplink pins the tunnel with `bind_address` instead.
 
 The answer to a probe arrives on the uplink it left by, so reverse-path
 filtering on the uplinks must be loose (`rp_filter = 2`) or off, as

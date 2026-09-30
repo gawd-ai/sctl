@@ -26,10 +26,16 @@
 #     egressed through it may promote. Every failure mode falls back to cellular.
 #
 # WHY THIS IS SAFE TO DO REMOTELY
-#   The management tunnel is pinned with bind_address = "<lte_if>" and sctl sets
-#   SO_BINDTODEVICE (server/src/tunnel/client.rs:466-548), so tunnel egress does
-#   not follow the default route. Changing the default route cannot cost us the
-#   management channel. If that pin is ever removed, this feature becomes unsafe.
+#   The management tunnel does not ride the default route this script moves.
+#   With the default install (relay_route = "prefer", see install.sh) sctl keeps
+#   its own /32 to the relay at metric 0, probes each uplink itself and moves
+#   that route between the wire and LTE on its own evidence; with a unit that
+#   pins bind_address = "<iface>" instead, sctl sets SO_BINDTODEVICE
+#   (server/src/tunnel/client.rs) and egress ignores the default route too.
+#   Either way, changing the default route cannot cost us the management
+#   channel: this script owns the default route for passenger traffic, sctl
+#   owns the relay's route. If BOTH the pin and relay_route are ever removed,
+#   this feature becomes unsafe.
 
 START=99
 STOP=10

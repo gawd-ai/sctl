@@ -90,18 +90,26 @@ rm -f /etc/sctl/disabled
 - Use `sysupgrade --test` only for firmware research; this deployment does not require firmware flashing.
 - **`install.sh` overwrites `/etc/sctl/sctl.toml` wholesale.** The `[tunnel]` block is
   per-deployment and is therefore *not* in the template. To stop a re-install silently
-  un-pinning a unit that is only reachable over that tunnel, `install.sh` either writes a
-  fresh block from `TUNNEL_URL`/`TUNNEL_KEY`/`TUNNEL_BIND_ADDRESS`, or — when those are not
-  supplied — reads the existing block off the device and carries it forward verbatim. It
-  prints which path it took. Check that line on every install against an onboarded unit.
-- **`bind_address` must be an interface *name*, not an IP.** sctl only applies
-  `SO_BINDTODEVICE` when the value fails to parse as an IP address
-  (`server/src/tunnel/client.rs:474-482`). An IP literal sets only the source address, which
-  leaves tunnel egress following the default route — exactly what pinning is meant to prevent.
+  changing how a unit that is only reachable over that tunnel routes it, `install.sh` either
+  writes a fresh block from `TUNNEL_URL`/`TUNNEL_KEY` (with `RELAY_ROUTE_PREFER` or
+  `TUNNEL_BIND_ADDRESS`), or, when those are not supplied, reads the existing block off the
+  device and carries it forward verbatim. It prints which path it took. Check that line on
+  every install against an onboarded unit.
+- **The default block is unpinned: sctl keeps the relay's route itself.** It writes
+  `relay_route = "prefer"` and `relay_route_prefer = ["eth0", "usb0"]` (`RELAY_ROUTE_PREFER`,
+  comma-separated). The vendor dial script installs LTE's default route at metric 0 on every
+  dial, so `"follow_default"` would keep the relay on the SIM; `"prefer"` names the wire
+  first, and sctl's own probes still move the relay's `/32` to LTE when the wire cannot
+  reach the relay and back when it can (`docs/config.md`, `relay_route`). `netage-wanpref`
+  keeps owning the default route for passenger traffic; the two never touch the same route.
+- **`TUNNEL_BIND_ADDRESS` still pins a unit that must stay on one uplink**, and turns
+  `relay_route` off, since the two conflict. It must be an interface *name*, not an IP: sctl
+  only applies `SO_BINDTODEVICE` when the value fails to parse as an IP address
+  (`server/src/tunnel/client.rs`). An IP literal sets only the source address, which leaves
+  tunnel egress following the default route, exactly what pinning is meant to prevent.
 - **A pin on the cellular interface is a metering decision, not a routing one.** With
   `bind_address` on the LTE bearer, every byte of the management plane (tunnel heartbeats,
   the fleet's health, uplink and infra polls, sessions) rides the SIM even while a wired WAN
-  is up and preferred by metric. The RUT241 at Canphone did that for three months at
-  ~50 MB/day. Pin the wired side when a pin is wanted, or leave `TUNNEL_BIND_ADDRESS` empty
-  so the tunnel follows the default route and fails over to cellular with it (a reconnect
-  of a few seconds instead of a zero-gap handover).
+  is up. The RUT241 at Canphone did that for three months at ~50 MB/day. Pin the wired side
+  when a pin is wanted, or leave the default so the relay rides the wire and fails over to
+  cellular on sctl's own evidence.

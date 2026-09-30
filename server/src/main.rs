@@ -509,7 +509,12 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         .tunnel
         .as_ref()
         .filter(|tc| tc.url.is_some() && !tc.relay)
-        .map(|tc| Arc::new(netwatch::owner::RelayRoute::new(tc.relay_route)));
+        .map(|tc| {
+            Arc::new(netwatch::owner::RelayRoute::new(
+                tc.relay_route,
+                tc.relay_route_prefer.clone(),
+            ))
+        });
 
     let mut state = AppState {
         session_manager,
@@ -803,8 +808,9 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         })
     });
 
-    // The relay route owner ([tunnel] relay_route = "follow_default"). It
-    // needs the network watch; stopping it leaves its route in place.
+    // The relay route owner ([tunnel] relay_route = "follow_default" or
+    // "prefer"). It needs the network watch; stopping it leaves its route in
+    // place.
     let relay_route_task = state
         .relay_route
         .clone()

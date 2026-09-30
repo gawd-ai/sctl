@@ -14,7 +14,10 @@
 //! The scenario: the route lands on the wire; the relay goes down and comes
 //! back, which moves nothing; the wire's upstream goes dark and the route
 //! moves to LTE; the upstream returns and so does the route; with
-//! `relay_route = "off"` nothing is written.
+//! `relay_route = "off"` nothing is written; with `relay_route = "prefer"`
+//! listing LTE before the wire, the route lands on LTE at metric 40 over the
+//! wire at metric 0, moves to the wire when LTE's upstream goes dark, and
+//! comes back when it returns.
 //!
 //! Needs root, so it is ignored by default. Build it as yourself, then run the
 //! binary with sudo:
@@ -45,6 +48,7 @@ use sctl::state::{TunnelPath, TunnelStats};
 const RELAY: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(10, 99, 0, 1), 7443);
 const WAN0: Ipv4Addr = Ipv4Addr::new(10, 10, 1, 2);
 const WAN0_GW: Ipv4Addr = Ipv4Addr::new(10, 10, 1, 1);
+const WAN1: Ipv4Addr = Ipv4Addr::new(10, 10, 2, 2);
 /// LTE's default route: `default via 10.10.9.1 dev wan1 onlink`, a gateway
 /// outside wan1's 10.10.2.0/24 that the upstream side answers ARP for.
 const WAN1_GW: Ipv4Addr = Ipv4Addr::new(10, 10, 9, 1);
@@ -399,13 +403,13 @@ async fn scenario(ns: &Namespaces, relay: &AtomicBool) {
     let (publisher, net) = netwatch::channel();
     tokio::spawn(netwatch::run(Arc::new(publisher), 1));
     // Only the wait between probe rounds is shortened.
-    let timing = Timing {
+    let timing = || Timing {
         return_schedule: vec![PROBE_EVERY],
         ..Timing::default()
     };
 
     // follow_default: the /32 lands on the metric-0 link, beside netifd's pin.
-    let route = Arc::new(RelayRoute::new(RelayRouteMode::FollowDefault));
+    let route = Arc::new(RelayRoute::new(RelayRouteMode::FollowDefault, Vec::new()));
     let stats = Arc::new(TunnelStats::new());
     // The stand-in relay speaks plain TCP, as a ws:// relay would; the TLS
     // handshake a wss:// probe adds is tested against a TLS server on
@@ -414,7 +418,7 @@ async fn scenario(ns: &Namespaces, relay: &AtomicBool) {
         route.clone(),
         net.clone(),
         stats.clone(),
-        timing,
+        timing(),
         Probe::Connect,
     ));
     let tunnel_task = tokio::spawn(tunnel(route.clone(), stats.clone()));
@@ -565,7 +569,7 @@ async fn scenario(ns: &Namespaces, relay: &AtomicBool) {
     );
     route::delete(&any).await.expect("sctl's route removed");
 
-    let off = Arc::new(RelayRoute::new(RelayRouteMode::Off));
+    let off = Arc::new(RelayRoute::new(RelayRouteMode::Off, Vec::new()));
     let stats = Arc::new(TunnelStats::new());
     let before = seen(&off, &stats).await.routes;
     let owner_task = tokio::spawn(owner::run(
@@ -591,6 +595,94 @@ async fn scenario(ns: &Namespaces, relay: &AtomicBool) {
     assert_eq!(after.tunnel.as_deref(), Some("wan1"));
     assert_eq!(after.report.mode, RelayRouteMode::Off);
     assert!(events(&stats).await.is_empty());
+    owner_task.abort();
+    tunnel_task.abort();
+
+    // relay_route = "prefer" with the metric-40 link listed before the
+    // metric-0 one: the list beats the metric. The tunnel is still on wan1
+    // over netifd's pin, which proves wan1 without a probe.
+    let prefers = Arc::new(RelayRoute::new(
+        RelayRouteMode::Prefer,
+        vec!["wan1".into(), "wan0".into()],
+    ));
+    let stats = Arc::new(TunnelStats::new());
+    let owner_task = tokio::spawn(owner::run(
+        prefers.clone(),
+        net.clone(),
+        stats.clone(),
+        timing(),
+        Probe::Connect,
+    ));
+    let tunnel_task = tokio::spawn(tunnel(prefers.clone(), stats.clone()));
+    let took = wait_until(
+        "the owner's route lands on the metric-40 link listed first",
+        Duration::from_secs(15),
+        &prefers,
+        &stats,
+        |s| {
+            s.ours() == Some(("wan1", Some(WAN1_GW)))
+                && s.netifd_pin_intact()
+                && s.tunnel.as_deref() == Some("wan1")
+                && s.report.dev.as_deref() == Some("wan1")
+        },
+    )
+    .await;
+    eprintln!("route on wan1 (preferred) after {took:?}");
+    assert_eq!(prefers.report().prefer, ["wan1", "wan0"]);
+    assert_eq!(events(&stats).await, ["none -> wan1 (preferred uplink)"]);
+
+    // The preferred link's upstream goes dark: the next listed one, wan0,
+    // takes the route through the same probe and suspect machinery.
+    ip(&[
+        "-n",
+        &ns.up,
+        "route",
+        "add",
+        "blackhole",
+        &format!("{WAN1}/32"),
+    ]);
+    let took = wait_until(
+        "the route moves to the metric-0 link listed second",
+        Duration::from_mins(1),
+        &prefers,
+        &stats,
+        |s| {
+            s.ours() == Some(("wan0", Some(WAN0_GW)))
+                && s.report.suspect == ["wan1"]
+                && s.tunnel.as_deref() == Some("wan0")
+        },
+    )
+    .await;
+    eprintln!("route on wan0 {took:?} after the blackhole on wan1");
+    assert!(events(&stats)
+        .await
+        .contains(&"wan1 -> wan0 (wan1: no answer from the relay)".to_string()));
+
+    // The preferred link returns: so does the route, after two good probes.
+    ip(&[
+        "-n",
+        &ns.up,
+        "route",
+        "del",
+        "blackhole",
+        &format!("{WAN1}/32"),
+    ]);
+    let took = wait_until(
+        "the route returns to the preferred link",
+        Duration::from_secs(30),
+        &prefers,
+        &stats,
+        |s| {
+            s.ours() == Some(("wan1", Some(WAN1_GW)))
+                && s.report.suspect.is_empty()
+                && s.tunnel.as_deref() == Some("wan1")
+        },
+    )
+    .await;
+    eprintln!("route back on wan1 {took:?} after the restore");
+    assert!(events(&stats)
+        .await
+        .contains(&"wan0 -> wan1 (wan1 answers the relay again)".to_string()));
     owner_task.abort();
     tunnel_task.abort();
 }

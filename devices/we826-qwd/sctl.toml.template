@@ -31,8 +31,15 @@ level = "warn"
 # install.sh, not templated here — either from TUNNEL_URL/TUNNEL_KEY, or by
 # PRESERVING the block already on the device when those are not supplied.
 # install.sh overwrites this whole file, so that preservation is what stops a
-# re-install from silently un-pinning a unit that is only reachable over the
-# tunnel. Do not "simplify" it away.
+# re-install from silently changing how a unit that is only reachable over the
+# tunnel routes it. Do not "simplify" it away.
+#
+# The block install.sh writes by default has no bind_address: it sets
+# relay_route = "prefer" with relay_route_prefer = ["eth0", "usb0"], so sctl
+# keeps the relay on the wire while the wire answers and falls back to LTE
+# itself (the vendor dial script leaves LTE at metric 0, which is why
+# "follow_default" is not used here). TUNNEL_BIND_ADDRESS still pins a unit
+# that must stay on one uplink, and turns relay_route off.
 
 [comms]
 provider = "quectel-at"

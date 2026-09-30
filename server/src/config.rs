@@ -47,7 +47,8 @@
 //! reconnect_max_delay_secs = 30            # client mode, max backoff
 //! heartbeat_interval_secs = 5              # client mode, ping interval
 //! bind_address = "wwan0"                   # client mode, interface name or IP
-//! relay_route = "off"                      # client mode, "off" or "follow_default"
+//! relay_route = "off"                      # client mode, "off", "follow_default" or "prefer"
+//! relay_route_prefer = ["eth0", "usb0"]    # client mode, with relay_route = "prefer"
 //!
 //! # Optional — external comms plugin
 //! [comms]
@@ -307,10 +308,17 @@ pub struct TunnelConfig {
     pub bind_address: Option<String>,
     /// Who keeps the host route to the relay (client mode, default `off`).
     /// With `follow_default`, sctl keeps one `/32` to the relay through the
-    /// lowest-metric default route that reaches it. Conflicts with
-    /// `bind_address`.
+    /// lowest-metric default route that reaches it; with `prefer`, through
+    /// the first of `relay_route_prefer` that holds a default route and
+    /// reaches it. Conflicts with `bind_address`.
     #[serde(default)]
     pub relay_route: RelayRouteMode,
+    /// The uplinks to prefer for the relay route, in order, whatever their
+    /// default routes' metrics (`relay_route = "prefer"` only). An uplink not
+    /// listed is used only when no listed one holds a default route and
+    /// reaches the relay, lowest metric first.
+    #[serde(default)]
+    pub relay_route_prefer: Vec<String>,
     /// Optional PEM file with additional root CA certificates for `wss://`
     /// tunnel client connections. Public webpki roots remain enabled.
     pub tls_ca_file: Option<String>,
@@ -330,7 +338,24 @@ pub enum RelayRouteMode {
     /// sctl keeps one host route to the relay through the lowest-metric
     /// default route that reaches it (`netwatch::owner`).
     FollowDefault,
+    /// As `FollowDefault`, but the uplinks in `relay_route_prefer` come
+    /// first, in that order, whatever their metrics.
+    Prefer,
 }
+
+impl RelayRouteMode {
+    /// The value as it is written in the config file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::FollowDefault => "follow_default",
+            Self::Prefer => "prefer",
+        }
+    }
+}
+
+/// The longest interface name the kernel accepts (`IFNAMSIZ - 1`).
+const MAX_IFNAME_LEN: usize = 15;
 
 /// GPS/location configuration.
 ///
@@ -742,11 +767,40 @@ impl Config {
                 }
             }
             if tc.relay_route != RelayRouteMode::Off && tc.bind_address.is_some() {
-                errors.push(
-                    "tunnel.relay_route = \"follow_default\" conflicts with tunnel.bind_address: \
+                errors.push(format!(
+                    "tunnel.relay_route = \"{}\" conflicts with tunnel.bind_address: \
                      bind_address pins the tunnel to one interface, relay_route moves the \
-                     relay's route between uplinks; set one or the other"
-                        .to_string(),
+                     relay's route between uplinks; set one or the other",
+                    tc.relay_route.as_str()
+                ));
+            }
+            if tc.relay_route == RelayRouteMode::Prefer {
+                if tc.relay_route_prefer.is_empty() {
+                    errors.push(
+                        "tunnel.relay_route = \"prefer\" needs tunnel.relay_route_prefer: the \
+                         interfaces to prefer, in order, such as [\"eth0\", \"usb0\"]"
+                            .to_string(),
+                    );
+                }
+                for (i, name) in tc.relay_route_prefer.iter().enumerate() {
+                    if name.is_empty()
+                        || name.len() > MAX_IFNAME_LEN
+                        || name.chars().any(char::is_whitespace)
+                    {
+                        errors.push(format!(
+                            "tunnel.relay_route_prefer[{i}] '{name}' is not an interface name \
+                             (1 to {MAX_IFNAME_LEN} bytes, no whitespace)"
+                        ));
+                    }
+                    if tc.relay_route_prefer[..i].contains(name) {
+                        errors.push(format!(
+                            "tunnel.relay_route_prefer lists '{name}' more than once"
+                        ));
+                    }
+                }
+            } else if !tc.relay_route_prefer.is_empty() {
+                errors.push(
+                    "tunnel.relay_route_prefer needs tunnel.relay_route = \"prefer\"".to_string(),
                 );
             }
             if tc.relay && tc.tunnel_key.len() < 8 {
@@ -876,11 +930,19 @@ mod tests {
     }
 
     #[test]
-    fn relay_route_with_bind_address_is_refused() {
+    fn relay_route_with_bind_address_is_refused_and_names_the_mode() {
         let config = client("relay_route = \"follow_default\"\nbind_address = \"wwan0\"");
         let errors = config.validate();
         assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(errors[0].contains("relay_route"));
+        assert!(errors[0].contains("relay_route = \"follow_default\""));
+        assert!(errors[0].contains("bind_address"));
+
+        let prefer = client(
+            "relay_route = \"prefer\"\nrelay_route_prefer = [\"eth0\"]\nbind_address = \"eth0\"",
+        );
+        let errors = prefer.validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("relay_route = \"prefer\""), "{errors:?}");
         assert!(errors[0].contains("bind_address"));
     }
 
@@ -898,5 +960,78 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("follow_default"), "{err}");
+        assert!(err.to_string().contains("prefer"), "{err}");
+    }
+
+    #[test]
+    fn relay_route_prefer_lists_the_uplinks_in_order() {
+        let config = client("relay_route = \"prefer\"\nrelay_route_prefer = [\"eth0\", \"usb0\"]");
+        let tc = config.tunnel.as_ref().unwrap();
+        assert_eq!(tc.relay_route, RelayRouteMode::Prefer);
+        assert_eq!(tc.relay_route_prefer, ["eth0", "usb0"]);
+        assert!(config.validate().is_empty(), "{:?}", config.validate());
+        assert!(client("").tunnel.unwrap().relay_route_prefer.is_empty());
+    }
+
+    #[test]
+    fn prefer_needs_a_non_empty_list() {
+        for extra in [
+            "relay_route = \"prefer\"",
+            "relay_route = \"prefer\"\nrelay_route_prefer = []",
+        ] {
+            let errors = client(extra).validate();
+            assert_eq!(errors.len(), 1, "{extra}: {errors:?}");
+            assert!(
+                errors[0].contains("needs tunnel.relay_route_prefer"),
+                "{errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_list_holds_distinct_interface_names() {
+        let errors = client("relay_route = \"prefer\"\nrelay_route_prefer = [\"eth0\", \"eth0\"]")
+            .validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("'eth0' more than once"), "{errors:?}");
+
+        for bad in [
+            "\"\"",
+            "\"eth 0\"",
+            "\"an-interface-name-too-long\"",
+            "\"eth0\\n\"",
+        ] {
+            let errors = client(&format!(
+                "relay_route = \"prefer\"\nrelay_route_prefer = [{bad}]"
+            ))
+            .validate();
+            assert_eq!(errors.len(), 1, "{bad}: {errors:?}");
+            assert!(
+                errors[0].contains("is not an interface name"),
+                "{bad}: {errors:?}"
+            );
+        }
+        // Fifteen bytes is the longest name the kernel takes.
+        assert!(
+            client("relay_route = \"prefer\"\nrelay_route_prefer = [\"abcdefghijklmno\"]")
+                .validate()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_list_without_prefer_is_refused() {
+        for mode in [
+            "",
+            "relay_route = \"off\"\n",
+            "relay_route = \"follow_default\"\n",
+        ] {
+            let errors = client(&format!("{mode}relay_route_prefer = [\"eth0\"]")).validate();
+            assert_eq!(errors.len(), 1, "{mode:?}: {errors:?}");
+            assert_eq!(
+                errors[0],
+                "tunnel.relay_route_prefer needs tunnel.relay_route = \"prefer\""
+            );
+        }
     }
 }
