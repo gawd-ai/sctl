@@ -119,6 +119,10 @@ CI runs these checks on every push and pull request.
 
 The web package includes a [`web/CLAUDE.md`](web/CLAUDE.md) file that serves as a self-contained integration guide for AI agents -- component API, type shapes, common patterns, and gotchas, all in one file. Consider this pattern when adding new packages or significant feature surfaces.
 
+## Decisions and build specs
+
+A decision that shapes the agent, the relay or the way they are built and released gets an ADR in `docs/adr/` (`NNN-slug.md`; `Proposed` → `Accepted (<date>)`, frozen once accepted). What it takes to build it, in which files and how it is accepted, is a TRD in `docs/trd/` (`TRD-N-slug.md`; `Planned` → `Implemented (<date>)`, flipped in the change that ships it, with the verification it ran). Each folder has a `README.md` index. `docs/upgrade.md`, `docs/config.md` and `docs/http-api.md` remain the contracts; ADRs cite them.
+
 ## Pull Requests
 
 1. Fork the repo and create a branch from `main`

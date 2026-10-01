@@ -4,6 +4,7 @@ Start with the doc that matches what you're doing:
 
 | You are… | Read |
 |----------|------|
+| **Deciding and specifying**: a change that shapes the agent, the relay or the release pipeline | [adr/](adr/README.md): architecture decision records · [trd/](trd/README.md): technical requirements documents, one per decision to build |
 | **Operating devices** — a unit crash-looped, or you're rolling out a release | [safe-mode.md](safe-mode.md) — the safe-mode runbook: inspect, investigate, clear (incl. remotely over the relay) · [releasing.md](releasing.md) — rundev.sh toolbox, version scheme, payload publish-vs-activate, release checklist |
 | **Writing an API client** | [http-api.md](http-api.md) — every route, request/response shapes, auth modes, relay access (CI-gated against the registered routes) · [errors.md](errors.md) — the error shape, `retryable` semantics, complete code catalog |
 | **Configuring a device or relay** | [config.md](config.md) — every TOML key with its true default, validation rules, env precedence (CI-gated against `config.rs`) · plus the fully-keyed [`sctl.toml.example`](../server/sctl.toml.example) and [`relay.toml.example`](../server/relay.toml.example) |
