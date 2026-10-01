@@ -13,6 +13,11 @@ under per-component headings. `server/CHANGELOG.md` is frozen.
 ### Managed upgrades
 - **The relay upgrades itself through the managed path** (ADR-003, TRD-3): in relay mode a `POST /api/upgrade` without `manifest_url` reads the manifest from the relay's own artifacts route on loopback (`http://127.0.0.1:<listen port>/api/tunnel/artifacts/<version>/release.json`, bearer the tunnel key). `rundev.sh relay upgrade <user@host> <version>` is now that request followed to its outcome through `/api/health`; the scp-stop-copy-start path is gone (`relay deploy` stays for a first install).
 
+### Ramboot units
+- **A unit that runs its agent through a loader can run the upgrade helper** (ADR-002, TRD-2): `install.json` gains `helper_prefix` (the WE826: `["/tmp/sctl/lib/libc.so","--library-path","/tmp/sctl/lib"]`); with it the helper is a copy of the binary `ramboot.conf` names as `BIN`, started through those words. Without it, the WE826 ended every request `helper_lost`.
+- **Staging never trusts a cached payload by its size**: a file already at the destination is kept when its SHA-256 is the manifest's (no download), dropped first when it is at least as large and different (the ramboot cache holds the live payloads, so the first request of every upgrade failed `sha256_mismatch` and the second passed), resumed when smaller.
+- **`devices/we826-qwd/install.sh`** takes `MIRROR_BASE=<http://relay:8081/artifacts/<version>>` and reads the names and SHA-256s from that mirror's `release.json` (the explicit `*_URL`/`*_SHA256` still win), writes `helper_prefix` into `install.json`; the README installs from a relay's mirror, not a laptop. The relay keeps the previous bundle while a ramboot unit may roll back to it (docs/upgrade.md, "Bundle retention").
+
 ### Release pipeline
 - **The `Release` workflow proves every server artifact embeds the manifest's version before signing** (ADR-001, TRD-1): `strings` over each `sctl-<target>` and gunzipped `sctl-server-<target>.gz`, the four-part version bounded by non-version characters; one miss refuses the bundle. 0.6.7.172 (OpenWrt servers stamped `0.6.7.1`) would have been refused; 0.6.8.179 passes. The plugins, `libc` and `libgcc` embed no version and are not checked.
 - **`docs/releasing.md`** says that a preset `SCTL_BUILD_NUMBER` wins in every build path and that a hand build meant to match a release pins it.

@@ -37,7 +37,21 @@ Do not flash custom firmware on this device unless you have a verified recovery 
 
 ## Install
 
-Provide URLs for the compressed server and plugin payloads. Hashes are for the downloaded payload files, before gzip expansion.
+The unit boots its payloads from a relay's plain-HTTP mirror of a release
+(docs/upgrade.md, "Bundle retention"): name the mirror and the script reads
+every URL and SHA-256 from its `release.json`, writes `ramboot.conf` and an
+`install.json` with the `helper_prefix` the upgrade helper needs under this
+unit's musl loader. From then on the unit upgrades itself when the fleet asks
+(the relay keeps the previous bundle until the unit is past it).
+
+```sh
+API_KEY=... \
+MIRROR_BASE=http://174.138.114.209:8081/artifacts/0.6.9.200 \
+TUNNEL_URL=wss://relay-001.netage.ai/api/tunnel/register TUNNEL_KEY=... \
+devices/we826-qwd/install.sh root@ROUTER_IP
+```
+
+For a bench without a relay, provide the URLs for the compressed server and plugin payloads yourself. Hashes are for the downloaded payload files, before gzip expansion.
 
 Build local payload artifacts:
 

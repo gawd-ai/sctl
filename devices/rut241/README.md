@@ -97,3 +97,8 @@ device.
 
 `install.sh` above still installs the gz-tmp layout for a unit with room; a
 `[tunnel]` block is not written by it and must be re-added.
+
+A rollback on this layout restores the previous `ramboot.conf` only; the next
+boot (or the helper's restart) fetches the previous version from the previous
+mirror into the cache. The relay therefore keeps the previous bundle and its
+mirror until this unit is past it (docs/upgrade.md, "Bundle retention").

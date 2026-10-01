@@ -9,7 +9,11 @@ Usage:
 
 Environment:
   API_KEY               Required. Auth token written to /etc/sctl/sctl.toml.
-  SERVER_URL            Required. URL for compressed or raw sctl server payload.
+  MIRROR_BASE           A relay's plain-HTTP mirror of one release, e.g.
+                        http://relay:8081/artifacts/0.6.9.200 (docs/upgrade.md). The
+                        four payload URLs and SHA-256s below are read from its
+                        release.json (target mips_24kc) unless given explicitly.
+  SERVER_URL            Required unless MIRROR_BASE. URL for compressed or raw sctl server payload.
   SERVER_SHA256         Required unless ALLOW_UNSIGNED=1. Hash of downloaded server payload.
   SERVER_GZIP           Default: 1
   PLUGIN_URL            Required for LTE/comms config. URL for comms plugin payload.
@@ -59,8 +63,25 @@ if [[ -z "${API_KEY:-}" ]]; then
     exit 2
 fi
 
+# The relay's mirror names every payload of the release (docs/upgrade.md,
+# "The release bundle"): an explicit URL or hash still wins.
+if [[ -n "${MIRROR_BASE:-}" ]]; then
+    MIRROR_BASE=${MIRROR_BASE%/}
+    manifest=$(curl -fsS --max-time 30 "$MIRROR_BASE/release.json") || { echo "cannot read $MIRROR_BASE/release.json" >&2; exit 2; }
+    mirror_file() { echo "$manifest" | jq -r --arg role "$1" '.targets.mips_24kc.files[] | select(.role == $role) | "\(.name) \(.sha256) \(.gzip)"'; }
+    for spec in "server SERVER" "plugin PLUGIN" "libc MUSL_LIBC" "libgcc LIBGCC"; do
+        role=${spec% *}; var=${spec#* }
+        read -r name sha gz <<<"$(mirror_file "$role")"
+        [[ -n "$name" ]] || { echo "$MIRROR_BASE/release.json has no mips_24kc $role" >&2; exit 2; }
+        [[ -n "$(eval "echo \${${var}_URL:-}")" ]] || eval "${var}_URL=\"$MIRROR_BASE/$name\""
+        [[ -n "$(eval "echo \${${var}_SHA256:-}")" ]] || eval "${var}_SHA256=\"$sha\""
+        [[ -n "$(eval "echo \${${var}_GZIP:-}")" ]] || { [[ "$gz" == "true" ]] && eval "${var}_GZIP=1" || eval "${var}_GZIP=0"; }
+    done
+    unset manifest
+fi
+
 if [[ -z "${SERVER_URL:-}" ]]; then
-    echo "SERVER_URL is required" >&2
+    echo "SERVER_URL is required (or MIRROR_BASE)" >&2
     usage
     exit 2
 fi
@@ -346,7 +367,7 @@ cp /tmp/sctl.init /etc/init.d/sctl
 cp /tmp/ramboot.sh /etc/sctl/ramboot.sh
 cp /tmp/ramboot.conf /etc/sctl/ramboot.conf
 cp /tmp/sctl.toml /etc/sctl/sctl.toml
-printf '{"v":1,"layout":"ramboot","target":"mips_24kc"}\n' > /etc/sctl/install.json
+printf '{"v":1,"layout":"ramboot","target":"mips_24kc","helper_prefix":["/tmp/sctl/lib/libc.so","--library-path","/tmp/sctl/lib"]}\n' > /etc/sctl/install.json
 cp /tmp/wanpref.init /etc/init.d/netage-wanpref
 cp /tmp/wanpref.conf /etc/sctl/wanpref.conf
 

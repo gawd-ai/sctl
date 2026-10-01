@@ -80,6 +80,21 @@ roles, so the agent knows which artifact replaces which file without a
 per-device table. Every key in `install.json` except `layout` and `target` has
 a default per layout; a script writes only what differs.
 
+`helper_prefix` (0.6.9) is for a unit that runs its agent through a loader, the
+WE826's musl `libc.so --library-path /tmp/sctl/lib`: the words the helper is
+started through (`["/tmp/sctl/lib/libc.so", "--library-path", "/tmp/sctl/lib"]`).
+Under a loader `current_exe()` is the loader, so with a prefix the helper is a
+copy of the binary `ramboot.conf` names as `BIN`. Empty everywhere else.
+
+**Bundle retention.** A ramboot unit's rollback restores its previous
+`ramboot.conf`, and its next boot fetches that version from that mirror; so a
+relay keeps a version and its mirror until no ramboot unit may still roll back
+to it (the one before the version every ramboot unit runs). Removing a bundle
+(`rundev.sh relay artifacts <host> delete <version>`) is an operations step the
+fleet's operations doc owns. Staging never trusts a cached file by its size: a
+file already at the destination is kept when its SHA-256 is the manifest's,
+dropped when it is at least as large and different, resumed when smaller.
+
 An agent with no `install.json` reports `layout: null` and refuses to upgrade
 ("no install.json: this device was installed before 0.6.7"). The last hand
 upgrade to 0.6.7 writes the file.

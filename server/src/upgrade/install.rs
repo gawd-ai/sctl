@@ -79,6 +79,8 @@ struct Raw {
     ramboot_conf: Option<String>,
     #[serde(default)]
     cache_dir: Option<String>,
+    #[serde(default)]
+    helper_prefix: Option<Vec<String>>,
 }
 
 /// The resolved install: every field filled.
@@ -106,6 +108,11 @@ pub struct InstallInfo {
     pub ramboot_conf: Option<PathBuf>,
     /// The boot fetcher's cache (ramboot layout).
     pub cache_dir: Option<PathBuf>,
+    /// How the unit runs its agent when a loader is needed (the WE826's musl
+    /// loader): the helper is started through the same words, e.g.
+    /// `["/tmp/sctl/lib/libc.so", "--library-path", "/tmp/sctl/lib"]`.
+    /// Empty on every other unit.
+    pub helper_prefix: Vec<String>,
 }
 
 impl InstallInfo {
@@ -170,6 +177,12 @@ impl InstallInfo {
         }
         if let Some(c) = raw.cache_dir {
             info.cache_dir = Some(PathBuf::from(c));
+        }
+        if let Some(prefix) = raw.helper_prefix {
+            if prefix.iter().any(String::is_empty) {
+                return Err("install.json helper_prefix has an empty word".to_string());
+            }
+            info.helper_prefix = prefix;
         }
         if !info.files.contains_key("server") && layout != Layout::Ramboot {
             return Err("install.json names no server file".to_string());
@@ -265,6 +278,7 @@ impl InstallInfo {
             unit,
             ramboot_conf,
             cache_dir,
+            helper_prefix: Vec::new(),
         }
     }
 
@@ -295,6 +309,7 @@ impl InstallInfo {
             "unit": self.unit,
             "ramboot_conf": self.ramboot_conf.as_ref().map(|p| p.display().to_string()),
             "cache_dir": self.cache_dir.as_ref().map(|p| p.display().to_string()),
+            "helper_prefix": self.helper_prefix,
         })
     }
 }
@@ -336,6 +351,35 @@ mod tests {
             "http://127.0.0.1:1337/api/health"
         );
         assert_eq!(info.min_free_kb, 4096);
+    }
+
+    #[test]
+    fn a_loader_run_unit_names_its_helper_prefix() {
+        let info = InstallInfo::parse(
+            br#"{"layout":"ramboot","target":"mips_24kc","helper_prefix":["/tmp/sctl/lib/libc.so","--library-path","/tmp/sctl/lib"]}"#,
+            "mips_24kc",
+        )
+        .unwrap();
+        assert_eq!(
+            info.helper_prefix,
+            vec!["/tmp/sctl/lib/libc.so", "--library-path", "/tmp/sctl/lib"]
+        );
+        assert_eq!(
+            info.report("127.0.0.1:1337")["helper_prefix"],
+            serde_json::json!(["/tmp/sctl/lib/libc.so", "--library-path", "/tmp/sctl/lib"])
+        );
+        let plain = InstallInfo::parse(
+            br#"{"layout":"ramboot","target":"mipsel_24kc"}"#,
+            "mipsel_24kc",
+        )
+        .unwrap();
+        assert!(plain.helper_prefix.is_empty());
+        let err = InstallInfo::parse(
+            br#"{"layout":"ramboot","target":"mips_24kc","helper_prefix":[""]}"#,
+            "mips_24kc",
+        )
+        .unwrap_err();
+        assert!(err.contains("helper_prefix"), "{err}");
     }
 
     #[test]

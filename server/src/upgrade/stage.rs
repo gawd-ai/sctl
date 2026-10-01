@@ -417,6 +417,41 @@ fn copy_file(from: &Path, to: &Path) -> Result<(), String> {
         .map_err(|e| format!("copy {} to {}: {e}", from.display(), to.display()))
 }
 
+/// One value of a `ramboot.conf` (`KEY='value'` or `KEY=value`).
+pub fn conf_value(conf: &str, key: &str) -> Option<String> {
+    conf.lines().find_map(|line| {
+        let rest = line.strip_prefix(key)?.strip_prefix('=')?;
+        let value = rest.trim().trim_matches('\'').trim_matches('"');
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// What a file already at the destination is worth (ADR-002): the one the
+/// manifest names (keep it, no download), a stale file at least as large as
+/// the one expected (never trusted by size: dropped first), or a partial
+/// download (resumed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cache {
+    Absent,
+    Keep,
+    Stale,
+    Partial,
+}
+
+pub fn cache_disposition(dest: &Path, expected_size: u64, expected_sha256: &str) -> Cache {
+    let Ok(meta) = std::fs::metadata(dest) else {
+        return Cache::Absent;
+    };
+    if super::sha256_file(dest).is_ok_and(|actual| actual == expected_sha256) {
+        return Cache::Keep;
+    }
+    if meta.len() >= expected_size {
+        Cache::Stale
+    } else {
+        Cache::Partial
+    }
+}
+
 /// The new `ramboot.conf`: the current one with every URL and SHA-256 the
 /// manifest covers replaced.
 pub fn ramboot_conf(current: &str, files: &[ArtifactFile], mirror_base: &str) -> String {
@@ -566,17 +601,26 @@ async fn stage(ctx: &Context, req: &Request, handle: &Handle) -> Result<(), Refu
         } else {
             stage.join(&file.name)
         };
-        let have = std::fs::metadata(&dest).map_or(0, |m| m.len());
-        need_space(&stage, file.size.saturating_sub(have), install.min_free_kb)?;
-        fetcher
-            .get_to_file(
-                &format!("{dir_url}{}", file.name),
-                &dest,
-                file.size,
-                Some(&file.sha256),
-            )
-            .await
-            .map_err(|e| Refusal::new(Reason::DownloadFailed, e))?;
+        let cached = cache_disposition(&dest, file.size, &file.sha256);
+        if cached == Cache::Stale {
+            // An older payload at least as large as this one (a ramboot cache
+            // holds the live files): trusting it by size made the first
+            // request of an upgrade fail its SHA-256 (ADR-002).
+            let _ = std::fs::remove_file(&dest);
+        }
+        if cached != Cache::Keep {
+            let have = std::fs::metadata(&dest).map_or(0, |m| m.len());
+            need_space(&stage, file.size.saturating_sub(have), install.min_free_kb)?;
+            fetcher
+                .get_to_file(
+                    &format!("{dir_url}{}", file.name),
+                    &dest,
+                    file.size,
+                    Some(&file.sha256),
+                )
+                .await
+                .map_err(|e| Refusal::new(Reason::DownloadFailed, e))?;
+        }
         let actual = super::sha256_file(&dest)
             .map_err(|e| Refusal::new(Reason::Internal, format!("{}: {e}", dest.display())))?;
         if actual != file.sha256 {
@@ -700,10 +744,30 @@ async fn stage(ctx: &Context, req: &Request, handle: &Handle) -> Result<(), Refu
     )
     .map_err(|e| Refusal::new(Reason::Internal, format!("{}: {e}", plan_path.display())))?;
 
-    // The helper: a copy of this binary, detached.
+    // The helper: a copy of this binary, detached. Under a loader (the
+    // WE826's musl `libc.so --library-path`) `current_exe()` is the loader,
+    // so the running binary is the one `ramboot.conf` names as `BIN`.
     let helper = stage.join("helper");
-    let me = std::env::current_exe()
-        .map_err(|e| Refusal::new(Reason::Internal, format!("current_exe: {e}")))?;
+    let me = if install.helper_prefix.is_empty() {
+        std::env::current_exe()
+            .map_err(|e| Refusal::new(Reason::Internal, format!("current_exe: {e}")))?
+    } else {
+        let conf_path = install
+            .ramboot_conf
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/etc/sctl/ramboot.conf"));
+        let conf = std::fs::read_to_string(&conf_path)
+            .map_err(|e| Refusal::new(Reason::Internal, format!("{}: {e}", conf_path.display())))?;
+        PathBuf::from(conf_value(&conf, "BIN").ok_or_else(|| {
+            Refusal::new(
+                Reason::Internal,
+                format!(
+                    "{}: no BIN for the helper under a loader",
+                    conf_path.display()
+                ),
+            )
+        })?)
+    };
     copy_file(&me, &helper).map_err(|e| Refusal::new(Reason::Internal, e))?;
     set_mode(&helper, 0o755).map_err(|e| Refusal::new(Reason::Internal, e))?;
     // The old helper's log starts afresh for this attempt.
@@ -722,6 +786,7 @@ async fn stage(ctx: &Context, req: &Request, handle: &Handle) -> Result<(), Refu
         install.layout,
         &manifest.version,
         &plan.log_path,
+        &install.helper_prefix,
     )
     .map_err(|e| Refusal::new(Reason::Internal, e))?;
     info!(version = %manifest.version, "upgrade: handed off to the helper");
@@ -730,13 +795,15 @@ async fn stage(ctx: &Context, req: &Request, handle: &Handle) -> Result<(), Refu
 
 /// Start `helper upgrade-apply --stage <stage>` in its own session with
 /// its output in `log`; on the systemd layout as a transient unit so it
-/// lives outside the hardened service's cgroup.
+/// lives outside the hardened service's cgroup; through `prefix` (the
+/// unit's loader and its words) when the unit runs its agent that way.
 fn spawn_helper(
     helper: &Path,
     stage: &Path,
     layout: Layout,
     version: &str,
     log: &Path,
+    prefix: &[String],
 ) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     let log_file = std::fs::OpenOptions::new()
@@ -764,6 +831,14 @@ fn spawn_helper(
                 log.display()
             ))
             .arg(format!("--property=StandardError=append:{}", log.display()))
+            .arg(helper)
+            .arg("upgrade-apply")
+            .arg("--stage")
+            .arg(stage);
+        c
+    } else if let Some((first, rest)) = prefix.split_first() {
+        let mut c = std::process::Command::new(first);
+        c.args(rest)
             .arg(helper)
             .arg("upgrade-apply")
             .arg("--stage")
@@ -961,6 +1036,95 @@ mod tests {
             manifest_url(&c, &req("0.6.9.1")).unwrap(),
             "http://upstream:8443/api/tunnel/artifacts/0.6.9.1/release.json"
         );
+    }
+
+    #[test]
+    fn a_cached_file_is_kept_by_hash_never_by_size() {
+        let dir = std::env::temp_dir().join(format!("sctl-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("sctl-server.payload");
+        let good = b"the payload the manifest names";
+        std::fs::write(&dest, good).unwrap();
+        let sha = super::super::sha256_file(&dest).unwrap();
+        assert_eq!(
+            cache_disposition(&dest, good.len() as u64, &sha),
+            Cache::Keep
+        );
+        std::fs::remove_file(&dest).unwrap();
+        assert_eq!(
+            cache_disposition(&dest, good.len() as u64, &sha),
+            Cache::Absent
+        );
+        // An older payload, larger than the new one: stale, not "complete".
+        std::fs::write(&dest, b"an older payload that happens to be longer").unwrap();
+        assert_eq!(
+            cache_disposition(&dest, good.len() as u64, &sha),
+            Cache::Stale
+        );
+        // Same size, different bytes: stale too.
+        std::fs::write(&dest, b"the payload the manifest shames").unwrap();
+        assert_eq!(
+            cache_disposition(&dest, good.len() as u64, &sha),
+            Cache::Stale
+        );
+        std::fs::write(&dest, &good[..10]).unwrap();
+        assert_eq!(
+            cache_disposition(&dest, good.len() as u64, &sha),
+            Cache::Partial
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn conf_values_are_read_quoted_or_bare() {
+        let conf =
+            "RUN_DIR='/tmp/sctl'\nBIN=\"/tmp/sctl/sctl-server\"\nMIN_TMP_KB=24576\nEMPTY=''\n";
+        assert_eq!(
+            conf_value(conf, "BIN").as_deref(),
+            Some("/tmp/sctl/sctl-server")
+        );
+        assert_eq!(conf_value(conf, "RUN_DIR").as_deref(), Some("/tmp/sctl"));
+        assert_eq!(conf_value(conf, "MIN_TMP_KB").as_deref(), Some("24576"));
+        assert_eq!(conf_value(conf, "EMPTY"), None);
+        assert_eq!(conf_value(conf, "BINARY"), None);
+    }
+
+    #[test]
+    fn the_helper_starts_through_the_units_loader_words() {
+        let dir = std::env::temp_dir().join(format!("sctl-prefix-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The "helper" is a script that records how it was called; the
+        // "loader" is /bin/sh, which runs it with the words that follow.
+        let helper = dir.join("helper");
+        let argv = dir.join("argv");
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\necho \"$0 $*\" > '{}'\n", argv.display()),
+        )
+        .unwrap();
+        set_mode(&helper, 0o755).unwrap();
+        let log = dir.join("log");
+        let prefix = vec!["/bin/sh".to_string(), "-e".to_string()];
+        spawn_helper(&helper, &dir, Layout::Ramboot, "0.6.9.1", &log, &prefix).unwrap();
+        let mut recorded = String::new();
+        for _ in 0..50 {
+            if let Ok(s) = std::fs::read_to_string(&argv) {
+                recorded = s;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            recorded.trim(),
+            format!(
+                "{} upgrade-apply --stage {}",
+                helper.display(),
+                dir.display()
+            )
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
