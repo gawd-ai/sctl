@@ -1,6 +1,6 @@
 # TRD-1: Release integrity guard
 
-Implements [ADR-001](../adr/001-an-artifact-carries-the-version-its-manifest-names.md). Status: Planned.
+Implements [ADR-001](../adr/001-an-artifact-carries-the-version-its-manifest-names.md). Status: Implemented (2026-10-01); slice 2, the first release run with the proof, is recorded at the next tag.
 
 ## 1. Objective
 
@@ -26,5 +26,5 @@ The four-part version is a compile-time constant in every **server** binary, ins
 
 ## 5. Slices and status
 
-1. Workflow step and docs: Planned.
+1. Workflow step and docs: Implemented (2026-10-01). Verified locally with the step's shell as written in `release.yml` (`grep` without `-q`: under `pipefail` an early exit made every artifact read as a miss, found and fixed in the rehearsal): over the 0.6.8.179 bundle all six server artifacts print `proof ok`; over the 0.6.7.172 bundle the four cross-built servers pass and `sctl-server-mips_24kc.gz` and `sctl-server-mipsel_24kc.gz` fail, the release is refused with exit 1. The negative control is that second run.
 2. First release run with the proof: Planned (the next tag).

@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 This root file is the only changelog; per-component history is recorded here
 under per-component headings. `server/CHANGELOG.md` is frozen.
 
+## [Unreleased]
+
+### Release pipeline
+- **The `Release` workflow proves every server artifact embeds the manifest's version before signing** (ADR-001, TRD-1): `strings` over each `sctl-<target>` and gunzipped `sctl-server-<target>.gz`, the four-part version bounded by non-version characters; one miss refuses the bundle. 0.6.7.172 (OpenWrt servers stamped `0.6.7.1`) would have been refused; 0.6.8.179 passes. The plugins, `libc` and `libgcc` embed no version and are not checked.
+- **`docs/releasing.md`** says that a preset `SCTL_BUILD_NUMBER` wins in every build path and that a hand build meant to match a release pins it.
+- **`devices/rut241/README.md`**: the probe env files on the relay are not where a unit's API key lives; netage-server's `[[fleet.device_keys]]` entry is.
+
 ## [0.6.8] - 2026-10-01
 
 ### Release pipeline

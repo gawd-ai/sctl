@@ -37,6 +37,18 @@ The build number bumps on every commit, so a fresh binary is never mistaken
 for an older one — `sctl v0.6.0.113` in the startup log identifies the
 exact commit count it was cut from.
 
+A preset `SCTL_BUILD_NUMBER` wins everywhere: `server/build.rs`, `rundev.sh`
+and `devices/common/build-lib.sh` all keep one that is already exported.
+That is how CI's `Release` workflow gives every job the number its `meta`
+job counted on a full checkout, and how a hand build is made to match a
+release: `SCTL_BUILD_NUMBER=179 ./rundev.sh device upgrade-remote <name>`
+produces the same `0.6.8.179` the bundle carries. Before 2026-10-01 the
+device build counted its own checkout over the preset, so CI's shallow
+OpenWrt jobs stamped 0.6.7.172's `mips_24kc` and `mipsel_24kc` servers as
+`0.6.7.1` and a managed upgrade from that bundle failed its version proof on
+every XE300 and RUT241 (ADR-001). The `Release` workflow now refuses such a
+bundle (see "Managed upgrades").
+
 ## rundev.sh subcommands
 
 `./rundev.sh <command>` is the whole dev/deploy toolbox. From the dispatch
@@ -240,4 +252,14 @@ Release checklist additions:
    artifacts (unsigned unless `SIGNING_KEY_FILE` is set; a bench signs with
    its own key and lists it in `[upgrade] trust_keys`).
 3. `./rundev.sh relay artifacts <user@host> <version> <dir>` on every relay,
-   then the fleet's rollout.
+   then `./rundev.sh relay artifacts <user@host> mirror <version> <url>` for
+   the plain-HTTP copy a `ramboot` unit boots from, then the fleet's rollout.
+
+Before the bundle is signed, the `Assemble` step proves every `server`
+artifact (`sctl-<target>`, the gunzipped `sctl-server-<target>.gz`) embeds
+the manifest's four-part version (`strings -n 5`, the version bounded by
+non-version characters: it sits inside a longer merged string in the
+binary). The plugins, `libc` and `libgcc` embed no version and are not
+checked. One failure refuses the release, so a bundle on a relay is trusted
+to upgrade every target it names (ADR-001). The step's log reads
+`proof ok <name>` per artifact.

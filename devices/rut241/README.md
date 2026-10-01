@@ -50,6 +50,14 @@ SERIAL=RUT241-001 LTE_INTERFACE=qmimux0 \
 API_KEY=... devices/rut241/install.sh root@ROUTER_IP
 ```
 
+The unit's API key has one owner once it is in the fleet: netage-server's
+`[[fleet.device_keys]]` entry for its serial (on the relay droplet,
+`/etc/netage-server/netage-server.toml`). The probe env files under
+`/root/probes/<serial>.env` there are what an onboarding wrote at the time
+and go stale when a key is rotated (D4C5's was, found 2026-10-01); do not
+read a key from them. Read it inside the shell into a variable and never
+print it.
+
 The AT port is auto-detected (USB interface :1.2) — never hardcode `/dev/ttyUSBn`,
 it re-enumerates and a stale path takes the modem down. `LTE_INTERFACE=qmimux0` is
 the QMI data bearer (holds the IPv4); using `wwan0` is the long-standing NOCONN bug.

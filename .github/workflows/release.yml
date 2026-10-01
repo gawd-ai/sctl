@@ -159,6 +159,21 @@ jobs:
           specs+=("mipsel_24kc:plugin:in/device-rut241/sctl-comms-quectel-mipsel_24kc.so.gz:gzip")
           scripts/release-bundle.sh release "$VERSION" "${specs[@]}"
           cat release/release.json
+          # Every server artifact must embed the version the manifest names
+          # (ADR-001): 0.6.7.172's OpenWrt servers said 0.6.7.1. The plugins,
+          # libc and libgcc embed no version. grep reads to the end on purpose:
+          # with pipefail a -q early exit would report a SIGPIPE as a miss.
+          pattern="(^|[^0-9.])${VERSION//./\\.}([^0-9]|$)"
+          failed=0
+          while IFS='|' read -r name gz; do
+            if [ "$gz" = "true" ]; then reader=(gzip -dc "release/$name"); else reader=(cat "release/$name"); fi
+            if "${reader[@]}" | strings -n 5 | grep -E "$pattern" >/dev/null; then
+              echo "proof ok $name"
+            else
+              echo "proof FAILED $name: does not embed $VERSION"; failed=1
+            fi
+          done < <(jq -r '.targets | to_entries[] | .value.files[] | select(.role == "server") | "\(.name)|\(.gzip)"' release/release.json)
+          [ "$failed" = 0 ] || { echo "release $VERSION refused: an artifact does not carry the version its manifest names (ADR-001)"; exit 1; }
           if [ -n "${SIGNING_KEY_FILE:-}" ]; then
             scripts/release-sign.sh verify release/release.json "$(scripts/release-sign.sh pubkey "$SIGNING_KEY_FILE" | sed -n 's/^public_key_hex=//p')"
             rm -f "$SIGNING_KEY_FILE"
