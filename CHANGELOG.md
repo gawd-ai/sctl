@@ -10,6 +10,9 @@ under per-component headings. `server/CHANGELOG.md` is frozen.
 
 ## [Unreleased]
 
+### Managed upgrades
+- **The relay upgrades itself through the managed path** (ADR-003, TRD-3): in relay mode a `POST /api/upgrade` without `manifest_url` reads the manifest from the relay's own artifacts route on loopback (`http://127.0.0.1:<listen port>/api/tunnel/artifacts/<version>/release.json`, bearer the tunnel key). `rundev.sh relay upgrade <user@host> <version>` is now that request followed to its outcome through `/api/health`; the scp-stop-copy-start path is gone (`relay deploy` stays for a first install).
+
 ### Release pipeline
 - **The `Release` workflow proves every server artifact embeds the manifest's version before signing** (ADR-001, TRD-1): `strings` over each `sctl-<target>` and gunzipped `sctl-server-<target>.gz`, the four-part version bounded by non-version characters; one miss refuses the bundle. 0.6.7.172 (OpenWrt servers stamped `0.6.7.1`) would have been refused; 0.6.8.179 passes. The plugins, `libc` and `libgcc` embed no version and are not checked.
 - **`docs/releasing.md`** says that a preset `SCTL_BUILD_NUMBER` wins in every build path and that a hand build meant to match a release pins it.

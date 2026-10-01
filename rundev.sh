@@ -39,7 +39,7 @@
 # Relay VPS deployment:
 #   ./rundev.sh relay setup <user@host>   # full VPS provisioning (Caddy + sctl + firewall)
 #   ./rundev.sh relay deploy [user@host]  # deploy binary + service (preserves config)
-#   ./rundev.sh relay upgrade [user@host] # binary-only upgrade
+#   ./rundev.sh relay upgrade <user@host> <version>  # the relay upgrades itself from its own bundle (managed path)
 #   ./rundev.sh relay status [user@host]  # health check + connected devices
 #   ./rundev.sh relay sctlin [user@host]  # deploy sctlin web UI to relay
 #
@@ -91,7 +91,7 @@ CLOUDFLARED_PID_FILE="$DATA_DIR/cloudflared.pid"
 # Relay VPS deployment
 RELAY_X86_BIN="$REPO_DIR/target/release/sctl"
 RELAY_REMOTE_BIN="/usr/local/bin/sctl"
-RELAY_REMOTE_CONFIG="/etc/sctl/relay.toml"
+RELAY_REMOTE_CONFIG="${RELAY_REMOTE_CONFIG:-/etc/sctl/relay.toml}"
 
 # Binaries (release for speed, debug takes too long on PTY-heavy sessions)
 SCTL_BIN="$REPO_DIR/target/release/sctl"
@@ -3801,102 +3801,88 @@ do_relay_deploy() {
 }
 
 do_relay_upgrade() {
-    local remote="${1:-}"
-    if [[ -z "$remote" ]]; then
-        if [[ -f "$REPO_DIR/.env.local" ]]; then
-            source "$REPO_DIR/.env.local"
-            remote="${RELAY_HOST:-}"
-        fi
-        if [[ -z "$remote" ]]; then
-            err "Usage: $0 relay upgrade <user@host>"
-            err "  (or set RELAY_HOST in .env.local via 'relay setup')"
-            exit 1
-        fi
-        log "Using RELAY_HOST=$remote from .env.local"
+    # The managed path (docs/upgrade.md "The relay upgrades itself", ADR-003):
+    # the relay is asked through its own operator API to upgrade to a
+    # version it already serves in its artifact store, and does what a
+    # device does: fetch from its own artifacts route, verify, stage, hand
+    # off to the helper (a transient systemd unit), swap, restart, health,
+    # rollback. Nothing is copied from this laptop. Run it after every
+    # device ring of the version is done on this relay.
+    local remote="${1:-}" version="${2:-}"
+    if [[ -z "$remote" || -z "$version" ]]; then
+        err "Usage: $0 relay upgrade <user@host> <version>"
+        err "  The bundle must be on the relay first: $0 relay artifacts <user@host> <version> <dir>"
+        err "  A bench relay on this machine: RELAY_REMOTE_CONFIG=<relay.toml> RELAY_API_PORT=<port> $0 relay upgrade local <version>"
+        exit 1
     fi
-
     local ssh_opts="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+    # Every command runs on the relay (over SSH, or in a shell here for a bench).
+    relay_run() {
+        if [[ "$remote" == "local" ]]; then bash -c "$1"; else ssh $ssh_opts "$remote" "$1"; fi
+    }
+    # The relay's operator key, read where it lives; it never leaves the relay.
+    local key_expr="\$(sed -n 's/^api_key *= *\"\(.*\)\"/\1/p' $RELAY_REMOTE_CONFIG | head -n1)"
+    local base="http://127.0.0.1:${RELAY_API_PORT:-8443}/api"
 
-    # Get old version
-    local old_version
-    old_version=$(ssh $ssh_opts "$remote" "$RELAY_REMOTE_BIN --version 2>/dev/null || echo unknown") || old_version="unknown"
-
-    # Build
-    log "Building sctl for relay host..."
-    cargo build --manifest-path "$SCTL_DIR/Cargo.toml" --release
-
-    # Record old PID
-    local old_pid
-    old_pid=$(ssh $ssh_opts "$remote" "systemctl show sctl-relay --property=MainPID --value 2>/dev/null") || old_pid="0"
-    [[ "$old_pid" == "0" ]] && old_pid=""
-
-    # Stop service
-    log "Stopping sctl-relay on $remote... (pid ${old_pid:-unknown})"
-    ssh $ssh_opts "$remote" "systemctl stop sctl-relay" || true
-
-    # Verify the process is actually gone
-    local retries=0
-    while ssh $ssh_opts "$remote" "pgrep -x sctl >/dev/null 2>&1"; do
-        retries=$((retries + 1))
-        if [[ $retries -ge 10 ]]; then
-            warn "sctl process still alive after stop — force killing"
-            ssh $ssh_opts "$remote" "pkill -9 -x sctl || true"
-            sleep 1
-            break
-        fi
-        sleep 1
-    done
-
-    # Upload new binary
-    log "Uploading binary to $remote..."
-    scp $ssh_opts "$RELAY_X86_BIN" "$remote:$RELAY_REMOTE_BIN"
-    ssh $ssh_opts "$remote" "chmod +x $RELAY_REMOTE_BIN"
-
-    # Start service
-    log "Starting sctl-relay..."
-    ssh $ssh_opts "$remote" "systemctl start sctl-relay"
-
-    # Verify new PID is different (give systemd a moment to record it)
-    sleep 1
-    local new_pid
-    new_pid=$(ssh $ssh_opts "$remote" "systemctl show sctl-relay --property=MainPID --value 2>/dev/null") || new_pid="0"
-    if [[ "$new_pid" == "0" || "$new_pid" == "$old_pid" ]]; then
-        err "Service failed to start or PID didn't change (old=$old_pid new=$new_pid)"
-        err "Check logs: ssh $remote journalctl -u sctl-relay -n 50"
+    local listing
+    listing=$(relay_run "curl -sS -H \"Authorization: Bearer $key_expr\" $base/tunnel/artifacts") || { err "The relay did not answer its artifacts listing"; exit 1; }
+    if ! echo "$listing" | jq -e --arg v "$version" '.versions[] | select(.version == $v and .complete == true)' >/dev/null 2>&1; then
+        err "The relay does not hold a complete $version bundle. Upload it first: $0 relay artifacts $remote $version <dir>"
+        echo "$listing" | jq -c '.versions[] | {version, complete}' 2>/dev/null
         exit 1
     fi
+    local running
+    running=$(relay_run "curl -sS -H \"Authorization: Bearer $key_expr\" $base/health" | jq -r '.version // "unknown"') || running="unknown"
+    log "Relay $remote runs $running; asking it to upgrade to $version through POST /api/upgrade..."
 
-    # Get new version
-    local new_version
-    new_version=$(ssh $ssh_opts "$remote" "$RELAY_REMOTE_BIN --version 2>/dev/null || echo unknown") || new_version="unknown"
+    local request_id="relay:$version:$(date -u +%Y%m%dT%H%M%SZ)"
+    local body
+    body=$(jq -cn --arg v "$version" --arg r "$request_id" '{version: $v, request_id: $r}')
+    local answer
+    answer=$(relay_run "curl -sS -w '\n%{http_code}' -X POST -H \"Authorization: Bearer $key_expr\" -H 'Content-Type: application/json' -d '$body' $base/upgrade") || { err "The request did not reach the relay"; exit 1; }
+    local status="${answer##*$'\n'}"
+    local payload="${answer%$'\n'*}"
+    case "$status" in
+        202) log "Accepted: $(echo "$payload" | jq -c '.state | {phase, request_id}' 2>/dev/null)" ;;
+        200) ok "The relay already runs $version"; return 0 ;;
+        *)
+            err "The relay refused (HTTP $status): $(echo "$payload" | jq -c '{code, message, detail}' 2>/dev/null || echo "$payload")"
+            exit 1
+            ;;
+    esac
 
-    # Health check — poll for up to 60s. The relay can take several seconds
-    # to come ready while it cleans up session journals at startup, so a
-    # single curl right after `systemctl start` will often miss the window.
-    local health=""
-    local waited=0
-    while [[ $waited -lt 60 ]]; do
-        health=$(ssh $ssh_opts "$remote" "curl -sf -m 3 http://127.0.0.1:8443/api/health" 2>/dev/null) || health=""
-        if [[ -n "$health" ]]; then
-            break
+    # Follow it through /api/health's upgrade block: every phase change,
+    # then the outcome and the log tail. The relay restarts in the middle,
+    # so a health miss is expected for a few seconds, not a failure.
+    log "Following the relay's upgrade state (the relay restarts once; devices reconnect once)..."
+    local last="" health st phase outcome waited=0
+    while [[ $waited -lt 300 ]]; do
+        sleep 5
+        waited=$((waited + 5))
+        health=$(relay_run "curl -sf -m 5 -H \"Authorization: Bearer $key_expr\" $base/health" 2>/dev/null) || { echo "  ${waited}s: relay not answering (restarting?)"; continue; }
+        st=$(echo "$health" | jq -c '{version, phase: .upgrade.phase, outcome: .upgrade.outcome, reason: .upgrade.reason, to: .upgrade.to_version}' 2>/dev/null) || st=""
+        if [[ "$st" != "$last" ]]; then
+            echo "  ${waited}s: $st"
+            last="$st"
         fi
-        sleep 2
-        waited=$((waited + 2))
+        phase=$(echo "$health" | jq -r '.upgrade.phase // ""')
+        outcome=$(echo "$health" | jq -r '.upgrade.outcome // ""')
+        if [[ "$phase" == "done" || "$phase" == "idle" ]]; then
+            running=$(echo "$health" | jq -r '.version // "unknown"')
+            if [[ "$running" == "$version" && ( "$outcome" == "ok" || "$phase" == "idle" ) ]]; then
+                ok "Relay $remote runs $version (upgrade ${outcome:-applied}, ${waited}s)"
+                return 0
+            fi
+            if [[ -n "$outcome" && "$outcome" != "ok" ]]; then
+                err "The upgrade ended '$outcome' ($(echo "$health" | jq -r '.upgrade.reason // ""')); the relay runs $running"
+                echo "$health" | jq -r '.upgrade.log_tail // ""' | sed 's/^/    /'
+                exit 1
+            fi
+        fi
     done
-
-    if [[ -z "$health" ]]; then
-        err "Health check failed after 60s — check logs: ssh $remote journalctl -u sctl-relay -n 50"
-        exit 1
-    fi
-
-    local uptime_secs
-    uptime_secs=$(echo "$health" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uptime_secs',999))" 2>/dev/null) || uptime_secs="999"
-    if [[ "$uptime_secs" -lt 90 ]]; then
-        ok "Upgrade complete: $old_version → $new_version (pid $new_pid, uptime ${uptime_secs}s, waited ${waited}s)"
-    else
-        warn "Relay healthy but uptime=${uptime_secs}s — old process may not have been replaced"
-        warn "Check: ssh $remote journalctl -u sctl-relay -n 50"
-    fi
+    err "No outcome after ${waited}s; the relay reports: $last"
+    err "Check: ssh $remote journalctl -u sctl-relay -n 50, and GET $base/upgrade"
+    exit 1
 }
 
 # Upload a release bundle (docs/upgrade.md) to a relay: the manifest and its
@@ -4359,7 +4345,7 @@ case "${1:-setup}" in
         case "${2:-status}" in
             setup)   do_relay_setup "${3:-}" ;;
             deploy)  do_relay_deploy "${3:-}" ;;
-            upgrade) do_relay_upgrade "${3:-}" ;;
+            upgrade) do_relay_upgrade "${3:-}" "${4:-}" ;;
             status)  do_relay_status "${3:-}" ;;
             sctlin)  do_relay_sctlin "${3:-}" ;;
             artifacts) do_relay_artifacts "${3:-}" "${4:-}" "${5:-}" "${6:-}" ;;
@@ -4431,7 +4417,7 @@ case "${1:-setup}" in
         echo "Relay VPS deployment:"
         echo "  relay setup <user@host>     full VPS provisioning (Caddy + sctl + firewall)"
         echo "  relay deploy [user@host]    deploy binary + service (preserves config)"
-        echo "  relay upgrade [user@host]   binary-only upgrade"
+        echo "  relay upgrade <user@host> <version>  the relay upgrades itself from its own bundle (managed path)"
         echo "  relay status [user@host]    health check + connected devices"
         echo "  relay sctlin [user@host]    deploy sctlin web UI to relay"
         echo "  relay artifacts <user@host> <version> <dir>   upload a release bundle (docs/upgrade.md)"

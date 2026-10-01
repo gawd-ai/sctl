@@ -985,7 +985,9 @@ Ask the device to upgrade. Body:
 ```
 
 `version` is required. `manifest_url` defaults to the device's own relay
-(`https://<host of tunnel.url>/api/tunnel/artifacts/<version>/release.json`);
+(`https://<host of tunnel.url>/api/tunnel/artifacts/<version>/release.json`),
+and on a relay (`[tunnel] relay = true`, no `url`) to its own artifacts route
+on loopback (`http://127.0.0.1:<listen port>/api/tunnel/artifacts/<version>/release.json`);
 the artifacts are fetched from the manifest's directory with the tunnel key.
 `not_before` and `not_after` are the window the requester means: read
 outside it, the request is refused and nothing happens. `mirror_base` is for

@@ -217,21 +217,26 @@ pub fn refuse_early(ctx: &Context, req: &Request) -> Result<Version, Refusal> {
     Ok(target)
 }
 
-/// The manifest URL: the request's, or the relay's artifacts route.
+/// The manifest URL: the request's, else the device's relay (`[tunnel] url`),
+/// else, on a relay, its own artifacts route on loopback (ADR-003): a relay
+/// has no `[tunnel] url` and upgrades itself from the bundle it serves.
 pub fn manifest_url(ctx: &Context, req: &Request) -> Result<String, Refusal> {
     if let Some(url) = &req.manifest_url {
         return Ok(url.clone());
     }
-    let tunnel_url = ctx
-        .tunnel
-        .as_ref()
-        .and_then(|tc| tc.url.clone())
-        .ok_or_else(|| {
-            Refusal::new(
-                Reason::Internal,
-                "no manifest_url and no [tunnel] url to derive it from",
-            )
-        })?;
+    let Some(tunnel_url) = ctx.tunnel.as_ref().and_then(|tc| tc.url.clone()) else {
+        if ctx.tunnel.as_ref().is_some_and(|tc| tc.relay) {
+            let port = ctx.listen.rsplit(':').next().unwrap_or("8443");
+            return Ok(format!(
+                "http://127.0.0.1:{port}/api/tunnel/artifacts/{}/release.json",
+                req.version
+            ));
+        }
+        return Err(Refusal::new(
+            Reason::Internal,
+            "no manifest_url and no [tunnel] url to derive it from",
+        ));
+    };
     let (tls, rest) = if let Some(r) = tunnel_url.strip_prefix("wss://") {
         (true, r)
     } else if let Some(r) = tunnel_url.strip_prefix("ws://") {
@@ -932,6 +937,30 @@ mod tests {
         let mut r = req("0.6.8.1");
         r.manifest_url = Some("http://mirror/r.json".into());
         assert_eq!(manifest_url(&c, &r).unwrap(), "http://mirror/r.json");
+    }
+
+    #[test]
+    fn a_relay_derives_the_manifest_url_from_its_own_listener() {
+        let mut c = ctx(Some(InstallInfo::defaults(Layout::Systemd, "x86_64")));
+        c.listen = "0.0.0.0:8443".into();
+        let mut tc = crate::config::TunnelConfig::plain();
+        tc.relay = true;
+        c.tunnel = Some(tc.clone());
+        assert_eq!(
+            manifest_url(&c, &req("0.6.9.1")).unwrap(),
+            "http://127.0.0.1:8443/api/tunnel/artifacts/0.6.9.1/release.json"
+        );
+        // An explicit URL still wins, and a relay that also names a tunnel
+        // url (unusual) follows that url as a device would.
+        let mut r = req("0.6.9.1");
+        r.manifest_url = Some("http://mirror/r.json".into());
+        assert_eq!(manifest_url(&c, &r).unwrap(), "http://mirror/r.json");
+        tc.url = Some("ws://upstream:8443/api/tunnel/register".into());
+        c.tunnel = Some(tc);
+        assert_eq!(
+            manifest_url(&c, &req("0.6.9.1")).unwrap(),
+            "http://upstream:8443/api/tunnel/artifacts/0.6.9.1/release.json"
+        );
     }
 
     #[test]

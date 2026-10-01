@@ -353,7 +353,13 @@ unit on restart. The helper therefore runs as a transient unit through
 `systemd-run`, outside the hardened service, with the stage under
 `/var/lib/sctl/upgrade/`. A relay is upgraded last, after its devices, by
 the same `POST /api/upgrade` on its own operator API; its devices reconnect
-once.
+once. A relay has no `[tunnel] url`, so without a `manifest_url` the request
+reads the manifest from the relay's own artifacts route on loopback
+(`http://127.0.0.1:<listen port>/api/tunnel/artifacts/<version>/release.json`,
+bearer: the tunnel key, which the reader accepts); the bundle must be
+complete there first (`rundev.sh relay artifacts`). `rundev.sh relay upgrade
+<user@host> <version>` is that request plus the watch of `/api/health` until
+the outcome; nothing is copied from the operator's machine (ADR-003).
 
 ## By hand
 

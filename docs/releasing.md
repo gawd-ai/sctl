@@ -238,10 +238,11 @@ uploaded to each relay (`./rundev.sh relay artifacts <user@host> <version>
 (`POST /api/upgrade`), rolling back on their own when the new agent does not
 answer health. `docs/upgrade.md` is the contract.
 
-The paths above (`device upgrade`, `device upgrade-remote`, `relay upgrade`)
-remain for a unit that runs an agent older than 0.6.7 or has no
-`/etc/sctl/install.json`; each of them now writes that file, so the last
-hand upgrade leaves a unit that upgrades itself from then on. `sctl upgrade
+The paths above (`device upgrade`, `device upgrade-remote`) remain for a
+unit that runs an agent older than 0.6.7 or has no `/etc/sctl/install.json`;
+each of them now writes that file, so the last hand upgrade leaves a unit
+that upgrades itself from then on. `relay deploy` remains for a first
+install; `relay upgrade` is the managed request above, no longer an scp. `sctl upgrade
 <version>` from a shell on the box does what the fleet does, for a bench.
 
 Release checklist additions:
@@ -254,6 +255,12 @@ Release checklist additions:
 3. `./rundev.sh relay artifacts <user@host> <version> <dir>` on every relay,
    then `./rundev.sh relay artifacts <user@host> mirror <version> <url>` for
    the plain-HTTP copy a `ramboot` unit boots from, then the fleet's rollout.
+4. The relay itself, last: `./rundev.sh relay upgrade <user@host> <version>`
+   once every device ring of that version is done on it. The relay fetches
+   the bundle from its own store, swaps under a transient `systemd-run`
+   unit, checks its own health and rolls back by itself; its devices
+   reconnect once (ADR-003). The previous binary stays in
+   `/var/lib/sctl/rollback/`.
 
 Before the bundle is signed, the `Assemble` step proves every `server`
 artifact (`sctl-<target>`, the gunzipped `sctl-server-<target>.gz`) embeds
