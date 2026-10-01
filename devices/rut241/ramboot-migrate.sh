@@ -115,11 +115,13 @@ sleep 3
 
 # 1. The payloads, into the cache the ramboot init reads first.
 state fetching
-# shellcheck disable=SC1090
-. "$STAGE/ramboot.conf"
+# Only the four values this script needs: ramboot.conf also sets PLUGIN, BIN
+# and RUN_DIR, which are this script's own names for other things.
+eval "$(sed -n "s/^\(SERVER_URL\|SERVER_SHA256\|PLUGIN_URL\|PLUGIN_SHA256\)=/CONF_\1=/p" "$STAGE/ramboot.conf")"
+[ -n "${CONF_SERVER_URL:-}" ] && [ -n "${CONF_SERVER_SHA256:-}" ] && [ -n "${CONF_PLUGIN_URL:-}" ] && [ -n "${CONF_PLUGIN_SHA256:-}" ] || { state failed; say "ramboot.conf names no server and plugin URL and SHA-256"; exit 1; }
 mkdir -p "$CACHE_DIR"
-fetch "$SERVER_URL" "$SERVER_SHA256" "$CACHE_DIR/sctl-server.payload" "server" || { state failed; exit 1; }
-fetch "$PLUGIN_URL" "$PLUGIN_SHA256" "$CACHE_DIR/sctl-comms.payload" "plugin" || { state failed; exit 1; }
+fetch "$CONF_SERVER_URL" "$CONF_SERVER_SHA256" "$CACHE_DIR/sctl-server.payload" "server" || { state failed; exit 1; }
+fetch "$CONF_PLUGIN_URL" "$CONF_PLUGIN_SHA256" "$CACHE_DIR/sctl-comms.payload" "plugin" || { state failed; exit 1; }
 # The cached server must run here before anything on flash moves.
 gzip -dc "$CACHE_DIR/sctl-server.payload" > "$RUN_DIR/sctl-server.probe" || { state failed; exit 1; }
 chmod 0755 "$RUN_DIR/sctl-server.probe"
