@@ -2512,10 +2512,10 @@ do_device_upgrade_remote_rut241() {
     local complete mirror server_name server_sha plugin_name plugin_sha
     complete=$(printf '%s' "$entry" | jq -r '.complete')
     mirror=$(printf '%s' "$entry" | jq -r '.mirror // empty')
-    server_name=$(printf '%s' "$entry" | jq -r '.manifest.targets.mipsel_24kc.files[] | select(.role == "server") | .name')
-    server_sha=$(printf '%s' "$entry" | jq -r '.manifest.targets.mipsel_24kc.files[] | select(.role == "server") | .sha256')
-    plugin_name=$(printf '%s' "$entry" | jq -r '.manifest.targets.mipsel_24kc.files[] | select(.role == "plugin") | .name')
-    plugin_sha=$(printf '%s' "$entry" | jq -r '.manifest.targets.mipsel_24kc.files[] | select(.role == "plugin") | .sha256')
+    server_name=$(printf '%s' "$entry" | jq -r '.targets.mipsel_24kc.files[] | select(.role == "server") | .name')
+    server_sha=$(printf '%s' "$entry" | jq -r '.targets.mipsel_24kc.files[] | select(.role == "server") | .sha256')
+    plugin_name=$(printf '%s' "$entry" | jq -r '.targets.mipsel_24kc.files[] | select(.role == "plugin") | .name')
+    plugin_sha=$(printf '%s' "$entry" | jq -r '.targets.mipsel_24kc.files[] | select(.role == "plugin") | .sha256')
     [[ "$complete" == "true" ]] || { err "Bundle $version is not complete on the relay"; exit 1; }
     [[ -n "$mirror" ]] || { err "Bundle $version has no mirror; set one with: $0 relay artifacts $relay mirror $version <url>"; exit 1; }
     [[ -n "$server_name" && -n "$server_sha" && -n "$plugin_name" && -n "$plugin_sha" ]] || { err "The manifest names no mipsel_24kc server and plugin"; exit 1; }
