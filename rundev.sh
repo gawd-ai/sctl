@@ -3836,8 +3836,11 @@ do_relay_upgrade() {
     log "Relay $remote runs $running; asking it to upgrade to $version through POST /api/upgrade..."
 
     local request_id="relay:$version:$(date -u +%Y%m%dT%H%M%SZ)"
+    # The manifest URL is named here as well as defaulted in the agent
+    # (0.6.9): a relay still on 0.6.7 or 0.6.8 has no relay-mode default and
+    # would refuse a request without it.
     local body
-    body=$(jq -cn --arg v "$version" --arg r "$request_id" '{version: $v, request_id: $r}')
+    body=$(jq -cn --arg v "$version" --arg r "$request_id" --arg m "$base/tunnel/artifacts/$version/release.json" '{version: $v, request_id: $r, manifest_url: $m}')
     local answer
     answer=$(relay_run "curl -sS -w '\n%{http_code}' -X POST -H \"Authorization: Bearer $key_expr\" -H 'Content-Type: application/json' -d '$body' $base/upgrade") || { err "The request did not reach the relay"; exit 1; }
     local status="${answer##*$'\n'}"
