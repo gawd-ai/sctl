@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 This root file is the only changelog; per-component history is recorded here
 under per-component headings. `server/CHANGELOG.md` is frozen.
 
-## [Unreleased]
+## [0.6.9] - 2026-10-01
 
 ### Managed upgrades
 - **The relay upgrades itself through the managed path** (ADR-003, TRD-3): in relay mode a `POST /api/upgrade` without `manifest_url` reads the manifest from the relay's own artifacts route on loopback (`http://127.0.0.1:<listen port>/api/tunnel/artifacts/<version>/release.json`, bearer the tunnel key). `rundev.sh relay upgrade <user@host> <version>` is now that request followed to its outcome through `/api/health`; the scp-stop-copy-start path is gone (`relay deploy` stays for a first install).
