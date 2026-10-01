@@ -13,8 +13,15 @@ repo_root_from() {
     git -C "$start" rev-parse --show-toplevel 2>/dev/null
 }
 
+# A preset SCTL_BUILD_NUMBER wins, as in CI and rundev.sh: a hand build meant
+# to match a release must not take the checkout's count, which any later
+# commit moves.
 build_number() {
-    git -C "$REPO_ROOT" rev-list --count HEAD 2>/dev/null || echo 0
+    if [[ -n "${SCTL_BUILD_NUMBER:-}" ]]; then
+        echo "$SCTL_BUILD_NUMBER"
+    else
+        git -C "$REPO_ROOT" rev-list --count HEAD 2>/dev/null || echo 0
+    fi
 }
 
 ensure_rust_build_std() {
