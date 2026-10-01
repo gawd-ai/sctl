@@ -70,8 +70,8 @@ writes it to `/etc/sctl/install.json` and the agent reads it at start:
 | Layout | Files | Restart | Rollback set | Used by |
 |---|---|---|---|---|
 | `usr-bin` | the raw binary at `/usr/bin/sctl`, the plugin `.so` beside procd | `/etc/init.d/sctl restart` | `/usr/lib/sctl/rollback/` | generic OpenWrt, the BPIs |
-| `gz-tmp` | gzipped payloads under `/usr/local/lib/sctl/`; the init expands them to `/tmp/sctl/` at start | `/etc/init.d/sctl restart` | `/usr/local/lib/sctl/rollback/` | XE300, RUT241 |
-| `ramboot` | nothing but `/etc/sctl/ramboot.conf` (URLs and SHA-256s); `ramboot.sh` fetches into `/tmp/sctl/cache/` at boot | `/etc/init.d/sctl restart` | the previous `ramboot.conf` | WE826 (832 KB overlay) |
+| `gz-tmp` | gzipped payloads under `/usr/local/lib/sctl/`; the init expands them to `/tmp/sctl/` at start | `/etc/init.d/sctl restart` | `/usr/local/lib/sctl/rollback/` | XE300 |
+| `ramboot` | nothing but `/etc/sctl/ramboot.conf` (URLs and SHA-256s); `ramboot.sh` fetches into `/tmp/sctl/cache/` at boot | `/etc/init.d/sctl restart` | the previous `ramboot.conf` | WE826 (832 KB overlay), RUT241 (4 MB overlay: a 0.6.7 payload set does not fit beside the one it runs; `devices/rut241/ramboot-migrate.sh` moves it) |
 | `systemd` | the raw binary at `/usr/local/bin/sctl` | `systemctl restart <unit>` | `/var/lib/sctl/rollback/` | the relay |
 
 `files` names the persistent locations by **role**: `server`, `plugin`, and for

@@ -2247,9 +2247,9 @@ stp_upload_resilient() {
 }
 
 do_device_upgrade_remote() {
-    local name="${1:-}"
+    local name="${1:-}" version="${2:-}" relay="${3:-}"
     if [[ -z "$name" ]]; then
-        err "Usage: $0 device upgrade-remote <name>"
+        err "Usage: $0 device upgrade-remote <name> [<version> <user@relay>]"
         exit 1
     fi
 
@@ -2279,6 +2279,10 @@ do_device_upgrade_remote() {
     layout=$(remote_exec_stdout_trimmed "$url" "$api_key" "$XE300_LAYOUT_PROBE" 5000 3 8) || true
     if [[ "$layout" == "xe300" ]]; then
         do_device_upgrade_remote_xe300 "$name" "$url" "$api_key"
+        return
+    fi
+    if [[ "$layout" == "rut241" ]]; then
+        do_device_upgrade_remote_rut241 "$name" "$url" "$api_key" "$version" "$relay"
         return
     fi
 
@@ -2463,6 +2467,180 @@ do_device_upgrade_remote() {
     fi
 }
 
+# ─── device upgrade-remote: Teltonika RUT241 ─────────────────────────
+#
+# The RUT241's overlay (4 MB) cannot hold a 0.6.7 payload set next to the one
+# it runs, so it moves to the ramboot layout (docs/upgrade.md): the shared
+# ramboot init fetches the payloads from the relay's plain-HTTP mirror into
+# /tmp at boot, and from then on the agent upgrades itself by rewriting
+# /etc/sctl/ramboot.conf. This path reads the version's manifest and mirror
+# from the relay (operator key, over SSH, as `relay artifacts` does), writes
+# ramboot.conf, stages the files through the file API and hands the swap to
+# devices/rut241/ramboot-migrate.sh on the device, which fetches both
+# payloads into the cache first, keeps the old init and payloads in /tmp, and
+# puts them back unless the agent returns with the version and its tunnel up.
+#
+# Usage: ./rundev.sh device upgrade-remote <name> <version> <user@relay>
+
+RUT241_STAGE="/tmp/sctl-rut241-ramboot"
+RUT241_LOG="/tmp/sctl-rut241-ramboot.log"
+
+do_device_upgrade_remote_rut241() {
+    local name="$1" url="$2" api_key="$3" version="${4:-}" relay="${5:-}"
+    ok "'$name' is a RUT241 on the gz-tmp layout: it moves to ramboot"
+    if [[ -z "$version" || -z "$relay" ]]; then
+        err "Usage: $0 device upgrade-remote $name <version> <user@relay>"
+        err "The version must be a bundle the relay holds with a mirror set (relay artifacts <user@relay> list)."
+        exit 1
+    fi
+    local d="$RUT241_STAGE"
+    local ssh_opts="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+    local key_expr="\$(sed -n 's/^api_key *= *\"\(.*\)\"/\1/p' $RELAY_REMOTE_CONFIG | head -n1)"
+
+    # Step 1: the version's mipsel_24kc files and the mirror, from the relay.
+    log "Reading the $version listing on $relay..."
+    local listing entry
+    listing=$(ssh $ssh_opts "$relay" "curl -sS -H \"Authorization: Bearer $key_expr\" http://127.0.0.1:8443/api/tunnel/artifacts") || {
+        err "Could not read the relay's artifact listing"
+        exit 1
+    }
+    entry=$(printf '%s' "$listing" | jq -c --arg v "$version" '.versions[] | select(.version == $v)')
+    if [[ -z "$entry" ]]; then
+        err "The relay holds no bundle $version"
+        exit 1
+    fi
+    local complete mirror server_name server_sha plugin_name plugin_sha
+    complete=$(printf '%s' "$entry" | jq -r '.complete')
+    mirror=$(printf '%s' "$entry" | jq -r '.mirror // empty')
+    server_name=$(printf '%s' "$entry" | jq -r '.manifest.targets.mipsel_24kc.files[] | select(.role == "server") | .name')
+    server_sha=$(printf '%s' "$entry" | jq -r '.manifest.targets.mipsel_24kc.files[] | select(.role == "server") | .sha256')
+    plugin_name=$(printf '%s' "$entry" | jq -r '.manifest.targets.mipsel_24kc.files[] | select(.role == "plugin") | .name')
+    plugin_sha=$(printf '%s' "$entry" | jq -r '.manifest.targets.mipsel_24kc.files[] | select(.role == "plugin") | .sha256')
+    [[ "$complete" == "true" ]] || { err "Bundle $version is not complete on the relay"; exit 1; }
+    [[ -n "$mirror" ]] || { err "Bundle $version has no mirror; set one with: $0 relay artifacts $relay mirror $version <url>"; exit 1; }
+    [[ -n "$server_name" && -n "$server_sha" && -n "$plugin_name" && -n "$plugin_sha" ]] || { err "The manifest names no mipsel_24kc server and plugin"; exit 1; }
+    mirror=${mirror%/}
+    ok "Mirror $mirror: $server_name, $plugin_name"
+    # The mirror must answer from here too, with the right bytes, before the
+    # device is asked to depend on it.
+    local probe_sha
+    probe_sha=$(curl -sfL --max-time 120 "$mirror/$plugin_name" | sha256sum | cut -d' ' -f1) || true
+    [[ "$probe_sha" == "$plugin_sha" ]] || { err "The mirror does not serve $plugin_name with the manifest's SHA-256 (got ${probe_sha:-nothing})"; exit 1; }
+    ok "Mirror serves the plugin with the manifest's SHA-256"
+
+    # Step 2: the files to stage, written here.
+    local tmp
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' RETURN
+    {
+        printf "RUN_DIR='/tmp/sctl'\n"
+        printf "CACHE_DIR='/tmp/sctl/cache'\n"
+        printf "BIN='/tmp/sctl/sctl-server'\n"
+        printf "PLUGIN='/tmp/sctl/lib/libsctl_comms_quectel.so'\n"
+        printf "SCTL_CONFIG='/etc/sctl/sctl.toml'\n"
+        printf "SERVER_URL='%s/%s'\n" "$mirror" "$server_name"
+        printf "SERVER_SHA256='%s'\n" "$server_sha"
+        printf "SERVER_GZIP=1\n"
+        printf "PLUGIN_URL='%s/%s'\n" "$mirror" "$plugin_name"
+        printf "PLUGIN_SHA256='%s'\n" "$plugin_sha"
+        printf "PLUGIN_GZIP=1\n"
+        printf "MIN_TMP_KB=24576\n"
+        printf "FETCH_TIMEOUT_SECS=180\n"
+        printf "CONNECT_TIMEOUT_SECS=10\n"
+        printf "FETCH_ATTEMPTS=20\n"
+        printf "FETCH_RETRY_SECS=15\n"
+        printf "ALLOW_UNSIGNED=0\n"
+    } > "$tmp/ramboot.conf"
+    printf '{"v":1,"layout":"ramboot","target":"mipsel_24kc"}\n' > "$tmp/install.json"
+    cp "$REPO_DIR/devices/common/sctl-ramboot.init" "$tmp/sctl.init"
+    cp "$REPO_DIR/devices/common/sctl-ramboot.sh" "$tmp/ramboot.sh"
+    cp "$REPO_DIR/devices/rut241/ramboot-migrate.sh" "$tmp/ramboot-migrate.sh"
+
+    # Step 3: an empty stage directory, unless an earlier migration still runs.
+    log "Preparing $d on the device..."
+    local prep
+    prep=$(remote_exec_stdout_trimmed "$url" "$api_key" \
+        'd='"$d"'; case "$(cat $d/state 2>/dev/null)" in ""|done|rolled_back|failed) ;; *) echo busy; exit 0 ;; esac; rm -rf $d && mkdir -p $d && echo ready' \
+        5000 5 8) || true
+    case "$prep" in
+        ready) ;;
+        busy) err "A migration is still running on '$name' (see $d/state and $RUT241_LOG)"; exit 1 ;;
+        *) err "Could not prepare $d on the device"; exit 1 ;;
+    esac
+    local f
+    for f in sctl.init ramboot.sh ramboot.conf install.json ramboot-migrate.sh; do
+        local mode=0644
+        [[ "$f" == "ramboot.conf" ]] && mode=0600
+        [[ "$f" == "ramboot.sh" || "$f" == "ramboot-migrate.sh" || "$f" == "sctl.init" ]] && mode=0755
+        if ! remote_put_file "$url" "$api_key" "$tmp/$f" "$d/$f" "$mode"; then
+            err "Could not write $d/$f on the device"
+            exit 1
+        fi
+    done
+    ok "Ramboot files staged"
+
+    # Step 4: the swap, detached from the exec that starts it (the RUT241 has
+    # no start-stop-daemon: a subshell that ignores HUP and TERM outlives the
+    # agent). Idempotent: a retry finds the state file.
+    log "Handing the migration to $d/ramboot-migrate.sh (one restart; it rolls back unless healthy)..."
+    local launch
+    launch=$(remote_exec_stdout_trimmed "$url" "$api_key" \
+        'd='"$d"'; if [ -f $d/state ]; then cat $d/state; else (trap "" HUP TERM; sh $d/ramboot-migrate.sh '"$version"' </dev/null >/dev/null 2>&1 &); echo launched; fi' \
+        5000 3 8) || true
+    [[ -n "$launch" ]] || warn "No answer to the launch; waiting for its state anyway"
+
+    # Step 5: the outcome, from the state file once the agent answers again.
+    log "Waiting for the outcome (the device rolls back by itself after 240s unhealthy)..."
+    local outcome="" last="" deadline resp
+    deadline=$(( $(date +%s) + 720 ))
+    while (( $(date +%s) < deadline )); do
+        sleep 5
+        resp=$(curl -sf --max-time 8 -X POST "$url/api/exec" \
+            -H "Authorization: Bearer $api_key" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg command "cat $d/state" '{command: $command, timeout: 5000}')" 2>/dev/null) || {
+            printf "."
+            continue
+        }
+        outcome=$(echo "$resp" | jq -r '.stdout // empty' 2>/dev/null | tr -d '[:space:]')
+        if [[ -n "$outcome" && "$outcome" != "$last" ]]; then
+            printf "\n  state: %s" "$outcome"
+            last="$outcome"
+        fi
+        case "$outcome" in done|rolled_back|failed) break ;; esac
+    done
+    echo ""
+    case "$outcome" in
+        done) ;;
+        rolled_back|failed)
+            err "The migration on '$name' ended '$outcome': the device runs what it ran before"
+            remote_exec_json "$url" "$api_key" "tail -n 30 $RUT241_LOG" 5000 3 8 | jq -r '.stdout // empty' 2>/dev/null || true
+            exit 1
+            ;;
+        *)
+            err "No outcome within 720s (last state: ${outcome:-unknown})"
+            err "The device rolls back by itself unless the new agent is healthy; see $d/state and $RUT241_LOG"
+            exit 1
+            ;;
+    esac
+    local running
+    running=$(remote_exec_stdout_trimmed "$url" "$api_key" "/tmp/sctl/sctl-server --version" 5000 10 8) || true
+    running=${running#sctl}
+    running=${running# }
+    if [[ "$running" != "$version" ]]; then
+        err "The device reported done, but answers version '${running:-unavailable}'"
+        exit 1
+    fi
+    jq --arg name "$name" --arg ver "$version" \
+        '.devices[$name].sctl_version = $ver' \
+        "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    remote_exec_json "$url" "$api_key" "rm -rf $d" 5000 2 5 >/dev/null 2>&1 || true
+    ok "Migration complete for '$name': ramboot layout, sctl $version"
+    echo "  Payloads: fetched from $mirror into /tmp/sctl/cache at boot (SHA-256s in /etc/sctl/ramboot.conf)"
+    echo "  Old init and payloads: /tmp/sctl-rut241-rollback until the next boot"
+    echo "  Log on the device: $RUT241_LOG"
+}
+
 # ─── device upgrade-remote: GL-XE300 ─────────────────────────────────
 #
 # The XE300 keeps gzipped payloads in /usr/local/lib/sctl, and its procd init
@@ -2483,7 +2661,7 @@ do_device_upgrade_remote() {
 XE300_ARTIFACT_DIR="$REPO_DIR/.artifacts/xe300"
 XE300_STAGE="/tmp/sctl-xe300-upgrade"
 XE300_LOG="/tmp/sctl-xe300-upgrade.log"
-XE300_LAYOUT_PROBE="if [ -f /usr/local/lib/sctl/sctl-server-mips_24kc.gz ] && [ -x /etc/init.d/sctl ]; then echo xe300; else echo other; fi"
+XE300_LAYOUT_PROBE="if [ -x /etc/init.d/sctl ] && [ -f /usr/local/lib/sctl/sctl-server-mips_24kc.gz ]; then echo xe300; elif [ -x /etc/init.d/sctl ] && [ -f /usr/local/lib/sctl/sctl-server-mipsel_24kc.gz ]; then echo rut241; else echo other; fi"
 
 # Write a local text file to the device through the file API, retrying across
 # short windows.
@@ -3722,12 +3900,14 @@ do_relay_upgrade() {
 #   ./rundev.sh relay artifacts <user@host> <version> <bundle dir>
 #   ./rundev.sh relay artifacts <user@host> list
 #   ./rundev.sh relay artifacts <user@host> delete <version>
+#   ./rundev.sh relay artifacts <user@host> mirror <version> <url>
 do_relay_artifacts() {
-    local remote="${1:-}" verb="${2:-}" arg="${3:-}"
+    local remote="${1:-}" verb="${2:-}" arg="${3:-}" arg2="${4:-}"
     if [[ -z "$remote" || -z "$verb" ]]; then
         err "Usage: $0 relay artifacts <user@host> <version> <bundle dir>"
         err "       $0 relay artifacts <user@host> list"
         err "       $0 relay artifacts <user@host> delete <version>"
+        err "       $0 relay artifacts <user@host> mirror <version> <url>"
         exit 1
     fi
     local ssh_opts="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
@@ -3741,6 +3921,14 @@ do_relay_artifacts() {
         delete)
             [[ -n "$arg" ]] || { err "delete needs a version"; exit 1; }
             ssh $ssh_opts "$remote" "curl -sS -X DELETE -H \"Authorization: Bearer $key_expr\" $base/$arg" | jq .
+            ;;
+        mirror)
+            # Where a ramboot device's boot fetcher gets the same files over
+            # plain HTTP (docs/upgrade.md). An empty url clears it.
+            [[ -n "$arg" ]] || { err "mirror needs a version and a url"; exit 1; }
+            local body
+            body=$(jq -cn --arg url "$arg2" '{url: $url}')
+            ssh $ssh_opts "$remote" "curl -sS -X PUT -H \"Authorization: Bearer $key_expr\" -H 'Content-Type: application/json' -d '$body' $base/$arg/mirror" | jq .
             ;;
         *)
             local version="$verb" dir="$arg"
@@ -4142,7 +4330,7 @@ case "${1:-setup}" in
             deploy)  do_device_deploy "${3:-}" ;;
             upgrade) do_device_upgrade "${3:-}" ;;
             deploy-watchdog) do_device_deploy_watchdog "${3:-}" ;;
-            upgrade-remote)  do_device_upgrade_remote "${3:-}" ;;
+            upgrade-remote)  do_device_upgrade_remote "${3:-}" "${4:-}" "${5:-}" ;;
             *)
                 echo "Usage: $0 device <command>"
                 echo ""
@@ -4154,6 +4342,8 @@ case "${1:-setup}" in
                 echo "  upgrade <name>           binary-only upgrade via SSH (stop → upload → start)"
                 echo "  deploy-watchdog <name>   deploy watchdog script + cron (SSH or API)"
                 echo "  upgrade-remote <name>    binary upgrade via relay (STP upload + swap)"
+                echo "  upgrade-remote <name> <version> <user@relay>"
+                echo "                           RUT241: move to the ramboot layout, fed by the relay's mirror"
                 exit 1
                 ;;
         esac
@@ -4165,7 +4355,7 @@ case "${1:-setup}" in
             upgrade) do_relay_upgrade "${3:-}" ;;
             status)  do_relay_status "${3:-}" ;;
             sctlin)  do_relay_sctlin "${3:-}" ;;
-            artifacts) do_relay_artifacts "${3:-}" "${4:-}" "${5:-}" ;;
+            artifacts) do_relay_artifacts "${3:-}" "${4:-}" "${5:-}" "${6:-}" ;;
             *)
                 echo "Usage: $0 relay <command> [user@host]"
                 echo ""
@@ -4222,6 +4412,7 @@ case "${1:-setup}" in
         echo "  device upgrade <name>           binary-only upgrade via SSH"
         echo "  device deploy-watchdog <name>   deploy watchdog script + cron"
         echo "  device upgrade-remote <name>    binary upgrade via relay (no SSH needed)"
+        echo "  device upgrade-remote <name> <version> <user@relay>  RUT241 to the ramboot layout"
         echo ""
         echo "Environment profiles:"
         echo "  env show                        show current active profile"
@@ -4238,6 +4429,7 @@ case "${1:-setup}" in
         echo "  relay sctlin [user@host]    deploy sctlin web UI to relay"
         echo "  relay artifacts <user@host> <version> <dir>   upload a release bundle (docs/upgrade.md)"
         echo "  relay artifacts <user@host> list|delete <ver> list or remove bundles"
+        echo "  relay artifacts <user@host> mirror <ver> <url> the plain-HTTP mirror ramboot units boot from"
         echo ""
         echo "Playbook library:"
         echo "  playbook ls                              list playbooks in library"

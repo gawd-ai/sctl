@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 This root file is the only changelog; per-component history is recorded here
 under per-component headings. `server/CHANGELOG.md` is frozen.
 
+## [Unreleased]
+
+### Device tooling
+- **RUT241 to the ramboot layout** (`devices/rut241/ramboot-migrate.sh`, `rundev.sh device upgrade-remote <name> <version> <user@relay>`): its 4 MB overlay cannot hold a 0.6.7 payload set beside the one it runs, so the unit moves to the shared ramboot init fed by the relay's plain-HTTP mirror, through the relay and with no SSH; the old init and payloads go back unless the agent returns healthy. `rundev.sh relay artifacts <user@host> mirror <version> <url>` sets the mirror.
+- A preset `SCTL_BUILD_NUMBER` wins in `rundev.sh` and the device builds (`devices/common/build-lib.sh`), as in CI, so a hand build matches a release; `rundev.sh device upgrade-remote` tells a RUT241 from an XE300 by its payload name.
+
 ## [0.6.7] - 2026-09-30
 
 ### sctl (server)
