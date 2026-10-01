@@ -8,7 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 This root file is the only changelog; per-component history is recorded here
 under per-component headings. `server/CHANGELOG.md` is frozen.
 
-## [Unreleased]
+## [0.6.8] - 2026-10-01
+
+### Release pipeline
+- **The OpenWrt artifacts of 0.6.7.172 (mips_24kc, mipsel_24kc) call themselves `0.6.7.1`**: CI's OpenWrt jobs check out shallowly and `devices/common/build-lib.sh` counted that checkout's one commit over the workflow's build number, so a managed upgrade from that bundle fails its version proof on an XE300 or a RUT241 (the cross-built targets were right). A preset `SCTL_BUILD_NUMBER` now wins there too; this release exists to put a consistent bundle on the relays.
 
 ### Device tooling
 - **RUT241 to the ramboot layout** (`devices/rut241/ramboot-migrate.sh`, `rundev.sh device upgrade-remote <name> <version> <user@relay>`): its 4 MB overlay cannot hold a 0.6.7 payload set beside the one it runs, so the unit moves to the shared ramboot init fed by the relay's plain-HTTP mirror, through the relay and with no SSH; the old init and payloads go back unless the agent returns healthy. `rundev.sh relay artifacts <user@host> mirror <version> <url>` sets the mirror.
