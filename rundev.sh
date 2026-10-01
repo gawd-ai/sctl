@@ -2512,12 +2512,19 @@ do_device_upgrade_remote_rut241() {
     local complete mirror server_name server_sha plugin_name plugin_sha
     complete=$(printf '%s' "$entry" | jq -r '.complete')
     mirror=$(printf '%s' "$entry" | jq -r '.mirror // empty')
-    server_name=$(printf '%s' "$entry" | jq -r '.targets.mipsel_24kc.files[] | select(.role == "server") | .name')
-    server_sha=$(printf '%s' "$entry" | jq -r '.targets.mipsel_24kc.files[] | select(.role == "server") | .sha256')
-    plugin_name=$(printf '%s' "$entry" | jq -r '.targets.mipsel_24kc.files[] | select(.role == "plugin") | .name')
-    plugin_sha=$(printf '%s' "$entry" | jq -r '.targets.mipsel_24kc.files[] | select(.role == "plugin") | .sha256')
     [[ "$complete" == "true" ]] || { err "Bundle $version is not complete on the relay"; exit 1; }
     [[ -n "$mirror" ]] || { err "Bundle $version has no mirror; set one with: $0 relay artifacts $relay mirror $version <url>"; exit 1; }
+    # The listing names files; the SHA-256s are in the signed manifest, which
+    # the relay verified before storing it.
+    local manifest
+    manifest=$(ssh $ssh_opts "$relay" "curl -sS -H \"Authorization: Bearer $key_expr\" http://127.0.0.1:8443/api/tunnel/artifacts/$version/release.json") || {
+        err "Could not read the relay's manifest for $version"
+        exit 1
+    }
+    server_name=$(printf '%s' "$manifest" | jq -r '.targets.mipsel_24kc.files[] | select(.role == "server") | .name')
+    server_sha=$(printf '%s' "$manifest" | jq -r '.targets.mipsel_24kc.files[] | select(.role == "server") | .sha256')
+    plugin_name=$(printf '%s' "$manifest" | jq -r '.targets.mipsel_24kc.files[] | select(.role == "plugin") | .name')
+    plugin_sha=$(printf '%s' "$manifest" | jq -r '.targets.mipsel_24kc.files[] | select(.role == "plugin") | .sha256')
     [[ -n "$server_name" && -n "$server_sha" && -n "$plugin_name" && -n "$plugin_sha" ]] || { err "The manifest names no mipsel_24kc server and plugin"; exit 1; }
     mirror=${mirror%/}
     ok "Mirror $mirror: $server_name, $plugin_name"
