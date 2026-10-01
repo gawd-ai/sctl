@@ -58,7 +58,10 @@ QUECTEL_DRIVER_DIR="$REPO_DIR/drivers/sctl-comms-quectel"
 # Stamp the host's git commit count into the binary. `cross build` runs
 # inside a container that can't see the host's .git dir, so build.rs
 # would fall back to "0" unless we pass this through (see Cross.toml).
-export SCTL_BUILD_NUMBER="$(git -C "$REPO_DIR" rev-list --count HEAD 2>/dev/null || echo 0)"
+# A preset SCTL_BUILD_NUMBER wins, as in CI: a hand build meant to match a
+# release (`SCTL_BUILD_NUMBER=172 ./rundev.sh device upgrade-remote ...`)
+# must not take the checkout's count, which any later commit moves.
+export SCTL_BUILD_NUMBER="${SCTL_BUILD_NUMBER:-$(git -C "$REPO_DIR" rev-list --count HEAD 2>/dev/null || echo 0)}"
 
 # Dev config
 API_KEY="dev-key"
