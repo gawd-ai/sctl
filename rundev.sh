@@ -2538,7 +2538,6 @@ do_device_upgrade_remote_rut241() {
     # Step 2: the files to stage, written here.
     local tmp
     tmp=$(mktemp -d)
-    trap 'rm -rf "$tmp"' RETURN
     {
         printf "RUN_DIR='/tmp/sctl'\n"
         printf "CACHE_DIR='/tmp/sctl/cache'\n"
@@ -2642,6 +2641,7 @@ do_device_upgrade_remote_rut241() {
         '.devices[$name].sctl_version = $ver' \
         "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
     remote_exec_json "$url" "$api_key" "rm -rf $d" 5000 2 5 >/dev/null 2>&1 || true
+    rm -rf "$tmp"
     ok "Migration complete for '$name': ramboot layout, sctl $version"
     echo "  Payloads: fetched from $mirror into /tmp/sctl/cache at boot (SHA-256s in /etc/sctl/ramboot.conf)"
     echo "  Old init and payloads: /tmp/sctl-rut241-rollback until the next boot"
