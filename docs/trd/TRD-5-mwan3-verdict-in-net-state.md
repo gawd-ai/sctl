@@ -1,6 +1,6 @@
 # TRD-5: mwan3's verdict in net.state
 
-Implements [ADR-005](../adr/005-the-agent-reports-the-units-own-uplink-verdict.md). Status: Planned.
+Implements [ADR-005](../adr/005-the-agent-reports-the-units-own-uplink-verdict.md). Status: Implemented (2026-10-05): slices 1 to 3 shipped in 0.6.10; slice 4 is recorded below once the fleet's rollout reaches an XE300.
 
 ## 1. Objective
 
@@ -26,7 +26,7 @@ An XE300 whose wire has link and a lease but no internet reports, in `net.state`
 
 ## 4. Slices and status
 
-1. mwan3 module, netwatch wiring, message and health fields, unit tests: Planned.
-2. netns flip case: Planned.
-3. Release 0.6.10: Planned.
+1. mwan3 module, netwatch wiring, message and health fields, unit tests: Implemented (2026-10-05, `7f4af3e`; 349 tests, clippy and fmt as CI runs them).
+2. netns flip case: Implemented (2026-10-05): `offline` then `online` on wan0 published 0.9 s and 1.0 s after the write (the 1 s debounce), `relay_route_netns` 98 s green as root.
+3. Release 0.6.10: Implemented (2026-10-05).
 4. Seen on an XE300 after the fleet's rollout: Planned.
