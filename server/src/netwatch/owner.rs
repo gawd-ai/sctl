@@ -1115,6 +1115,7 @@ mod tests {
             ipv4: Some(Ipv4Cidr { addr, prefix: 24 }),
             default_metric: metric,
             master: None,
+            verdict: None,
         }
     }
 

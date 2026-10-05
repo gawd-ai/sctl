@@ -224,6 +224,18 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
     if let Some(ld) = live_devices {
         resp["live_devices"] = json!(ld);
     }
+    // The failover engine's verdict per uplink (ADR-005), from the state the
+    // watcher already holds: nothing is dumped for a health call.
+    if let Some(net) = state.netwatch.as_ref().and_then(|w| w.borrow().clone()) {
+        let verdicts: serde_json::Map<String, Value> = net
+            .interfaces
+            .iter()
+            .filter_map(|i| i.verdict.map(|v| (i.name.clone(), json!(v))))
+            .collect();
+        if !verdicts.is_empty() {
+            resp["network"] = json!({ "verdicts": verdicts });
+        }
+    }
     let total_ms = start.elapsed().as_millis() as u64;
     if lte_lock_wait_ms >= 250 {
         warn!(

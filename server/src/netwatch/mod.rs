@@ -12,6 +12,7 @@
 //! When the socket cannot be opened the watcher logs once and publishes
 //! nothing, so its readers behave as if the network never changed.
 
+pub mod mwan3;
 mod netlink;
 pub mod owner;
 pub mod route;
@@ -91,6 +92,10 @@ pub struct Interface {
     pub ipv4: Option<Ipv4Cidr>,
     /// Lowest metric among the default routes through this interface.
     pub default_metric: Option<u32>,
+    /// What the unit's own failover engine (mwan3) holds about this uplink,
+    /// when it tracks one (ADR-005). A flip counts as a change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<mwan3::Verdict>,
 }
 
 /// A default route in the main table.
@@ -219,6 +224,7 @@ impl NetState {
                     .filter(|d| d.dev == l.name)
                     .map(|d| d.metric)
                     .min(),
+                verdict: None,
             })
             .collect();
         interfaces.sort_by(|a, b| a.name.cmp(&b.name).then(a.index.cmp(&b.index)));
@@ -296,13 +302,20 @@ pub async fn next_state(rx: Option<&mut NetWatch>) -> Arc<NetState> {
     std::future::pending().await
 }
 
-/// Dump the network now, unstamped (`boot` and `seq` are 0).
+/// Dump the network now, unstamped (`boot` and `seq` are 0), with the
+/// failover engine's verdicts when the unit has one.
 pub async fn dump() -> io::Result<NetState> {
     let mut socket = NlSocket::open(0)?;
     dump_with(&mut socket).await
 }
 
 async fn dump_with(socket: &mut NlSocket) -> io::Result<NetState> {
+    let mut state = dump_kernel(socket).await?;
+    mwan3::annotate(&mut state).await;
+    Ok(state)
+}
+
+async fn dump_kernel(socket: &mut NlSocket) -> io::Result<NetState> {
     let mut buf = vec![0; netlink::RECV_BUF];
     let [links, addrs, routes] = netlink::dump_requests();
     let order = Order::NATIVE;
@@ -332,6 +345,7 @@ async fn dump_with(socket: &mut NlSocket) -> io::Result<NetState> {
 /// parked with `tx` held, so readers never see the channel close.
 pub async fn run(tx: Arc<NetPublisher>, boot: u64) {
     let mut opened_before = false;
+    let mut verdicts = mwan3::Watcher::new();
     loop {
         let events = match NlSocket::open(GROUPS) {
             Ok(socket) => socket,
@@ -351,15 +365,21 @@ pub async fn run(tx: Arc<NetPublisher>, boot: u64) {
             info!("netwatch: watching link, address and route events");
         }
         opened_before = true;
-        let e = watch_events(&events, &tx, boot).await;
+        let e = watch_events(&events, &tx, boot, &mut verdicts).await;
         warn!("netwatch: event socket failed ({e}); reopening in {RETRY:?}");
         tokio::time::sleep(RETRY).await;
     }
 }
 
-/// Dump, publish, wait for the next burst of events, repeat. Returns only
-/// when the event socket fails.
-async fn watch_events(events: &NlSocket, tx: &NetPublisher, boot: u64) -> io::Error {
+/// Dump, publish, wait for the next burst of events (from the kernel or the
+/// failover engine's verdict directory), repeat. Returns only when the event
+/// socket fails.
+async fn watch_events(
+    events: &NlSocket,
+    tx: &NetPublisher,
+    boot: u64,
+    verdicts: &mut mwan3::Watcher,
+) -> io::Error {
     let mut buf = vec![0; netlink::RECV_BUF];
     let mut requests: Option<NlSocket> = None;
     let mut failing = false;
@@ -367,6 +387,7 @@ async fn watch_events(events: &NlSocket, tx: &NetPublisher, boot: u64) -> io::Er
         // Drain before dumping: an event that lands during the dump then
         // wakes the next round instead of being swallowed with the burst.
         drain(events, &mut buf);
+        verdicts.arm();
         let dumped = match requests.as_mut() {
             Some(socket) => dump_with(socket).await,
             None => match NlSocket::open(0) {
@@ -400,8 +421,13 @@ async fn watch_events(events: &NlSocket, tx: &NetPublisher, boot: u64) -> io::Er
                 continue;
             }
         }
-        if let Err(e) = wait_for_event(events, &mut buf).await {
-            return e;
+        tokio::select! {
+            waited = wait_for_event(events, &mut buf) => {
+                if let Err(e) = waited {
+                    return e;
+                }
+            }
+            () = verdicts.changed() => {}
         }
         tokio::time::sleep(DEBOUNCE).await;
     }

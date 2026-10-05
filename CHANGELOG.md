@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 This root file is the only changelog; per-component history is recorded here
 under per-component headings. `server/CHANGELOG.md` is frozen.
 
+## [0.6.10] - 2026-10-05
+
+### Network state
+- **The agent reports the verdict of the unit's own failover engine (mwan3) beside the kernel's routes** (ADR-005, TRD-5): every interface in `net.state`, `GET /api/net` and `GET /api/health` (`network.verdicts`) carries `verdict: online | offline` when mwan3 tracks its logical owner (`/var/run/mwan3/iface_state`, mapped to the kernel device through `ubus call network.interface dump`). A wire with link, a lease and the lowest-metric default route can read `offline`: the engine then steers traffic elsewhere and the main table does not show it, which is how Mountain Arena stayed dark for three days while the fleet called the wire active. The directory is watched with inotify (no poll) and read on every dump; a unit without mwan3 reports nothing new. `net.state` stays v1 (additive, optional field).
+
 ## [0.6.9] - 2026-10-01
 
 ### Managed upgrades

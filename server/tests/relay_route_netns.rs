@@ -399,7 +399,67 @@ fn the_relay_route_follows_the_uplink_that_reaches_the_relay() {
     runtime.block_on(scenario(&ns, &relay));
 }
 
+/// A stand-in for mwan3 and netifd: the verdict directory the watcher reads
+/// and a `ubus` on PATH that maps `wan` to wan0 and `lte` to wan1.
+struct FakeMwan3 {
+    dir: std::path::PathBuf,
+    bin: std::path::PathBuf,
+}
+
+impl FakeMwan3 {
+    fn install() -> Self {
+        let base = std::env::temp_dir().join(format!("sctl-netns-mwan3-{}", std::process::id()));
+        let dir = base.join("iface_state");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            bin.join("ubus"),
+            "#!/bin/sh\necho '{\"interface\":[{\"interface\":\"wan\",\"up\":true,\"l3_device\":\"wan0\"},{\"interface\":\"lte\",\"up\":true,\"l3_device\":\"wan1\"}]}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            bin.join("ubus"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: the test is single-threaded here; nothing reads the
+        // environment concurrently.
+        unsafe {
+            std::env::set_var("SCTL_MWAN3_STATE_DIR", &dir);
+            std::env::set_var("PATH", format!("{}:{path}", bin.display()));
+        }
+        Self { dir, bin }
+    }
+
+    fn verdict(&self, iface: &str, text: &str) {
+        std::fs::write(self.dir.join(iface), text).unwrap();
+    }
+}
+
+impl Drop for FakeMwan3 {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(self.bin.parent().unwrap());
+    }
+}
+
+/// The verdict `net` holds for `dev`, as its lowercase word.
+fn verdict_of(net: &netwatch::NetWatch, dev: &str) -> Option<String> {
+    net.borrow()
+        .as_ref()
+        .and_then(|s| s.interface(dev).and_then(|i| i.verdict))
+        .map(|v| {
+            serde_json::to_value(v)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+}
+
 async fn scenario(ns: &Namespaces, relay: &AtomicBool) {
+    let mwan3 = FakeMwan3::install();
     let (publisher, net) = netwatch::channel();
     tokio::spawn(netwatch::run(Arc::new(publisher), 1));
     // Only the wait between probe rounds is shortened.
@@ -683,6 +743,32 @@ async fn scenario(ns: &Namespaces, relay: &AtomicBool) {
     assert!(events(&stats)
         .await
         .contains(&"wan0 -> wan1 (wan1 answers the relay again)".to_string()));
+
+    // The failover engine's verdict (ADR-005): a write to the verdict
+    // directory alone, no kernel event, republishes the state with the
+    // verdict on the mapped interface, and the flip back does the same.
+    assert_eq!(
+        verdict_of(&net, "wan0"),
+        None,
+        "no verdict before mwan3 writes one"
+    );
+    for (word, expect) in [("offline", "offline"), ("online", "online")] {
+        let started = Instant::now();
+        mwan3.verdict("wan", word);
+        mwan3.verdict("lte", "online");
+        while verdict_of(&net, "wan0").as_deref() != Some(expect) {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the verdict {word} on wan0 was not published within 10 s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        eprintln!(
+            "verdict {word} on wan0 published after {:?}",
+            started.elapsed()
+        );
+    }
+    assert_eq!(verdict_of(&net, "wan1").as_deref(), Some("online"));
     owner_task.abort();
     tunnel_task.abort();
 }

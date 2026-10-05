@@ -133,6 +133,10 @@ Response `200`:
 - `gps` / `lte` — `null` when the subsystem is not configured;
   `{"status": "no_signal"}` / `{"status": "provider_unavailable"}` when
   configured but degraded.
+- `network.verdicts` — on a unit whose failover engine (mwan3) tracks its
+  uplinks, the engine's verdict per kernel interface, `{"eth1": "offline",
+  "wwan0": "online"}`, the same `verdict` that `net.state` carries; absent
+  otherwise.
 - In relay mode, three extra fields appear: `connection_history` (recent
   device connect/disconnect records), `device_snapshots` (last-known
   telemetry per serial, survives disconnects), and `live_devices`
@@ -1099,8 +1103,8 @@ the last one sent on that connection, at most one per second:
   "type": "net.state", "v": 1,
   "boot": 1790000000000, "seq": 4, "ts": "2026-09-26T12:00:00Z",
   "interfaces": [
-    {"name": "eth1", "operstate": "up", "carrier": true, "metric": 10, "ip": "10.42.0.7/24"},
-    {"name": "wwan0", "operstate": "unknown", "carrier": null, "metric": 40, "ip": "10.180.41.231/30"}
+    {"name": "eth1", "operstate": "up", "carrier": true, "metric": 10, "ip": "10.42.0.7/24", "verdict": "offline"},
+    {"name": "wwan0", "operstate": "unknown", "carrier": null, "metric": 40, "ip": "10.180.41.231/30", "verdict": "online"}
   ],
   "default_routes": [
     {"dev": "eth1", "via": "10.42.0.1", "metric": 10},
@@ -1122,6 +1126,14 @@ the last one sent on that connection, at most one per second:
   report it; `metric` is the lowest main-table IPv4 default-route metric on
   the interface; `ip` is its primary IPv4 address; `master` names the bridge
   (or bond) the interface is a port of and is absent when it is not enslaved.
+  `verdict` is what the unit's own failover engine holds about the uplink
+  (`online` or `offline`, from mwan3's `/var/run/mwan3/iface_state`, mapped
+  to the kernel device through netifd) and is absent on a unit without one
+  or on an interface it does not track. A wire with link, a lease and the
+  lowest-metric default route can still read `offline`: the engine then
+  steers the unit's traffic elsewhere, and the main table does not show it.
+  The agent reports the verdict and interprets nothing; a reader that
+  decides which uplink carries traffic takes the verdict over the routes.
 - `default_routes`: main-table IPv4 default routes, lowest metric first.
 - `relay_route`: the kernel's route to the relay the tunnel is connected to,
   what `ip route get` says (`null` when there is none). `tunnel`: the live

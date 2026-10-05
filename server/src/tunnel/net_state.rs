@@ -11,7 +11,7 @@
 //! {"type": "net.state", "v": 1, "boot": 1790000000000, "seq": 4,
 //!  "ts": "2026-09-26T12:00:00Z",
 //!  "interfaces": [{"name": "eth1", "operstate": "up", "carrier": true,
-//!                  "metric": 10, "ip": "10.42.0.7/24"},
+//!                  "metric": 10, "ip": "10.42.0.7/24", "verdict": "offline"},
 //!                 {"name": "lan1", "operstate": "up", "carrier": true,
 //!                  "metric": null, "ip": null, "master": "br-lan"}],
 //!  "default_routes": [{"dev": "eth1", "via": "10.42.0.1", "metric": 10}],
@@ -44,6 +44,7 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, warn};
 
+use crate::netwatch::mwan3::Verdict;
 use crate::netwatch::{self, source, wg, Interface, Ipv4Cidr, NetState, NetWatch};
 use crate::state::TunnelPath;
 
@@ -109,6 +110,10 @@ pub struct InterfaceEntry {
     /// not enslaved.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub master: Option<String>,
+    /// The failover engine's verdict on this uplink (`online`, `offline`);
+    /// absent when the unit has none or it does not track this interface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<Verdict>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -257,6 +262,7 @@ pub fn build(net: &NetState, lookups: Lookups, ts: String) -> NetStateMessage {
             metric: i.default_metric,
             ip: i.ipv4,
             master: i.master.as_deref().map(|m| capped(m, &mut truncated)),
+            verdict: i.verdict,
         })
         .collect();
     interfaces.sort_by(|a, b| a.name.cmp(&b.name));
@@ -403,6 +409,7 @@ mod tests {
                 prefix: 24,
             }),
             default_metric: metric,
+            verdict: None,
         }
     }
 
