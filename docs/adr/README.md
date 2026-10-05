@@ -9,3 +9,4 @@ A decision that shapes the agent, the relay or the way they are built and releas
 | [003](003-the-relay-upgrades-itself-through-the-managed-path-last.md) | The relay upgrades itself through the managed path, last | Accepted (2026-10-01) | [TRD-3](../trd/TRD-3-managed-relay-upgrade.md) |
 | [004](004-relay-route-ownership-on-units-with-a-wireguard-pin.md) | Relay route ownership on units with a WireGuard pin | Proposed (2026-10-01) | [TRD-4](../trd/TRD-4-relay-route-ownership-bench-and-rollout.md) |
 | [005](005-the-agent-reports-the-units-own-uplink-verdict.md) | The agent reports the uplink verdict of the unit's own failover engine (mwan3) beside the kernel's routes | Accepted (2026-10-05) | [TRD-5](../trd/TRD-5-mwan3-verdict-in-net-state.md) |
+| [006](006-the-agent-carries-its-own-network-tools.md) | The agent carries its own network tools | Accepted (2026-10-05) | [TRD-6](../trd/TRD-6-sctl-net-tools.md) |
