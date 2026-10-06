@@ -50,6 +50,9 @@ futures-util = "0.3"
 serde_yaml = "0.9"
 tokio-util = { version = "0.7", features = ["io"] }
 libloading = "0.8"
+# `sctl net snmp` and the Infra SNMP check (ADR-006): v1/v2c only, no v3 crypto;
+# heap_buffers keeps its two 64 KiB buffers off the task stack.
+snmp2 = { version = "0.5", default-features = false, features = ["tokio", "heap_buffers"] }
 
 
 [dev-dependencies]

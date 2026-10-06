@@ -929,7 +929,7 @@ Response `200`:
 }
 ```
 
-`tls` is absent for plain-http targets. Note the upstream status rides
+`tls` is absent for plain-http targets. `set_cookies` lists every `Set-Cookie` header in order (`headers` keeps one value per name); it is absent when there are none. Note the upstream status rides
 inside the JSON — the sctl response itself is `200` whenever the fetch
 completed.
 

@@ -72,6 +72,10 @@ enum Command {
     UpgradeApply {
         stage: String,
     },
+    /// `sctl net <tool> ...`: the network tools for runbooks (ADR-006).
+    Net {
+        args: Vec<String>,
+    },
     /// `sctl target`: the compile target.
     PrintTarget,
     /// `sctl install-info`: `install.json` with defaults applied.
@@ -118,6 +122,9 @@ async fn main() {
         }
         Command::UpgradeApply { stage } => {
             std::process::exit(sctl::upgrade::apply::main(&stage));
+        }
+        Command::Net { args } => {
+            std::process::exit(sctl::net_tools::main(args).await);
         }
         Command::PrintTarget => {
             println!("{}", sctl::upgrade::TARGET);
@@ -285,6 +292,7 @@ where
                 "serve" => Ok(Command::PrintHelp(serve_help())),
                 "supervise" => Ok(Command::PrintHelp(supervise_help())),
                 "upgrade" => Ok(Command::PrintHelp(upgrade_help())),
+                "net" => Ok(Command::PrintHelp(sctl::net_tools::help())),
                 other => Err(format!("unknown help topic '{other}'")),
             }
         }
@@ -300,6 +308,10 @@ where
         "upgrade" => {
             args.remove(0);
             parse_upgrade_args(args)
+        }
+        "net" => {
+            args.remove(0);
+            Ok(Command::Net { args })
         }
         "upgrade-apply" => {
             args.remove(0);
@@ -430,7 +442,7 @@ where
 fn main_help() -> &'static str {
     "Remote shell control service for Linux devices\n\n\
 Usage: sctl [COMMAND] [OPTIONS]\n\n\
-Commands:\n  serve      Run the HTTP/WS server (default when no subcommand is given)\n  supervise  Start and monitor the server process\n  upgrade    Upgrade this agent to a signed release (see `help upgrade`)\n  help       Print this message or the help for a command\n\n\
+Commands:\n  serve      Run the HTTP/WS server (default when no subcommand is given)\n  supervise  Start and monitor the server process\n  upgrade    Upgrade this agent to a signed release (see `help upgrade`)\n  net        Network tools for runbooks: snmp, http, tcp (see `help net`)\n  help       Print this message or the help for a command\n\n\
 Options:\n  -h, --help     Print help\n  -V, --version  Print version"
 }
 

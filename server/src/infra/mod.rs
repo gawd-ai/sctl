@@ -169,6 +169,12 @@ pub struct RecoveryConfig {
     /// Maximum number of executions before exhaustion (resets on recovery).
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
+    /// Credentials the command names (ADR-006, fleet ADR-0017): entry `n`
+    /// (from 1) is in the command's environment as `SCTL_CRED_USER_n` and
+    /// `SCTL_CRED_PASS_n`, read from this unit's credential store. The
+    /// command carries the variable names, never the values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credential_ids: Vec<String>,
 }
 
 fn default_cooldown() -> u64 {

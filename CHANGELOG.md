@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 This root file is the only changelog; per-component history is recorded here
 under per-component headings. `server/CHANGELOG.md` is frozen.
 
+## [Unreleased]
+
+### Network tools
+- **`sctl net snmp|http|tcp`: the network tools a command, runbook or recovery action needs, the same on every unit** (ADR-006, TRD-6). `snmp get|walk|set` (v1/v2c through the `snmp2` crate, v3 and its crypto left out; the community from `-c` or `SCTL_SNMP_COMMUNITY`, never defaulted for a set), `http` (one request through the agent's own TLS stack and its pin ladder, a cookie jar file kept between steps, redirects followed, form bodies, Basic auth from `SCTL_CRED_USER_n`/`SCTL_CRED_PASS_n`), `tcp` (does a port answer). One JSON object on stdout; exit 0, 1 on failure, 2 on a usage error. The XE300 firmware has no SNMP client; a LiveBarn arena came back on 2026-10-05 only after an SNMP packet was built by hand.
+- **The Infra SNMP check uses the same client**: the units do not ship `snmpget`, so every SNMP target read down.
+- **An HTTP(S) Infra check without `expected_status` counts any HTTP answer as up**: a login redirect, a 401 or an error page prove the host answers; set the status to require one.
+- **A recovery action reads the credentials it names from this unit's store**: `recovery.credential_ids` puts entry n in the command's environment as `SCTL_CRED_USER_n`/`SCTL_CRED_PASS_n` (fleet ADR-0017); a credential the unit does not hold fails the run instead of running without it; passwords are masked in the recovery log.
+- **`POST /api/fetch` reports every `Set-Cookie`** in a new `set_cookies` list.
+
 ## [0.6.10] - 2026-10-05
 
 ### Network state

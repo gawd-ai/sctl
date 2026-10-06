@@ -122,6 +122,10 @@ pub struct FetchResponse {
     pub http_version: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsReport>,
+    /// Every `Set-Cookie` header, in order: `headers` keeps one value per
+    /// name, and a login usually sets several cookies.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub set_cookies: Vec<String>,
 }
 
 // ─── certificate verification ────────────────────────────────────────────────
@@ -367,10 +371,7 @@ impl FetchError {
 
 /// Perform a fetch from inside the binary, with the same trust ladder the
 /// route applies. `data_dir` locates the pin store.
-pub(crate) async fn execute(
-    data_dir: &str,
-    req: &FetchRequest,
-) -> Result<FetchResponse, FetchError> {
+pub async fn execute(data_dir: &str, req: &FetchRequest) -> Result<FetchResponse, FetchError> {
     let started = Instant::now();
 
     let target = parse_target(&req.url).map_err(FetchError::Invalid)?;
@@ -424,7 +425,7 @@ pub(crate) async fn execute(
             .and_then(|g| g.as_ref().map(|o| o.sha256.clone()))
     };
 
-    let (status, headers, body, truncated, http_version, alpn) = match outcome {
+    let (status, headers, body, truncated, http_version, alpn, set_cookies) = match outcome {
         Err(_) => return Err(FetchError::Timeout(timeout.as_millis() as u64)),
         Ok(Err(e)) => {
             // rustls stringifies a custom verifier rejection as
@@ -482,6 +483,7 @@ pub(crate) async fn execute(
         elapsed_ms: started.elapsed().as_millis() as u64,
         http_version,
         tls,
+        set_cookies,
     })
 }
 
@@ -503,6 +505,16 @@ type PerformOk = (
     bool,
     &'static str,
     Option<String>,
+    Vec<String>,
+);
+
+type SendOk = (
+    u16,
+    HashMap<String, String>,
+    Bytes,
+    bool,
+    &'static str,
+    Vec<String>,
 );
 
 async fn perform(
@@ -564,15 +576,15 @@ async fn perform(
             .alpn_protocol()
             .map(|p| String::from_utf8_lossy(p).into_owned());
         let use_h2 = req.http2 || alpn.as_deref() == Some("h2");
-        let (status, headers, body, truncated, version) =
+        let (status, headers, body, truncated, version, cookies) =
             send(stream, request, max_bytes, use_h2).await?;
-        Ok((status, headers, body, truncated, version, alpn))
+        Ok((status, headers, body, truncated, version, alpn, cookies))
     } else {
         // Cleartext. h2 here is prior-knowledge h2c — there is no ALPN and no
         // upgrade dance, which is exactly how LAN gRPC endpoints are reached.
-        let (status, headers, body, truncated, version) =
+        let (status, headers, body, truncated, version, cookies) =
             send(tcp, request, max_bytes, req.http2).await?;
-        Ok((status, headers, body, truncated, version, None))
+        Ok((status, headers, body, truncated, version, None, cookies))
     }
 }
 
@@ -590,10 +602,7 @@ async fn send<S>(
     request: hyper::Request<http_body_util::Full<Bytes>>,
     max_bytes: usize,
     use_h2: bool,
-) -> Result<
-    (u16, HashMap<String, String>, Bytes, bool, &'static str),
-    Box<dyn std::error::Error + Send + Sync>,
->
+) -> Result<SendOk, Box<dyn std::error::Error + Send + Sync>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -616,6 +625,12 @@ where
 
     let version = if use_h2 { "HTTP/2" } else { "HTTP/1.1" };
     let status = response.status().as_u16();
+    let set_cookies: Vec<String> = response
+        .headers()
+        .get_all(hyper::header::SET_COOKIE)
+        .iter()
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        .collect();
     let headers = response
         .headers()
         .iter()
@@ -646,7 +661,14 @@ where
         }
     }
 
-    Ok((status, headers, Bytes::from(buf), truncated, version))
+    Ok((
+        status,
+        headers,
+        Bytes::from(buf),
+        truncated,
+        version,
+        set_cookies,
+    ))
 }
 
 #[cfg(test)]

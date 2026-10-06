@@ -101,7 +101,7 @@ pub async fn run_check_with(spec: &CheckSpec, ctx: &CheckContext) -> CheckResult
             url,
             expected_status,
             timeout_ms,
-        } => check_http(url, expected_status.unwrap_or(200), *timeout_ms).await,
+        } => check_http(url, *expected_status, *timeout_ms).await,
         CheckSpec::TcpPort {
             host,
             port,
@@ -228,7 +228,13 @@ async fn check_ping(host: &str, timeout_ms: Option<u64>) -> CheckResult {
 /// (`Range: bytes=0-0`); a 206 to that request is the resource saying 200.
 /// A server that ignores Range still sends its page, the old cost, paid only
 /// by HEAD-refusing servers. Latency is time to first byte, not full transfer.
-async fn check_http(url: &str, expected_status: u16, timeout_ms: Option<u64>) -> CheckResult {
+/// Without `expected_status`, any HTTP answer means the host is up: a login
+/// redirect, a 401 or an error page all prove it answers (ADR-006).
+async fn check_http(
+    url: &str,
+    expected_status: Option<u16>,
+    timeout_ms: Option<u64>,
+) -> CheckResult {
     if let Err(e) = validate_url(url) {
         return CheckResult {
             ok: false,
@@ -259,8 +265,12 @@ async fn check_http(url: &str, expected_status: u16, timeout_ms: Option<u64>) ->
             #[allow(clippy::cast_sign_loss)]
             let latency = (time_secs * 1000.0) as u64;
             let latency = if latency == 0 { elapsed } else { latency };
-            let matched = status_code == expected_status
-                || (ranged && status_code == 206 && expected_status == 200);
+            let matched = match expected_status {
+                None => true,
+                Some(expected) => {
+                    status_code == expected || (ranged && status_code == 206 && expected == 200)
+                }
+            };
 
             if matched {
                 CheckResult {
@@ -274,7 +284,10 @@ async fn check_http(url: &str, expected_status: u16, timeout_ms: Option<u64>) ->
                 CheckResult {
                     ok: false,
                     latency_ms: Some(latency),
-                    detail: format!("HTTP {status_code} (expected {expected_status}) {latency}ms"),
+                    detail: format!(
+                        "HTTP {status_code} (expected {}) {latency}ms",
+                        expected_status.unwrap_or_default()
+                    ),
                     http_status: Some(status_code),
                     ..CheckResult::default()
                 }
@@ -393,7 +406,8 @@ async fn check_tcp(host: &str, port: u16, timeout_ms: Option<u64>) -> CheckResul
     }
 }
 
-/// SNMP check using snmpget (args-based, no shell interpretation).
+/// SNMP check: a v2c GET of sysDescr through the agent's own client (ADR-006);
+/// the units do not ship `snmpget`.
 async fn check_snmp(host: &str, community: &str, timeout_ms: Option<u64>) -> CheckResult {
     if let Err(e) = validate_host(host) {
         return CheckResult {
@@ -413,44 +427,30 @@ async fn check_snmp(host: &str, community: &str, timeout_ms: Option<u64>) -> Che
             ..CheckResult::default()
         };
     }
-    let timeout_secs = timeout_ms.unwrap_or(5000) / 1000;
-    let timeout_secs = timeout_secs.max(1);
+    let target = crate::net_tools::snmp::Target {
+        host: host.to_string(),
+        port: 161,
+        community: community.to_string(),
+        version: crate::net_tools::snmp::Version::V2c,
+        timeout: std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(500)),
+    };
     let start = Instant::now();
-
-    let ts = timeout_secs.to_string();
-    let output = exec_args(
-        "snmpget",
-        &[
-            "-v2c",
-            "-c",
-            community,
-            "-t",
-            &ts,
-            "-r",
-            "0",
-            host,
-            ".1.3.6.1.2.1.1.1.0",
-        ],
-        timeout_ms.unwrap_or(10000),
-    )
-    .await;
-
+    let result = crate::net_tools::snmp::get(&target, &[SYS_DESCR.to_string()]).await;
     let elapsed = start.elapsed().as_millis() as u64;
-
-    match output {
-        Ok((0, stdout, _stderr)) => CheckResult {
-            ok: true,
-            latency_ms: Some(elapsed),
-            detail: format!("SNMP OK {elapsed}ms: {}", truncate(&stdout, 100)),
-            http_status: None,
-            ..CheckResult::default()
-        },
-        Ok((_exit, stdout, stderr)) => {
-            let err = if stderr.is_empty() { &stdout } else { &stderr };
+    match result {
+        Ok(bindings) => {
+            let descr = bindings
+                .first()
+                .map(|b| {
+                    b.value
+                        .as_str()
+                        .map_or_else(|| b.value.to_string(), str::to_string)
+                })
+                .unwrap_or_default();
             CheckResult {
-                ok: false,
-                latency_ms: None,
-                detail: format!("SNMP FAIL: {}", first_line(err).unwrap_or("timeout")),
+                ok: true,
+                latency_ms: Some(elapsed),
+                detail: format!("SNMP OK {elapsed}ms: {}", truncate(&descr, 100)),
                 http_status: None,
                 ..CheckResult::default()
             }
@@ -458,12 +458,14 @@ async fn check_snmp(host: &str, community: &str, timeout_ms: Option<u64>) -> Che
         Err(e) => CheckResult {
             ok: false,
             latency_ms: None,
-            detail: format!("SNMP ERROR: {e}"),
+            detail: format!("SNMP FAIL: {e}"),
             http_status: None,
             ..CheckResult::default()
         },
     }
 }
+
+const SYS_DESCR: &str = "1.3.6.1.2.1.1.1.0";
 
 /// Custom script check — run a user-provided command via shell and check exit code.
 /// This intentionally uses shell execution since the command is operator-configured.
@@ -536,6 +538,24 @@ pub async fn exec_args_pub(
 /// Public variant for use by the recovery action executor and discovery module.
 pub async fn exec_simple_pub(cmd: &str, timeout_ms: u64) -> Result<(i32, String, String), String> {
     exec_simple(cmd, timeout_ms).await
+}
+
+/// `exec_simple` with extra environment (a recovery's credentials).
+pub async fn exec_with_env(
+    cmd: &str,
+    env: &[(String, String)],
+    timeout_ms: u64,
+) -> Result<(i32, String, String), String> {
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("spawn failed: {e}"))?;
+    read_child_output(&mut child, timeout_ms).await
 }
 
 /// Execute a shell command with timeout, returning (exit_code, stdout, stderr).
@@ -812,7 +832,7 @@ mod tests {
             return;
         }
         let fx = spawn_fixture(FixtureMode::HeadOk).await;
-        let r = check_http(&format!("http://{}/", fx.addr), 200, Some(3000)).await;
+        let r = check_http(&format!("http://{}/", fx.addr), Some(200), Some(3000)).await;
         assert!(r.ok, "{}", r.detail);
         assert_eq!(r.http_status, Some(200));
         assert!(r.latency_ms.is_some());
@@ -828,7 +848,7 @@ mod tests {
             return;
         }
         let fx = spawn_fixture(FixtureMode::HeadRefused).await;
-        let r = check_http(&format!("http://{}/", fx.addr), 200, Some(3000)).await;
+        let r = check_http(&format!("http://{}/", fx.addr), Some(200), Some(3000)).await;
         assert!(r.ok, "{}", r.detail);
         assert_eq!(r.http_status, Some(206));
         let seen = fx.seen.lock().unwrap();
@@ -848,10 +868,21 @@ mod tests {
             return;
         }
         let fx = spawn_fixture(FixtureMode::HeadOk).await;
-        let r = check_http(&format!("http://{}/", fx.addr), 204, Some(3000)).await;
+        let r = check_http(&format!("http://{}/", fx.addr), Some(204), Some(3000)).await;
         assert!(!r.ok);
         assert_eq!(r.http_status, Some(200));
         assert!(r.detail.contains("expected 204"), "{}", r.detail);
+    }
+
+    #[tokio::test]
+    async fn http_check_without_an_expected_status_takes_any_answer() {
+        if !curl_available() {
+            return;
+        }
+        let fx = spawn_fixture(FixtureMode::HeadRefused).await;
+        let r = check_http(&format!("http://{}/", fx.addr), None, Some(3000)).await;
+        assert!(r.ok, "{}", r.detail);
+        assert!(r.http_status.is_some());
     }
 
     #[tokio::test]

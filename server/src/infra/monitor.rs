@@ -280,6 +280,29 @@ fn compute_status(
     }
 }
 
+/// `SCTL_CRED_USER_n` / `SCTL_CRED_PASS_n` for each credential id, in order
+/// (n from 1); the first id this unit does not hold is the error.
+pub(crate) fn recovery_env(
+    store: &std::collections::HashMap<String, super::Credential>,
+    ids: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    let mut env = Vec::with_capacity(ids.len() * 2);
+    for (i, id) in ids.iter().enumerate() {
+        let c = store.get(id).ok_or_else(|| id.clone())?;
+        env.push((format!("SCTL_CRED_USER_{}", i + 1), c.username.clone()));
+        env.push((format!("SCTL_CRED_PASS_{}", i + 1), c.password.clone()));
+    }
+    Ok(env)
+}
+
+/// A recovery's output with its passwords masked, before it is logged or kept.
+fn mask(text: &str, secrets: &[String]) -> String {
+    secrets
+        .iter()
+        .filter(|s| s.len() >= 4)
+        .fold(text.to_string(), |acc, s| acc.replace(s.as_str(), "***"))
+}
+
 /// Attempt to execute a recovery action (respecting cooldown and max retries).
 async fn try_recovery(
     state: &mut InfraState,
@@ -314,12 +337,25 @@ async fn try_recovery(
 
     info!("Executing recovery for {target_id}: {}", recovery.command);
 
-    // Run the recovery command (5-minute hard timeout)
-    let result = super::checks::exec_simple_pub(&recovery.command, 300_000).await;
-
-    let (exit_code, stdout) = match result {
-        Ok((exit, out, _err)) => (exit, out),
-        Err(e) => (-1, format!("ERROR: {e}")),
+    // Run the recovery command (5-minute hard timeout), with the credentials
+    // it names as environment; a credential this unit does not hold is a
+    // failed run, never a command run without it.
+    let (exit_code, stdout) = match recovery_env(&state.credentials, &recovery.credential_ids) {
+        Err(missing) => (
+            -1,
+            format!("ERROR: credential {missing} is not on this unit"),
+        ),
+        Ok(env) => {
+            let secrets: Vec<String> = env
+                .iter()
+                .filter(|(k, _)| k.starts_with("SCTL_CRED_PASS_"))
+                .map(|(_, v)| v.clone())
+                .collect();
+            match super::checks::exec_with_env(&recovery.command, &env, 300_000).await {
+                Ok((exit, out, _err)) => (exit, mask(&out, &secrets)),
+                Err(e) => (-1, format!("ERROR: {e}")),
+            }
+        }
     };
 
     // Truncate stdout for the log
@@ -351,6 +387,51 @@ async fn try_recovery(
     clippy::cast_sign_loss
 )]
 mod tests {
+
+    #[test]
+    fn recovery_env_names_each_credential_in_order() {
+        let mut store = std::collections::HashMap::new();
+        store.insert(
+            "pdu".to_string(),
+            super::super::Credential {
+                username: "cyber".into(),
+                password: "S3cret-pw".into(),
+            },
+        );
+        store.insert(
+            "rtr".to_string(),
+            super::super::Credential {
+                username: "admin".into(),
+                password: "x".into(),
+            },
+        );
+        let env = recovery_env(&store, &["pdu".into(), "rtr".into()]).unwrap();
+        assert_eq!(
+            env[0],
+            ("SCTL_CRED_USER_1".to_string(), "cyber".to_string())
+        );
+        assert_eq!(env[3], ("SCTL_CRED_PASS_2".to_string(), "x".to_string()));
+        assert_eq!(recovery_env(&store, &["gone".into()]).unwrap_err(), "gone");
+        assert_eq!(
+            mask("login S3cret-pw ok", &["S3cret-pw".into()]),
+            "login *** ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recovery_command_reads_its_credentials_from_the_environment() {
+        let env = vec![("SCTL_CRED_PASS_1".to_string(), "S3cret-pw".to_string())];
+        let (code, out, _) = crate::infra::checks::exec_with_env(
+            "printf %s \"$SCTL_CRED_PASS_1\" | wc -c",
+            &env,
+            5_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "9");
+    }
+
     use super::*;
     use serde_json::json;
 
