@@ -1,6 +1,6 @@
 # ADR-007: The agent reports a unit's power only from a source the unit already publishes; the XE300 publishes none
 
-Status: Proposed (2026-10-07). The firmware study is done. The live check on one XE300 the owner names (fleet plan, phase S, step 8) confirms or corrects sections 3 and 4 before this is accepted. Realized by: none yet; TRD-7 is written only if the owner takes option B of section 7 after the live check. Cites `docs/http-api.md` (`GET /api/info`).
+Status: Accepted (2026-10-08), option A of section 7. The live check (section 9) confirmed sections 3 and 4 on a deployed unit, and the owner's rule for this round was option A unless the check showed a read-only source; it showed none. Realized by: none; no agent code is written (TRD-7 only if option B is ever taken). Cites `docs/http-api.md` (`GET /api/info`).
 
 ## 1. Trigger
 
@@ -122,4 +122,20 @@ logread | grep -iE 'mcu|batt|charg|power|ttyUSB0|ch341|cp210' | tail -50
 dmesg | grep -iE 'ttyUSB|ch341|cp210|usb 1-1\.4|batt|charg' | tail -50
 ```
 
-Expected, from the image: the three hashes of section 2; an empty `/sys/class/power_supply`; `1-1.4:1.0/ttyUSB0` present on a battery unit (and GPIO 16 not exported); no ubus object or uci key about power; no process holding `ttyUSB0`; `/tmp/mcu_data` absent, or its mtime far older than `date -u`.
+Expected, from the image: the three hashes of section 2; an empty `/sys/class/power_supply`; `1-1.4:1.0/ttyUSB0` present on a battery unit; no ubus object or uci key about power; no process holding `ttyUSB0`; `/tmp/mcu_data` absent, or its mtime far older than `date -u`.
+
+## 9. The live check, run (2026-10-08)
+
+One read-only batch, the list of section 8 exactly, on one XE300 of the production fleet (XE300-9483C446D3EA), through its own agent, at 2026-10-08 15:40 UTC, uptime 14.9 days. Then two more reads: `/etc/init.d/init_gpio` and GPIO 16's sysfs entries. No `/dev/tty*` was opened, no vendor tool run, no service touched.
+
+- Firmware 3.212, OpenWrt 19.07.8 r11364; `gl-xe300-mcu 3.0.4-1`. The three hashes equal section 2's table, so 3.212 carries the same battery package as the studied images.
+- `/sys/class/power_supply` is empty: no supply driver.
+- USB `1-1.4` is the MCU's bridge: `1a86:7523` ("USB Serial"), bound to `ch341`, `ttyUSB0`; the modem's ports are `ttyUSB1` to `ttyUSB4`.
+- No ubus object about power, battery or charge; the only matching uci keys are the radio's `txpower` and `txpower_max`.
+- The scripts naming the MCU or the battery are `init_gpio` and `gl_monitor` (enabled), as the image showed; `gl_mqtt`, `gl_bigdata`, `gl_tertf`, `gl_s2s`, `siderouter` and `gl_init` are disabled (the onboarding's work).
+- No process holds `ttyUSB0`. `smsd` and the agent hold `ttyUSB3` (the modem's AT port), `askfirst` the console `ttyS0`.
+- `/tmp/mcu_data` and `/tmp/mcu.lock` do not exist: nothing has read the MCU since boot.
+- The logs name no battery or charge event; `dmesg` shows the `ch341` bridge attaching at 33 s.
+- **Correction to section 8's expectation:** GPIO 16 IS exported, direction out, value 1, on this battery unit. `init_gpio` runs at `START=01`, before USB enumerates `1-1.4` (14 s in `dmesg`), so its battery-unit test (the `ttyUSB0` directory) is false at that moment and it powers the USB bus on every unit. GPIO 16 is an output the vendor drives, not an input about power, so it is no source either.
+
+**Result:** no source a unit publishes without a write. Option A stands: the agent reports no `power` key on the XE300, and the fleet says the unit reports no power state (fleet TRD-10). The mains-unplug test is not needed for option A and stays with the owner for a later phase, should option B ever be taken.
