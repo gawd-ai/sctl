@@ -9,4 +9,4 @@ A TRD says what to build, in which files, and how it is accepted: the implementa
 | [TRD-3](TRD-3-managed-relay-upgrade.md) | Managed relay upgrade | [ADR-003](../adr/003-the-relay-upgrades-itself-through-the-managed-path-last.md) | Implemented (2026-10-01) |
 | [TRD-4](TRD-4-relay-route-ownership-bench-and-rollout.md) | Relay route ownership bench and rollout | [ADR-004](../adr/004-relay-route-ownership-on-units-with-a-wireguard-pin.md) | Planned |
 | [TRD-5](TRD-5-mwan3-verdict-in-net-state.md) | mwan3's verdict in net.state | [ADR-005](../adr/005-the-agent-reports-the-units-own-uplink-verdict.md) | Implemented (2026-10-05) |
-| [TRD-6](TRD-6-sctl-net-tools.md) | sctl net tools | [ADR-006](../adr/006-the-agent-carries-its-own-network-tools.md) | Planned |
+| [TRD-6](TRD-6-sctl-net-tools.md) | sctl net tools | [ADR-006](../adr/006-the-agent-carries-its-own-network-tools.md) | Implemented (2026-10-08) |

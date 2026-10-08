@@ -1,6 +1,6 @@
 # TRD-6: sctl net tools
 
-Implements [ADR-006](../adr/006-the-agent-carries-its-own-network-tools.md). Status: Planned.
+Implements [ADR-006](../adr/006-the-agent-carries-its-own-network-tools.md). Status: Implemented (2026-10-08): slices 1 and 2 shipped in 0.6.11; slice 3 is recorded below once the fleet's rollout reaches the units.
 
 ## 1. Objective
 
@@ -26,4 +26,4 @@ Unit tests: a loopback SNMP agent (GET round trip with the community on the wire
 
 ## 4. Slices and status
 
-1. snmp, http, tcp subcommands: Planned. 2. HTTP check meaning: Planned. 3. Released and rolled out: Planned.
+1. snmp, http, tcp subcommands: Implemented (2026-10-06, `5b2931e`). 2. HTTP check meaning: Implemented (2026-10-06, `5b2931e`). 3. Released (0.6.11, 2026-10-08) and rolled out: Planned until the fleet's rollout.
