@@ -2,7 +2,8 @@
 # Writes the stage that devices/we826-qwd/ramboot-refresh.sh runs from (TRD-8):
 # the current shared init and ramboot.sh, a ramboot.conf naming the release's
 # four mips_24kc payloads on its mirror, install.json with the musl loader as
-# helper_prefix, the script itself, and files.sha256 over all of them.
+# helper_prefix, sizes (each payload's bytes, for the /tmp check), the script
+# itself, and files.sha256 over all of them.
 # `rundev.sh device upgrade-remote` calls it for a WE826; so do the tests.
 #
 # Usage: devices/we826-qwd/refresh-stage.sh <release.json> <mirror base> <out dir>
@@ -35,6 +36,7 @@ conf_kv() {
 }
 
 mkdir -p "$out"
+: > "$out/sizes"
 {
     conf_kv RUN_DIR /tmp/sctl
     conf_kv CACHE_DIR /tmp/sctl/cache
@@ -46,13 +48,15 @@ mkdir -p "$out"
     for spec in "server SERVER" "plugin PLUGIN" "libc MUSL_LIBC" "libgcc LIBGCC"; do
         role=${spec% *}
         key=${spec#* }
-        name='' sha='' gz=''
-        read -r name sha gz < <(jq -r --arg role "$role" \
-            '[.targets.mips_24kc.files[]? | select(.role == $role)] | first // empty | "\(.name) \(.sha256) \(.gzip)"' \
+        name='' sha='' gz='' size=''
+        read -r name sha gz size < <(jq -r --arg role "$role" \
+            '[.targets.mips_24kc.files[]? | select(.role == $role)] | first // empty | "\(.name) \(.sha256) \(.gzip) \(.size)"' \
             "$manifest") || true
         [[ -n "${name:-}" ]] || die "the manifest has no mips_24kc $role"
         [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "the mips_24kc $role is named '$name'"
         [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || die "the mips_24kc $role has no SHA-256"
+        [[ "$size" =~ ^[0-9]+$ ]] || die "the mips_24kc $role has no size"
+        printf '%s %s\n' "$key" "$size" >> "$out/sizes"
         conf_kv "${key}_URL" "$mirror/$name"
         conf_kv "${key}_SHA256" "$sha"
         if [[ "$gz" == "true" ]]; then
@@ -75,7 +79,7 @@ cp "$COMMON/sctl-ramboot.init" "$out/sctl.init"
 cp "$COMMON/sctl-ramboot.sh" "$out/ramboot.sh"
 cp "$HERE/ramboot-refresh.sh" "$out/ramboot-refresh.sh"
 chmod 0600 "$out/ramboot.conf"
-chmod 0644 "$out/install.json"
+chmod 0644 "$out/install.json" "$out/sizes"
 chmod 0755 "$out/sctl.init" "$out/ramboot.sh" "$out/ramboot-refresh.sh"
-(cd "$out" && sha256sum sctl.init ramboot.sh ramboot.conf install.json ramboot-refresh.sh > files.sha256)
+(cd "$out" && sha256sum sctl.init ramboot.sh ramboot.conf install.json sizes ramboot-refresh.sh > files.sha256)
 echo "$version"
