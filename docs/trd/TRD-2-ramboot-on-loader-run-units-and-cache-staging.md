@@ -22,7 +22,7 @@ A ramboot unit started under a loader (the WE826) can run the upgrade helper; st
 - The netns rehearsal (`scratchpad/upg` bench): a ramboot-layout fake agent started through a stub loader script upgrades from the bench relay (good bundle: `done`/`ok`), rolls back a bad binary (`rolled_back`, the previous `ramboot.conf` restored, the fetcher re-downloads the previous payload from the bench mirror), and a stale oversized cache file is replaced.
 - The ZBT WE826 bench unit, installed with `helper_prefix`: an upgrade to a bench bundle and a rollback, end to end, over its real loader.
 - Release 0.6.9 through the `Release` workflow with TRD-1's proof; upload to do-toronto with its mirror; the RUT241 takes 0.6.9 through the fleet's rollout (its first self-upgrade) and reports `done`.
-- Bus 01 WE826, when online and with the owner's OK: `ramboot.conf` repointed at the relay's mirror (the version the bench proved) and `install.json` written, with the bus's dead-man switch (restore the previous `ramboot.conf` and restart unless the tunnel is back within 120 s); then it is a rollout citizen.
+- Bus 01 WE826, when online and with the owner's OK: `ramboot.conf` repointed at the relay's mirror (the version the bench proved) and `install.json` written, with the bus's dead-man switch (restore the previous `ramboot.conf` and restart unless the tunnel is back within 120 s); then it is a rollout citizen. Bus 01 runs 0.6.2, older than any agent that reads `install.json`, so this step is [TRD-8](TRD-8-we826-guarded-move-to-the-current-ramboot-layout.md)'s guarded move (2026-10-09).
 
 ## 4. Slices and status
 

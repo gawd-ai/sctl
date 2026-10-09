@@ -9,6 +9,7 @@ This device has only about 832 KB of writable overlay, so the install writes onl
 /etc/sctl/ramboot.sh          fetch/verify/expand wrapper
 /etc/sctl/ramboot.conf        payload URLs and hashes
 /etc/sctl/sctl.toml           runtime server config
+/etc/sctl/install.json        layout, target and loader prefix (docs/upgrade.md)
 /tmp/sctl/sctl-server         runtime expanded server binary
 /tmp/sctl/lib/*.so            runtime expanded comms plugin
 ```
@@ -95,6 +96,40 @@ Set `INSTALL_DISABLED=1` to install the files without starting the service. Remo
 rm -f /etc/sctl/disabled
 /etc/init.d/sctl restart
 ```
+
+## A unit installed before 0.6.7
+
+A unit whose agent is older than 0.6.7 has no `install.json` and no upgrade
+route, so the fleet cannot ask it (Bus 01 runs 0.6.2). It moves once, through
+the relay and with no SSH, to the current layout and a current release
+([TRD-8](../../docs/trd/TRD-8-we826-guarded-move-to-the-current-ramboot-layout.md)):
+
+```sh
+./rundev.sh device upgrade-remote <name> <version> http://174.138.114.209:8081/artifacts/<version>
+# or name the relay and let its listing give the mirror:
+./rundev.sh device upgrade-remote <name> <version> root@174.138.114.209
+```
+
+`rundev.sh` checks the release's signature and the mirror's bytes, stages
+`ramboot-refresh.sh` (with `refresh-stage.sh`) and follows its state. On the
+unit the script refuses a layout it does not recognise, fetches and proves the
+new payloads (the server runs through the new loader and reads this unit's
+`sctl.toml`) before anything moves, keeps the old files and payloads in RAM,
+writes the current init, `ramboot.sh`, `install.json` and `ramboot.conf`,
+restarts once, and puts everything back unless the new agent answers with the
+version and a connected tunnel twice within 300 s (`WE826_WAIT_SECS`). The
+rollback starts the old agent from its cache, with no network. `sctl.toml` is
+never written; the unit's fetch settings (`FETCH_ATTEMPTS` and friends) are
+kept. States in `/tmp/sctl-we826-refresh/state`, log in
+`/tmp/sctl-we826-refresh.log`, the old files in
+`/tmp/sctl-we826-refresh-rollback` until the next boot. A unit installed by
+0.6.7 or 0.6.8 (an `install.json` without `helper_prefix`) takes the same
+move; one whose `install.json` names the loader is refused: it takes managed
+upgrades.
+
+Run it with the unit parked and powered (it is ignition-fed on a bus), on its
+wire when there is one. The tests (`tests/ramboot-refresh-test.sh`,
+`tests/upgrade-remote-test.sh`) need `busybox`, `dash`, `jq` and `openssl`.
 
 ## Safety
 

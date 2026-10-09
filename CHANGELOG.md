@@ -10,6 +10,9 @@ under per-component headings. `server/CHANGELOG.md` is frozen.
 
 ## [Unreleased]
 
+### Devices
+- **A WE826 whose agent cannot take a managed upgrade moves once to the current ramboot layout, and back by itself unless the new agent is healthy** (ADR-002, TRD-8). `rundev.sh device upgrade-remote <name> <version> <user@relay | mirror URL>` reads the version's `release.json` from the relay's mirror, checks its signature against the keys the agent embeds and the mirror's bytes against it, and stages `devices/we826-qwd/ramboot-refresh.sh`. On the unit the script refuses a layout it does not recognise, fetches and proves the new payloads (the server runs through the new musl loader and reads the unit's `sctl.toml` and the new `install.json`) before anything moves, keeps the old files and payloads in RAM, writes the current init, `ramboot.sh`, `install.json` and `ramboot.conf` (last), restarts once, and puts everything back byte for byte, with no network, unless the version answers with its tunnel up twice within 300 s. `sctl.toml` is never written. Bus 01 (0.6.2) is the unit it is for; tested under BusyBox ash and dash with the WE826's tools, and end to end through `rundev.sh` against a fake unit.
+
 ## [0.6.11] - 2026-10-08
 
 ### Network tools

@@ -10,3 +10,4 @@ A TRD says what to build, in which files, and how it is accepted: the implementa
 | [TRD-4](TRD-4-relay-route-ownership-bench-and-rollout.md) | Relay route ownership bench and rollout | [ADR-004](../adr/004-relay-route-ownership-on-units-with-a-wireguard-pin.md) | Planned |
 | [TRD-5](TRD-5-mwan3-verdict-in-net-state.md) | mwan3's verdict in net.state | [ADR-005](../adr/005-the-agent-reports-the-units-own-uplink-verdict.md) | Implemented (2026-10-05) |
 | [TRD-6](TRD-6-sctl-net-tools.md) | sctl net tools | [ADR-006](../adr/006-the-agent-carries-its-own-network-tools.md) | Implemented (2026-10-08) |
+| [TRD-8](TRD-8-we826-guarded-move-to-the-current-ramboot-layout.md) | WE826 guarded move to the current ramboot layout | [ADR-002](../adr/002-flash-constrained-units-boot-from-the-relays-mirror.md) | Planned |

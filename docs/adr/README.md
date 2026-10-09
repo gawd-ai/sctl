@@ -5,7 +5,7 @@ A decision that shapes the agent, the relay or the way they are built and releas
 | ADR | Title | Status | Realized by |
 |---|---|---|---|
 | [001](001-an-artifact-carries-the-version-its-manifest-names.md) | An artifact carries the version its manifest names, and CI proves it | Accepted (2026-10-01) | [TRD-1](../trd/TRD-1-release-integrity-guard.md) |
-| [002](002-flash-constrained-units-boot-from-the-relays-mirror.md) | Flash-constrained units boot from the relay's mirror | Accepted (2026-10-01) | [TRD-2](../trd/TRD-2-ramboot-on-loader-run-units-and-cache-staging.md) |
+| [002](002-flash-constrained-units-boot-from-the-relays-mirror.md) | Flash-constrained units boot from the relay's mirror | Accepted (2026-10-01) | [TRD-2](../trd/TRD-2-ramboot-on-loader-run-units-and-cache-staging.md), [TRD-8](../trd/TRD-8-we826-guarded-move-to-the-current-ramboot-layout.md) (a WE826 installed before 0.6.7) |
 | [003](003-the-relay-upgrades-itself-through-the-managed-path-last.md) | The relay upgrades itself through the managed path, last | Accepted (2026-10-01) | [TRD-3](../trd/TRD-3-managed-relay-upgrade.md) |
 | [004](004-relay-route-ownership-on-units-with-a-wireguard-pin.md) | Relay route ownership on units with a WireGuard pin | Proposed (2026-10-01) | [TRD-4](../trd/TRD-4-relay-route-ownership-bench-and-rollout.md) |
 | [005](005-the-agent-reports-the-units-own-uplink-verdict.md) | The agent reports the uplink verdict of the unit's own failover engine (mwan3) beside the kernel's routes | Accepted (2026-10-05) | [TRD-5](../trd/TRD-5-mwan3-verdict-in-net-state.md) |

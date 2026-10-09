@@ -20,6 +20,7 @@ application.
 - [The `upgrade.state` push](#the-upgradestate-push)
 - [Holds](#holds)
 - [The relay upgrades itself](#the-relay-upgrades-itself)
+- [A WE826 installed before 0.6.7](#a-we826-installed-before-067)
 - [By hand](#by-hand)
 
 ## Roles
@@ -71,7 +72,7 @@ writes it to `/etc/sctl/install.json` and the agent reads it at start:
 |---|---|---|---|---|
 | `usr-bin` | the raw binary at `/usr/bin/sctl`, the plugin `.so` beside procd | `/etc/init.d/sctl restart` | `/usr/lib/sctl/rollback/` | generic OpenWrt, the BPIs |
 | `gz-tmp` | gzipped payloads under `/usr/local/lib/sctl/`; the init expands them to `/tmp/sctl/` at start | `/etc/init.d/sctl restart` | `/usr/local/lib/sctl/rollback/` | XE300 |
-| `ramboot` | nothing but `/etc/sctl/ramboot.conf` (URLs and SHA-256s); `ramboot.sh` fetches into `/tmp/sctl/cache/` at boot | `/etc/init.d/sctl restart` | the previous `ramboot.conf` | WE826 (832 KB overlay), RUT241 (4 MB overlay: a 0.6.7 payload set does not fit beside the one it runs; `devices/rut241/ramboot-migrate.sh` moves it) |
+| `ramboot` | nothing but `/etc/sctl/ramboot.conf` (URLs and SHA-256s); `ramboot.sh` fetches into `/tmp/sctl/cache/` at boot | `/etc/init.d/sctl restart` | the previous `ramboot.conf` | WE826 (832 KB overlay; one installed before 0.6.7 moves once with `devices/we826-qwd/ramboot-refresh.sh`, [below](#a-we826-installed-before-067)), RUT241 (4 MB overlay: a 0.6.7 payload set does not fit beside the one it runs; `devices/rut241/ramboot-migrate.sh` moves it) |
 | `systemd` | the raw binary at `/usr/local/bin/sctl` | `systemctl restart <unit>` | `/var/lib/sctl/rollback/` | the relay |
 
 `files` names the persistent locations by **role**: `server`, `plugin`, and for
@@ -376,6 +377,39 @@ complete there first (`rundev.sh relay artifacts`). `rundev.sh relay upgrade
 <user@host> <version>` is that request plus the watch of `/api/health` until
 the outcome; nothing is copied from the operator's machine (ADR-003).
 
+## A WE826 installed before 0.6.7
+
+A WE826 whose agent predates 0.6.7 has no `install.json` and no
+`POST /api/upgrade`; one installed by 0.6.7 or 0.6.8 has an `install.json`
+without `helper_prefix`, so its helper cannot start under the loader. The
+fleet can ask neither. Each moves once, through the relay and with no SSH:
+`rundev.sh device upgrade-remote <name> <version> <user@relay | mirror URL>`
+([TRD-8](trd/TRD-8-we826-guarded-move-to-the-current-ramboot-layout.md)).
+The operator's machine reads the version's `release.json` from the relay's
+mirror, checks its signature against the embedded keys and the mirror's
+bytes against it, and stages `devices/we826-qwd/ramboot-refresh.sh` with the
+current init and `ramboot.sh`, a `ramboot.conf` for the version and
+`install.json`. On the unit, detached, the script:
+
+1. recognises the old layout (the shared ramboot init, a `ramboot.conf`
+   naming the four payloads at the layout's paths, `sctl.toml`, the musl
+   loader, the agent answering `/api/health`) or refuses with nothing
+   changed;
+2. fetches and verifies the four payloads, keeps the old ones in RAM, and
+   runs the new server through the new loader (`--version`, `target`,
+   `install-info` on this unit's `sctl.toml` and the staged `install.json`)
+   before anything moves;
+3. stops the old agent with its own init, writes the new files (`ramboot.conf`
+   last), puts the new payloads in the cache and starts once;
+4. healthy is the version and, with a `[tunnel] url`, a connected tunnel,
+   twice in a row within 300 s; otherwise every file and the old payloads go
+   back byte for byte and the old version must answer, with no network.
+
+It reports `failed` (nothing moved), `done`, `rolled_back` or `needs_hands`
+in its stage and logs to `/tmp/sctl-we826-refresh.log`. `sctl.toml` is never
+written. Afterwards the unit reports layout `ramboot` and target `mips_24kc`,
+and every later release reaches it as a rollout.
+
 ## By hand
 
 - `sctl upgrade <version> [--manifest <url>] [--allow-downgrade]` does what the
@@ -386,5 +420,6 @@ the outcome; nothing is copied from the operator's machine (ADR-003).
 - `sctl target` prints the compile target, and `sctl install-info` prints what
   `install.json` resolves to with defaults applied.
 - `rundev.sh device upgrade-remote` remains for a unit that runs an agent
-  older than 0.6.7 or has no `install.json`. After the last hand upgrade every
-  release is a rollout.
+  older than 0.6.7 or has no `install.json` (the RUT241's move to `ramboot`,
+  the WE826's move above). After the last hand upgrade every release is a
+  rollout.
