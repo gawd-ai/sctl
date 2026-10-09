@@ -100,6 +100,8 @@ one agent client's config)
 | `device upgrade <name>` | Binary-only upgrade via SSH (stop → upload → start). |
 | `device deploy-watchdog <name>` | Deploy the watchdog script + cron entry (SSH or API). |
 | `device upgrade-remote <name>` | Binary upgrade **via the relay** (STP upload + swap) — no SSH path needed. |
+| `device upgrade-remote <name> <version> <user@relay>` | RUT241: the move to the ramboot layout, fed by the relay's mirror (`devices/rut241/ramboot-migrate.sh`). |
+| `device upgrade-remote <name> <version> <user@relay \| mirror URL>` | WE826 installed before 0.6.9: one guarded move to the current ramboot layout, rolled back by itself unless healthy (`devices/we826-qwd/ramboot-refresh.sh`, TRD-8). The mirror by IP for a unit that fetches by IP. |
 
 **Relay VPS deployment**
 
@@ -239,8 +241,9 @@ uploaded to each relay (`./rundev.sh relay artifacts <user@host> <version>
 answer health. `docs/upgrade.md` is the contract.
 
 The paths above (`device upgrade`, `device upgrade-remote`) remain for a
-unit that runs an agent older than 0.6.7 or has no `/etc/sctl/install.json`;
-each of them now writes that file, so the last hand upgrade leaves a unit
+unit that runs an agent older than 0.6.7 or has no `/etc/sctl/install.json`
+(and a WE826 whose `install.json` lacks `helper_prefix`, installed by 0.6.7
+or 0.6.8); each of them now writes that file, so the last hand upgrade leaves a unit
 that upgrades itself from then on. `relay deploy` remains for a first
 install; `relay upgrade` is the managed request above, no longer an scp. `sctl upgrade
 <version>` from a shell on the box does what the fleet does, for a bench.

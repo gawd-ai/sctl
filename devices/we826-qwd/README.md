@@ -97,39 +97,54 @@ rm -f /etc/sctl/disabled
 /etc/init.d/sctl restart
 ```
 
-## A unit installed before 0.6.7
+## A unit installed before 0.6.9
 
 A unit whose agent is older than 0.6.7 has no `install.json` and no upgrade
-route, so the fleet cannot ask it (Bus 01 runs 0.6.2). It moves once, through
-the relay and with no SSH, to the current layout and a current release
+route, so the fleet cannot ask it (Bus 01 runs 0.6.2); one installed by 0.6.7
+or 0.6.8 has an `install.json` without `helper_prefix`, so its upgrade helper
+cannot start under the loader. It moves once, through the relay and with no
+SSH, to the current layout and a current release
 ([TRD-8](../../docs/trd/TRD-8-we826-guarded-move-to-the-current-ramboot-layout.md)):
 
 ```sh
 ./rundev.sh device upgrade-remote <name> <version> http://174.138.114.209:8081/artifacts/<version>
-# or name the relay and let its listing give the mirror:
+# or name the relay and let its listing give the mirror (it must be by IP for
+# a unit that fetches by IP, as Bus 01 does):
 ./rundev.sh device upgrade-remote <name> <version> root@174.138.114.209
 ```
 
-`rundev.sh` checks the release's signature and the mirror's bytes, stages
+`rundev.sh` checks the release's signature and the mirror's bytes, refuses a
+mirror by name for a unit whose `ramboot.conf` names its mirror by IP, stages
 `ramboot-refresh.sh` (with `refresh-stage.sh`) and follows its state. On the
-unit the script refuses a layout it does not recognise, fetches and proves the
-new payloads (the server runs through the new loader and reads this unit's
-`sctl.toml`) before anything moves, keeps the old files and payloads in RAM,
-writes the current init, `ramboot.sh`, `install.json` and `ramboot.conf`,
-restarts once, and puts everything back unless the new agent answers with the
-version and a connected tunnel twice within 300 s (`WE826_WAIT_SECS`). The
-rollback starts the old agent from its cache, with no network. `sctl.toml` is
-never written; the unit's fetch settings (`FETCH_ATTEMPTS` and friends) are
-kept. States in `/tmp/sctl-we826-refresh/state`, log in
-`/tmp/sctl-we826-refresh.log`, the old files in
-`/tmp/sctl-we826-refresh-rollback` until the next boot. A unit installed by
-0.6.7 or 0.6.8 (an `install.json` without `helper_prefix`) takes the same
-move; one whose `install.json` names the loader is refused: it takes managed
-upgrades.
+unit the script refuses a layout it does not recognise and anything the move
+would change beyond the agent (`relay_route` the old agent does not run, a
+`netage-wanpref` that is installed but not running and enabled), fetches and
+proves the new payloads (the server runs through the new loader and reads
+this unit's `sctl.toml`), fetches the old payloads from their URLs into RAM,
+then stops the old agent, writes the current init and `ramboot.sh`, and runs
+the new version from a RAM copy of its `ramboot.conf`: flash still boots the
+old version. Only when the new agent answers with the version and a tunnel
+that holds for 60 s does it write `ramboot.conf` and `install.json` and restart
+once more from flash. Otherwise it puts everything back byte for byte (the
+state dir included) and the old agent starts from its cache, with no network;
+if the old agent does not come back with its tunnel, the unit reboots into
+the old layout. `sctl.toml` is never written; the unit's fetch settings
+(`FETCH_ATTEMPTS` and friends) are kept. A power cut at any step boots one
+version whole.
+
+`WE826_WAIT_SECS` (300) is how long the new agent has to become healthy, and
+the old one to come back; `WE826_PREMOVE_SECS` (1800) bounds the fetches,
+after which nothing moves. The states are in `/tmp/sctl-we826-refresh/state`
+while it runs (`rundev.sh` removes that directory after `done`); the log
+stays in `/tmp/sctl-we826-refresh.log` and the old files in
+`/tmp/sctl-we826-refresh-rollback` until the next boot. A unit whose
+`install.json` names the loader is refused: it takes managed upgrades.
 
 Run it with the unit parked and powered (it is ignition-fed on a bus), on its
 wire when there is one. The tests (`tests/ramboot-refresh-test.sh`,
-`tests/upgrade-remote-test.sh`) need `busybox`, `dash`, `jq` and `openssl`.
+`tests/upgrade-remote-test.sh`) need `busybox`, `dash`, `jq`, `openssl`,
+`xxd`, `git` (they run the released init files and `ramboot.sh` from the
+history) and a coreutils `sleep`.
 
 ## Safety
 

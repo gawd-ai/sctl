@@ -20,7 +20,7 @@ application.
 - [The `upgrade.state` push](#the-upgradestate-push)
 - [Holds](#holds)
 - [The relay upgrades itself](#the-relay-upgrades-itself)
-- [A WE826 installed before 0.6.7](#a-we826-installed-before-067)
+- [A WE826 installed before 0.6.9](#a-we826-installed-before-069)
 - [By hand](#by-hand)
 
 ## Roles
@@ -72,7 +72,7 @@ writes it to `/etc/sctl/install.json` and the agent reads it at start:
 |---|---|---|---|---|
 | `usr-bin` | the raw binary at `/usr/bin/sctl`, the plugin `.so` beside procd | `/etc/init.d/sctl restart` | `/usr/lib/sctl/rollback/` | generic OpenWrt, the BPIs |
 | `gz-tmp` | gzipped payloads under `/usr/local/lib/sctl/`; the init expands them to `/tmp/sctl/` at start | `/etc/init.d/sctl restart` | `/usr/local/lib/sctl/rollback/` | XE300 |
-| `ramboot` | nothing but `/etc/sctl/ramboot.conf` (URLs and SHA-256s); `ramboot.sh` fetches into `/tmp/sctl/cache/` at boot | `/etc/init.d/sctl restart` | the previous `ramboot.conf` | WE826 (832 KB overlay; one installed before 0.6.7 moves once with `devices/we826-qwd/ramboot-refresh.sh`, [below](#a-we826-installed-before-067)), RUT241 (4 MB overlay: a 0.6.7 payload set does not fit beside the one it runs; `devices/rut241/ramboot-migrate.sh` moves it) |
+| `ramboot` | nothing but `/etc/sctl/ramboot.conf` (URLs and SHA-256s); `ramboot.sh` fetches into `/tmp/sctl/cache/` at boot | `/etc/init.d/sctl restart` | the previous `ramboot.conf` | WE826 (832 KB overlay; one installed before 0.6.9 moves once with `devices/we826-qwd/ramboot-refresh.sh`, [below](#a-we826-installed-before-069)), RUT241 (4 MB overlay: a 0.6.7 payload set does not fit beside the one it runs; `devices/rut241/ramboot-migrate.sh` moves it) |
 | `systemd` | the raw binary at `/usr/local/bin/sctl` | `systemctl restart <unit>` | `/var/lib/sctl/rollback/` | the relay |
 
 `files` names the persistent locations by **role**: `server`, `plugin`, and for
@@ -377,38 +377,52 @@ complete there first (`rundev.sh relay artifacts`). `rundev.sh relay upgrade
 <user@host> <version>` is that request plus the watch of `/api/health` until
 the outcome; nothing is copied from the operator's machine (ADR-003).
 
-## A WE826 installed before 0.6.7
+## A WE826 installed before 0.6.9
 
 A WE826 whose agent predates 0.6.7 has no `install.json` and no
 `POST /api/upgrade`; one installed by 0.6.7 or 0.6.8 has an `install.json`
 without `helper_prefix`, so its helper cannot start under the loader. The
 fleet can ask neither. Each moves once, through the relay and with no SSH:
 `rundev.sh device upgrade-remote <name> <version> <user@relay | mirror URL>`
-([TRD-8](trd/TRD-8-we826-guarded-move-to-the-current-ramboot-layout.md)).
+([TRD-8](trd/TRD-8-we826-guarded-move-to-the-current-ramboot-layout.md)),
+with the mirror by IP when the unit fetches by IP (a bus's resolver can time
+out on the relay's name; both ends refuse a name there).
 The operator's machine reads the version's `release.json` from the relay's
 mirror, checks its signature against the embedded keys and the mirror's
 bytes against it, and stages `devices/we826-qwd/ramboot-refresh.sh` with the
-current init and `ramboot.sh`, a `ramboot.conf` for the version and
-`install.json`. On the unit, detached, the script:
+current init and `ramboot.sh`, a `ramboot.conf` for the version, `install.json`
+and the payload sizes. On the unit, detached, the script:
 
 1. recognises the old layout (the shared ramboot init, a `ramboot.conf`
    naming the four payloads at the layout's paths, `sctl.toml`, the musl
-   loader, the agent answering `/api/health`) or refuses with nothing
-   changed;
-2. fetches and verifies the four payloads, keeps the old ones in RAM, and
-   runs the new server through the new loader (`--version`, `target`,
-   `install-info` on this unit's `sctl.toml` and the staged `install.json`)
-   before anything moves;
-3. stops the old agent with its own init, writes the new files (`ramboot.conf`
-   last), puts the new payloads in the cache and starts once;
-4. healthy is the version and, with a `[tunnel] url`, a connected tunnel,
-   twice in a row within 300 s; otherwise every file and the old payloads go
-   back byte for byte and the old version must answer, with no network.
+   loader, the agent answering `/api/health`, its tunnel up exactly when
+   `sctl.toml` names one) or refuses with nothing changed; it also refuses
+   what the trial would change beyond the agent (`relay_route` the old agent
+   does not run, a `netage-wanpref` today's `ramboot.sh` would start);
+2. fetches and verifies the four payloads, runs the new server through the
+   new loader (`--version`, `target`, `install-info` on this unit's
+   `sctl.toml` and the staged `install.json`), and fetches the old payloads
+   from their URLs into RAM, all before anything moves, keeping the old
+   `MIN_TMP_KB` free in `/tmp` throughout;
+3. stops the old agent with its own init, writes the init and `ramboot.sh`
+   (both still boot the old version), puts the new payloads in the cache and
+   starts the new version from a RAM copy of its `ramboot.conf`
+   (`SCTL_RAMBOOT_CONFIG`): flash still boots the old version;
+4. healthy is the version and, when the unit had a tunnel, the tunnel
+   connected with no reconnect for 60 s, starting within 300 s; then
+   `ramboot.conf` and `install.json` go to flash and the agent restarts once
+   more from there, healthy again with layout `ramboot`;
+5. otherwise `install.json` and `ramboot.conf` go back first, then every
+   other file, the state dir and the old payloads, byte for byte, and the old
+   version must answer with its tunnel, with no network. If it does not, the
+   unit reboots into the restored layout, whose payloads step 2 proved are
+   served.
 
-It reports `failed` (nothing moved), `done`, `rolled_back` or `needs_hands`
-in its stage and logs to `/tmp/sctl-we826-refresh.log`. `sctl.toml` is never
-written. Afterwards the unit reports layout `ramboot` and target `mips_24kc`,
-and every later release reaches it as a rollout.
+It reports `failed` (nothing moved), `done`, `rolled_back`, `rebooting` or
+`needs_hands` in its stage and logs to `/tmp/sctl-we826-refresh.log`. A power
+cut at any step boots one version whole. `sctl.toml` is never written.
+Afterwards the unit reports layout `ramboot` and target `mips_24kc`, and every
+later release reaches it as a rollout.
 
 ## By hand
 
