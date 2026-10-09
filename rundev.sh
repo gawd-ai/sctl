@@ -28,6 +28,8 @@
 #   ./rundev.sh device upgrade <name>           # binary-only upgrade via SSH
 #   ./rundev.sh device deploy-watchdog <name>   # deploy watchdog + cron (SSH or API)
 #   ./rundev.sh device upgrade-remote <name>    # binary upgrade via relay (no SSH)
+#   ./rundev.sh device upgrade-remote <name> <version> <user@relay | mirror URL>
+#                                               # RUT241 / WE826: move to the current ramboot layout
 #
 # Environment profiles:
 #   ./rundev.sh env show              # show current active profile
@@ -2249,7 +2251,7 @@ stp_upload_resilient() {
 do_device_upgrade_remote() {
     local name="${1:-}" version="${2:-}" relay="${3:-}"
     if [[ -z "$name" ]]; then
-        err "Usage: $0 device upgrade-remote <name> [<version> <user@relay>]"
+        err "Usage: $0 device upgrade-remote <name> [<version> <user@relay | mirror URL>]"
         exit 1
     fi
 
@@ -2284,6 +2286,15 @@ do_device_upgrade_remote() {
     if [[ "$layout" == "rut241" ]]; then
         do_device_upgrade_remote_rut241 "$name" "$url" "$api_key" "$version" "$relay"
         return
+    fi
+    if [[ "$layout" == "we826" ]]; then
+        do_device_upgrade_remote_we826 "$name" "$url" "$api_key" "$version" "$relay"
+        return
+    fi
+    if [[ "$layout" == "we826-managed" ]]; then
+        err "'$name' is a WE826 on the current ramboot layout (its install.json names the musl loader)."
+        err "It upgrades itself: ask it through a managed rollout (docs/upgrade.md), not upgrade-remote."
+        exit 1
     fi
 
     if [[ -z "$arch" ]]; then
@@ -2648,6 +2659,230 @@ do_device_upgrade_remote_rut241() {
     echo "  Log on the device: $RUT241_LOG"
 }
 
+# ─── device upgrade-remote: ZBT WE826-Q-WD ───────────────────────────
+#
+# A WE826 boots its agent from RAM through the musl loader (the ramboot
+# layout, docs/upgrade.md). One installed before 0.6.7 has no install.json and
+# an agent without POST /api/upgrade, so the fleet cannot ask it; one
+# installed by 0.6.7 or 0.6.8 has an install.json without the loader's
+# helper_prefix, so its helper cannot start. This path moves such a unit once
+# onto the current layout and a current release (TRD-8). It reads the
+# version's release.json from the relay's plain-HTTP mirror, checks its
+# signature against the keys the agent embeds (server/src/upgrade/keys.rs;
+# SCTL_TRUST_KEY adds a bench key, hex), checks the mirror serves the four
+# mips_24kc payloads with the manifest's SHA-256s, writes the stage with
+# devices/we826-qwd/refresh-stage.sh, stages it through the file API and hands
+# the move to devices/we826-qwd/ramboot-refresh.sh on the device, detached.
+# That script fetches and proves the new payloads before anything on flash
+# moves, keeps the old files and payloads in RAM, and puts them back unless
+# the new agent answers healthy twice with its tunnel up.
+#
+# Usage: ./rundev.sh device upgrade-remote <name> <version> <user@relay | mirror URL>
+#   user@relay   the mirror is read from the relay's artifact listing (as for a RUT241)
+#   mirror URL   the version's mirror itself, e.g. http://<relay>:8081/artifacts/<version>
+# WE826_WAIT_SECS (default 300): how long the device waits for the new agent
+# to be healthy, and for the old one after a rollback. WE826_WATCH_SECS
+# (default 1800): how long this watches for the outcome.
+
+WE826_STAGE="/tmp/sctl-we826-refresh"
+WE826_LOG="/tmp/sctl-we826-refresh.log"
+
+# The hex public keys a release may be signed with: the agent's embedded ones,
+# then SCTL_TRUST_KEY (comma-separated) for a bench.
+we826_trusted_keys() {
+    awk '/pub const EMBEDDED/ {f = 1} f && /^\];/ {exit} f' "$REPO_DIR/server/src/upgrade/keys.rs" \
+        | grep -o '0x[0-9a-fA-F][0-9a-fA-F]' | sed 's/^0x//' | tr -d '\n' | fold -w 64
+    echo
+    if [[ -n "${SCTL_TRUST_KEY:-}" ]]; then
+        tr ',' '\n' <<< "$SCTL_TRUST_KEY"
+    fi
+}
+
+do_device_upgrade_remote_we826() {
+    local name="$1" url="$2" api_key="$3" version="${4:-}" source="${5:-}"
+    ok "'$name' is a WE826 whose agent cannot take a managed upgrade: the one-time move to the current ramboot layout"
+    if [[ -z "$version" || -z "$source" ]]; then
+        err "Usage: $0 device upgrade-remote $name <version> <user@relay | mirror URL>"
+        err "The mirror URL is the version's plain-HTTP mirror, e.g. http://<relay>:8081/artifacts/$version"
+        exit 1
+    fi
+    local d="$WE826_STAGE"
+    local wait_secs="${WE826_WAIT_SECS:-300}" watch_secs="${WE826_WATCH_SECS:-1800}"
+    [[ "$wait_secs" =~ ^[0-9]+$ && "$watch_secs" =~ ^[0-9]+$ ]] || { err "WE826_WAIT_SECS and WE826_WATCH_SECS are seconds"; exit 1; }
+    local mirror
+    if [[ "$source" =~ ^https?:// ]]; then
+        mirror=${source%/}
+    else
+        # The relay's listing names the version's mirror, as for a RUT241.
+        local ssh_opts="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+        local key_expr="\$(sed -n 's/^api_key *= *\"\(.*\)\"/\1/p' $RELAY_REMOTE_CONFIG | head -n1)"
+        log "Reading the $version listing on $source..."
+        local listing entry
+        listing=$(ssh $ssh_opts "$source" "curl -sS -H \"Authorization: Bearer $key_expr\" http://127.0.0.1:8443/api/tunnel/artifacts") || {
+            err "Could not read the relay's artifact listing"
+            exit 1
+        }
+        entry=$(printf '%s' "$listing" | jq -c --arg v "$version" '.versions[] | select(.version == $v)')
+        [[ -n "$entry" ]] || { err "The relay holds no bundle $version"; exit 1; }
+        [[ "$(printf '%s' "$entry" | jq -r '.complete')" == "true" ]] || { err "Bundle $version is not complete on the relay"; exit 1; }
+        mirror=$(printf '%s' "$entry" | jq -r '.mirror // empty')
+        [[ -n "$mirror" ]] || { err "Bundle $version has no mirror; set one with: $0 relay artifacts $source mirror $version <url>"; exit 1; }
+        mirror=${mirror%/}
+    fi
+
+    # Step 1: the manifest, from the mirror the device will boot from, signed
+    # by a key the agent trusts, naming this version.
+    we826_tmp=$(mktemp -d)
+    trap 'rm -rf "$we826_tmp"' EXIT
+    local tmp="$we826_tmp"
+    log "Reading $mirror/release.json..."
+    curl -sf --max-time 30 -o "$tmp/release.json" "$mirror/release.json" || { err "Cannot read $mirror/release.json"; exit 1; }
+    curl -sf --max-time 30 -o "$tmp/release.json.sig" "$mirror/release.json.sig" || { err "Cannot read $mirror/release.json.sig"; exit 1; }
+    local key verified=""
+    while read -r key; do
+        [[ -n "$key" ]] || continue
+        if "$REPO_DIR/scripts/release-sign.sh" verify "$tmp/release.json" "$key" >/dev/null 2>&1; then
+            verified=$key
+            break
+        fi
+    done < <(we826_trusted_keys)
+    [[ -n "$verified" ]] || { err "$mirror/release.json is not signed by a key the agent trusts (SCTL_TRUST_KEY adds a bench key)"; exit 1; }
+    local manifest_version
+    manifest_version=$(jq -r '.version // empty' "$tmp/release.json")
+    [[ "$manifest_version" == "$version" ]] || { err "$mirror/release.json is version '${manifest_version:-none}', not $version"; exit 1; }
+    ok "release.json $version verifies (key ${verified:0:8}...)"
+
+    # Step 2: the stage, written here, and the mirror's bytes checked from here.
+    "$REPO_DIR/devices/we826-qwd/refresh-stage.sh" "$tmp/release.json" "$mirror" "$tmp/stage" >/dev/null || {
+        err "Could not write the stage from $mirror/release.json"
+        exit 1
+    }
+    local fname fsha got
+    while read -r fname fsha; do
+        got=$(curl -sfL --max-time 300 "$mirror/$fname" | sha256sum | cut -d' ' -f1) || true
+        [[ "$got" == "$fsha" ]] || { err "The mirror does not serve $fname with the manifest's SHA-256 (got ${got:-nothing})"; exit 1; }
+    done < <(jq -r '.targets.mips_24kc.files[] | "\(.name) \(.sha256)"' "$tmp/release.json")
+    ok "The mirror serves the four mips_24kc payloads with the manifest's SHA-256s"
+
+    # Step 3: what the device says it runs.
+    local health running target layout
+    health=$(curl -sf --connect-timeout 3 --max-time 8 -H "Authorization: Bearer $api_key" "$url/api/health" 2>/dev/null) || true
+    running=$(echo "$health" | jq -r '.version // empty' 2>/dev/null)
+    target=$(echo "$health" | jq -r '.target // empty' 2>/dev/null)
+    layout=$(echo "$health" | jq -r '.layout // empty' 2>/dev/null)
+    [[ -n "$running" ]] || { err "'$name' does not answer /api/health"; exit 1; }
+    if [[ -n "$target" && "$target" != "mips_24kc" ]]; then
+        err "'$name' reports target $target, not mips_24kc"
+        exit 1
+    fi
+    if [[ -n "$layout" ]]; then
+        err "'$name' reports layout $layout: its install.json is read, so it takes managed upgrades"
+        exit 1
+    fi
+    log "'$name' runs $running (target ${target:-not reported}, no install.json read)"
+
+    # Step 4: an empty stage directory, unless a move still runs in it.
+    # Device commands carry no backslash: /api/exec re-quotes them.
+    log "Preparing $d on the device..."
+    local prep
+    prep=$(remote_exec_stdout_trimmed "$url" "$api_key" \
+        'd='"$d"'; case "$(cat $d/state 2>/dev/null)" in ""|done|rolled_back|failed|needs_hands) ;; *) if kill -0 "$(cat $d/pid 2>/dev/null)" 2>/dev/null; then echo busy; exit 0; fi ;; esac; rm -rf $d && mkdir -p $d && echo ready' \
+        5000 5 8) || true
+    case "$prep" in
+        ready) ;;
+        busy) err "A move is still running on '$name' (see $d/state and $WE826_LOG)"; exit 1 ;;
+        *) err "Could not prepare $d on the device"; exit 1 ;;
+    esac
+    local f mode
+    for f in sctl.init ramboot.sh ramboot.conf install.json ramboot-refresh.sh files.sha256; do
+        mode=0644
+        [[ "$f" == "ramboot.conf" ]] && mode=0600
+        [[ "$f" == "sctl.init" || "$f" == "ramboot.sh" || "$f" == "ramboot-refresh.sh" ]] && mode=0755
+        if ! remote_put_file "$url" "$api_key" "$tmp/stage/$f" "$d/$f" "$mode"; then
+            err "Could not write $d/$f on the device"
+            exit 1
+        fi
+    done
+    ok "Stage written (the device checks every file against files.sha256 first)"
+
+    # Step 5: the move, detached from the exec that starts it, in its own
+    # session where the box has start-stop-daemon or setsid. No signal is
+    # ignored on the way: the supervisor the init starts from that script
+    # would inherit it (devices/we826-qwd/ramboot-refresh.sh). Idempotent: a
+    # retry finds the state file, or the pid of the run a lost answer started.
+    log "Handing the move to $d/ramboot-refresh.sh (one restart; it rolls back unless healthy)..."
+    local args="$version $wait_secs" launch
+    launch=$(remote_exec_stdout_trimmed "$url" "$api_key" \
+        'd='"$d"'; if [ -f $d/state ]; then cat $d/state; elif command -v start-stop-daemon >/dev/null 2>&1; then if start-stop-daemon -S -b -m -p $d/pid -x /bin/sh -- $d/ramboot-refresh.sh '"$args"' </dev/null >/dev/null 2>&1; then echo launched; elif [ -f $d/state ]; then cat $d/state; elif kill -0 "$(cat $d/pid 2>/dev/null)" 2>/dev/null; then echo launched; else echo launch_failed; fi; elif command -v setsid >/dev/null 2>&1; then setsid /bin/sh $d/ramboot-refresh.sh '"$args"' </dev/null >/dev/null 2>&1 & echo launched; else (/bin/sh $d/ramboot-refresh.sh '"$args"' </dev/null >/dev/null 2>&1 &); echo launched; fi' \
+        5000 3 8) || true
+    case "$launch" in
+        launch_failed) err "start-stop-daemon refused to start $d/ramboot-refresh.sh; nothing was changed"; exit 1 ;;
+        "") warn "No answer to the launch; waiting for its state anyway" ;;
+    esac
+
+    # Step 6: the outcome, from the state file whenever the agent answers.
+    log "Waiting for the outcome (the device rolls back by itself ${wait_secs}s after the restart unless healthy)..."
+    local outcome="" last="" deadline resp
+    deadline=$(( $(date +%s) + watch_secs ))
+    while (( $(date +%s) < deadline )); do
+        sleep 5
+        resp=$(curl -sf --max-time 8 -X POST "$url/api/exec" \
+            -H "Authorization: Bearer $api_key" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg command "cat $d/state" '{command: $command, timeout: 5000}')" 2>/dev/null) || {
+            printf "."
+            continue
+        }
+        outcome=$(echo "$resp" | jq -r '.stdout // empty' 2>/dev/null | tr -d '[:space:]')
+        if [[ -n "$outcome" && "$outcome" != "$last" ]]; then
+            printf "\n  state: %s" "$outcome"
+            last="$outcome"
+        fi
+        case "$outcome" in done|rolled_back|failed|needs_hands) break ;; esac
+    done
+    echo ""
+    case "$outcome" in
+        done) ;;
+        failed)
+            err "The move on '$name' was refused before anything changed: it runs $running as before"
+            remote_exec_json "$url" "$api_key" "tail -n 30 $WE826_LOG" 5000 3 8 | jq -r '.stdout // empty' 2>/dev/null || true
+            exit 1
+            ;;
+        rolled_back)
+            err "The new agent on '$name' was not healthy: the old files are back and $running answers"
+            remote_exec_json "$url" "$api_key" "tail -n 40 $WE826_LOG" 5000 3 8 | jq -r '.stdout // empty' 2>/dev/null || true
+            exit 1
+            ;;
+        needs_hands)
+            err "'$name' needs hands: the restore is incomplete or the old agent did not answer after it"
+            err "The old files are in /tmp/sctl-we826-refresh-rollback until the next boot; see $WE826_LOG"
+            exit 1
+            ;;
+        *)
+            err "No outcome within ${watch_secs}s (last state: ${outcome:-unknown})"
+            err "The device rolls back by itself unless the new agent is healthy; see $d/state and $WE826_LOG"
+            exit 1
+            ;;
+    esac
+    health=$(curl -sf --connect-timeout 3 --max-time 8 -H "Authorization: Bearer $api_key" "$url/api/health" 2>/dev/null) || true
+    running=$(echo "$health" | jq -r '.version // empty' 2>/dev/null)
+    target=$(echo "$health" | jq -r '.target // empty' 2>/dev/null)
+    layout=$(echo "$health" | jq -r '.layout // empty' 2>/dev/null)
+    if [[ "$running" != "$version" || "$layout" != "ramboot" || "$target" != "mips_24kc" ]]; then
+        err "The device reported done, but answers version '${running:-unavailable}', layout '${layout:-none}', target '${target:-none}'"
+        exit 1
+    fi
+    jq --arg name "$name" --arg ver "$version" \
+        '.devices[$name].sctl_version = $ver' \
+        "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    remote_exec_json "$url" "$api_key" "rm -rf $d" 5000 2 5 >/dev/null 2>&1 || true
+    ok "Move complete for '$name': ramboot layout with install.json, sctl $version, target mips_24kc"
+    echo "  Payloads: fetched from $mirror into /tmp/sctl/cache at boot (SHA-256s in /etc/sctl/ramboot.conf)"
+    echo "  Old files: /tmp/sctl-we826-refresh-rollback until the next boot"
+    echo "  Log on the device: $WE826_LOG"
+    echo "  From now on it upgrades through managed rollouts."
+}
+
 # ─── device upgrade-remote: GL-XE300 ─────────────────────────────────
 #
 # The XE300 keeps gzipped payloads in /usr/local/lib/sctl, and its procd init
@@ -2668,7 +2903,11 @@ do_device_upgrade_remote_rut241() {
 XE300_ARTIFACT_DIR="$REPO_DIR/.artifacts/xe300"
 XE300_STAGE="/tmp/sctl-xe300-upgrade"
 XE300_LOG="/tmp/sctl-xe300-upgrade.log"
-XE300_LAYOUT_PROBE="if [ -x /etc/init.d/sctl ] && [ -f /usr/local/lib/sctl/sctl-server-mips_24kc.gz ]; then echo xe300; elif [ -x /etc/init.d/sctl ] && [ -f /usr/local/lib/sctl/sctl-server-mipsel_24kc.gz ]; then echo rut241; else echo other; fi"
+# How sctl is installed, in one word: xe300, rut241 (gz-tmp payloads), we826
+# (ramboot run through the musl loader, no install.json that names it: the
+# one-time move), we826-managed (install.json names the loader: a rollout
+# citizen), or other.
+XE300_LAYOUT_PROBE="if [ -x /etc/init.d/sctl ] && [ -f /usr/local/lib/sctl/sctl-server-mips_24kc.gz ]; then echo xe300; elif [ -x /etc/init.d/sctl ] && [ -f /usr/local/lib/sctl/sctl-server-mipsel_24kc.gz ]; then echo rut241; elif [ -x /etc/init.d/sctl ] && grep -q '^MUSL_LIBC_URL=' /etc/sctl/ramboot.conf 2>/dev/null && [ -f /tmp/sctl/lib/libc.so ]; then if grep -q helper_prefix /etc/sctl/install.json 2>/dev/null; then echo we826-managed; else echo we826; fi; else echo other; fi"
 
 # Write a local text file to the device through the file API, retrying across
 # short windows.
@@ -4340,6 +4579,8 @@ case "${1:-setup}" in
                 echo "  upgrade-remote <name>    binary upgrade via relay (STP upload + swap)"
                 echo "  upgrade-remote <name> <version> <user@relay>"
                 echo "                           RUT241: move to the ramboot layout, fed by the relay's mirror"
+                echo "  upgrade-remote <name> <version> <user@relay | mirror URL>"
+                echo "                           WE826 older than 0.6.7: one guarded move to the current ramboot layout"
                 exit 1
                 ;;
         esac
@@ -4409,6 +4650,7 @@ case "${1:-setup}" in
         echo "  device deploy-watchdog <name>   deploy watchdog script + cron"
         echo "  device upgrade-remote <name>    binary upgrade via relay (no SSH needed)"
         echo "  device upgrade-remote <name> <version> <user@relay>  RUT241 to the ramboot layout"
+        echo "  device upgrade-remote <name> <version> <user@relay | mirror URL>  WE826 to the current ramboot layout"
         echo ""
         echo "Environment profiles:"
         echo "  env show                        show current active profile"
