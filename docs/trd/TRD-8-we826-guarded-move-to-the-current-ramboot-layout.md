@@ -1,6 +1,6 @@
 # TRD-8: WE826 guarded move to the current ramboot layout
 
-Implements [ADR-002](../adr/002-flash-constrained-units-boot-from-the-relays-mirror.md), decision 5 (the move of an in-service unit through the relay, with no SSH), for the WE826. Status: Planned: the script, the `rundev.sh` branch, the tests and the docs are built (slices 1 to 3, revised after two reviews on 2026-10-09); the bench run and the field run on Bus 01 are not. (TRD-7 is the number ADR-007 names for its option B, so this is TRD-8.)
+Implements [ADR-002](../adr/002-flash-constrained-units-boot-from-the-relays-mirror.md), decision 5 (the move of an in-service unit through the relay, with no SSH), for the WE826. Status: Implemented (2026-10-10): Bus 01 moved to 0.6.11.196 on the current ramboot layout (slice 5); the bench run on the ZBT (slice 4) was skipped by the owner's choice, since the unit is with a technician. (TRD-7 is the number ADR-007 names for its option B, so this is TRD-8.)
 
 ## 1. Objective
 
@@ -67,5 +67,5 @@ What the current install writes beyond that: today's `ramboot.sh` (the cache gat
 1. `ramboot-refresh.sh`, `refresh-stage.sh`, the unit tests under BusyBox ash and dash: Implemented (2026-10-09, `d7db958`; revised the same day: the trial from RAM, steady health, the tunnel from live health, the mirror by IP, the old payloads proven served, the `/tmp` floor at every step, the state dir, the pre-move deadline, the reboot as last resort, the released init and `ramboot.sh` run in the tests, the power-cut boots).
 2. `rundev.sh device upgrade-remote` WE826 branch and its end-to-end test: Implemented (2026-10-09, `9474141`; revised the same day: a 0.6.7-era unit moves, the mirror by IP, the reboot reported, the key id, the watch, the layout probe tested).
 3. Docs (`docs/upgrade.md`, `docs/releasing.md`, the WE826 README, this TRD, CHANGELOG): Implemented (2026-10-09).
-4. Bench run on the ZBT WE826: Planned.
-5. Bus 01 field run with the owner present: Planned.
+4. Bench run on the ZBT WE826: Skipped (the owner chose the field run while the bench unit is with a technician).
+5. Bus 01 field run: Implemented (2026-10-10 01:15 to 01:21 UTC, owner's go, no departure scheduled). `rundev.sh device upgrade-remote bus01 0.6.11.196 http://174.138.114.209:8081/artifacts/0.6.11.196` through the relay with the unit's own key: the probe read 0.6.2.142 with no install.json; states started, fetching, trial, restarting, done. Afterwards `/api/health` reports 0.6.11.196 with the tunnel connected and 0 reconnects, `sctl install-info` reports layout `ramboot`, target `mips_24kc` and the musl `helper_prefix`, and /tmp has 44 MB free. The next release reaches it through a managed rollout.
