@@ -147,7 +147,10 @@ INSTALL_DISABLED=${INSTALL_DISABLED:-0}
 WANPREF=${WANPREF:-0}
 WANPREF_WAN_IF=${WANPREF_WAN_IF:-eth0}
 WANPREF_LTE_IF=${WANPREF_LTE_IF:-usb0}
-WANPREF_TARGETS=${WANPREF_TARGETS:-"174.138.114.209:8443 1.1.1.1:80"}
+# Public anycast targets: either answering proves the wired path carries internet
+# traffic. To also prove the relay is reachable, add its address as <ip>:443 (the
+# relay's own port is not public).
+WANPREF_TARGETS=${WANPREF_TARGETS:-"1.1.1.1:80 1.0.0.1:80"}
 SSH=${SSH:-ssh}
 SCP=${SCP:-scp}
 SSH_OPTS=${SSH_OPTS:-}
