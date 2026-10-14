@@ -501,7 +501,7 @@ mod tests {
         ));
         routes.extend(route_message(
             order,
-            Some(([174, 138, 114, 209], 32)),
+            Some(([203, 0, 113, 10], 32)),
             Some([10, 180, 41, 232]),
             7,
             40,
@@ -602,7 +602,7 @@ mod tests {
         assert_eq!(
             little.host_routes,
             vec![HostRoute {
-                dst: Ipv4Addr::new(174, 138, 114, 209),
+                dst: Ipv4Addr::new(203, 0, 113, 10),
                 dev: "wwan0".into(),
                 via: Some(Ipv4Addr::new(10, 180, 41, 232)),
                 metric: 40,
@@ -682,7 +682,7 @@ mod tests {
     #[test]
     fn host_routes_to_finds_every_route_to_one_destination() {
         let mut state = state_from(Order::NATIVE, &fixture_dumps(Order::NATIVE));
-        let relay = Ipv4Addr::new(174, 138, 114, 209);
+        let relay = Ipv4Addr::new(203, 0, 113, 10);
         state.host_routes.insert(
             0,
             HostRoute {

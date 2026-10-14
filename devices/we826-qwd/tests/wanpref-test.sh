@@ -216,11 +216,11 @@ fi
 
 # --- 8. probe refuses to clobber an existing pinned host route ---------------
 setup 'default via 192.168.50.1 dev eth0 metric 3
-174.138.114.209 via 100.119.100.16 dev usb0'
+198.51.100.10 via 100.119.100.16 dev usb0'
 load_script
 HAVE_CURL_IFACE=0
-code=$(probe_one 174.138.114.209 8443 192.168.50.1)
-if [ "$code" = "000" ] && grep -q '174.138.114.209 via 100.119.100.16 dev usb0' "$FAKE_TABLE"; then
+code=$(probe_one 198.51.100.10 8443 192.168.50.1)
+if [ "$code" = "000" ] && grep -q '198.51.100.10 via 100.119.100.16 dev usb0' "$FAKE_TABLE"; then
     ok "probe refuses a /32 for a target that already has a host route"
 else
     bad "probe refuses to clobber pinned /32" "code=$code table: $(table | tr '\n' ';')"

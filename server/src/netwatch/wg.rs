@@ -193,7 +193,7 @@ mod tests {
                     (1, vec![0x11; 32]), // WGPEER_A_PUBLIC_KEY
                     (
                         WGPEER_A_ENDPOINT,
-                        sockaddr_in(order, [174, 138, 114, 209], 51820),
+                        sockaddr_in(order, [203, 0, 113, 10], 51820),
                     ),
                 ],
                 // A peer that has not been heard from has no endpoint.
@@ -216,7 +216,7 @@ mod tests {
             assert_eq!(
                 peer_endpoints(msg.payload, order),
                 vec![
-                    SocketAddr::from((Ipv4Addr::new(174, 138, 114, 209), 51820)),
+                    SocketAddr::from((Ipv4Addr::new(203, 0, 113, 10), 51820)),
                     SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 443)),
                 ],
                 "{order:?}"

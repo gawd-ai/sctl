@@ -368,7 +368,7 @@ Health metrics are exposed in the `/api/health` response:
     "rtt_median_ms": 45,
     "rtt_p95_ms": 120,
     "dropped_outbound": 0,
-    "path": { "local": "192.168.8.20:40022", "remote": "174.138.114.209:443", "dev": "eth1" },
+    "path": { "local": "192.168.8.20:40022", "remote": "203.0.113.10:443", "dev": "eth1" },
     "relay_route": { "mode": "follow_default", "dev": "eth1", "via": "192.168.8.1", "suspect": [] }
   }
 }

@@ -4,7 +4,7 @@ Status: Accepted (2026-10-05). Realized by [TRD-6](../trd/TRD-6-sctl-net-tools.m
 
 ## 1. Trigger
 
-Restoring a LiveBarn arena's internet on 2026-10-05 needed one SNMP set on a power bar. The XE300's firmware has busybox `wget` (no `-S`), `curl`, `nc`, and no SNMP client; the operator built an SNMPv1 packet by hand in shell. Before that, the fleet's assistant spent hours on curl and busybox differences across firmware. The agent already speaks SNMP (its Infra `snmp` check) and HTTP.
+Restoring a customer site's internet on 2026-10-05 needed one SNMP set on a power bar. The XE300's firmware has busybox `wget` (no `-S`), `curl`, `nc`, and no SNMP client; the operator built an SNMPv1 packet by hand in shell. Before that, the fleet's assistant spent hours on curl and busybox differences across firmware. The agent already speaks SNMP (its Infra `snmp` check) and HTTP.
 
 ## 2. Decision
 

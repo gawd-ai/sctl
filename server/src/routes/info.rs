@@ -693,7 +693,7 @@ mod disk_tests {
     use super::{disks_from_mounts, master_of};
     use serde_json::{json, Value};
 
-    /// Real `/proc/mounts` from WE826-F85E3CD01310, the device whose duplicate
+    /// Real `/proc/mounts` from a WE826 unit, the device whose duplicate
     /// `/` took a fleet page down. Read off the unit, not composed by hand.
     const WE826_MOUNTS: &str = "\
 rootfs / rootfs rw 0 0

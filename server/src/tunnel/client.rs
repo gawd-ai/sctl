@@ -4743,8 +4743,8 @@ mod dns_fallback_tests {
     #[test]
     fn url_host_port_reads_the_authority_with_its_default_port() {
         assert_eq!(
-            url_host_port("wss://relay-001.netage.ai/api/tunnel/register?token=k"),
-            ("relay-001.netage.ai", 443)
+            url_host_port("wss://relay.example.com/api/tunnel/register?token=k"),
+            ("relay.example.com", 443)
         );
         assert_eq!(
             url_host_port("ws://10.0.0.1:1337/api/tunnel/register"),
@@ -4758,7 +4758,7 @@ mod dns_fallback_tests {
     fn a_lookup_that_found_addresses_is_dialed_ipv4_first() {
         let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
         let v4: SocketAddr = "203.0.113.7:443".parse().unwrap();
-        let fallback: SocketAddr = "174.138.114.209:443".parse().unwrap();
+        let fallback: SocketAddr = "203.0.113.10:443".parse().unwrap();
         let addrs = dialed(dial_addresses(Ok(vec![v6, v4]), "relay", Some(fallback)));
         assert_eq!(addrs, [v4, v6], "the fallback is only for a failed lookup");
     }
@@ -4781,7 +4781,7 @@ mod dns_fallback_tests {
 
     #[test]
     fn a_failed_lookup_dials_the_known_address() {
-        let fallback: SocketAddr = "174.138.114.209:443".parse().unwrap();
+        let fallback: SocketAddr = "203.0.113.10:443".parse().unwrap();
         for lookup in [Err(transient("no such host")), Ok(Vec::new())] {
             assert_eq!(
                 dialed(dial_addresses(lookup, "relay", Some(fallback))),
@@ -4817,7 +4817,7 @@ mod dns_fallback_tests {
 
     #[test]
     fn the_known_address_after_a_restart_is_sctls_own_route() {
-        let relay = Ipv4Addr::new(174, 138, 114, 209);
+        let relay = Ipv4Addr::new(203, 0, 113, 10);
         let host = |metric, protocol| HostRoute {
             dst: relay,
             dev: "eth1".into(),
@@ -4996,7 +4996,7 @@ mod rehome_tests {
 
     #[test]
     fn only_an_ipv4_path_is_followed() {
-        let relay = SocketAddrV4::new(Ipv4Addr::new(174, 138, 114, 209), 443);
+        let relay = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 10), 443);
         let local = SocketAddrV4::new(ETH, 40_022);
         assert_eq!(
             rehome_ends(&path(local.into(), relay.into())),

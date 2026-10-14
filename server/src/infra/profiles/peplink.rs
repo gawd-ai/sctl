@@ -673,7 +673,7 @@ pub fn build_snapshot(
 mod tests {
     use super::*;
 
-    /// Verbatim shape from the Peplink MAX BR1 on Concord Tours Bus 01,
+    /// Verbatim shape from a Peplink MAX BR1 on a customer's coach,
     /// 2026-08-11 19:52 UTC. WAN1 connected, cellular in cold standby.
     fn real_wan() -> Value {
         json!({

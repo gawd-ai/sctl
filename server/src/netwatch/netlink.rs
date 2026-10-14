@@ -878,8 +878,9 @@ pub(crate) mod tests {
     /// `default via 192.168.8.1 dev eth9 proto boot metric 10`, read from a
     /// little-endian x86_64 kernel (6.17) with a raw route dump.
     const CAPTURED_DEFAULT: &str = "3c0000001800020007000000896e2e0002000000fe0300010000000008000f00fe000000080006000a00000008000500c0a808010800040003000000"; // secret-scan: allow
-    /// `174.138.114.209 via 192.168.8.1 dev eth9 proto static metric 40`.
-    const CAPTURED_HOST: &str = "440000001800020007000000896e2e0002200000fe0400010000000008000f00fe00000008000100ae8a72d1080006002800000008000500c0a808010800040003000000"; // secret-scan: allow
+    /// `203.0.113.10 via 192.168.8.1 dev eth9 proto static metric 40`, captured the
+    /// same way (the relay's address replaced by a documentation address).
+    const CAPTURED_HOST: &str = "440000001800020007000000896e2e0002200000fe0400010000000008000f00fe00000008000100cb00710a080006002800000008000500c0a808010800040003000000"; // secret-scan: allow
     /// `192.168.8.2/24 brd 192.168.8.255 scope global eth9`, with its label,
     /// IFA_FLAGS and cache info.
     const CAPTURED_ADDR: &str = "500000001400020007000000896e2e00021880000300000008000100c0a8080208000200c0a80802090003006574683900000000080008008000000014000600ffffffffffffffffd9469403d9469403"; // secret-scan: allow
@@ -943,7 +944,7 @@ pub(crate) mod tests {
         assert_eq!(default, unhex(CAPTURED_DEFAULT));
         let host = route_message(
             Order::Little,
-            Some(([174, 138, 114, 209], 32)),
+            Some(([203, 0, 113, 10], 32)),
             Some([192, 168, 8, 1]),
             3,
             40,
@@ -970,7 +971,7 @@ pub(crate) mod tests {
                 scope: 0,
                 kind: RTN_UNICAST,
                 flags: 0,
-                dst: Some(Ipv4Addr::new(174, 138, 114, 209)),
+                dst: Some(Ipv4Addr::new(203, 0, 113, 10)),
                 gateway: Some(Ipv4Addr::new(192, 168, 8, 1)),
                 oif: Some(3),
                 priority: 40,
@@ -1026,7 +1027,7 @@ pub(crate) mod tests {
 
             let route = route_message(
                 order,
-                Some(([174, 138, 114, 209], 32)),
+                Some(([203, 0, 113, 10], 32)),
                 Some([10, 42, 0, 1]),
                 0x0102_0304,
                 0x0a0b_0c0d,
@@ -1038,7 +1039,7 @@ pub(crate) mod tests {
             // Addresses are network order in either host order: never swapped.
             assert_eq!(
                 parsed.dst,
-                Some(Ipv4Addr::new(174, 138, 114, 209)),
+                Some(Ipv4Addr::new(203, 0, 113, 10)),
                 "{order:?}"
             );
             assert_eq!(
@@ -1274,7 +1275,7 @@ pub(crate) mod tests {
         for order in ORDERS {
             let mut answer = route_message(
                 order,
-                Some(([174, 138, 114, 209], 32)),
+                Some(([203, 0, 113, 10], 32)),
                 Some([10, 42, 0, 1]),
                 3,
                 0,

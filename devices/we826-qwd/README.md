@@ -47,8 +47,8 @@ unit's musl loader. From then on the unit upgrades itself when the fleet asks
 
 ```sh
 API_KEY=... \
-MIRROR_BASE=http://174.138.114.209:8081/artifacts/0.6.9.200 \
-TUNNEL_URL=wss://relay-001.netage.ai/api/tunnel/register TUNNEL_KEY=... \
+MIRROR_BASE=http://<relay-ip>:8081/artifacts/0.6.9.200 \
+TUNNEL_URL=wss://<relay-host>/api/tunnel/register TUNNEL_KEY=... \
 devices/we826-qwd/install.sh root@ROUTER_IP
 ```
 
@@ -107,10 +107,10 @@ SSH, to the current layout and a current release
 ([TRD-8](../../docs/trd/TRD-8-we826-guarded-move-to-the-current-ramboot-layout.md)):
 
 ```sh
-./rundev.sh device upgrade-remote <name> <version> http://174.138.114.209:8081/artifacts/<version>
+./rundev.sh device upgrade-remote <name> <version> http://<relay-ip>:8081/artifacts/<version>
 # or name the relay and let its listing give the mirror (it must be by IP for
 # a unit that fetches by IP, as Bus 01 does):
-./rundev.sh device upgrade-remote <name> <version> root@174.138.114.209
+./rundev.sh device upgrade-remote <name> <version> root@<relay-ip>
 ```
 
 `rundev.sh` checks the release's signature and the mirror's bytes, refuses a
@@ -174,6 +174,6 @@ history) and a coreutils `sleep`.
 - **A pin on the cellular interface is a metering decision, not a routing one.** With
   `bind_address` on the LTE bearer, every byte of the management plane (tunnel heartbeats,
   the fleet's health, uplink and infra polls, sessions) rides the SIM even while a wired WAN
-  is up. The RUT241 at Canphone did that for three months at ~50 MB/day. Pin the wired side
+  is up. One RUT241 on a metered link did that for three months at ~50 MB/day. Pin the wired side
   when a pin is wanted, or leave the default so the relay rides the wire and fails over to
   cellular on sctl's own evidence.

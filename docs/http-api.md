@@ -110,7 +110,7 @@ Response `200`:
   `rtt_p95_ms`, `recent_events` (last 10 tunnel events), `path` and
   `relay_route`. Otherwise only `{connected, reconnects}`.
 - `tunnel.path`: where the tunnel's TCP connection runs,
-  `{"local": "192.168.8.20:40022", "remote": "174.138.114.209:443", "dev": "eth1"}`.
+  `{"local": "192.168.8.20:40022", "remote": "203.0.113.10:443", "dev": "eth1"}`.
   `dev` is the interface holding the local address (`null` for IPv6).
   The object is `null` while no TCP connection to the relay is open. It is
   set as soon as one opens, before registration, so it can be present while
@@ -1110,9 +1110,9 @@ the last one sent on that connection, at most one per second:
     {"dev": "eth1", "via": "10.42.0.1", "metric": 10},
     {"dev": "wwan0", "via": null, "metric": 40}
   ],
-  "relay_route": {"ip": "174.138.114.209", "dev": "eth1", "via": "10.42.0.1", "src": "10.42.0.7"},
-  "tunnel": {"dev": "eth1", "local": "10.42.0.7", "remote": "174.138.114.209"},
-  "wg_routes": [{"ip": "174.138.114.209", "dev": "eth1", "via": "10.42.0.1", "src": "10.42.0.7"}],
+  "relay_route": {"ip": "203.0.113.10", "dev": "eth1", "via": "10.42.0.1", "src": "10.42.0.7"},
+  "tunnel": {"dev": "eth1", "local": "10.42.0.7", "remote": "203.0.113.10"},
+  "wg_routes": [{"ip": "203.0.113.10", "dev": "eth1", "via": "10.42.0.1", "src": "10.42.0.7"}],
   "truncated": false
 }
 ```

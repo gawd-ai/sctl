@@ -22,7 +22,7 @@ The relay on do-toronto runs 0.6.7.172 under the `systemd` layout with its `inst
 
 - The relay's upgrade has the same proof, dead-man and rollback as a device's; `/api/health` tells its outcome.
 - Ops owns the relay's upgrade (one command per relay); the fleet does not ask the relay like a device.
-- The 0.6.7.172 relay is upgraded to the current release after LiveBarn's first rollout completes.
+- The 0.6.7.172 relay is upgraded to the current release after the first customer rollout completes.
 
 ## 5. Rejected alternatives
 

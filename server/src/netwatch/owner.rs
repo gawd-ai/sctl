@@ -1099,7 +1099,7 @@ mod tests {
     use super::super::{Interface, Ipv4Cidr};
     use super::*;
 
-    const RELAY: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(174, 138, 114, 209), 443);
+    const RELAY: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 10), 443);
     const ETH1: Ipv4Addr = Ipv4Addr::new(10, 42, 0, 7);
     const ETH1_GW: Ipv4Addr = Ipv4Addr::new(10, 42, 0, 1);
     const ETH2: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 50);
@@ -1588,7 +1588,7 @@ mod tests {
         );
         assert_eq!(
             fake.writes(),
-            ["replace 174.138.114.209 via 10.42.0.1 dev eth1 metric 0"]
+            ["replace 203.0.113.10 via 10.42.0.1 dev eth1 metric 0"]
         );
         // netifd's pin stays, outranked.
         assert!(fake
@@ -1626,7 +1626,7 @@ mod tests {
         owner.on_signal(registered(ETH1)).await;
         assert_eq!(
             fake.writes(),
-            ["replace 174.138.114.209 via 10.9.9.1 dev eth1 metric 0 onlink"]
+            ["replace 203.0.113.10 via 10.9.9.1 dev eth1 metric 0 onlink"]
         );
         // LTE's gateway is in its prefix: no flag.
         fake.kill("eth1");
@@ -1635,7 +1635,7 @@ mod tests {
         owner.on_signal(failed(ETH1)).await;
         assert_eq!(
             fake.writes(),
-            ["replace 174.138.114.209 via 10.180.41.232 dev wwan0 metric 0"]
+            ["replace 203.0.113.10 via 10.180.41.232 dev wwan0 metric 0"]
         );
     }
 
@@ -1727,7 +1727,7 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(
             changes[0].to_string(),
-            "left to 174.138.114.209/32 via 10.42.0.1 dev eth1 proto 3, a route sctl did not install"
+            "left to 203.0.113.10/32 via 10.42.0.1 dev eth1 proto 3, a route sctl did not install"
         );
         assert!(fake.writes().is_empty());
         // Said once.
@@ -1807,7 +1807,7 @@ mod tests {
         );
         assert_eq!(
             fake.writes(),
-            ["replace 174.138.114.209 via 10.180.41.232 dev wwan0 metric 0"]
+            ["replace 203.0.113.10 via 10.180.41.232 dev wwan0 metric 0"]
         );
         let report = owner.report(RelayRouteMode::FollowDefault);
         assert_eq!(
@@ -1927,7 +1927,7 @@ mod tests {
         assert_eq!(fake.probes(), ["eth1", "eth1"], "no third probe to move");
         assert_eq!(
             fake.writes(),
-            ["replace 174.138.114.209 via 10.42.0.1 dev eth1 metric 0"]
+            ["replace 203.0.113.10 via 10.42.0.1 dev eth1 metric 0"]
         );
         assert!(owner
             .report(RelayRouteMode::FollowDefault)
@@ -2147,7 +2147,7 @@ mod tests {
         assert!(fake.probes().is_empty(), "the registration is the proof");
         assert_eq!(
             fake.writes(),
-            ["replace 174.138.114.209 via 10.42.0.1 dev eth1 metric 0"]
+            ["replace 203.0.113.10 via 10.42.0.1 dev eth1 metric 0"]
         );
         assert!(owner
             .report(RelayRouteMode::FollowDefault)
@@ -2256,7 +2256,7 @@ mod tests {
             changes,
             moved(Some("eth1"), None, "no uplink left to hold it")
         );
-        assert_eq!(fake.writes(), ["delete 174.138.114.209"]);
+        assert_eq!(fake.writes(), ["delete 203.0.113.10"]);
         assert!(fake.ours().is_empty());
         assert!(fake
             .state()
@@ -2283,7 +2283,7 @@ mod tests {
         assert_eq!(
             fake.writes(),
             [
-                "delete 174.138.114.209",
+                "delete 203.0.113.10",
                 "replace 203.0.113.9 via 10.42.0.1 dev eth1 metric 0"
             ]
         );

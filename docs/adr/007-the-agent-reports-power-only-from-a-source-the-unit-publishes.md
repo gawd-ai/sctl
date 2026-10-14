@@ -4,7 +4,7 @@ Status: Accepted (2026-10-08), option A of section 7. The live check (section 9)
 
 ## 1. Trigger
 
-On 2026-10-06 LiveBarn's Mountain Arena unit (XE300-9483C446D52E, a GL.iNet GL-XE300C4 "Puli" with an internal battery) lost its wire at 17:34 UTC and went silent at 20:38. Nobody could tell a power cut that the battery carried for three hours from a line loss followed by an LTE loss, and the fleet's assistant guessed about the battery. The fleet already has a battery field and a battery bar, but no agent fills them, so the guess had nothing to stand on.
+On 2026-10-06 a customer site's unit (an XE300, a GL.iNet GL-XE300C4 "Puli" with an internal battery) lost its wire at 17:34 UTC and went silent at 20:38. Nobody could tell a power cut that the battery carried for three hours from a line loss followed by an LTE loss, and the fleet's assistant guessed about the battery. The fleet already has a battery field and a battery bar, but no agent fills them, so the guess had nothing to stand on.
 
 ## 2. What was studied
 
@@ -126,7 +126,7 @@ Expected, from the image: the three hashes of section 2; an empty `/sys/class/po
 
 ## 9. The live check, run (2026-10-08)
 
-One read-only batch, the list of section 8 exactly, on one XE300 of the production fleet (XE300-9483C446D3EA), through its own agent, at 2026-10-08 15:40 UTC, uptime 14.9 days. Then two more reads: `/etc/init.d/init_gpio` and GPIO 16's sysfs entries. No `/dev/tty*` was opened, no vendor tool run, no service touched.
+One read-only batch, the list of section 8 exactly, on one XE300 of the production fleet (XE300-XXXXXXXXXXXX), through its own agent, at 2026-10-08 15:40 UTC, uptime 14.9 days. Then two more reads: `/etc/init.d/init_gpio` and GPIO 16's sysfs entries. No `/dev/tty*` was opened, no vendor tool run, no service touched.
 
 - Firmware 3.212, OpenWrt 19.07.8 r11364; `gl-xe300-mcu 3.0.4-1`. The three hashes equal section 2's table, so 3.212 carries the same battery package as the studied images.
 - `/sys/class/power_supply` is empty: no supply driver.

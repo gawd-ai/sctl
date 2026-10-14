@@ -16,7 +16,7 @@ under per-component headings. `server/CHANGELOG.md` is frozen.
 ## [0.6.11] - 2026-10-08
 
 ### Network tools
-- **`sctl net snmp|http|tcp`: the network tools a command, runbook or recovery action needs, the same on every unit** (ADR-006, TRD-6). `snmp get|walk|set` (v1/v2c through the `snmp2` crate, v3 and its crypto left out; the community from `-c` or `SCTL_SNMP_COMMUNITY`, never defaulted for a set), `http` (one request through the agent's own TLS stack and its pin ladder, a cookie jar file kept between steps, redirects followed, form bodies, Basic auth from `SCTL_CRED_USER_n`/`SCTL_CRED_PASS_n`), `tcp` (does a port answer). One JSON object on stdout; exit 0, 1 on failure, 2 on a usage error. The XE300 firmware has no SNMP client; a LiveBarn arena came back on 2026-10-05 only after an SNMP packet was built by hand.
+- **`sctl net snmp|http|tcp`: the network tools a command, runbook or recovery action needs, the same on every unit** (ADR-006, TRD-6). `snmp get|walk|set` (v1/v2c through the `snmp2` crate, v3 and its crypto left out; the community from `-c` or `SCTL_SNMP_COMMUNITY`, never defaulted for a set), `http` (one request through the agent's own TLS stack and its pin ladder, a cookie jar file kept between steps, redirects followed, form bodies, Basic auth from `SCTL_CRED_USER_n`/`SCTL_CRED_PASS_n`), `tcp` (does a port answer). One JSON object on stdout; exit 0, 1 on failure, 2 on a usage error. The XE300 firmware has no SNMP client; a customer site came back on 2026-10-05 only after an SNMP packet was built by hand.
 - **The Infra SNMP check uses the same client**: the units do not ship `snmpget`, so every SNMP target read down.
 - **An HTTP(S) Infra check without `expected_status` counts any HTTP answer as up**: a login redirect, a 401 or an error page prove the host answers; set the status to require one.
 - **A recovery action reads the credentials it names from this unit's store**: `recovery.credential_ids` puts entry n in the command's environment as `SCTL_CRED_USER_n`/`SCTL_CRED_PASS_n` (fleet ADR-0017); a credential the unit does not hold fails the run instead of running without it; passwords are masked in the recovery log.
@@ -25,7 +25,7 @@ under per-component headings. `server/CHANGELOG.md` is frozen.
 ## [0.6.10] - 2026-10-05
 
 ### Network state
-- **The agent reports the verdict of the unit's own failover engine (mwan3) beside the kernel's routes** (ADR-005, TRD-5): every interface in `net.state`, `GET /api/net` and `GET /api/health` (`network.verdicts`) carries `verdict: online | offline` when mwan3 tracks its logical owner (`/var/run/mwan3/iface_state`, mapped to the kernel device through `ubus call network.interface dump`). A wire with link, a lease and the lowest-metric default route can read `offline`: the engine then steers traffic elsewhere and the main table does not show it, which is how Mountain Arena stayed dark for three days while the fleet called the wire active. The directory is watched with inotify (no poll) and read on every dump; a unit without mwan3 reports nothing new. `net.state` stays v1 (additive, optional field).
+- **The agent reports the verdict of the unit's own failover engine (mwan3) beside the kernel's routes** (ADR-005, TRD-5): every interface in `net.state`, `GET /api/net` and `GET /api/health` (`network.verdicts`) carries `verdict: online | offline` when mwan3 tracks its logical owner (`/var/run/mwan3/iface_state`, mapped to the kernel device through `ubus call network.interface dump`). A wire with link, a lease and the lowest-metric default route can read `offline`: the engine then steers traffic elsewhere and the main table does not show it, which is how one site stayed dark for three days while the fleet called the wire active. The directory is watched with inotify (no poll) and read on every dump; a unit without mwan3 reports nothing new. `net.state` stays v1 (additive, optional field).
 
 ## [0.6.9] - 2026-10-01
 
@@ -117,7 +117,7 @@ under per-component headings. `server/CHANGELOG.md` is frozen.
 
 ### sctl (server)
 
-- **`http`/`https` infra checks no longer transfer the page** — the check sends HEAD and reads the status and headers; only a server that refuses HEAD (405, 501) gets a GET, and that GET asks for one byte (`Range: bytes=0-0`, a 206 counts as the expected 200). Latency is now time to first byte. Before, `curl -o /dev/null` still pulled the whole body: a 60 s check of a gateway's 82 KB page cost 118 MB/day on the site's WAN (RUT241, Canphone).
+- **`http`/`https` infra checks no longer transfer the page** — the check sends HEAD and reads the status and headers; only a server that refuses HEAD (405, 501) gets a GET, and that GET asks for one byte (`Range: bytes=0-0`, a 206 counts as the expected 200). Latency is now time to first byte. Before, `curl -o /dev/null` still pulled the whole body: a 60 s check of a gateway's 82 KB page cost 118 MB/day on the site's WAN (a RUT241).
 - **`tcp_port` checks connect natively** — no more `nc -z -w`, which the busybox nc on RUTOS does not accept (every tcp_port target on a RUT241 was DOWN). A `TcpStream::connect` with a deadline; its duration is the latency.
 - **Peplink profile** — when firmware 8.6.0 ships `rat[]` entries without a `name`, the cellular WAN's `rat` list falls back to `dataTechnology`, then `mobileType`, instead of reading blank.
 

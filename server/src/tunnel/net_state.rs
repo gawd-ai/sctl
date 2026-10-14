@@ -15,9 +15,9 @@
 //!                 {"name": "lan1", "operstate": "up", "carrier": true,
 //!                  "metric": null, "ip": null, "master": "br-lan"}],
 //!  "default_routes": [{"dev": "eth1", "via": "10.42.0.1", "metric": 10}],
-//!  "relay_route": {"ip": "174.138.114.209", "dev": "eth1", "via": "10.42.0.1", "src": "10.42.0.7"},
-//!  "tunnel": {"dev": "eth1", "local": "10.42.0.7", "remote": "174.138.114.209"},
-//!  "wg_routes": [{"ip": "174.138.114.209", "dev": "eth1", "via": "10.42.0.1", "src": "10.42.0.7"}],
+//!  "relay_route": {"ip": "203.0.113.10", "dev": "eth1", "via": "10.42.0.1", "src": "10.42.0.7"},
+//!  "tunnel": {"dev": "eth1", "local": "10.42.0.7", "remote": "203.0.113.10"},
+//!  "wg_routes": [{"ip": "203.0.113.10", "dev": "eth1", "via": "10.42.0.1", "src": "10.42.0.7"}],
 //!  "truncated": false}
 //! ```
 //!
@@ -448,7 +448,7 @@ mod tests {
         }
     }
 
-    const RELAY: Ipv4Addr = Ipv4Addr::new(174, 138, 114, 209);
+    const RELAY: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
 
     fn relay_route(dev: &str) -> RouteEntry {
         RouteEntry {
@@ -481,7 +481,7 @@ mod tests {
             "2026-09-26T12:00:00Z".into(),
         );
         let route =
-            json!({"ip": "174.138.114.209", "dev": "eth1", "via": "10.42.0.1", "src": "10.42.0.7"});
+            json!({"ip": "203.0.113.10", "dev": "eth1", "via": "10.42.0.1", "src": "10.42.0.7"});
         assert_eq!(
             serde_json::to_value(&message).unwrap(),
             json!({
@@ -501,7 +501,7 @@ mod tests {
                     {"dev": "wwan0", "via": null, "metric": 40},
                 ],
                 "relay_route": route,
-                "tunnel": {"dev": "eth1", "local": "10.42.0.7", "remote": "174.138.114.209"},
+                "tunnel": {"dev": "eth1", "local": "10.42.0.7", "remote": "203.0.113.10"},
                 "wg_routes": [route],
                 "truncated": false,
             })
@@ -788,7 +788,7 @@ mod tests {
         let task = spawn_forwarder(true, Some(watch), tx, look).unwrap();
         let message = next_message(&mut rx).await;
         assert_eq!(message["relay_route"]["dev"], "wwan0");
-        assert_eq!(message["tunnel"]["remote"], "174.138.114.209");
+        assert_eq!(message["tunnel"]["remote"], "203.0.113.10");
         task.abort();
     }
 

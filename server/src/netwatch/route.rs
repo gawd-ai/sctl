@@ -123,7 +123,7 @@ mod tests {
     use super::*;
 
     const ROUTE: OwnedRoute = OwnedRoute {
-        dst: Ipv4Addr::new(174, 138, 114, 209),
+        dst: Ipv4Addr::new(203, 0, 113, 10),
         via: Some(Ipv4Addr::new(10, 42, 0, 1)),
         oif: 3,
         metric: 0,
@@ -164,7 +164,7 @@ mod tests {
                 "{order:?}"
             );
             // The address bytes sit in network order whatever the host order.
-            assert_eq!(&bytes[32..36], &[174, 138, 114, 209]);
+            assert_eq!(&bytes[32..36], &[203, 0, 113, 10]);
         }
     }
 

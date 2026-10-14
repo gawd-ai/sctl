@@ -8,7 +8,7 @@ Usage:
 
 Environment:
   API_KEY               Required. Auth token written to /etc/sctl/sctl.toml.
-  SERIAL                Default: GL-XE300. Use model+MAC (e.g. XE300-9483C446D42F);
+  SERIAL                Default: GL-XE300. Use model+MAC (e.g. XE300-AABBCCDDEEFF);
                         devices.agent_serial is UNIQUE fleet-side and a bare model
                         name collides at the second unit.
   LTE_INTERFACE         Default: wwan0  (the netdev holding the bearer IPv4)
