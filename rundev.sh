@@ -44,8 +44,9 @@
 #   ./rundev.sh relay setup <user@host>   # full VPS provisioning (Caddy + sctl + firewall)
 #   ./rundev.sh relay deploy [user@host]  # deploy binary + service (preserves config)
 #   ./rundev.sh relay upgrade <user@host> <version>  # the relay upgrades itself from its own bundle (managed path)
-#   ./rundev.sh relay status [user@host]  # health check + connected devices
-#   ./rundev.sh relay sctlin [user@host]  # deploy sctlin web UI to relay
+#   ./rundev.sh relay status [user@host]  # health check + connected devices (over SSH; keys stay on the relay)
+#   ./rundev.sh relay sctlin [user@host]  # deploy sctlin web UI to relay (no keys in its seed)
+#   Operator access to a relay (its API, /d/<serial>, sctlin): ssh -N -L 18443:127.0.0.1:8443 <user@relay>
 #
 # Playbook library:
 #   ./rundev.sh playbook ls                          # list playbooks in library
@@ -2509,12 +2510,14 @@ do_device_upgrade_remote_rut241() {
     fi
     local d="$RUT241_STAGE"
     local ssh_opts="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
-    local key_expr="\$(sed -n 's/^api_key *= *\"\(.*\)\"/\1/p' $RELAY_REMOTE_CONFIG | head -n1)"
+    # The relay's operator key stays on the relay (relay_auth_curl).
+    local auth_curl
+    auth_curl=$(relay_auth_curl "$RELAY_REMOTE_CONFIG" operator)
 
     # Step 1: the version's mipsel_24kc files and the mirror, from the relay.
     log "Reading the $version listing on $relay..."
     local listing entry
-    listing=$(ssh $ssh_opts "$relay" "curl -sS -H \"Authorization: Bearer $key_expr\" http://127.0.0.1:8443/api/tunnel/artifacts") || {
+    listing=$(ssh $ssh_opts "$relay" "$auth_curl -sS http://127.0.0.1:8443/api/tunnel/artifacts") || {
         err "Could not read the relay's artifact listing"
         exit 1
     }
@@ -2531,7 +2534,7 @@ do_device_upgrade_remote_rut241() {
     # The listing names files; the SHA-256s are in the signed manifest, which
     # the relay verified before storing it.
     local manifest
-    manifest=$(ssh $ssh_opts "$relay" "curl -sS -H \"Authorization: Bearer $key_expr\" http://127.0.0.1:8443/api/tunnel/artifacts/$version/release.json") || {
+    manifest=$(ssh $ssh_opts "$relay" "$auth_curl -sS http://127.0.0.1:8443/api/tunnel/artifacts/$version/release.json") || {
         err "Could not read the relay's manifest for $version"
         exit 1
     }
@@ -2736,10 +2739,12 @@ do_device_upgrade_remote_we826() {
     else
         # The relay's listing names the version's mirror, as for a RUT241.
         local ssh_opts="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
-        local key_expr="\$(sed -n 's/^api_key *= *\"\(.*\)\"/\1/p' $RELAY_REMOTE_CONFIG | head -n1)"
+        # The relay's operator key stays on the relay (relay_auth_curl).
+        local auth_curl
+        auth_curl=$(relay_auth_curl "$RELAY_REMOTE_CONFIG" operator)
         log "Reading the $version listing on $source..."
         local listing entry
-        listing=$(ssh $ssh_opts "$source" "curl -sS -H \"Authorization: Bearer $key_expr\" http://127.0.0.1:8443/api/tunnel/artifacts") || {
+        listing=$(ssh $ssh_opts "$source" "$auth_curl -sS http://127.0.0.1:8443/api/tunnel/artifacts") || {
             err "Could not read the relay's artifact listing"
             exit 1
         }
@@ -3853,6 +3858,38 @@ REOF
 }
 
 # ─── relay (production VPS deployment) ────────────────────────────────
+#
+# A relay key never goes on a command line (where `ps` shows it to every user
+# of the host) or into a URL, and never leaves the relay. relay_auth_curl
+# prints a shell snippet to run ON THE RELAY (over ssh, or `bash -c` for a
+# bench relay): it reads the key from the relay's own config into a 0600 curl
+# config file (mktemp), runs curl with -K on it, and removes the file when the
+# shell exits. Append the curl options (and, for `operator`, the URL).
+#
+#   relay_auth_curl <relay.toml> operator         [auth] api_key as a Bearer header
+#   relay_auth_curl <relay.toml> tunnel <url>     [tunnel] tunnel_key as the ?token=
+#                                                 the device listing reads; the URL
+#                                                 goes into the file with it
+#
+# The relay's own API, its health and /d/<serial> are reached from a laptop
+# through an SSH forward, never a public port:
+#   ssh -N -L 18443:127.0.0.1:8443 <user@relay>    then http://127.0.0.1:18443
+relay_auth_curl() {
+    local config="$1" which="$2" url="${3:-}" q="'"
+    local start="k=\$(mktemp) && trap ${q}rm -f \"\$k\"${q} EXIT && sed -n"
+    case "$which" in
+        operator)
+            printf '%s' "$start ${q}s/^api_key *= *\"\\(.*\\)\"/header = \"Authorization: Bearer \\1\"/p${q} $config | head -n1 > \"\$k\" && curl -K \"\$k\""
+            ;;
+        tunnel)
+            printf '%s' "$start ${q}s|^tunnel_key *= *\"\\(.*\\)\"|url = \"$url?token=\\1\"|p${q} $config | head -n1 > \"\$k\" && curl -K \"\$k\""
+            ;;
+        *)
+            err "relay_auth_curl: operator or tunnel"
+            return 1
+            ;;
+    esac
+}
 
 do_relay_setup() {
     local remote="${1:-}"
@@ -3881,17 +3918,24 @@ do_relay_setup() {
         tunnel_ws_url="wss://$domain/api/tunnel/register"
         relay_port="443"
     else
-        # IP-only mode: sctl binds directly, no Caddy
+        # IP-only mode: sctl binds directly, no Caddy. A bench relay on a private
+        # network only: device and relay keys cross that network in clear.
         listen_addr="0.0.0.0:8443"
         relay_url="http://$remote_ip:8443"
         tunnel_ws_url="ws://$remote_ip:8443/api/tunnel/register"
         relay_port="8443"
+        warn "IP-only relay: no TLS, keys cross the network in clear. Use a domain for anything but a bench."
     fi
 
-    # Generate tunnel key
-    local tunnel_key
+    # Generate the keys. Neither is ever printed. The tunnel key goes into the
+    # relay's config and into .env.local (0600) because devices need it; the
+    # relay's own key (its agent API and the artifact operator routes, root on
+    # the host) lives only in the relay's config, where the relay commands
+    # read it on the relay (relay_auth_curl).
+    local tunnel_key relay_api_key
     tunnel_key=$(openssl rand -hex 16)
-    log "Generated tunnel_key: $tunnel_key"
+    relay_api_key=$(openssl rand -hex 32)
+    log "Generated the tunnel key and the relay's own key (not shown)"
 
     local ssh_opts="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
 
@@ -3913,7 +3957,7 @@ journal_enabled = true
 data_dir = "/var/lib/sctl"
 
 [auth]
-api_key = "relay-no-direct-api"
+api_key = "$relay_api_key"
 
 [device]
 serial = "RELAY-001"
@@ -3928,9 +3972,9 @@ heartbeat_timeout_secs = 45
 tunnel_proxy_timeout_secs = 60
 EOF
     )
-    ssh $ssh_opts "$remote" "mkdir -p /etc/sctl /var/lib/sctl"
-    echo "$relay_toml" | ssh $ssh_opts "$remote" "cat > $RELAY_REMOTE_CONFIG"
-    ok "Config uploaded"
+    printf '%s\n' "$relay_toml" | ssh $ssh_opts "$remote" "umask 077 && install -d -m 700 /etc/sctl && mkdir -p /var/lib/sctl && cat > $RELAY_REMOTE_CONFIG && chmod 600 $RELAY_REMOTE_CONFIG"
+    unset relay_toml relay_api_key
+    ok "Config uploaded (0600, in a 0700 directory)"
     ssh $ssh_opts "$remote" "printf '%s\n' '"'{"v":1,"layout":"systemd","target":"x86_64","unit":"sctl-relay","files":{"server":"/usr/local/bin/sctl"},"health_url":"http://127.0.0.1:8443/api/health","rollback_dir":"/var/lib/sctl/rollback"}'"' > /etc/sctl/install.json"
     ok "install.json written (systemd)"
 
@@ -3957,9 +4001,25 @@ CADDY_EOF
         ok "Caddy ready"
 
         log "Configuring Caddy for $domain..."
-        echo "$domain {
-    reverse_proxy localhost:8443
-}" | ssh $ssh_opts "$remote" "cat > /etc/caddy/Caddyfile"
+        # One door: from the internet, only what devices need reaches the relay
+        # (the tunnel and signed artifact downloads). The relay's own agent API,
+        # its health, /d/<serial> and sctlin are reached through an SSH forward
+        # (see relay_auth_curl). A reload keeps live tunnels (stream_close_delay).
+        ssh $ssh_opts "$remote" "cat > /etc/caddy/Caddyfile" <<CADDYFILE_EOF
+$domain {
+	route {
+		reverse_proxy /api/tunnel/register 127.0.0.1:8443 {
+			stream_close_delay 10m
+		}
+		@unit_artifacts {
+			method GET HEAD
+			path /api/tunnel/artifacts/*
+		}
+		reverse_proxy @unit_artifacts 127.0.0.1:8443
+		respond 404
+	}
+}
+CADDYFILE_EOF
         ssh $ssh_opts "$remote" "systemctl restart caddy"
         ok "Caddy configured for $domain"
     fi
@@ -4007,11 +4067,14 @@ UFW_EOF
         warn "Health check failed — check logs: ssh $remote journalctl -u sctl-relay -n 50"
     fi
 
-    # Save to .env.local
+    # Save to .env.local (0600). RELAY_TUNNEL_KEY is kept there because every
+    # device must be configured with it; it is never printed.
     local env_file="$REPO_DIR/.env.local"
+    (umask 077 && touch "$env_file")
+    chmod 600 "$env_file"
     # Remove old relay vars if present
     if [[ -f "$env_file" ]]; then
-        grep -v '^RELAY_URL=\|^RELAY_TUNNEL_KEY=\|^RELAY_HOST=\|^RELAY_DOMAIN=' "$env_file" > "$env_file.tmp" || true
+        (umask 077 && grep -v '^RELAY_URL=\|^RELAY_TUNNEL_KEY=\|^RELAY_HOST=\|^RELAY_DOMAIN=' "$env_file" > "$env_file.tmp") || true
         mv "$env_file.tmp" "$env_file"
     fi
     cat >> "$env_file" <<EOF
@@ -4022,7 +4085,11 @@ RELAY_DOMAIN=$domain
 RELAY_URL=$relay_url
 RELAY_TUNNEL_KEY=$tunnel_key
 EOF
-    ok "Saved relay config to .env.local"
+    unset tunnel_key
+    ok "Saved relay config to .env.local (0600; RELAY_TUNNEL_KEY is there, not shown)"
+
+    local operator_url="$relay_url"
+    [[ -n "$domain" ]] && operator_url="http://127.0.0.1:18443"
 
     echo ""
     echo "============================================"
@@ -4032,20 +4099,25 @@ EOF
         echo "  Domain:       $domain"
     fi
     echo "  Relay URL:    $relay_url"
-    echo "  Tunnel key:   $tunnel_key"
+    echo "  Tunnel key:   RELAY_TUNNEL_KEY in $env_file (never printed)"
     echo "  Service:      sctl-relay (systemd)"
     echo "  Host:         $remote"
     echo ""
-    echo "  BPI config (/etc/sctl/sctl.toml):"
+    echo "  Device config (/etc/sctl/sctl.toml):"
     echo "    [tunnel]"
-    echo "    tunnel_key = \"$tunnel_key\""
+    echo "    tunnel_key = \"<RELAY_TUNNEL_KEY from .env.local>\""
     echo "    url = \"$tunnel_ws_url\""
     echo "    bind_address = \"wwan0\""
     echo ""
-    echo "  MCP config (~/.config/sctl/devices.dev.json):"
-    echo "    \"bpi-relay\": {"
-    echo "      \"url\": \"$relay_url/d/<serial>\","
-    echo "      \"api_key\": \"<bpi api key>\""
+    if [[ -n "$domain" ]]; then
+        echo "  Operator access (the relay API, /d/<serial>, sctlin), over SSH:"
+        echo "    ssh -N -L 18443:127.0.0.1:8443 $remote"
+        echo ""
+    fi
+    echo "  MCP config (~/.config/sctl/devices.dev.json, keep it 0600):"
+    echo "    \"device-relay\": {"
+    echo "      \"url\": \"$operator_url/d/<serial>\","
+    echo "      \"api_key\": \"<the device's api key>\""
     echo "    }"
     echo "============================================"
 }
@@ -4086,6 +4158,8 @@ do_relay_deploy() {
     ssh $ssh_opts "$remote" "chmod +x $RELAY_REMOTE_BIN"
     scp $ssh_opts "$SCTL_DIR/files/sctl-relay.service" "$remote:/etc/systemd/system/sctl-relay.service"
     ssh $ssh_opts "$remote" "printf '%s\n' '"'{"v":1,"layout":"systemd","target":"x86_64","unit":"sctl-relay","files":{"server":"/usr/local/bin/sctl"},"health_url":"http://127.0.0.1:8443/api/health","rollback_dir":"/var/lib/sctl/rollback"}'"' > /etc/sctl/install.json"
+    # The config holds the relay's keys: root-only, on relays set up before too.
+    ssh $ssh_opts "$remote" "chmod 700 \$(dirname $RELAY_REMOTE_CONFIG) && chmod 600 $RELAY_REMOTE_CONFIG"
     ssh $ssh_opts "$remote" "systemctl daemon-reload && systemctl start sctl-relay"
     ok "Binary + service deployed"
 
@@ -4121,19 +4195,21 @@ do_relay_upgrade() {
     relay_run() {
         if [[ "$remote" == "local" ]]; then bash -c "$1"; else ssh $ssh_opts "$remote" "$1"; fi
     }
-    # The relay's operator key, read where it lives; it never leaves the relay.
-    local key_expr="\$(sed -n 's/^api_key *= *\"\(.*\)\"/\1/p' $RELAY_REMOTE_CONFIG | head -n1)"
+    # The relay's operator key, read where it lives into a 0600 curl config:
+    # it never leaves the relay and is on no command line (relay_auth_curl).
+    local auth_curl
+    auth_curl=$(relay_auth_curl "$RELAY_REMOTE_CONFIG" operator)
     local base="http://127.0.0.1:${RELAY_API_PORT:-8443}/api"
 
     local listing
-    listing=$(relay_run "curl -sS -H \"Authorization: Bearer $key_expr\" $base/tunnel/artifacts") || { err "The relay did not answer its artifacts listing"; exit 1; }
+    listing=$(relay_run "$auth_curl -sS $base/tunnel/artifacts") || { err "The relay did not answer its artifacts listing"; exit 1; }
     if ! echo "$listing" | jq -e --arg v "$version" '.versions[] | select(.version == $v and .complete == true)' >/dev/null 2>&1; then
         err "The relay does not hold a complete $version bundle. Upload it first: $0 relay artifacts $remote $version <dir>"
         echo "$listing" | jq -c '.versions[] | {version, complete}' 2>/dev/null
         exit 1
     fi
     local running
-    running=$(relay_run "curl -sS -H \"Authorization: Bearer $key_expr\" $base/health" | jq -r '.version // "unknown"') || running="unknown"
+    running=$(relay_run "$auth_curl -sS $base/health" | jq -r '.version // "unknown"') || running="unknown"
     log "Relay $remote runs $running; asking it to upgrade to $version through POST /api/upgrade..."
 
     local request_id="relay:$version:$(date -u +%Y%m%dT%H%M%SZ)"
@@ -4143,7 +4219,7 @@ do_relay_upgrade() {
     local body
     body=$(jq -cn --arg v "$version" --arg r "$request_id" --arg m "$base/tunnel/artifacts/$version/release.json" '{version: $v, request_id: $r, manifest_url: $m}')
     local answer
-    answer=$(relay_run "curl -sS -w '\n%{http_code}' -X POST -H \"Authorization: Bearer $key_expr\" -H 'Content-Type: application/json' -d '$body' $base/upgrade") || { err "The request did not reach the relay"; exit 1; }
+    answer=$(relay_run "$auth_curl -sS -w '\n%{http_code}' -X POST -H 'Content-Type: application/json' -d '$body' $base/upgrade") || { err "The request did not reach the relay"; exit 1; }
     local status="${answer##*$'\n'}"
     local payload="${answer%$'\n'*}"
     case "$status" in
@@ -4163,7 +4239,7 @@ do_relay_upgrade() {
     while [[ $waited -lt 300 ]]; do
         sleep 5
         waited=$((waited + 5))
-        health=$(relay_run "curl -sf -m 5 -H \"Authorization: Bearer $key_expr\" $base/health" 2>/dev/null) || { echo "  ${waited}s: relay not answering (restarting?)"; continue; }
+        health=$(relay_run "$auth_curl -sf -m 5 $base/health" 2>/dev/null) || { echo "  ${waited}s: relay not answering (restarting?)"; continue; }
         st=$(echo "$health" | jq -c '{version, phase: .upgrade.phase, outcome: .upgrade.outcome, reason: .upgrade.reason, to: .upgrade.to_version}' 2>/dev/null) || st=""
         if [[ "$st" != "$last" ]]; then
             echo "  ${waited}s: $st"
@@ -4208,16 +4284,18 @@ do_relay_artifacts() {
         exit 1
     fi
     local ssh_opts="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
-    # The relay's operator key, read where it lives.
-    local key_expr="\$(sed -n 's/^api_key *= *\"\(.*\)\"/\1/p' $RELAY_REMOTE_CONFIG | head -n1)"
+    # The relay's operator key, read where it lives into a 0600 curl config:
+    # it never leaves the relay and is on no command line (relay_auth_curl).
+    local auth_curl
+    auth_curl=$(relay_auth_curl "$RELAY_REMOTE_CONFIG" operator)
     local base="http://127.0.0.1:8443/api/tunnel/artifacts"
     case "$verb" in
         list)
-            ssh $ssh_opts "$remote" "curl -sS -H \"Authorization: Bearer $key_expr\" $base" | jq .
+            ssh $ssh_opts "$remote" "$auth_curl -sS $base" | jq .
             ;;
         delete)
             [[ -n "$arg" ]] || { err "delete needs a version"; exit 1; }
-            ssh $ssh_opts "$remote" "curl -sS -X DELETE -H \"Authorization: Bearer $key_expr\" $base/$arg" | jq .
+            ssh $ssh_opts "$remote" "$auth_curl -sS -X DELETE $base/$arg" | jq .
             ;;
         mirror)
             # Where a ramboot device's boot fetcher gets the same files over
@@ -4225,7 +4303,7 @@ do_relay_artifacts() {
             [[ -n "$arg" ]] || { err "mirror needs a version and a url"; exit 1; }
             local body
             body=$(jq -cn --arg url "$arg2" '{url: $url}')
-            ssh $ssh_opts "$remote" "curl -sS -X PUT -H \"Authorization: Bearer $key_expr\" -H 'Content-Type: application/json' -d '$body' $base/$arg/mirror" | jq .
+            ssh $ssh_opts "$remote" "$auth_curl -sS -X PUT -H 'Content-Type: application/json' -d '$body' $base/$arg/mirror" | jq .
             ;;
         *)
             local version="$verb" dir="$arg"
@@ -4241,14 +4319,14 @@ do_relay_artifacts() {
             for f in "${files[@]}"; do
                 log "Uploading $f..."
                 local out
-                out=$(ssh $ssh_opts "$remote" "curl -sS -X PUT -H \"Authorization: Bearer $key_expr\" --data-binary @- $base/$version/$f" < "$dir/$f")
+                out=$(ssh $ssh_opts "$remote" "$auth_curl -sS -X PUT --data-binary @- $base/$version/$f" < "$dir/$f")
                 if [[ "$(printf '%s' "$out" | jq -r '.stored // empty' 2>/dev/null)" != "$f" ]]; then
                     err "upload of $f refused: $out"
                     exit 1
                 fi
             done
             ok "Bundle $version on $remote:"
-            ssh $ssh_opts "$remote" "curl -sS -H \"Authorization: Bearer $key_expr\" $base" | jq ".versions[] | select(.version == \"$version\")"
+            ssh $ssh_opts "$remote" "$auth_curl -sS $base" | jq ".versions[] | select(.version == \"$version\")"
             ;;
     esac
 }
@@ -4256,42 +4334,32 @@ do_relay_artifacts() {
 do_relay_status() {
     local remote="${1:-}"
 
-    # If no host given, try external health check via RELAY_URL
+    # No host given: RELAY_HOST from .env.local, over SSH, where the keys are.
+    # With only RELAY_URL, check that the TLS edge answers for devices; nothing
+    # carrying a key is ever sent from this machine.
     if [[ -z "$remote" ]]; then
         if [[ -f "$REPO_DIR/.env.local" ]]; then
             source "$REPO_DIR/.env.local"
         fi
-
-        if [[ -n "${RELAY_URL:-}" ]]; then
-            log "Checking relay health at $RELAY_URL..."
-            local health
-            health=$(curl -sf "$RELAY_URL/api/health" 2>/dev/null) || true
-            if [[ -n "$health" ]]; then
-                ok "Relay healthy: $health"
-            else
-                err "Relay unreachable at $RELAY_URL"
-            fi
-
-            # Try tunnel devices endpoint
-            if [[ -n "${RELAY_TUNNEL_KEY:-}" ]]; then
-                local devices
-                devices=$(curl -sf "$RELAY_URL/api/tunnel/devices?token=$RELAY_TUNNEL_KEY" 2>/dev/null) || true
-                if [[ -n "$devices" ]]; then
-                    echo ""
-                    echo "Connected devices:"
-                    echo "$devices" | python3 -m json.tool 2>/dev/null || echo "$devices"
-                fi
-            fi
-            return
-        fi
-
-        # Fall back to RELAY_HOST for SSH
         remote="${RELAY_HOST:-}"
         if [[ -z "$remote" ]]; then
+            if [[ -n "${RELAY_URL:-}" ]]; then
+                log "No RELAY_HOST: checking only that $RELAY_URL answers for devices..."
+                local code
+                code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$RELAY_URL/api/tunnel/register" 2>/dev/null) || code="000"
+                case "$code" in
+                    000) err "The relay edge did not answer at $RELAY_URL" ;;
+                    404) warn "The edge answers but does not route /api/tunnel/register to the relay (HTTP 404)" ;;
+                    *) ok "The edge routes the device tunnel to the relay (HTTP $code without a key, as expected)" ;;
+                esac
+                echo "  Health and connected devices: $0 relay status <user@host> (over SSH)"
+                return
+            fi
             err "Usage: $0 relay status [user@host]"
-            err "  (or set RELAY_URL/RELAY_HOST in .env.local via 'relay setup')"
+            err "  (or set RELAY_HOST in .env.local via 'relay setup')"
             exit 1
         fi
+        log "Using RELAY_HOST=$remote from .env.local"
     fi
 
     local ssh_opts="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
@@ -4304,19 +4372,17 @@ do_relay_status() {
     ssh $ssh_opts "$remote" "systemctl status sctl-relay --no-pager -l 2>/dev/null || echo 'Service not found'" || true
     echo ""
 
-    # Health check
+    # Health, with the relay's own key, so a relay that trims its public health
+    # still answers in full. The key is read on the relay (relay_auth_curl).
     echo "--- health ---"
-    ssh $ssh_opts "$remote" "curl -sf http://127.0.0.1:8443/api/health 2>/dev/null || echo 'Health check failed'" || true
+    ssh $ssh_opts "$remote" "$(relay_auth_curl "$RELAY_REMOTE_CONFIG" operator) -sf http://127.0.0.1:8443/api/health 2>/dev/null || echo 'Health check failed'" || true
     echo ""
 
-    # Connected devices
-    local tunnel_key
-    tunnel_key=$(ssh $ssh_opts "$remote" "grep tunnel_key $RELAY_REMOTE_CONFIG 2>/dev/null | head -1 | sed 's/.*= *\"\\(.*\\)\"/\\1/'" 2>/dev/null) || true
-    if [[ -n "$tunnel_key" ]]; then
-        echo "--- connected devices ---"
-        ssh $ssh_opts "$remote" "curl -sf 'http://127.0.0.1:8443/api/tunnel/devices?token=$tunnel_key' 2>/dev/null || echo 'No devices'" || true
-        echo ""
-    fi
+    # Connected devices. The listing reads the tunnel key as ?token=, so the
+    # whole URL goes into the 0600 curl config on the relay, never a command line.
+    echo "--- connected devices ---"
+    ssh $ssh_opts "$remote" "$(relay_auth_curl "$RELAY_REMOTE_CONFIG" tunnel http://127.0.0.1:8443/api/tunnel/devices) -sf 2>/dev/null || echo 'No devices'" || true
+    echo ""
 
     # Caddy status
     echo "--- caddy ---"
@@ -4359,16 +4425,24 @@ do_relay_sctlin() {
     # 3. Ensure build output has package.json with type=module (Node 18 ESM compat)
     echo '{"type":"module"}' > "$WEB_DIR/build/package.json"
 
-    # 4. Override sctlin-seed.json in build output if a relay-specific one exists
-    #    (web/sctlin-seed.json is gitignored — create it with relay device entries)
-    #    The build already includes web/static/sctlin-seed.json at build/client/sctlin/
+    # 4. Never ship a seed with keys. Vite copies web/static/sctlin-seed.json
+    #    (gitignored) into every build at build/client/sctlin/, its entries may
+    #    carry apiKey or relayApiKey, and the relay serves the build to anyone
+    #    who reaches /sctlin/. Drop it from the output, then write the
+    #    relay-specific seed (web/sctlin-seed.json, gitignored) without key
+    #    fields: the operator enters keys in the browser.
+    local seed_out="$WEB_DIR/build/client/sctlin/sctlin-seed.json"
+    rm -f "$seed_out" "$seed_out.br" "$seed_out.gz"
     local seed_file="$WEB_DIR/sctlin-seed.json"
     if [[ -f "$seed_file" ]]; then
-        log "Overriding sctlin-seed.json with relay-specific version"
-        cp "$seed_file" "$WEB_DIR/build/client/sctlin/sctlin-seed.json"
-        # Regenerate pre-compressed copies so adapter-node serves the updated file
-        rm -f "$WEB_DIR/build/client/sctlin/sctlin-seed.json.br" "$WEB_DIR/build/client/sctlin/sctlin-seed.json.gz"
-        gzip -k "$WEB_DIR/build/client/sctlin/sctlin-seed.json" 2>/dev/null || true
+        log "Writing the relay-specific seed without key fields"
+        if (umask 077 && jq 'map(del(.apiKey, .relayApiKey, .api_key, .token))' "$seed_file" > "$seed_out"); then
+            chmod 644 "$seed_out"
+            gzip -k "$seed_out" 2>/dev/null || true
+        else
+            rm -f "$seed_out"
+            warn "web/sctlin-seed.json is not a JSON array of servers: no seed deployed"
+        fi
     fi
 
     # 5. Upload build to relay
@@ -4402,13 +4476,9 @@ do_relay_sctlin() {
         warn "sctlin returned HTTP $sctlin_status — check: ssh $remote journalctl -u sctlin -n 30"
     fi
 
-    # Show access URL
-    if [[ -f "$REPO_DIR/.env.local" ]]; then
-        source "$REPO_DIR/.env.local"
-        if [[ -n "${RELAY_URL:-}" ]]; then
-            ok "Access sctlin at: ${RELAY_URL}/sctlin/"
-        fi
-    fi
+    # Show access: sctlin is an operator tool, reached through an SSH forward
+    # (a one-door edge does not forward /sctlin/).
+    ok "Access sctlin over SSH: ssh -N -L 18443:127.0.0.1:8443 $remote, then http://127.0.0.1:18443/sctlin/"
 }
 
 # ─── setup (default: build + start) ─────────────────────────────────

@@ -1,24 +1,38 @@
 # sctl Relay Configuration
 #
-# A relay server acts as a rendezvous point for devices behind NAT/CGNAT.
-# It does not run shells or manage files — it only proxies API requests
-# to connected tunnel devices.
+# A relay server is a rendezvous point for devices behind NAT/CGNAT: each
+# device holds an outbound tunnel to it, and it proxies API requests to them.
 #
-# Install: cp relay.toml.example /etc/sctl/relay.toml
+# The relay is also an sctl agent. In relay mode the same listener serves the
+# relay's own agent API (exec, files, sessions, upgrade, the artifact store)
+# as the user the service runs as (root under the shipped unit), behind
+# [auth].api_key, and its health answer lists the devices it has seen with
+# the addresses they connected from. So:
+#   - listen on loopback, behind a TLS edge (Caddy) that forwards only what
+#     devices need: /api/tunnel/register and GET /api/tunnel/artifacts/*;
+#   - reach everything else (the agent API, /d/<serial>, sctlin) through an
+#     SSH forward: ssh -N -L 18443:127.0.0.1:8443 <user@relay>.
+#
+# This file holds keys: keep it 0600 in a 0700 directory.
+# Install: install -m 600 relay.toml.example /etc/sctl/relay.toml
 # Start:   systemctl start sctl-relay
 
 [server]
-# Bind address — use 0.0.0.0 for public-facing relay
-listen = "0.0.0.0:8443"
+# Bind address. Loopback behind a TLS edge. 0.0.0.0 only for a bench relay on
+# a private network: device and relay keys then cross that network in clear.
+listen = "127.0.0.1:8443"
 
-# Relay doesn't need playbooks or shell config. Journal is disabled since
-# the relay doesn't run commands. data_dir (default /var/lib/sctl) IS used:
-# device connection history persists there across relay restarts.
+# The relay needs no playbooks or shell config, and keeps no session journal.
+# data_dir (default /var/lib/sctl) IS used: device connection history and the
+# artifact store persist there across relay restarts.
 journal_enabled = false
 
 [auth]
-# API key for the relay's own /api/health endpoint.
-# Device authentication uses tunnel_key below.
+# Key of the relay's own agent API and of the artifact operator routes. Under
+# the shipped unit it opens a root shell on the relay host: give it a random
+# value no device holds (openssl rand -hex 32), and never put it on a command
+# line. Device authentication uses tunnel_key below; each device's own
+# api_key authorizes the calls proxied to it.
 api_key = "change-me-relay-admin"
 
 [device]
@@ -31,7 +45,8 @@ relay = true
 
 # Shared secret that devices must present to register.
 # Must be at least 8 characters. Set a strong random value.
-# Devices configure this same key in their [tunnel] section.
+# Devices configure this same key in their [tunnel] section, so every device
+# holds it: rotate it when a device is lost.
 tunnel_key = "change-me-at-least-32-chars-for-production"
 
 # Seconds before a device is considered dead if no heartbeat (default 45)
