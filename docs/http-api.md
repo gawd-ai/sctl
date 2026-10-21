@@ -480,7 +480,8 @@ wrapping. All STP errors carry `detail: {transfer_id, recoverable}`; see
 Initialize a chunked download (device → client). **Auth: API key Bearer.**
 
 Request body: `{path, chunk_size?}` (`chunk_size` in bytes; server default
-when omitted).
+when omitted). A `chunk_size` under 1024 is raised to 1024, as an upload's
+is; the answer gives the size used.
 
 Response `200`: `{transfer_id, file_size, file_hash, chunk_size,
 total_chunks, filename}`.
@@ -512,7 +513,9 @@ Response `200`: binary chunk body (`application/octet-stream`) with headers
 
 A chunk is read only from the file the init hashed: the same device and
 inode, still a regular file, its mtime unchanged. Anything else at the path
-is `400` `FILE_CHANGED`, and is never opened.
+is `400` `FILE_CHANGED`, and is never opened. The transfer then fails: it
+gives back its place under `max_concurrent_transfers`, and every later chunk
+answers `FILE_CHANGED` too.
 
 ### `POST /api/stp/chunk/{xfer}/{idx}`
 

@@ -37,10 +37,14 @@ pub struct TransferManager {
     /// Downloads past the limit check and not yet registered: they hash.
     /// Counted with the active transfers against `max_concurrent`.
     hashing: Arc<AtomicUsize>,
-    /// Tests hold hashes here to fill the limit.
+    /// Tests hold hashes here, inside the hash, with their places taken.
     #[cfg(test)]
-    hash_hold: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    hash_hold: std::sync::Mutex<Option<Arc<tests::HashHold>>>,
 }
+
+/// The smallest chunk a transfer uses, an upload's or a download's: a
+/// smaller one asked for is raised to it, so 0 never divides a size.
+const MIN_CHUNK_SIZE: u32 = 1024;
 
 /// A download's place under `max_concurrent` from its limit check until it
 /// is registered. The hash owns it, so a place is freed only when its hash
@@ -166,29 +170,29 @@ impl TransferManager {
             ));
         }
 
+        // The size asked for, raised to the floor an upload has.
+        let chunk_size = chunk_size
+            .unwrap_or(self.config.chunk_size)
+            .max(MIN_CHUNK_SIZE);
+        let total_chunks = compute_chunks(file_size, chunk_size);
+
         // A place under the limit before the hash, so at most that many
         // hashes run (MAX_TRANSFERS past it).
         let place = self.take_place().await?;
 
-        #[cfg(test)]
-        {
-            let hold = self.hash_hold.lock().unwrap().clone();
-            if let Some(hold) = hold {
-                let _permit = hold.acquire().await;
-            }
-        }
-
-        let chunk_size = chunk_size.unwrap_or(self.config.chunk_size);
-        let total_chunks = compute_chunks(file_size, chunk_size);
-
         // Whole-file hash of exactly the size the stat gave, from the file
         // the gate judged. The hash holds the place until it ends.
-        let (hashed, place) =
-            tokio::task::spawn_blocking(move || (hasher::hash_exact(&mut file, file_size), place))
-                .await
-                .map_err(|e| {
-                    make_error("", "IO_ERROR", &format!("Failed to hash file: {e}"), false)
-                })?;
+        #[cfg(test)]
+        let hold = self.hash_hold.lock().unwrap().clone();
+        let (hashed, place) = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(hold) = hold {
+                hold.wait();
+            }
+            (hasher::hash_exact(&mut file, file_size), place)
+        })
+        .await
+        .map_err(|e| make_error("", "IO_ERROR", &format!("Failed to hash file: {e}"), false))?;
         let file_hash = hashed
             .map_err(|e| make_error("", "IO_ERROR", &format!("Failed to hash file: {e}"), false))?;
 
@@ -327,7 +331,7 @@ impl TransferManager {
         // Disk space pre-check via statvfs
         check_disk_space(&dir_path, req.file_size)?;
 
-        let chunk_size = req.chunk_size.max(1024); // Minimum 1 KiB
+        let chunk_size = req.chunk_size.max(MIN_CHUNK_SIZE);
         let total_chunks = compute_chunks(req.file_size, chunk_size);
 
         // Verify caller's chunk count matches
@@ -453,16 +457,24 @@ impl TransferManager {
             ));
         }
 
-        if !matches!(transfer.progress.phase, Phase::Transferring | Phase::Paused) {
-            return Err(make_error(
-                transfer_id,
-                "INVALID_REQUEST",
-                &format!(
-                    "Transfer in phase {:?}, cannot serve chunks",
-                    transfer.progress.phase.as_str()
-                ),
-                false,
-            ));
+        match &transfer.progress.phase {
+            Phase::Transferring | Phase::Paused => {}
+            // A download fails only when its file changed (ADR-011), and
+            // every later chunk says so again.
+            Phase::Failed(why) => {
+                return Err(make_error(transfer_id, "FILE_CHANGED", why, false));
+            }
+            phase => {
+                return Err(make_error(
+                    transfer_id,
+                    "INVALID_REQUEST",
+                    &format!(
+                        "Transfer in phase {:?}, cannot serve chunks",
+                        phase.as_str()
+                    ),
+                    false,
+                ));
+            }
         }
 
         if chunk_index >= transfer.spec.total_chunks {
@@ -497,7 +509,7 @@ impl TransferManager {
 
         // Read the chunk only from the file that was hashed.
         let id = transfer_id.to_string();
-        let buf = tokio::task::spawn_blocking(move || {
+        let read = tokio::task::spawn_blocking(move || {
             read_chunk(
                 &id,
                 &source_path,
@@ -508,7 +520,16 @@ impl TransferManager {
             )
         })
         .await
-        .map_err(|e| make_error(transfer_id, "IO_ERROR", &format!("Read failed: {e}"), false))??;
+        .map_err(|e| make_error(transfer_id, "IO_ERROR", &format!("Read failed: {e}"), false))?;
+        let buf = match read {
+            Ok(buf) => buf,
+            Err(e) => {
+                if e.code == "FILE_CHANGED" {
+                    self.fail_download(transfer_id, &e.message).await;
+                }
+                return Err(e);
+            }
+        };
 
         let chunk_hash = hasher::hash_bytes(&buf);
 
@@ -580,6 +601,20 @@ impl TransferManager {
             },
             buf,
         ))
+    }
+
+    /// A download whose file changed fails with `FILE_CHANGED` (ADR-011):
+    /// it gives back its place under `max_concurrent`, and the sweep
+    /// removes it once it has been idle for `stale_timeout_secs`.
+    async fn fail_download(&self, transfer_id: &str, why: &str) {
+        let mut transfers = self.transfers.write().await;
+        if let Some(t) = transfers.get_mut(transfer_id) {
+            if matches!(t.progress.phase, Phase::Transferring | Phase::Paused) {
+                t.progress.phase = Phase::Failed(why.to_string());
+                t.progress.last_activity = Instant::now();
+                info!(transfer_id = %transfer_id, reason = %why, "Download failed");
+            }
+        }
     }
 
     // ─── Receive Chunk (Upload) ──────────────────────────────────────────────
@@ -1237,6 +1272,64 @@ mod tests {
         p.display().to_string()
     }
 
+    /// Holds downloads inside their hash, their places taken, until the
+    /// test lets them through. Never longer than 10 s, so a test that fails
+    /// while it holds some still ends.
+    #[derive(Default)]
+    pub(super) struct HashHold {
+        /// Hashes held now, and hashes let through that have not left yet.
+        counts: std::sync::Mutex<(usize, usize)>,
+        let_through: std::sync::Condvar,
+    }
+
+    impl HashHold {
+        /// In the hash, on its blocking thread: wait to be let through.
+        pub(super) fn wait(&self) {
+            let mut counts = self.counts.lock().unwrap();
+            counts.0 += 1;
+            let (mut counts, _) = self
+                .let_through
+                .wait_timeout_while(counts, Duration::from_secs(10), |c| c.1 == 0)
+                .unwrap();
+            counts.0 -= 1;
+            counts.1 = counts.1.saturating_sub(1);
+        }
+
+        /// Let `n` held hashes go on.
+        fn release(&self, n: usize) {
+            self.counts.lock().unwrap().1 += n;
+            self.let_through.notify_all();
+        }
+
+        /// Wait, at most 2 s, until `n` hashes are held.
+        async fn until_held(&self, n: usize) {
+            for _ in 0..1000 {
+                if self.counts.lock().unwrap().0 == n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            panic!("{} hashes held, not {n}", self.counts.lock().unwrap().0);
+        }
+    }
+
+    /// A manager whose hashes wait in `HashHold` until let through.
+    fn held_manager(max_concurrent: usize) -> (Arc<TransferManager>, Arc<HashHold>) {
+        let tm = Arc::new(manager(max_concurrent));
+        let hold = Arc::new(HashHold::default());
+        *tm.hash_hold.lock().unwrap() = Some(hold.clone());
+        (tm, hold)
+    }
+
+    /// Start a download init on its own task.
+    fn spawn_init(
+        tm: &Arc<TransferManager>,
+        path: &Path,
+    ) -> tokio::task::JoinHandle<Result<InitDownloadResult, TransferError>> {
+        let (tm, path) = (tm.clone(), path_str(path));
+        tokio::spawn(async move { tm.init_download(&path, Some(1024)).await })
+    }
+
     #[tokio::test]
     async fn a_fifo_is_refused_at_init_without_waiting() {
         let dir = scratch("fifo");
@@ -1282,27 +1375,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_hash_takes_its_place_under_the_limit_before_it_runs() {
+    async fn a_hash_holds_its_place_under_the_limit_while_it_runs() {
         let dir = scratch("places");
-        let tm = Arc::new(manager(4));
-        let hold = Arc::new(tokio::sync::Semaphore::new(0));
-        *tm.hash_hold.lock().unwrap() = Some(hold.clone());
+        let (tm, hold) = held_manager(4);
 
         let mut inits = Vec::new();
         for i in 0..4 {
             let file = dir.join(format!("f{i}.bin"));
             std::fs::write(&file, vec![b'0' + i; 3000]).unwrap();
-            let tm = tm.clone();
-            inits.push(tokio::spawn(async move {
-                tm.init_download(&path_str(&file), None).await
-            }));
+            inits.push(spawn_init(&tm, &file));
         }
-        for _ in 0..1000 {
-            if tm.hashing.load(Ordering::SeqCst) == 4 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
+        // All four are inside their hash, each with its place.
+        hold.until_held(4).await;
         assert_eq!(tm.hashing.load(Ordering::SeqCst), 4);
 
         // Four hashes hold the four places: a fifth init, and an upload,
@@ -1325,7 +1409,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.code, "MAX_TRANSFERS");
 
-        hold.add_permits(4);
+        hold.release(4);
         for init in inits {
             let r = init.await.unwrap().unwrap();
             assert_eq!(r.file_size, 3000);
@@ -1333,6 +1417,70 @@ mod tests {
         // Registered, each counts once, as active.
         assert_eq!(tm.hashing.load(Ordering::SeqCst), 0);
         assert_eq!(tm.list().await.transfers.len(), 4);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_hash_reads_the_file_judged_to_the_size_its_stat_gave() {
+        let dir = scratch("judged");
+        let (tm, hold) = held_manager(4);
+        let original: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+
+        // A log that grows while its hash waits is hashed to its first size.
+        let grows = dir.join("grows.log");
+        std::fs::write(&grows, &original).unwrap();
+        let init = spawn_init(&tm, &grows);
+        hold.until_held(1).await;
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&grows)
+            .unwrap();
+        std::io::Write::write_all(&mut log, b"written after the stat").unwrap();
+        hold.release(1);
+        let init = init.await.unwrap().unwrap();
+        assert_eq!(init.file_size, 3000);
+        assert_eq!(init.file_hash, hasher::hash_bytes(&original));
+
+        // Another file renamed over the path while the hash waits: the hash
+        // still reads the file the gate judged.
+        let swapped = dir.join("swapped.bin");
+        std::fs::write(&swapped, &original).unwrap();
+        let init = spawn_init(&tm, &swapped);
+        hold.until_held(1).await;
+        let other = dir.join("other.bin");
+        std::fs::write(&other, vec![b'z'; 3000]).unwrap();
+        std::fs::rename(&other, &swapped).unwrap();
+        hold.release(1);
+        let init = init.await.unwrap().unwrap();
+        assert_eq!(init.file_size, 3000);
+        assert_eq!(init.file_hash, hasher::hash_bytes(&original));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_chunk_size_below_the_floor_is_raised_to_it() {
+        let dir = scratch("floor");
+        let file = dir.join("data.bin");
+        let data: Vec<u8> = (0..2500u32).map(|i| (i % 249) as u8).collect();
+        std::fs::write(&file, &data).unwrap();
+        let tm = manager(4);
+        // 0 divided the size by zero once the place was taken, and the
+        // caller got no answer; 1 made a chunk of every byte. Each is
+        // raised to 1 KiB, as an upload's is.
+        for asked in [0, 1, MIN_CHUNK_SIZE - 1] {
+            let init = tm
+                .init_download(&path_str(&file), Some(asked))
+                .await
+                .unwrap();
+            assert_eq!(init.chunk_size, MIN_CHUNK_SIZE, "{asked}");
+            assert_eq!(init.total_chunks, 3, "{asked}");
+            let mut got = Vec::new();
+            for i in 0..init.total_chunks {
+                got.extend(tm.serve_chunk(&init.transfer_id, i).await.unwrap().1);
+            }
+            assert_eq!(got, data, "{asked}");
+        }
+        assert_eq!(tm.hashing.load(Ordering::SeqCst), 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1373,7 +1521,8 @@ mod tests {
         let dir = scratch("changed");
         let file = dir.join("data.bin");
         std::fs::write(&file, vec![b'a'; 3000]).unwrap();
-        let tm = manager(4);
+        // One place: the transfer that fails must give it back.
+        let tm = manager(1);
         let init = tm
             .init_download(&path_str(&file), Some(1024))
             .await
@@ -1394,17 +1543,29 @@ mod tests {
         let e = tm.serve_chunk(&init.transfer_id, 1).await.unwrap_err();
         assert_eq!(e.code, "FILE_CHANGED");
 
+        // The transfer failed with it: every later chunk says so, and its
+        // place is free for the next download.
+        assert_eq!(tm.status(&init.transfer_id).await.unwrap().phase, "failed");
+        let e = tm.serve_chunk(&init.transfer_id, 2).await.unwrap_err();
+        assert_eq!(e.code, "FILE_CHANGED");
+        let other = dir.join("other.bin");
+        std::fs::write(&other, vec![b'c'; 3000]).unwrap();
+        let init = tm
+            .init_download(&path_str(&other), Some(1024))
+            .await
+            .unwrap();
+
         // A FIFO at the path is not opened.
-        std::fs::remove_file(&file).unwrap();
-        nix::unistd::mkfifo(&file, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        std::fs::remove_file(&other).unwrap();
+        nix::unistd::mkfifo(&other, nix::sys::stat::Mode::S_IRWXU).unwrap();
         let answer =
-            tokio::time::timeout(Duration::from_secs(5), tm.serve_chunk(&init.transfer_id, 1))
+            tokio::time::timeout(Duration::from_secs(5), tm.serve_chunk(&init.transfer_id, 0))
                 .await;
         let Ok(answer) = answer else {
             let _ = std::fs::OpenOptions::new()
                 .write(true)
                 .custom_flags(libc::O_NONBLOCK)
-                .open(&file);
+                .open(&other);
             panic!("serve_chunk waited on a FIFO");
         };
         assert_eq!(answer.unwrap_err().code, "FILE_CHANGED");

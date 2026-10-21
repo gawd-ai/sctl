@@ -148,7 +148,7 @@ STP (gawdxfer) errors reuse the unified shape and always put
 | `TRANSFER_NOT_FOUND` | 404 | No such transfer (expired, completed, or never existed) |
 | `HASH_MISMATCH` | 400 | Whole-file hash check failed at finalize |
 | `CHUNK_INTEGRITY` | 400 | A chunk's hash did not match its header |
-| `FILE_CHANGED` | 400 | Source file changed under an active transfer: a chunk is read only from the file the init hashed (the same device and inode, still a regular file, its mtime unchanged) |
+| `FILE_CHANGED` | 400 | Source file changed under an active transfer: a chunk is read only from the file the init hashed (the same device and inode, still a regular file, its mtime unchanged). The transfer then fails, gives back its place, and answers every later chunk with this code |
 | `DISK_FULL` | 507 | Not enough space to stage the transfer |
 | `MAX_TRANSFERS` | 429 | `max_concurrent_transfers` reached; a download takes its place before it hashes |
 | `PROTECTED_PATH` | 403 | The read gate refused the download's file (see the device catalog) |
