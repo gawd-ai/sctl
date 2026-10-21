@@ -11,3 +11,8 @@ A decision that shapes the agent, the relay or the way they are built and releas
 | [005](005-the-agent-reports-the-units-own-uplink-verdict.md) | The agent reports the uplink verdict of the unit's own failover engine (mwan3) beside the kernel's routes | Accepted (2026-10-05) | [TRD-5](../trd/TRD-5-mwan3-verdict-in-net-state.md) |
 | [006](006-the-agent-carries-its-own-network-tools.md) | The agent carries its own network tools | Accepted (2026-10-05) | [TRD-6](../trd/TRD-6-sctl-net-tools.md) |
 | [007](007-the-agent-reports-power-only-from-a-source-the-unit-publishes.md) | The agent reports a unit's power only from a source the unit already publishes; the XE300 publishes none | Accepted (2026-10-08), option A | None: no agent code; TRD-7 only if option B is ever taken |
+| [010](010-a-quiet-agent-proves-it-is-checking.md) | A quiet agent proves it is checking | Accepted (2026-10-21) | [TRD-9](../trd/TRD-9-release-0-6-12.md) (release 0.6.12) |
+| [011](011-file-reads-read-what-is-there-and-refuse-secrets-and-devices.md) | File reads read what is there, and refuse secrets and devices | Accepted (2026-10-21) | [TRD-9](../trd/TRD-9-release-0-6-12.md) (release 0.6.12) |
+| [012](012-net-tools-send-only-on-the-lan-to-the-device-expected.md) | Net tools send only on the LAN, to the device expected | Accepted (2026-10-21) | [TRD-9](../trd/TRD-9-release-0-6-12.md) (release 0.6.12) |
+
+ADR-008 and ADR-009 are reserved: ADR-008 for a router's WAN digest (fleet TRD-28, appendix A), ADR-009 for an uplink's throughput (fleet TRD-29). Each ships later with a TRD of its own, so 010 follows 007.
