@@ -97,11 +97,11 @@ one status depending on the route.
 | `INVALID_MODE` | 400 | Bad octal mode string on file write |
 | `INVALID_CONTENT` | 400 / 422 | base64 decode failed (400) / unparsable playbook (422) |
 | `FILE_NOT_FOUND` | 404 | File or directory does not exist |
-| `FILE_TOO_LARGE` | 400 / 413 | Exceeds `max_file_size` (or the 1 MB playbook cap) |
+| `FILE_TOO_LARGE` | 400 / 413 | Exceeds `max_file_size` (or the 1 MB playbook cap). Through the relay `GET /api/files` reads at most 4 MiB (`max_file_size` when smaller): a larger file asked with no range is refused before it is read (ask a range), and so is an answer that would not fit the tunnel's 8 MiB body (ask a smaller `limit`) |
 | `IS_DIRECTORY` | 400 | Path is a directory where a file was expected |
 | `NOT_A_DIRECTORY` | 400 | Upload target is not a directory |
 | `PROTECTED_PATH` | 403 | A file read the agent refuses (ADR-011): its own keys and their copies, a process's secrets (`/proc/<pid>/environ` and the like), a kernel stream, a procfs or sysfs file off its list, a debugfs or tracefs file. The message names the rule, never the content. Not worth a retry |
-| `NOT_A_REGULAR_FILE` | 400 | A FIFO, a socket or a device, refused before it is opened; on `GET /api/files/raw` and in a transfer, also a procfs or sysfs file (the message names its filesystem; `GET /api/files` reads it). Not worth a retry |
+| `NOT_A_REGULAR_FILE` | 400 | A FIFO, a socket or a device, refused before it is opened; on `GET /api/files/raw` and in a transfer, also a listed procfs or sysfs file (the message names its filesystem; `GET /api/files` reads it). The `PROTECTED_PATH` rules come first, so a pseudo file off the list is `PROTECTED_PATH` on every route. Not worth a retry |
 | `NOT_FOUND` | 404 | Resource absent — activity result evicted, playbook missing, subsystem not present |
 | `PERMISSION_DENIED` | 403 | OS permission error |
 | `IO_ERROR` | 500 | Other I/O failure |
@@ -152,12 +152,14 @@ STP (gawdxfer) errors reuse the unified shape and always put
 | `DISK_FULL` | 507 | Not enough space to stage the transfer |
 | `MAX_TRANSFERS` | 429 | `max_concurrent_transfers` reached; a download takes its place before it hashes |
 | `PROTECTED_PATH` | 403 | The read gate refused the download's file (see the device catalog) |
-| `NOT_A_REGULAR_FILE` | 400 | The download's file is a FIFO, a socket, a device, or a procfs or sysfs file |
+| `NOT_A_REGULAR_FILE` | 400 | The download's file is a FIFO, a socket, a device, or a listed procfs or sysfs file (one off the list is `PROTECTED_PATH`) |
 
-`FILE_NOT_FOUND` (404), `PERMISSION_DENIED` (403), `FILE_TOO_LARGE` /
-`INVALID_PATH` / `INVALID_REQUEST` (400) also appear with the same meanings
-as the device catalog. The tunnel's own transfer frames (`gx.download.init`)
-answer `PROTECTED_PATH` with 403 and `NOT_A_REGULAR_FILE` with 400 too.
+`FILE_NOT_FOUND` (404), `PERMISSION_DENIED` (403), `INVALID_PATH` /
+`INVALID_REQUEST` (400) also appear with the same meanings as the device
+catalog, and `FILE_TOO_LARGE` (400) for a file over
+`transfer_max_file_size`. The tunnel's own transfer frames
+(`gx.download.init`) answer `PROTECTED_PATH` with 403 and
+`NOT_A_REGULAR_FILE` with 400 too.
 
 ## Relay-only codes
 

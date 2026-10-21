@@ -14,7 +14,7 @@ The `constant_time_eq` function iterates the full expected-key length regardless
 
 ### The file read gate (`file_access.rs`)
 
-`GET /api/files`, `GET /api/files/raw` and the gawdxfer download init judge a file before they open it (ADR-011). A handle that opens nothing (`O_PATH`) gives the real path, the type, the link count and the filesystem. The agent's keys and their copies, a process's secrets, the kernel's streams, and any procfs or sysfs file off a short list are refused (`PROTECTED_PATH`); a FIFO, a socket or a device is never opened (`NOT_A_REGULAR_FILE`). The file read is the file judged, opened again through its handle, and each refusal is a `file_read` activity entry. The gate is not an authorization boundary: exec reads what it refuses.
+`GET /api/files`, `GET /api/files/raw` and the gawdxfer download init judge a file before they open it (ADR-011). A handle that opens nothing (`O_PATH`) gives the real path, the type, the link count and the filesystem. The agent's keys and their copies, a process's secrets, the kernel's streams, any procfs or sysfs file off a short list, and any debugfs or tracefs file are refused (`PROTECTED_PATH`); a FIFO, a socket or a device is never opened, and on `files/raw` and in a transfer a listed procfs or sysfs file is refused too (`NOT_A_REGULAR_FILE`). The file read is the file judged, opened again through its handle, and each refusal is a `file_read` activity entry. The gate is not an authorization boundary: exec reads what it refuses.
 
 ### Session limits (`sessions/mod.rs`)
 

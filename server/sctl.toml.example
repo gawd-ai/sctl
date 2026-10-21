@@ -75,8 +75,9 @@ max_file_size = 52428800
 
 [auth]
 # Pre-shared API key for all authenticated endpoints.
-# STRONGLY recommended: set via SCTL_API_KEY env var instead of
-# storing in config file.
+# Keep the key here, not in the service's environment: the agent's file
+# reads refuse this file (ADR-011), while its environment passes to every
+# command it runs. SCTL_API_KEY, when set, replaces it.
 api_key = "change-me"
 
 [shell]

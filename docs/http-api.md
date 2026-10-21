@@ -441,7 +441,8 @@ Response `200`: `application/octet-stream` body with
 `Content-Length`.
 
 Only a regular file on a filesystem that reports its size moves, so not a
-procfs or sysfs file (`GET /api/files` reads those). The body is exactly the
+procfs or sysfs file: a listed one is `NOT_A_REGULAR_FILE` (`GET /api/files`
+reads it), and one off the list is `PROTECTED_PATH`. The body is exactly the
 size its stat gave, with that `Content-Length`: a log that grows during the
 download is cut where its size was read.
 
@@ -488,7 +489,8 @@ total_chunks, filename}`.
 
 The file passes the read gate first (see [Files](#files)): `403`
 `PROTECTED_PATH`, and `400` `NOT_A_REGULAR_FILE` for a FIFO, a socket, a
-device or a procfs or sysfs file. The download then takes its place under
+device or a listed procfs or sysfs file (one off the list is
+`PROTECTED_PATH`). The download then takes its place under
 `max_concurrent_transfers` before it hashes the file (`429`
 `MAX_TRANSFERS` past it), so at most that many hashes run, and the hash
 reads exactly the size the stat gave. An empty file is one empty chunk.

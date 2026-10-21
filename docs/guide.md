@@ -87,7 +87,7 @@ Environment variables for quick setup:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SCTL_API_KEY` | -- | **Required.** Pre-shared auth key |
+| `SCTL_API_KEY` | -- | Pre-shared auth key for a quick run; replaces `[auth] api_key`. A service keeps the key in the config file (below) |
 | `SCTL_LISTEN` | `0.0.0.0:1337` | Bind address |
 | `SCTL_DEVICE_SERIAL` | `SCTL-0000-DEV-001` | Device serial for identification |
 | `SCTL_DATA_DIR` | `/var/lib/sctl` | Persistent data (journals) |

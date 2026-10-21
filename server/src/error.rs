@@ -81,8 +81,9 @@ pub mod codes {
     /// secrets, a kernel stream, a procfs or sysfs file off its list, or a
     /// debugfs or tracefs file. The message names the rule.
     pub const PROTECTED_PATH: &str = "PROTECTED_PATH";
-    /// A FIFO, a socket or a device, never opened; or a procfs or sysfs
-    /// file where only a regular file moves (`files/raw`, a transfer).
+    /// A FIFO, a socket or a device, never opened; or a listed procfs or
+    /// sysfs file where only a regular file moves (`files/raw`, a
+    /// transfer). The `PROTECTED_PATH` rules come first.
     pub const NOT_A_REGULAR_FILE: &str = "NOT_A_REGULAR_FILE";
     pub const NOT_FOUND: &str = "NOT_FOUND";
     pub const PERMISSION_DENIED: &str = "PERMISSION_DENIED";
