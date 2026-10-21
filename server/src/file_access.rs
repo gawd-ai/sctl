@@ -1061,12 +1061,22 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The gate `main` builds for an agent started with `--config <file>`.
+    /// Its data directory is apart from the config's, so only the config's
+    /// own rules can refuse the file.
+    fn started_with(config_file: &Path, data_dir: &Path) -> Gate {
+        let mut config: Config = toml::from_str("").unwrap();
+        config.server.data_dir = data_dir.display().to_string();
+        Gate::for_agent(&config, Some(config_file.to_str().unwrap()), None)
+    }
+
     #[test]
     fn the_agents_config_is_refused_however_it_is_reached() {
         let dir = scratch("config");
         let config = dir.join("agent.toml");
         std::fs::write(&config, "[auth]\napi_key = \"test\"\n").unwrap();
-        let gate = Gate::new(vec![], Some(config.clone()));
+        let data_dir = dir.join("data");
+        let gate = started_with(&config, &data_dir);
 
         // Directly: by its name.
         let (rule, stage) = expect_protected(gate.open(&config, Purpose::Read));
@@ -1096,9 +1106,9 @@ mod tests {
         // leads to is refused by its real path, whatever its name.
         let target = other.join("settings.conf");
         std::fs::write(&target, "x").unwrap();
-        let started_with = other.join("linked.toml");
-        symlink(&target, &started_with).unwrap();
-        let gate = Gate::new(vec![], Some(started_with));
+        let link = other.join("linked.toml");
+        symlink(&target, &link).unwrap();
+        let gate = started_with(&link, &data_dir);
         let (rule, stage) = expect_protected(gate.open(&target, Purpose::Read));
         assert_eq!(rule, "the agent's config file");
         assert_eq!(stage, Stage::File);
@@ -1185,6 +1195,87 @@ mod tests {
         assert_eq!(stage, Stage::Path);
         assert!(rule.starts_with("the agent's rollback set"), "{rule}");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn each_layout_refuses_its_key_directories_on_the_path_as_given() {
+        use crate::upgrade::install::Layout;
+        // Each install layout with the directories its units' configs set:
+        // the BPIs and the relay set neither, the XE300 keeps both on its
+        // overlay, and the RUT241 (installed as gz-tmp, later ramboot) and
+        // the WE826 keep data in tmpfs and state in /etc/sctl. An empty
+        // state_dir is data_dir.
+        let units = [
+            (Layout::UsrBin, "riscv64", "/var/lib/sctl", "", "sctl.toml"),
+            (
+                Layout::GzTmp,
+                "mips_24kc",
+                "/usr/local/lib/sctl/data",
+                "",
+                "sctl.toml",
+            ),
+            (
+                Layout::GzTmp,
+                "mipsel_24kc",
+                "/tmp/sctl/data",
+                "/etc/sctl/state",
+                "sctl.toml",
+            ),
+            (
+                Layout::Ramboot,
+                "mips_24kc",
+                "/tmp/sctl/data",
+                "/etc/sctl/state",
+                "sctl.toml",
+            ),
+            (Layout::Systemd, "x86_64", "/var/lib/sctl", "", "relay.toml"),
+        ];
+        for (layout, target, data_dir, state_dir, config_name) in units {
+            let mut config: Config = toml::from_str("").unwrap();
+            config.server.data_dir = data_dir.to_string();
+            config.server.state_dir = state_dir.to_string();
+            let install = InstallInfo::defaults(layout, target);
+            let config_file = format!("/etc/sctl/{config_name}");
+            let gate = Gate::for_agent(&config, Some(&config_file), Some(&install));
+            let dirs = gate.dirs_now();
+            // A match here refuses at the gate's first step, before any
+            // handle is taken: no refusal opens the file.
+            let rule = |p: &Path| gate.rule_for(&components(p), &dirs);
+            let unit = format!("{} with data in {data_dir}", layout.as_str());
+
+            let state = Path::new(config.server.state_dir());
+            let rollback = &install.rollback_dir;
+            for refused in [
+                rollback.join("sctl-server"),
+                Path::new("/overlay/upper").join(rollback.strip_prefix("/").unwrap()),
+                state.join("infra-secrets.json"),
+                state.join("infra-monitor.json"),
+                state.join("tls_pins.json"),
+                state.join("upgrade/state.json"),
+                Path::new(data_dir).join("sessions/journal.jsonl"),
+                PathBuf::from(&config_file),
+                PathBuf::from("/etc/sctl/install.json"),
+                PathBuf::from(format!("/tmp/{config_name}.backup.20261021")),
+            ] {
+                assert!(
+                    rule(&refused).is_some(),
+                    "{unit}: {} passed",
+                    refused.display()
+                );
+            }
+            // Its panic log is refused only where data_dir is state_dir.
+            let panic_log = Path::new(data_dir).join("last_panic.log");
+            assert_eq!(
+                rule(&panic_log).is_some(),
+                state_dir.is_empty(),
+                "{unit}: {}",
+                panic_log.display()
+            );
+            // The payloads hold no keys and stay readable.
+            for payload in install.files.values() {
+                assert_eq!(rule(payload), None, "{unit}: {}", payload.display());
+            }
+        }
     }
 
     #[test]

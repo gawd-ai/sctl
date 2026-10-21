@@ -1017,7 +1017,9 @@ mod content_disposition_tests {
 
 #[cfg(test)]
 mod gate_tests {
+    use std::os::unix::fs::OpenOptionsExt;
     use std::sync::atomic::AtomicU32;
+    use std::time::Duration;
 
     use super::*;
     use crate::activity::ActivityEntry;
@@ -1087,22 +1089,39 @@ mod gate_tests {
         let fifo = dir.join("pipe");
         nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
 
-        let (status, e) = read(
+        // A read that was served must not reach the failure's message: it
+        // would print this process's environment.
+        let Err((status, e)) = read(
             &state,
             query(Path::new("/proc/self/environ"), None, None),
             false,
         )
         .await
-        .unwrap_err();
+        else {
+            panic!("/proc/self/environ was served");
+        };
         assert_eq!(
             (status, e.code.as_str()),
             (StatusCode::FORBIDDEN, "PROTECTED_PATH")
         );
         assert_eq!(e.message, "Refused: a process's environment");
 
-        let (status, e) = read(&state, query(&fifo, None, None), false)
-            .await
-            .unwrap_err();
+        // An open that waited on the FIFO would hang the run: on a timeout
+        // the FIFO gets a writer (opened without waiting) before the test
+        // fails.
+        let answer = tokio::time::timeout(
+            Duration::from_secs(5),
+            read(&state, query(&fifo, None, None), false),
+        )
+        .await;
+        let Ok(answer) = answer else {
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo);
+            panic!("the read waited on a FIFO");
+        };
+        let (status, e) = answer.unwrap_err();
         assert_eq!(
             (status, e.code.as_str()),
             (StatusCode::BAD_REQUEST, "NOT_A_REGULAR_FILE")
