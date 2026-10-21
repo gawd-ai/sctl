@@ -434,7 +434,7 @@ pub fn build_snapshot(
                 let mut names: Vec<Value> = rat
                     .map(|r| r.iter().filter_map(|x| x.get("name").cloned()).collect())
                     .unwrap_or_default();
-                // Firmware 8.6.0 ships `rat[]` entries with no `name` (Bus 01,
+                // Firmware 8.6.0 ships `rat[]` entries with no `name` (a customer's coach,
                 // 2026-09-08: bands and signal present, technology blank).
                 // The technology is still stated elsewhere in the block:
                 // `dataTechnology` ("LTE-A"), else `mobileType`.
@@ -504,12 +504,12 @@ pub fn build_snapshot(
 
     // Which LAN carries the passengers.
     //
-    // The AP describes its own networks: on Bus 01, LAN 0 is 192.168.50.1/24
+    // The AP describes its own networks: on a customer's coach, LAN 0 is 192.168.50.1/24
     // (ours, unnamed) and LAN 1 is 10.10.10.1/24 named "PASSENGER". Taking the
     // id from the AP rather than from config means the next vehicle does not
     // need a hardcoded VLAN number that would be silently wrong.
     // NOTE the trap: the key in this reply is the LAN INDEX, not the VLAN id.
-    // On Bus 01 the passenger LAN is index "1" while its clients report
+    // On that coach the passenger LAN is index "1" while its clients report
     // `vlanId: 10`. Keying on the index counts zero riders for ever, silently,
     // because no client ever reports vlan 1.
     //
@@ -695,7 +695,7 @@ mod tests {
         })
     }
 
-    /// The AP's own LAN list, verbatim from Bus 01: LAN 0 is our management
+    /// The AP's own LAN list, verbatim from a customer's coach: LAN 0 is our management
     /// network and LAN 1 is the passengers', which the AP names itself.
     fn real_lan() -> Value {
         json!({
@@ -996,7 +996,7 @@ mod tests {
         );
     }
 
-    /// Firmware 8.6.0 (Bus 01, 2026-09-08): `rat[]` carries bands and signal
+    /// Firmware 8.6.0 (a customer's coach, 2026-09-08): `rat[]` carries bands and signal
     /// but no `name`, while `dataTechnology` says "LTE-A". The technology
     /// list must not read as blank on a connected modem.
     #[test]

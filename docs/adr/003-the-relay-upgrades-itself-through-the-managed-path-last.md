@@ -4,7 +4,7 @@ Status: Accepted (2026-10-01). Realized by [TRD-3](../trd/TRD-3-managed-relay-up
 
 ## 1. Trigger
 
-The relay on do-toronto runs 0.6.7.172 under the `systemd` layout with its `install.json` written, and serves `POST /api/upgrade` for itself (it is an authenticated route of every sctl). But a relay has no `[tunnel] url` (client mode only), so `manifest_url()` in `stage.rs` has nothing to derive the manifest's URL from and refuses the request with `internal` unless the caller passes `manifest_url`. The hand path, `rundev.sh relay upgrade`, is still a binary scp, a stop and a start with a 60 s health poll and no rollback.
+The production relay runs 0.6.7.172 under the `systemd` layout with its `install.json` written, and serves `POST /api/upgrade` for itself (it is an authenticated route of every sctl). But a relay has no `[tunnel] url` (client mode only), so `manifest_url()` in `stage.rs` has nothing to derive the manifest's URL from and refuses the request with `internal` unless the caller passes `manifest_url`. The hand path, `rundev.sh relay upgrade`, is still a binary scp, a stop and a start with a 60 s health poll and no rollback.
 
 ## 2. What existed
 

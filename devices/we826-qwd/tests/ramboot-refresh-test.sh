@@ -68,7 +68,7 @@ if [ "$P" = dash ]; then
         "[ -x '$UNIT_SH' ] && ! env -i PATH='$FIX/bin' '$UNIT_SH' -c 'command -v sha256sum || command -v setsid || command -v mktemp' >/dev/null"
 fi
 
-# --- 1. the happy path, Bus 01 as it is -----------------------------------------
+# --- 1. the happy path, the field unit as it is ---------------------------------
 printf '\n%s: happy path (c97ad7a init, 05-31 ramboot.sh, mirror by IP)\n' "$P"
 new_unit "$P-happy"
 echo "HAND_ADDED=1" >> "$R/etc/sctl/ramboot.conf"

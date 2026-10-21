@@ -558,7 +558,7 @@ mod tests {
     /// bytes (`fixtures/http-api-target.push.json`) for an access-point
     /// target; this test asserts the device accepts them. Change both or
     /// neither.
-    // The Bus 01 router's certificate fingerprint: a public value, not a secret.
+    // A customer coach's router certificate fingerprint: a public value, not a secret.
     const FIXTURE_PIN: &str = "e882b1b69849bcf9a076e027277975d62c704fed88bd1c038a1b71e0ff398773"; // secret-scan: allow
     /// The fixture with the pin as a placeholder, so the hex lives on one
     /// marked line above and the JSON stays byte-comparable to the fleet file.

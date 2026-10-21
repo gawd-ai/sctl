@@ -4,7 +4,7 @@ Status: Accepted (2026-10-05). Realized by [TRD-5](../trd/TRD-5-mwan3-verdict-in
 
 ## 1. Trigger
 
-At one customer site (an XE300, 2026-10-05) the wired uplink had link, a DHCP lease and a gateway that answered ping, while that gateway returned ICMP net-unreachable for every internet destination: the line above the arena's router was down. The GL-XE300 firmware's failover engine, mwan3 2.8.4, had marked its `wan` interface offline and steered every flow through a policy table to the modem. The kernel's main table still held `default via 192.168.1.1 dev eth1` at metric 0, so `net.state` reported the wire as an up interface holding the lowest-metric default route. Every reader downstream (netage-server, the fleet's uplink record, its alerts and notifications) concluded the wire carried the site. It had not for three days, and when the lease came back on 2026-10-02 the fleet even recorded a switchback to it.
+At one customer site (an XE300, 2026-10-05) the wired uplink had link, a DHCP lease and a gateway that answered ping, while that gateway returned ICMP net-unreachable for every internet destination: the line above the site's router was down. The GL-XE300 firmware's failover engine, mwan3 2.8.4, had marked its `wan` interface offline and steered every flow through a policy table to the modem. The kernel's main table still held `default via 192.168.1.1 dev eth1` at metric 0, so `net.state` reported the wire as an up interface holding the lowest-metric default route. Every reader downstream (netage-server, the fleet's uplink record, its alerts and notifications) concluded the wire carried the site. It had not for three days, and when the lease came back on 2026-10-02 the fleet even recorded a switchback to it.
 
 ## 2. What existed
 

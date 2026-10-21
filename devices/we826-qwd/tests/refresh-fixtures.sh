@@ -9,7 +9,7 @@
 # the agent running.
 #
 # What runs for real on the unit: the init files and ramboot.sh as released
-# (taken from git: Bus 01 carries c97ad7a's init and the 05-31 ramboot.sh),
+# (taken from git: the field unit carries c97ad7a's init and the 05-31 ramboot.sh),
 # so the supervisor, its pid files, its signal handling, SCTL_RAMBOOT_CONFIG
 # and the old ramboot.sh's /tmp check at every start are the real ones.
 # What is fake:
@@ -379,7 +379,7 @@ agent_up() {
     return 1
 }
 
-# A WE826 as a 0.6.2-era install left it, Bus 01 by default: the init
+# A WE826 as a 0.6.2-era install left it, the field unit by default: the init
 # (released file $1, default c97ad7a's) and ramboot.sh ($2, default the
 # 05-31 one), ramboot.conf as install.sh's write_kv wrote it with this unit's
 # FETCH_ATTEMPTS=60 and the mirror by IP, sctl.toml with a hand-written

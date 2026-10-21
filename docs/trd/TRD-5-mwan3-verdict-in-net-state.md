@@ -21,8 +21,8 @@ An XE300 whose wire has link and a lease but no internet reports, in `net.state`
 
 - `cargo test -p sctl`, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`.
 - The netns rehearsal with the flip.
-- On D52E after the rollout: `GET /api/health` shows `network.verdicts.eth1 = offline` while the arena line is down, and the relay's `/api/tunnel/events` carries the field in `net.state`.
-- Release 0.6.10 passes the release proof; the bundle and its mirror are on do-toronto with the previous bundles kept.
+- On the XE300 of ADR-005's trigger, after the rollout: `GET /api/health` shows `network.verdicts.eth1 = offline` while that site's line is down, and the relay's `/api/tunnel/events` carries the field in `net.state`.
+- Release 0.6.10 passes the release proof; the bundle and its mirror are on the production relay with the previous bundles kept.
 
 ## 4. Slices and status
 

@@ -4,13 +4,13 @@ Status: Proposed (2026-10-01); accepted when [TRD-4](../trd/TRD-4-relay-route-ow
 
 ## 1. Trigger
 
-After the 0.6.7 upgrades every XE300 and the BPI report `relay_route.dev = null`: the agent-owned relay route of 0.6.5 and 0.6.6 is inert in production. On the XE300s netifd's WireGuard handler pins a `/32` to the peer endpoint (the relay) through the wire at metric 0, and `owner.rs` leaves a foreign metric-0 route alone (`LeftAlone`). The BPI's tunnel is bound to `eth5` outright (`bind_address`) and its pins sit at metric 10 (WireGuard's) and 40 (a uci route on wwan). So the failover the route exists for, "the wire is up but cannot reach the relay", never happens: when the arena's ISP dies with the link light on, the unit goes dark until the ISP returns, SIM or not. When the cable is pulled the kernel drops the pin with the link and the tunnel falls to LTE anyway.
+After the 0.6.7 upgrades every XE300 and the BPI report `relay_route.dev = null`: the agent-owned relay route of 0.6.5 and 0.6.6 is inert in production. On the XE300s netifd's WireGuard handler pins a `/32` to the peer endpoint (the relay) through the wire at metric 0, and `owner.rs` leaves a foreign metric-0 route alone (`LeftAlone`). The BPI's tunnel is bound to `eth5` outright (`bind_address`) and its pins sit at metric 10 (WireGuard's) and 40 (a uci route on wwan). So the failover the route exists for, "the wire is up but cannot reach the relay", never happens: when the site's ISP dies with the link light on, the unit goes dark until the ISP returns, SIM or not. When the cable is pulled the kernel drops the pin with the link and the tunnel falls to LTE anyway.
 
 ## 2. What existed
 
 - `relay_route = "follow_default" | "prefer"` (0.6.5, 0.6.6): the agent keeps `relay/32 via <gw> dev <uplink> metric 0 proto 83`, probes the relay over the wire, and moves the route to LTE when the wire cannot reach it; refused together with `bind_address`.
 - `owner.rs`: a foreign `/32` at metric 0 is left alone; a foreign route at any other metric is outranked by the agent's metric-0 route and left in place.
-- The XE300 firmware's `/lib/netifd/proto/wireguard.sh` honours `option nohostroute '1'` (checked on D5C1 on 2026-10-01); the BPI has no netifd WireGuard handler and its metric-10 pin's origin is not yet found.
+- The XE300 firmware's `/lib/netifd/proto/wireguard.sh` honours `option nohostroute '1'` (checked on one XE300 on 2026-10-01); the BPI has no netifd WireGuard handler and its metric-10 pin's origin is not yet found.
 - The fallback was proven in a network namespace only (0.6.5).
 
 ## 3. Proposed decision

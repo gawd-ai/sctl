@@ -421,9 +421,9 @@ mod tests {
     #[tokio::test]
     async fn late_replaced_cleanup_cannot_close_the_successor() {
         let h = RelayConnectionHistory::new();
-        h.record_connect("bus01", 1, Some("1.1.1.1")).await;
-        h.record_connect("bus01", 2, Some("2.2.2.2")).await;
-        h.record_disconnect("bus01", 1, "replaced", None).await;
+        h.record_connect("dev01", 1, Some("1.1.1.1")).await;
+        h.record_connect("dev01", 2, Some("2.2.2.2")).await;
+        h.record_disconnect("dev01", 1, "replaced", None).await;
 
         let snap = h.snapshot().await;
         assert_eq!(snap.len(), 2);
@@ -443,18 +443,18 @@ mod tests {
     async fn no_overlap_and_no_negative_gap() {
         let h = RelayConnectionHistory::new();
         for cid in 1..=20u64 {
-            h.record_connect("bus01", cid, None).await;
+            h.record_connect("dev01", cid, None).await;
             if cid % 3 == 0 {
                 // Simulate the old handler's cleanup arriving late.
-                h.record_disconnect("bus01", cid - 1, "replaced", None)
+                h.record_disconnect("dev01", cid - 1, "replaced", None)
                     .await;
             }
             if cid % 4 == 0 {
-                h.record_disconnect("bus01", cid, "ws_close", None).await;
+                h.record_disconnect("dev01", cid, "ws_close", None).await;
             }
         }
         let snap = h.snapshot().await;
-        let bus: Vec<_> = snap.iter().filter(|s| s.serial == "bus01").collect();
+        let bus: Vec<_> = snap.iter().filter(|s| s.serial == "dev01").collect();
         assert!(bus.iter().filter(|s| s.disconnected_at.is_none()).count() <= 1);
         for pair in bus.windows(2) {
             let closed = pair[0]
@@ -504,26 +504,26 @@ mod tests {
 
         {
             let h = RelayConnectionHistory::with_persistence(&path);
-            h.record_connect("bus01", 1, Some("9.9.9.9")).await;
-            h.record_disconnect("bus01", 1, "pong_timeout", Some(31_000))
+            h.record_connect("dev01", 1, Some("9.9.9.9")).await;
+            h.record_disconnect("dev01", 1, "pong_timeout", Some(31_000))
                 .await;
-            h.record_connect("bus02", 2, None).await;
+            h.record_connect("dev02", 2, None).await;
         }
         // Torn tail: a crash mid-append leaves a partial line.
         {
             use std::io::Write as _;
             let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-            write!(f, "{{\"event\":\"connect\",\"serial\":\"bus").unwrap();
+            write!(f, "{{\"event\":\"connect\",\"serial\":\"dev").unwrap();
         }
 
         let h = RelayConnectionHistory::with_persistence(&path);
         let snap = h.snapshot().await;
         assert_eq!(snap.len(), 2);
-        let s1 = snap.iter().find(|s| s.serial == "bus01").unwrap();
+        let s1 = snap.iter().find(|s| s.serial == "dev01").unwrap();
         assert_eq!(s1.reason.as_deref(), Some("pong_timeout"));
         assert_eq!(s1.last_heartbeat_age_ms, Some(31_000));
         assert_eq!(s1.egress_ip.as_deref(), Some("9.9.9.9"));
-        let s2 = snap.iter().find(|s| s.serial == "bus02").unwrap();
+        let s2 = snap.iter().find(|s| s.serial == "dev02").unwrap();
         assert!(
             s2.disconnected_at.is_none(),
             "open session survives restart"

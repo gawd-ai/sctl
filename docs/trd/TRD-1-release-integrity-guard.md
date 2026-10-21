@@ -15,7 +15,7 @@ The four-part version is a compile-time constant in every **server** binary, ins
 - `.github/workflows/release.yml`, job `bundle`, step `Assemble`, after `scripts/release-bundle.sh` and before signing: for every entry of `release/release.json` with role `server` (`jq -r '.targets[].files[] | select(.role == "server") | "\(.name)|\(.gzip)"'`), read the file (`gzip -dc` when `gzip` is true) and require `strings -n 5 | grep -qE "(^|[^0-9.])$VERSION([^0-9]|$)"`; print `proof ok <name>` or `proof FAILED <name>` and exit 1 at the end if any failed. The step runs before `release-sign.sh verify` so an unproven bundle is never signed.
 - `scripts/release-bundle.sh`: no change (it names files and hashes; the proof is CI's).
 - `docs/releasing.md`: under "Managed upgrades (0.6.7+)", the proof step; under "Version scheme", that a preset `SCTL_BUILD_NUMBER` wins in `rundev.sh` and the device builds and that a hand build meant to match a release pins it (`SCTL_BUILD_NUMBER=<n>`), with the 0.6.7.172 incident as the reason.
-- `devices/rut241/README.md`: the probe env files under `/root/probes/<serial>.env` on the relay are not authoritative for a unit's API key (D4C5's was stale on 2026-10-01); the live key is netage-server's `[[fleet.device_keys]]` entry for that serial.
+- `devices/rut241/README.md`: the probe env files an onboarding left on the relay are not authoritative for a unit's API key (one unit's was stale on 2026-10-01); the live key is netage-server's `[[fleet.device_keys]]` entry for that serial.
 - `CHANGELOG.md` `[Unreleased]` (CRLF, edited byte-safe): the proof, the pin.
 
 ## 4. Verification

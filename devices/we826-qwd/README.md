@@ -100,7 +100,7 @@ rm -f /etc/sctl/disabled
 ## A unit installed before 0.6.9
 
 A unit whose agent is older than 0.6.7 has no `install.json` and no upgrade
-route, so the fleet cannot ask it (Bus 01 runs 0.6.2); one installed by 0.6.7
+route, so the fleet cannot ask it (the WE826 in the field ran 0.6.2); one installed by 0.6.7
 or 0.6.8 has an `install.json` without `helper_prefix`, so its upgrade helper
 cannot start under the loader. It moves once, through the relay and with no
 SSH, to the current layout and a current release
@@ -109,7 +109,7 @@ SSH, to the current layout and a current release
 ```sh
 ./rundev.sh device upgrade-remote <name> <version> http://<relay-ip>:8081/artifacts/<version>
 # or name the relay and let its listing give the mirror (it must be by IP for
-# a unit that fetches by IP, as Bus 01 does):
+# a unit that fetches by IP, as the WE826 in the field does):
 ./rundev.sh device upgrade-remote <name> <version> root@<relay-ip>
 ```
 
