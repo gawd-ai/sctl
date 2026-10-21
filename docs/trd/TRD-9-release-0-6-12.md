@@ -383,7 +383,7 @@ Staff then read these with exec, not through the file routes: where `data_dir` i
 
 ## 7. Slices and status
 
-1. File reads (3.1): Planned.
+1. File reads (3.1): Implemented (2026-10-21, `0c0d520`; 36 new tests, 401 in the library, the workspace, clippy and fmt green on 1.97.1 as CI runs them). Its acceptance on hardware (through a relay, 40 FIFO reads with relayed REST answering, each install layout's directories, the WE826's kernel) runs with section 6.
 2. The proof (3.2): Planned.
 3. The monitor (3.3): Planned.
 4. Net tools and `net_tools_netns` (3.4): Planned.
