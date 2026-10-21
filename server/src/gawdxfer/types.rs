@@ -34,6 +34,9 @@ pub struct TransferSpec {
     pub created_at: Instant,
     /// Source file mtime at init (download only) — detect `FILE_CHANGED`.
     pub source_mtime: Option<u64>,
+    /// The file a download hashed (download only): every chunk is read
+    /// from it or from nothing (`FILE_CHANGED`).
+    pub source_file: Option<crate::file_access::FileId>,
 }
 
 /// Mutable progress state for a transfer.

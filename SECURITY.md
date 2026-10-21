@@ -30,6 +30,7 @@ sctl is designed to run on network-accessible devices and takes security serious
 
 - **Authentication**: Pre-shared API key with constant-time comparison
 - **Path validation**: Rejects traversal attacks at the API boundary
+- **File reads**: One gate judges a file before any read opens it. The agent's own keys, a process's secrets and the kernel's streams are refused, and so is anything that is not a regular file (ADR-011). It keeps routine reads away from secrets; exec still reads what it refuses
 - **Process isolation**: Sessions in own process groups with `kill_on_drop`
 - **Atomic writes**: Temp-file-then-rename prevents partial reads
 - **Resource limits**: Configurable caps on sessions, file sizes, timeouts

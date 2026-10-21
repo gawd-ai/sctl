@@ -1,16 +1,19 @@
 //! Transfer lifecycle manager — owns transfers, chunk I/O, disk space checks.
 //!
 //! Zero full-file buffering: only one chunk (256 KiB default) in memory at a time.
-//! Uploads write chunks directly to a temp file via seek+write. Downloads serve
-//! chunks by seek+read from the source file.
+//! Uploads write chunks directly to a temp file via seek+write. A download
+//! passes the file gate at init (ADR-011), hashes exactly the size its stat
+//! gave, and serves each chunk by seek+read from the file it hashed.
 
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{info, warn};
 
@@ -21,6 +24,7 @@ use super::types::{
     TransferProgress, TransferSpec, TransferSummary,
 };
 use crate::activity::{ActivityLog, ActivitySource, ActivityType};
+use crate::file_access::{self, FileId, Gate, Opened, Purpose, Refusal, Reopen};
 
 /// Owns the set of active transfers and their lifecycle.
 pub struct TransferManager {
@@ -28,6 +32,25 @@ pub struct TransferManager {
     config: TransferConfig,
     progress_tx: broadcast::Sender<Value>,
     activity_log: Arc<ActivityLog>,
+    /// The file gate every download passes before its file is opened.
+    gate: Arc<Gate>,
+    /// Downloads past the limit check and not yet registered: they hash.
+    /// Counted with the active transfers against `max_concurrent`.
+    hashing: Arc<AtomicUsize>,
+    /// Tests hold hashes here to fill the limit.
+    #[cfg(test)]
+    hash_hold: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+}
+
+/// A download's place under `max_concurrent` from its limit check until it
+/// is registered. The hash owns it, so a place is freed only when its hash
+/// has ended, even when the request that started it is gone.
+struct Place(Arc<AtomicUsize>);
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 struct Transfer {
@@ -40,13 +63,51 @@ impl TransferManager {
         config: TransferConfig,
         progress_tx: broadcast::Sender<Value>,
         activity_log: Arc<ActivityLog>,
+        gate: Arc<Gate>,
     ) -> Self {
         Self {
             transfers: RwLock::new(HashMap::new()),
             config,
             progress_tx,
             activity_log,
+            gate,
+            hashing: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            hash_hold: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Transfers that hold a place: the active ones, and the downloads
+    /// still hashing.
+    fn places_in_use(&self, transfers: &HashMap<String, Transfer>) -> usize {
+        let active = transfers
+            .values()
+            .filter(|t| matches!(t.progress.phase, Phase::Init | Phase::Transferring))
+            .count();
+        active + self.hashing.load(Ordering::SeqCst)
+    }
+
+    fn max_transfers_error(&self) -> TransferError {
+        make_error(
+            "",
+            "MAX_TRANSFERS",
+            &format!(
+                "Concurrent transfer limit reached (max {})",
+                self.config.max_concurrent
+            ),
+            true,
+        )
+    }
+
+    /// Take a place under `max_concurrent`, or answer `MAX_TRANSFERS`.
+    async fn take_place(&self) -> Result<Place, TransferError> {
+        // The write lock orders every check-and-take against the others.
+        let transfers = self.transfers.write().await;
+        if self.places_in_use(&transfers) >= self.config.max_concurrent {
+            return Err(self.max_transfers_error());
+        }
+        self.hashing.fetch_add(1, Ordering::SeqCst);
+        Ok(Place(self.hashing.clone()))
     }
 
     // ─── Download Init ───────────────────────────────────────────────────────
@@ -58,20 +119,41 @@ impl TransferManager {
     ) -> Result<InitDownloadResult, TransferError> {
         let validated = validate_transfer_path(path)?;
 
-        let metadata = tokio::fs::metadata(&validated).await.map_err(|e| {
-            let (code, msg) = match e.kind() {
-                std::io::ErrorKind::NotFound => ("FILE_NOT_FOUND", "File not found"),
-                std::io::ErrorKind::PermissionDenied => ("PERMISSION_DENIED", "Permission denied"),
-                _ => ("IO_ERROR", "I/O error"),
+        // The gate, before anything opens the file: only a regular file on
+        // a filesystem that reports its size moves (ADR-011).
+        let gate = self.gate.clone();
+        let judged = validated.clone();
+        let opened =
+            match tokio::task::spawn_blocking(move || gate.open(&judged, Purpose::Move)).await {
+                Ok(Ok(opened)) => opened,
+                Ok(Err(refusal)) => {
+                    file_access::record(
+                        &self.activity_log,
+                        ActivitySource::Rest,
+                        path,
+                        &refusal,
+                        None,
+                    )
+                    .await;
+                    return Err(refusal_error(&refusal));
+                }
+                Err(e) => {
+                    return Err(make_error(
+                        "",
+                        "IO_ERROR",
+                        &format!("I/O error: {e}"),
+                        false,
+                    ));
+                }
             };
-            make_error("", code, &format!("{msg}: {e}"), false)
-        })?;
+        let Opened {
+            mut file,
+            size: file_size,
+            modified: source_mtime,
+            id: source_file,
+            ..
+        } = opened;
 
-        if metadata.is_dir() {
-            return Err(make_error("", "INVALID_PATH", "Path is a directory", false));
-        }
-
-        let file_size = metadata.len();
         if file_size > self.config.max_file_size {
             return Err(make_error(
                 "",
@@ -84,39 +166,31 @@ impl TransferManager {
             ));
         }
 
-        // Check concurrent transfer limit
+        // A place under the limit before the hash, so at most that many
+        // hashes run (MAX_TRANSFERS past it).
+        let place = self.take_place().await?;
+
+        #[cfg(test)]
         {
-            let transfers = self.transfers.read().await;
-            let active = transfers
-                .values()
-                .filter(|t| matches!(t.progress.phase, Phase::Init | Phase::Transferring))
-                .count();
-            if active >= self.config.max_concurrent {
-                return Err(make_error(
-                    "",
-                    "MAX_TRANSFERS",
-                    &format!(
-                        "Concurrent transfer limit reached (max {})",
-                        self.config.max_concurrent
-                    ),
-                    true,
-                ));
+            let hold = self.hash_hold.lock().unwrap().clone();
+            if let Some(hold) = hold {
+                let _permit = hold.acquire().await;
             }
         }
 
         let chunk_size = chunk_size.unwrap_or(self.config.chunk_size);
         let total_chunks = compute_chunks(file_size, chunk_size);
 
-        // Compute whole-file hash (streaming, 64KB blocks)
-        let file_hash = hasher::hash_file(&validated)
-            .await
+        // Whole-file hash of exactly the size the stat gave, from the file
+        // the gate judged. The hash holds the place until it ends.
+        let (hashed, place) =
+            tokio::task::spawn_blocking(move || (hasher::hash_exact(&mut file, file_size), place))
+                .await
+                .map_err(|e| {
+                    make_error("", "IO_ERROR", &format!("Failed to hash file: {e}"), false)
+                })?;
+        let file_hash = hashed
             .map_err(|e| make_error("", "IO_ERROR", &format!("Failed to hash file: {e}"), false))?;
-
-        let source_mtime = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs());
 
         let filename = validated.file_name().map_or_else(
             || "download".to_string(),
@@ -137,6 +211,7 @@ impl TransferManager {
             mode: None,
             created_at: Instant::now(),
             source_mtime,
+            source_file: Some(source_file),
         };
 
         let progress = TransferProgress {
@@ -148,10 +223,13 @@ impl TransferManager {
             error_count: 0,
         };
 
-        self.transfers
-            .write()
-            .await
-            .insert(transfer_id.clone(), Transfer { spec, progress });
+        {
+            // Registered, it counts as active: its place goes back under
+            // the same lock, so it is never counted twice or not at all.
+            let mut transfers = self.transfers.write().await;
+            transfers.insert(transfer_id.clone(), Transfer { spec, progress });
+            drop(place);
+        }
 
         info!(
             transfer_id = %transfer_id,
@@ -238,23 +316,11 @@ impl TransferManager {
             ));
         }
 
-        // Check concurrent transfer limit
+        // Check concurrent transfer limit (a hashing download holds a place)
         {
             let transfers = self.transfers.read().await;
-            let active = transfers
-                .values()
-                .filter(|t| matches!(t.progress.phase, Phase::Init | Phase::Transferring))
-                .count();
-            if active >= self.config.max_concurrent {
-                return Err(make_error(
-                    "",
-                    "MAX_TRANSFERS",
-                    &format!(
-                        "Concurrent transfer limit reached (max {})",
-                        self.config.max_concurrent
-                    ),
-                    true,
-                ));
+            if self.places_in_use(&transfers) >= self.config.max_concurrent {
+                return Err(self.max_transfers_error());
             }
         }
 
@@ -312,6 +378,7 @@ impl TransferManager {
             mode: req.mode,
             created_at: Instant::now(),
             source_mtime: None,
+            source_file: None,
         };
 
         let progress = TransferProgress {
@@ -410,52 +477,38 @@ impl TransferManager {
             ));
         }
 
-        // Check source file hasn't changed
-        if let Some(original_mtime) = transfer.spec.source_mtime {
-            if let Ok(meta) = tokio::fs::metadata(&transfer.spec.path).await {
-                let current_mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs());
-                if current_mtime != Some(original_mtime) {
-                    return Err(make_error(
-                        transfer_id,
-                        "FILE_CHANGED",
-                        "Source file modified during transfer",
-                        false,
-                    ));
-                }
-            }
-        }
-
         let offset = u64::from(chunk_index) * u64::from(transfer.spec.chunk_size);
         let chunk_len = std::cmp::min(
             u64::from(transfer.spec.chunk_size),
             transfer.spec.file_size.saturating_sub(offset),
         ) as usize;
         let source_path = transfer.spec.path.clone();
-
-        drop(transfers); // Release lock during I/O
-
-        // Read chunk from disk
-        let mut file = tokio::fs::File::open(&source_path).await.map_err(|e| {
+        let source_mtime = transfer.spec.source_mtime;
+        let source_file = transfer.spec.source_file.ok_or_else(|| {
             make_error(
                 transfer_id,
-                "IO_ERROR",
-                &format!("Failed to open source: {e}"),
+                "INVALID_REQUEST",
+                "Not a download transfer",
                 false,
             )
         })?;
-        file.seek(std::io::SeekFrom::Start(offset))
-            .await
-            .map_err(|e| {
-                make_error(transfer_id, "IO_ERROR", &format!("Seek failed: {e}"), false)
-            })?;
-        let mut buf = vec![0u8; chunk_len];
-        file.read_exact(&mut buf).await.map_err(|e| {
-            make_error(transfer_id, "IO_ERROR", &format!("Read failed: {e}"), false)
-        })?;
+
+        drop(transfers); // Release lock during I/O
+
+        // Read the chunk only from the file that was hashed.
+        let id = transfer_id.to_string();
+        let buf = tokio::task::spawn_blocking(move || {
+            read_chunk(
+                &id,
+                &source_path,
+                source_file,
+                source_mtime,
+                offset,
+                chunk_len,
+            )
+        })
+        .await
+        .map_err(|e| make_error(transfer_id, "IO_ERROR", &format!("Read failed: {e}"), false))??;
 
         let chunk_hash = hasher::hash_bytes(&buf);
 
@@ -1023,6 +1076,56 @@ pub fn compute_chunks(file_size: u64, chunk_size: u32) -> u32 {
     }
 }
 
+/// A gate refusal as a transfer error; a directory keeps its old code.
+fn refusal_error(refusal: &Refusal) -> TransferError {
+    let code = match refusal {
+        Refusal::IsDirectory => "INVALID_PATH",
+        other => other.code(),
+    };
+    make_error("", code, &refusal.message(), false)
+}
+
+/// Read one chunk of a download from the file it hashed: the same device
+/// and inode, still a regular file, its mtime unchanged. Any other file at
+/// the path is `FILE_CHANGED`, and is never opened for reading.
+fn read_chunk(
+    transfer_id: &str,
+    path: &Path,
+    id: FileId,
+    mtime: Option<u64>,
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u8>, TransferError> {
+    let (mut file, now) = file_access::reopen_judged(path, id).map_err(|e| match e {
+        Reopen::Changed(why) => make_error(
+            transfer_id,
+            "FILE_CHANGED",
+            &format!("Source file changed during transfer: {why}"),
+            false,
+        ),
+        Reopen::Io(e) => make_error(
+            transfer_id,
+            "IO_ERROR",
+            &format!("Failed to open source: {e}"),
+            false,
+        ),
+    })?;
+    if mtime.is_some() && now != mtime {
+        return Err(make_error(
+            transfer_id,
+            "FILE_CHANGED",
+            "Source file modified during transfer",
+            false,
+        ));
+    }
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| make_error(transfer_id, "IO_ERROR", &format!("Seek failed: {e}"), false))?;
+    let mut buf = vec![0u8; len];
+    file.read_exact(&mut buf)
+        .map_err(|e| make_error(transfer_id, "IO_ERROR", &format!("Read failed: {e}"), false))?;
+    Ok(buf)
+}
+
 /// Validate an absolute path (reuses logic from routes/files.rs).
 fn validate_transfer_path(path: &str) -> Result<PathBuf, TransferError> {
     let p = Path::new(path);
@@ -1092,5 +1195,219 @@ fn make_error(transfer_id: &str, code: &str, message: &str, recoverable: bool) -
         code: code.to_string(),
         message: message.to_string(),
         recoverable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::AtomicU32;
+    use std::time::Duration;
+
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "sctl-gx-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn manager(max_concurrent: usize) -> TransferManager {
+        let (tx, _) = broadcast::channel(64);
+        let log = Arc::new(ActivityLog::new(64, tx.clone()));
+        let gate = Arc::new(Gate::new(
+            vec![(PathBuf::from("/etc/sctl"), "the agent's directory")],
+            None,
+        ));
+        TransferManager::new(
+            TransferConfig::new(max_concurrent, 1024, 1 << 30, 60),
+            tx,
+            log,
+            gate,
+        )
+    }
+
+    fn path_str(p: &Path) -> String {
+        p.display().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_fifo_is_refused_at_init_without_waiting() {
+        let dir = scratch("fifo");
+        let fifo = dir.join("pipe");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let tm = manager(4);
+        let answer = tokio::time::timeout(
+            Duration::from_secs(5),
+            tm.init_download(&path_str(&fifo), None),
+        )
+        .await;
+        let Ok(answer) = answer else {
+            // Give the stuck open a writer so the test run can end.
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo);
+            panic!("init_download waited on a FIFO");
+        };
+        assert_eq!(answer.unwrap_err().code, "NOT_A_REGULAR_FILE");
+        let entries = tm.activity_log.read_since(0, 10).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].activity_type, ActivityType::FileRead);
+        assert!(entries[0].summary.starts_with("read refused"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_pseudo_file_and_a_protected_path_are_refused_at_init() {
+        let tm = manager(4);
+        let e = tm.init_download("/proc/net/arp", None).await.unwrap_err();
+        assert_eq!(e.code, "NOT_A_REGULAR_FILE");
+        assert!(e.message.contains("procfs"), "{}", e.message);
+        let e = tm
+            .init_download("/proc/self/environ", None)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, "PROTECTED_PATH");
+        let e = tm.init_download("/dev/zero", None).await.unwrap_err();
+        assert_eq!(e.code, "NOT_A_REGULAR_FILE");
+        assert_eq!(tm.activity_log.read_since(0, 10).await.len(), 3);
+        assert_eq!(tm.hashing.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_hash_takes_its_place_under_the_limit_before_it_runs() {
+        let dir = scratch("places");
+        let tm = Arc::new(manager(4));
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        *tm.hash_hold.lock().unwrap() = Some(hold.clone());
+
+        let mut inits = Vec::new();
+        for i in 0..4 {
+            let file = dir.join(format!("f{i}.bin"));
+            std::fs::write(&file, vec![b'0' + i; 3000]).unwrap();
+            let tm = tm.clone();
+            inits.push(tokio::spawn(async move {
+                tm.init_download(&path_str(&file), None).await
+            }));
+        }
+        for _ in 0..1000 {
+            if tm.hashing.load(Ordering::SeqCst) == 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(tm.hashing.load(Ordering::SeqCst), 4);
+
+        // Four hashes hold the four places: a fifth init, and an upload,
+        // are past the limit.
+        let fifth = dir.join("f5.bin");
+        std::fs::write(&fifth, b"five").unwrap();
+        let e = tm.init_download(&path_str(&fifth), None).await.unwrap_err();
+        assert_eq!(e.code, "MAX_TRANSFERS");
+        let e = tm
+            .init_upload(InitUpload {
+                path: path_str(&dir),
+                filename: "up.bin".to_string(),
+                file_size: 10,
+                file_hash: String::new(),
+                chunk_size: 1024,
+                total_chunks: 1,
+                mode: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, "MAX_TRANSFERS");
+
+        hold.add_permits(4);
+        for init in inits {
+            let r = init.await.unwrap().unwrap();
+            assert_eq!(r.file_size, 3000);
+        }
+        // Registered, each counts once, as active.
+        assert_eq!(tm.hashing.load(Ordering::SeqCst), 0);
+        assert_eq!(tm.list().await.transfers.len(), 4);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_download_hashes_and_serves_the_bytes_its_stat_gave() {
+        let dir = scratch("roundtrip");
+        let file = dir.join("data.bin");
+        let data: Vec<u8> = (0..2500u32).map(|i| (i % 253) as u8).collect();
+        std::fs::write(&file, &data).unwrap();
+        let tm = manager(4);
+        let init = tm
+            .init_download(&path_str(&file), Some(1024))
+            .await
+            .unwrap();
+        assert_eq!(init.total_chunks, 3);
+        assert_eq!(init.file_hash, hasher::hash_bytes(&data));
+
+        let mut got = Vec::new();
+        for i in 0..3 {
+            let (header, bytes) = tm.serve_chunk(&init.transfer_id, i).await.unwrap();
+            assert_eq!(header.chunk_hash, hasher::hash_bytes(&bytes));
+            got.extend(bytes);
+        }
+        assert_eq!(got, data);
+
+        // An empty file is still one empty chunk.
+        let empty = dir.join("empty.bin");
+        std::fs::write(&empty, b"").unwrap();
+        let init = tm.init_download(&path_str(&empty), None).await.unwrap();
+        assert_eq!(init.total_chunks, 1);
+        let (_, bytes) = tm.serve_chunk(&init.transfer_id, 0).await.unwrap();
+        assert!(bytes.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_chunk_comes_only_from_the_file_that_was_hashed() {
+        let dir = scratch("changed");
+        let file = dir.join("data.bin");
+        std::fs::write(&file, vec![b'a'; 3000]).unwrap();
+        let tm = manager(4);
+        let init = tm
+            .init_download(&path_str(&file), Some(1024))
+            .await
+            .unwrap();
+        tm.serve_chunk(&init.transfer_id, 0).await.unwrap();
+
+        // Another inode at the path, with the same size and mtime.
+        let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+        let next = dir.join("next.bin");
+        std::fs::write(&next, vec![b'b'; 3000]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&next)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        std::fs::rename(&next, &file).unwrap();
+        let e = tm.serve_chunk(&init.transfer_id, 1).await.unwrap_err();
+        assert_eq!(e.code, "FILE_CHANGED");
+
+        // A FIFO at the path is not opened.
+        std::fs::remove_file(&file).unwrap();
+        nix::unistd::mkfifo(&file, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let answer =
+            tokio::time::timeout(Duration::from_secs(5), tm.serve_chunk(&init.transfer_id, 1))
+                .await;
+        let Ok(answer) = answer else {
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&file);
+            panic!("serve_chunk waited on a FIFO");
+        };
+        assert_eq!(answer.unwrap_err().code, "FILE_CHANGED");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

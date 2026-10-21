@@ -9,9 +9,19 @@
 //! All paths must be absolute and must not contain `..` components or null
 //! bytes. This prevents path traversal attacks.
 //!
+//! ## The read gate
+//!
+//! A read (`GET /api/files`, `GET /api/files/raw`) passes
+//! [`crate::file_access::Gate`] before anything is opened: the agent's keys,
+//! a process's secrets, a kernel stream and a procfs or sysfs file off its
+//! list are `PROTECTED_PATH`; a FIFO, a socket or a device is
+//! `NOT_A_REGULAR_FILE` and is never opened (ADR-011). Each refusal is one
+//! `FileRead` activity entry. Writes, deletes and listings keep their rules.
+//!
 //! ## Size limits
 //!
-//! Reads and writes are capped at `server.max_file_size` (default 2 MB).
+//! Reads and writes are capped at `server.max_file_size` (default 50 MB).
+//! Through the relay a read returns at most 4 MiB, half the tunnel's body.
 //! Binary files are returned/accepted with base64 encoding.
 //!
 //! ## Atomicity
@@ -23,6 +33,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::atomic::AtomicU64;
@@ -35,14 +46,20 @@ use axum::{
     extract::{Multipart, Query, State},
     http::{HeaderMap, StatusCode},
     response::Response,
-    Json,
+    Extension, Json,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::activity::{self, request_id_from_headers, ActivityType};
 use crate::error::{codes, ApiError};
+use crate::file_access::{self, Gate, Purpose, Refusal};
+use crate::tunnel::client::{ViaTunnel, MAX_TUNNEL_BODY_BYTES};
 use crate::AppState;
+
+/// The most a read returns through the relay: half the tunnel's body, so
+/// the answer fits even as base64 (ADR-011 decision 1).
+pub const TUNNEL_READ_CAP: usize = MAX_TUNNEL_BODY_BYTES / 2;
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
@@ -66,11 +83,13 @@ pub struct FilesQuery {
 /// JSON response for a successful file read.
 #[derive(Serialize)]
 pub struct FileReadResponse {
-    /// Canonical path that was read.
+    /// The path as given.
     pub path: String,
     /// File contents — UTF-8 text, or base64 if binary (see `encoding`).
     pub content: String,
-    /// File size in bytes (total file size, not bytes returned).
+    /// File size in bytes (total file size, not bytes returned). On a
+    /// procfs or sysfs file, which reports no size, the bytes to where the
+    /// read stopped.
     pub size: u64,
     /// Last-modified time as a Unix timestamp (seconds since epoch).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -184,18 +203,24 @@ fn format_system_time(time: SystemTime) -> Option<String> {
 
 /// `GET /api/files` — read a file or list a directory.
 ///
+/// A read passes the gate first (ADR-011). Through the tunnel (the
+/// [`ViaTunnel`] mark) it returns at most [`TUNNEL_READ_CAP`] bytes.
+///
 /// # Error codes
 ///
-/// | HTTP | Code               | Meaning                          |
-/// |------|--------------------|----------------------------------|
-/// | 400  | `INVALID_PATH`     | Path is relative, has `..`, etc. |
-/// | 400  | `IS_DIRECTORY`     | Path is a dir but `list` is off  |
-/// | 400  | `FILE_TOO_LARGE`   | File exceeds `max_file_size`     |
-/// | 403  | `PERMISSION_DENIED`| OS permission error              |
-/// | 404  | `FILE_NOT_FOUND`   | File or directory does not exist |
-/// | 500  | `IO_ERROR`         | Other I/O failure                |
+/// | HTTP | Code                 | Meaning                                  |
+/// |------|----------------------|------------------------------------------|
+/// | 400  | `INVALID_PATH`       | Path is relative, has `..`, etc.         |
+/// | 400  | `IS_DIRECTORY`       | Path is a dir but `list` is off          |
+/// | 400  | `FILE_TOO_LARGE`     | File exceeds the cap, with no range      |
+/// | 400  | `NOT_A_REGULAR_FILE` | A FIFO, a socket or a device             |
+/// | 403  | `PROTECTED_PATH`     | The gate's rules refuse it               |
+/// | 403  | `PERMISSION_DENIED`  | OS permission error                      |
+/// | 404  | `FILE_NOT_FOUND`     | File or directory does not exist         |
+/// | 500  | `IO_ERROR`           | Other I/O failure                        |
 pub async fn get_file(
     State(state): State<AppState>,
+    via_tunnel: Option<Extension<ViaTunnel>>,
     headers: HeaderMap,
     Query(query): Query<FilesQuery>,
 ) -> ApiResult<Value> {
@@ -218,13 +243,28 @@ pub async fn get_file(
         return Ok(result);
     }
 
-    let result = read_file(
+    let result = match read_file(
+        state.file_gate.clone(),
         &path,
-        state.config.server.max_file_size,
-        query.offset,
-        query.limit,
+        ReadLimits {
+            max_size: state.config.server.max_file_size,
+            offset: query.offset,
+            limit: query.limit,
+            via_tunnel: via_tunnel.is_some(),
+        },
     )
-    .await?;
+    .await
+    {
+        Ok(v) => v,
+        Err(ReadFailure::Gate(refusal)) => {
+            file_access::record(&state.activity_log, source, &query.path, &refusal, req_id).await;
+            return Err(refusal_response(
+                &refusal,
+                "Path is a directory, use list=true",
+            ));
+        }
+        Err(ReadFailure::Api(e)) => return Err(e),
+    };
     state
         .activity_log
         .log(
@@ -235,127 +275,154 @@ pub async fn get_file(
             req_id,
         )
         .await;
-    Ok(result)
+    Ok(Json(result))
 }
 
-/// Read a single file, returning UTF-8 text or base64 for binary.
-///
-/// When `offset` and/or `limit` are provided, performs a partial read
-/// (seek + bounded read) and sets `truncated: true` if the file extends
-/// beyond the returned bytes.  Without range parameters the original
-/// behaviour is preserved: files larger than `max_size` are rejected.
-async fn read_file(
-    path: &Path,
+/// A gate refusal as the route's error; `directory` words `IS_DIRECTORY`.
+fn refusal_response(refusal: &Refusal, directory: &str) -> (StatusCode, Json<ApiError>) {
+    let status = match refusal {
+        Refusal::Protected { .. } | Refusal::PermissionDenied => StatusCode::FORBIDDEN,
+        Refusal::NotRegular(_) | Refusal::IsDirectory => StatusCode::BAD_REQUEST,
+        Refusal::NotFound => StatusCode::NOT_FOUND,
+        Refusal::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    let message = match refusal {
+        Refusal::IsDirectory => directory.to_string(),
+        other => other.message(),
+    };
+    ApiError::new(refusal.code(), message).into_response_with(status)
+}
+
+/// What bounds one read.
+#[derive(Clone, Copy, Debug)]
+struct ReadLimits {
+    /// `server.max_file_size`.
     max_size: usize,
     offset: Option<u64>,
     limit: Option<usize>,
-) -> ApiResult<Value> {
-    let metadata = match tokio::fs::metadata(path).await {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ApiError::new(codes::FILE_NOT_FOUND, "File not found")
-                .into_response_with(StatusCode::NOT_FOUND));
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Err(ApiError::new(codes::PERMISSION_DENIED, "Permission denied")
-                .into_response_with(StatusCode::FORBIDDEN));
-        }
-        Err(e) => {
-            return Err(ApiError::new(codes::IO_ERROR, e.to_string())
-                .into_response_with(StatusCode::INTERNAL_SERVER_ERROR));
-        }
-    };
+    /// The request came through the tunnel.
+    via_tunnel: bool,
+}
 
-    if metadata.is_dir() {
-        return Err(
-            ApiError::new(codes::IS_DIRECTORY, "Path is a directory, use list=true")
-                .into_response_with(StatusCode::BAD_REQUEST),
-        );
+impl ReadLimits {
+    /// `max_file_size`, or the request's `limit` below it; through the
+    /// tunnel at most [`TUNNEL_READ_CAP`].
+    fn cap(self) -> usize {
+        let cap = self.limit.map_or(self.max_size, |l| l.min(self.max_size));
+        if self.via_tunnel {
+            cap.min(TUNNEL_READ_CAP)
+        } else {
+            cap
+        }
     }
 
-    let file_size = metadata.len();
-    let read_offset = offset.unwrap_or(0);
-    let read_limit = limit.map_or(max_size, |l| l.min(max_size));
-
-    // Without range params, enforce the old behaviour: reject oversized files.
-    if offset.is_none() && limit.is_none() && file_size as usize > max_size {
-        return Err(ApiError::new(
-            codes::FILE_TOO_LARGE,
-            format!("File too large ({file_size} bytes, max {max_size})"),
-        )
-        .into_response_with(StatusCode::BAD_REQUEST));
+    fn ranged(self) -> bool {
+        self.offset.is_some() || self.limit.is_some()
     }
+}
 
-    let modified = metadata.modified().ok().and_then(format_system_time);
+/// Why a read returned nothing: the gate refused it (recorded on the unit),
+/// or the route did.
+enum ReadFailure {
+    Gate(Refusal),
+    Api((StatusCode, Json<ApiError>)),
+}
 
-    // Open, seek, and read up to `read_limit` bytes.
-    let bytes = {
-        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+fn io_failure(e: &impl std::fmt::Display) -> ReadFailure {
+    ReadFailure::Api(
+        ApiError::new(codes::IO_ERROR, e.to_string())
+            .into_response_with(StatusCode::INTERNAL_SERVER_ERROR),
+    )
+}
 
-        let mut file = match tokio::fs::File::open(path).await {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                return Err(ApiError::new(codes::PERMISSION_DENIED, "Permission denied")
-                    .into_response_with(StatusCode::FORBIDDEN));
-            }
-            Err(e) => {
-                return Err(ApiError::new(codes::IO_ERROR, e.to_string())
-                    .into_response_with(StatusCode::INTERNAL_SERVER_ERROR));
-            }
-        };
+fn too_large(message: String) -> ReadFailure {
+    ReadFailure::Api(
+        ApiError::new(codes::FILE_TOO_LARGE, message).into_response_with(StatusCode::BAD_REQUEST),
+    )
+}
 
-        if read_offset > 0 {
-            file.seek(std::io::SeekFrom::Start(read_offset))
-                .await
-                .map_err(|e| {
-                    ApiError::new(codes::IO_ERROR, e.to_string())
-                        .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
-                })?;
+/// How many bytes a value serializes to, without building them.
+fn json_len(value: &Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
         }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
+}
 
-        let remaining = file_size.saturating_sub(read_offset) as usize;
-        let to_read = read_limit.min(remaining);
-        let mut buf = vec![0u8; to_read];
-        let n = file.read(&mut buf).await.map_err(|e| {
-            ApiError::new(codes::IO_ERROR, e.to_string())
-                .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
-        })?;
-        buf.truncate(n);
-        buf
-    };
+/// Read a single file through the gate, returning UTF-8 text or base64 for
+/// binary.
+///
+/// A regular file is read up to the size its stat gave (from `offset`,
+/// within the cap); without a range, a file over the cap is refused before
+/// it is read. A listed procfs or sysfs file is read until it ends or the
+/// cap stops it: `size` is then the bytes to where the read stopped, and
+/// `truncated` says the cap stopped it. Through the tunnel an answer that
+/// would still not fit its body is `FILE_TOO_LARGE`, never the tunnel's 502.
+async fn read_file(gate: Arc<Gate>, path: &Path, limits: ReadLimits) -> Result<Value, ReadFailure> {
+    let cap = limits.cap();
+    let judged = path.to_path_buf();
+    let (out, modified) = tokio::task::spawn_blocking(move || {
+        let mut opened = gate
+            .open(&judged, Purpose::Read)
+            .map_err(ReadFailure::Gate)?;
+        if !limits.ranged() && opened.pseudo.is_none() && opened.size > cap as u64 {
+            let size = opened.size;
+            return Err(too_large(if limits.via_tunnel {
+                format!("File too large ({size} bytes, max {cap} through the relay)")
+            } else {
+                format!("File too large ({size} bytes, max {cap})")
+            }));
+        }
+        let out = opened
+            .read(limits.offset.unwrap_or(0), cap)
+            .map_err(|e| io_failure(&e))?;
+        Ok((out, opened.modified))
+    })
+    .await
+    .map_err(|e| io_failure(&e))??;
 
-    let truncated = (read_offset + bytes.len() as u64) < file_size;
-
-    // Try to interpret as UTF-8; fall back to base64 for binary files.
+    let modified = modified.map(|secs| secs.to_string());
     let path_str = path.to_string_lossy().into_owned();
-    if std::str::from_utf8(&bytes).is_ok() {
-        let text = String::from_utf8(bytes).expect("validated UTF-8 above");
-        Ok(Json(
-            serde_json::to_value(FileReadResponse {
+    let response = match String::from_utf8(out.bytes) {
+        Ok(text) => FileReadResponse {
+            path: path_str,
+            content: text,
+            size: out.size,
+            modified,
+            encoding: None,
+            truncated: out.truncated,
+        },
+        Err(e) => {
+            use base64::Engine;
+            FileReadResponse {
                 path: path_str,
-                content: text,
-                size: file_size,
-                modified,
-                encoding: None,
-                truncated,
-            })
-            .unwrap(),
-        ))
-    } else {
-        use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        Ok(Json(
-            serde_json::to_value(FileReadResponse {
-                path: path_str,
-                content: encoded,
-                size: file_size,
+                content: base64::engine::general_purpose::STANDARD.encode(e.as_bytes()),
+                size: out.size,
                 modified,
                 encoding: Some("base64".to_string()),
-                truncated,
-            })
-            .unwrap(),
-        ))
+                truncated: out.truncated,
+            }
+        }
+    };
+    let value = serde_json::to_value(response).map_err(|e| io_failure(&e))?;
+    if limits.via_tunnel {
+        let len = json_len(&value);
+        if len > MAX_TUNNEL_BODY_BYTES {
+            return Err(too_large(format!(
+                "The answer would be {len} bytes, over the relay's {MAX_TUNNEL_BODY_BYTES}; ask a smaller limit"
+            )));
+        }
     }
+    Ok(value)
 }
 
 /// List a directory's contents, sorted by name.
@@ -633,40 +700,40 @@ pub async fn delete_file(
 
 /// `GET /api/files/raw` — stream a file as raw bytes (no base64, no size cap).
 ///
+/// Only a regular file on a filesystem that reports its size moves, through
+/// the gate (ADR-011): exactly the size its stat gave, with that
+/// `Content-Length`, so a log that grows during the download is cut where
+/// its size was read.
+///
 /// Returns `application/octet-stream` with `Content-Disposition: attachment`.
 pub async fn download_file(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<DownloadQuery>,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    use tokio::io::AsyncReadExt as _;
+
     let source = activity::source_from_headers(&headers);
     let req_id = request_id_from_headers(&headers);
     let path = validate_path(&query.path)?;
 
-    let metadata = tokio::fs::metadata(&path)
-        .await
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => ApiError::new(codes::FILE_NOT_FOUND, "File not found")
-                .into_response_with(StatusCode::NOT_FOUND),
-            std::io::ErrorKind::PermissionDenied => {
-                ApiError::new(codes::PERMISSION_DENIED, "Permission denied")
-                    .into_response_with(StatusCode::FORBIDDEN)
-            }
-            _ => ApiError::new(codes::IO_ERROR, e.to_string())
-                .into_response_with(StatusCode::INTERNAL_SERVER_ERROR),
-        })?;
+    let gate = state.file_gate.clone();
+    let judged = path.clone();
+    let opened = match tokio::task::spawn_blocking(move || gate.open(&judged, Purpose::Move)).await
+    {
+        Ok(Ok(opened)) => opened,
+        Ok(Err(refusal)) => {
+            file_access::record(&state.activity_log, source, &query.path, &refusal, req_id).await;
+            return Err(refusal_response(&refusal, "Path is a directory"));
+        }
+        Err(e) => {
+            return Err(ApiError::new(codes::IO_ERROR, e.to_string())
+                .into_response_with(StatusCode::INTERNAL_SERVER_ERROR));
+        }
+    };
 
-    if metadata.is_dir() {
-        return Err(ApiError::new(codes::IS_DIRECTORY, "Path is a directory")
-            .into_response_with(StatusCode::BAD_REQUEST));
-    }
-
-    let file = tokio::fs::File::open(&path).await.map_err(|e| {
-        ApiError::new(codes::IO_ERROR, e.to_string())
-            .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
-    })?;
-
-    let file_size = metadata.len();
+    let file_size = opened.size;
+    let file = tokio::fs::File::from_std(opened.file);
     let basename = path.file_name().map_or_else(
         || "download".to_string(),
         |n| n.to_string_lossy().into_owned(),
@@ -683,7 +750,7 @@ pub async fn download_file(
         )
         .await;
 
-    let stream = tokio_util::io::ReaderStream::new(file);
+    let stream = tokio_util::io::ReaderStream::new(file.take(file_size));
     let body = Body::from_stream(stream);
 
     Response::builder()
@@ -945,5 +1012,337 @@ mod content_disposition_tests {
         let v = content_disposition_attachment("a\u{7f}b.bin");
         assert!(v.starts_with("attachment; filename=\"a_b.bin\";"));
         assert_valid_header(&v);
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use std::sync::atomic::AtomicU32;
+
+    use super::*;
+    use crate::activity::ActivityEntry;
+    use crate::config::Config;
+
+    fn scratch(tag: &str) -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "sctl-files-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A state whose data and state directory is `<dir>/data`.
+    fn state_in(dir: &Path) -> AppState {
+        let mut config: Config = toml::from_str("").unwrap();
+        config.server.data_dir = dir.join("data").display().to_string();
+        let gate = Arc::new(Gate::for_agent(&config, None, None));
+        AppState::for_tests(config, gate)
+    }
+
+    fn query(path: &Path, offset: Option<u64>, limit: Option<usize>) -> FilesQuery {
+        FilesQuery {
+            path: path.display().to_string(),
+            list: false,
+            offset,
+            limit,
+        }
+    }
+
+    async fn read(
+        state: &AppState,
+        q: FilesQuery,
+        via_tunnel: bool,
+    ) -> Result<Value, (StatusCode, ApiError)> {
+        get_file(
+            State(state.clone()),
+            via_tunnel.then_some(Extension(ViaTunnel)),
+            HeaderMap::new(),
+            Query(q),
+        )
+        .await
+        .map(|Json(v)| v)
+        .map_err(|(status, Json(e))| (status, e))
+    }
+
+    async fn refusals(state: &AppState) -> Vec<ActivityEntry> {
+        state
+            .activity_log
+            .read_since(0, 100)
+            .await
+            .into_iter()
+            .filter(|e| e.summary.starts_with("read refused"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn each_refusal_answers_its_code_and_leaves_one_entry() {
+        let dir = scratch("refusals");
+        let state = state_in(&dir);
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        std::fs::write(dir.join("data/infra-monitor.json"), "{}").unwrap();
+        let fifo = dir.join("pipe");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+
+        let (status, e) = read(
+            &state,
+            query(Path::new("/proc/self/environ"), None, None),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            (status, e.code.as_str()),
+            (StatusCode::FORBIDDEN, "PROTECTED_PATH")
+        );
+        assert_eq!(e.message, "Refused: a process's environment");
+
+        let (status, e) = read(&state, query(&fifo, None, None), false)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (status, e.code.as_str()),
+            (StatusCode::BAD_REQUEST, "NOT_A_REGULAR_FILE")
+        );
+
+        let (status, e) = read(
+            &state,
+            query(&dir.join("data/infra-monitor.json"), None, None),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            (status, e.code.as_str()),
+            (StatusCode::FORBIDDEN, "PROTECTED_PATH")
+        );
+
+        // Not refusals: answered as before, with no entry.
+        let (status, e) = read(&state, query(&dir.join("absent"), None, None), false)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (status, e.code.as_str()),
+            (StatusCode::NOT_FOUND, "FILE_NOT_FOUND")
+        );
+        let (status, e) = read(&state, query(&dir, None, None), false)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (status, e.code.as_str()),
+            (StatusCode::BAD_REQUEST, "IS_DIRECTORY")
+        );
+
+        let entries = refusals(&state).await;
+        assert_eq!(entries.len(), 3, "{entries:?}");
+        assert!(entries
+            .iter()
+            .all(|e| e.activity_type == ActivityType::FileRead));
+        assert_eq!(
+            entries[0].detail.as_ref().unwrap()["rule"],
+            "a process's environment"
+        );
+        assert_eq!(
+            entries[1].detail.as_ref().unwrap()["code"],
+            "NOT_A_REGULAR_FILE"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_neighbour_table_reads_to_its_end() {
+        let dir = scratch("arp");
+        let state = state_in(&dir);
+        for via_tunnel in [false, true] {
+            let v = read(
+                &state,
+                query(Path::new("/proc/net/arp"), None, None),
+                via_tunnel,
+            )
+            .await
+            .unwrap();
+            let content = v["content"].as_str().unwrap();
+            assert!(content.starts_with("IP address"), "{content}");
+            assert_eq!(v["size"].as_u64().unwrap(), content.len() as u64);
+            assert!(v.get("truncated").is_none());
+            assert_eq!(v["path"], "/proc/net/arp");
+        }
+        let v = read(
+            &state,
+            query(Path::new("/sys/class/net/lo/address"), None, None),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(v["content"], "00:00:00:00:00:00\n");
+        assert_eq!(v["size"], 18);
+        assert!(v.get("truncated").is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn through_the_tunnel_a_read_stays_within_half_its_body() {
+        let dir = scratch("relay");
+        let state = state_in(&dir);
+        let big = dir.join("big.txt");
+        std::fs::write(&big, vec![b'a'; 5 * 1024 * 1024]).unwrap();
+
+        // No range: refused before it is read.
+        let (status, e) = read(&state, query(&big, None, None), true)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (status, e.code.as_str()),
+            (StatusCode::BAD_REQUEST, "FILE_TOO_LARGE")
+        );
+        assert!(e.message.contains("through the relay"), "{}", e.message);
+
+        // A 1 MiB limit reads.
+        let v = read(&state, query(&big, None, Some(1024 * 1024)), true)
+            .await
+            .unwrap();
+        assert_eq!(v["content"].as_str().unwrap().len(), 1024 * 1024);
+        assert_eq!(v["size"], 5 * 1024 * 1024);
+        assert_eq!(v["truncated"], true);
+
+        // A range with no limit is cut at the tunnel's cap.
+        let v = read(&state, query(&big, Some(10), None), true)
+            .await
+            .unwrap();
+        assert_eq!(v["content"].as_str().unwrap().len(), TUNNEL_READ_CAP);
+        assert_eq!(v["truncated"], true);
+
+        // On the LAN port the whole file reads.
+        let v = read(&state, query(&big, None, None), false).await.unwrap();
+        assert_eq!(v["content"].as_str().unwrap().len(), 5 * 1024 * 1024);
+        assert!(v.get("truncated").is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_would_not_fit_the_tunnel_is_too_large_not_a_502() {
+        let dir = scratch("escape");
+        let state = state_in(&dir);
+        // Valid UTF-8 whose every byte JSON writes as six: 1.5 MiB in,
+        // 9 MiB out.
+        let file = dir.join("controls.txt");
+        std::fs::write(&file, vec![1u8; 3 * 512 * 1024]).unwrap();
+        let (status, e) = read(&state, query(&file, None, None), true)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (status, e.code.as_str()),
+            (StatusCode::BAD_REQUEST, "FILE_TOO_LARGE")
+        );
+        // Off the tunnel it reads.
+        assert!(read(&state, query(&file, None, None), false).await.is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn writes_and_listings_keep_their_rules() {
+        let dir = scratch("writes");
+        let state = state_in(&dir);
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let script = data.join("watchdog.sh");
+
+        // A write into the agent's own directory still works.
+        let written = put_file(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(FileWriteRequest {
+                path: script.display().to_string(),
+                content: "#!/bin/sh\n".to_string(),
+                create_dirs: false,
+                mode: Some("0755".to_string()),
+                encoding: None,
+            }),
+        )
+        .await;
+        assert!(written.is_ok());
+        assert_eq!(std::fs::read(&script).unwrap(), b"#!/bin/sh\n");
+
+        // So does a listing; the read of the file it lists does not.
+        let mut q = query(&data, None, None);
+        q.list = true;
+        let v = read(&state, q, false).await.unwrap();
+        assert_eq!(v["entries"][0]["name"], "watchdog.sh");
+        let (status, e) = read(&state, query(&script, None, None), false)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (status, e.code.as_str()),
+            (StatusCode::FORBIDDEN, "PROTECTED_PATH")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    async fn download(state: &AppState, path: &Path) -> Result<Response, (StatusCode, ApiError)> {
+        download_file(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(DownloadQuery {
+                path: path.display().to_string(),
+            }),
+        )
+        .await
+        .map_err(|(status, Json(e))| (status, e))
+    }
+
+    #[tokio::test]
+    async fn raw_sends_exactly_the_size_its_stat_gave() {
+        let dir = scratch("raw");
+        let state = state_in(&dir);
+        let log = dir.join("growing.log");
+        std::fs::write(&log, vec![b'x'; 100_000]).unwrap();
+
+        let resp = download(&state, &log).await.unwrap();
+        assert_eq!(resp.headers()["content-length"], "100000");
+        // The file grows while the body is still to be sent.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        std::io::Write::write_all(&mut f, &vec![b'y'; 50_000]).unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), 100_000);
+        assert!(body.iter().all(|b| *b == b'x'));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_moves_no_pseudo_file_and_no_device() {
+        let dir = scratch("raw-refused");
+        let state = state_in(&dir);
+        let (status, e) = download(&state, Path::new("/proc/net/arp"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (status, e.code.as_str()),
+            (StatusCode::BAD_REQUEST, "NOT_A_REGULAR_FILE")
+        );
+        assert!(e.message.contains("procfs"), "{}", e.message);
+        let (status, e) = download(&state, Path::new("/dev/zero")).await.unwrap_err();
+        assert_eq!(
+            (status, e.code.as_str()),
+            (StatusCode::BAD_REQUEST, "NOT_A_REGULAR_FILE")
+        );
+        let (status, e) = download(&state, Path::new("/proc/self/environ"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (status, e.code.as_str()),
+            (StatusCode::FORBIDDEN, "PROTECTED_PATH")
+        );
+        let (status, e) = download(&state, &dir).await.unwrap_err();
+        assert_eq!(
+            (status, e.code.as_str()),
+            (StatusCode::BAD_REQUEST, "IS_DIRECTORY")
+        );
+        assert_eq!(refusals(&state).await.len(), 3);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

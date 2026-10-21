@@ -74,7 +74,7 @@ HTTP server and resource limits (`ServerConfig`).
 | `exec_timeout_ms` | `30000` | Default timeout for `POST /api/exec`, milliseconds. |
 | `include_interface_addresses_in_info` | `true` | Whether `/api/info` enumerates interface IP addresses on demand. Set `false` to keep interface names/state/MAC but skip request-path address discovery on fragile network stacks. |
 | `max_batch_size` | `20` | Maximum commands per `POST /api/exec/batch`. |
-| `max_file_size` | `52428800` (50 MB) | Maximum file size in bytes for `/api/files` read/write. |
+| `max_file_size` | `52428800` (50 MB) | Maximum file size in bytes for `/api/files` read/write. It also ends the read of a procfs or sysfs file, which reports no size (`truncated: true` when it stops one). Through the relay a read returns at most 4 MiB whatever this says. |
 | `session_buffer_size` | `1000` | Maximum output entries kept per session ring buffer. |
 | `data_dir` | `"/var/lib/sctl"` | Directory for persistent data — journals, safe-mode flag, panic markers, relay connection history. Env: `SCTL_DATA_DIR`. |
 | `state_dir` | `""` (= `data_dir`) | Directory for the few small files that must survive a reboot even where `data_dir` is tmpfs: `infra-monitor.json`, `infra-secrets.json`, `tls_pins.json`. Created `0700`. RAM-booted device profiles set it to `/etc/sctl/state`. Env: `SCTL_STATE_DIR`. |
@@ -99,7 +99,7 @@ Authentication (`AuthConfig`).
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `api_key` | `"change-me"` | Pre-shared Bearer token for every authenticated route. The default triggers a startup warning. Env: `SCTL_API_KEY` (preferred over storing the key in the file). |
+| `api_key` | `"change-me"` | Pre-shared Bearer token for every authenticated route. The default triggers a startup warning. Env: `SCTL_API_KEY`, which replaces the file's key. A service keeps the key in the file: the agent's file reads refuse it there (ADR-011), while its environment passes to every command it runs. |
 
 ## `[shell]`
 

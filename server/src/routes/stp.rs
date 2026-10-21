@@ -147,9 +147,14 @@ pub async fn abort_transfer(
 fn transfer_error_to_http(e: TransferError) -> (StatusCode, Json<ApiError>) {
     let status = match e.code.as_str() {
         "FILE_NOT_FOUND" | "TRANSFER_NOT_FOUND" => StatusCode::NOT_FOUND,
-        "PERMISSION_DENIED" => StatusCode::FORBIDDEN,
-        "FILE_TOO_LARGE" | "INVALID_PATH" | "INVALID_REQUEST" | "HASH_MISMATCH"
-        | "CHUNK_INTEGRITY" | "FILE_CHANGED" => StatusCode::BAD_REQUEST,
+        codes::PERMISSION_DENIED | codes::PROTECTED_PATH => StatusCode::FORBIDDEN,
+        "FILE_TOO_LARGE"
+        | "INVALID_PATH"
+        | "INVALID_REQUEST"
+        | "HASH_MISMATCH"
+        | "CHUNK_INTEGRITY"
+        | "FILE_CHANGED"
+        | codes::NOT_A_REGULAR_FILE => StatusCode::BAD_REQUEST,
         "DISK_FULL" => StatusCode::INSUFFICIENT_STORAGE,
         "MAX_TRANSFERS" => StatusCode::TOO_MANY_REQUESTS,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -160,4 +165,31 @@ fn transfer_error_to_http(e: TransferError) -> (StatusCode, Json<ApiError>) {
             "recoverable": e.recoverable,
         }))
         .into_response_with(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status_of(code: &str) -> StatusCode {
+        transfer_error_to_http(TransferError {
+            transfer_id: String::new(),
+            code: code.to_string(),
+            message: String::new(),
+            recoverable: false,
+        })
+        .0
+    }
+
+    #[test]
+    fn the_gates_refusals_map_to_403_and_400() {
+        assert_eq!(status_of("PROTECTED_PATH"), StatusCode::FORBIDDEN);
+        assert_eq!(status_of("NOT_A_REGULAR_FILE"), StatusCode::BAD_REQUEST);
+        assert_eq!(status_of("FILE_CHANGED"), StatusCode::BAD_REQUEST);
+        assert_eq!(status_of("MAX_TRANSFERS"), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            status_of("SOMETHING_NEW"),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 }

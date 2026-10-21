@@ -104,13 +104,17 @@ After=network.target
 
 [Service]
 ExecStart=/usr/local/bin/sctl serve --config /etc/sctl/sctl.toml
-Environment=SCTL_API_KEY=your-secret-key
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+Keep the key in the config file (`[auth] api_key`), not in an
+`Environment=` line. The agent's file reads refuse its config and its
+directories (ADR-011), while a unit's environment is shown by
+`systemctl show` and passed to every command the agent runs.
 
 ### Cross-Compilation
 

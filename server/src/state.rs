@@ -16,6 +16,7 @@ use crate::activity::{ActivityLog, ExecResultsCache};
 use crate::atomic::AtomicU64;
 use crate::comms::{CommsClient, CommsState};
 use crate::config::Config;
+use crate::file_access::Gate;
 use crate::gawdxfer::manager::TransferManager;
 use crate::infra::InfraState;
 use crate::netwatch::owner::RelayRoute;
@@ -83,6 +84,63 @@ pub struct AppState {
     pub install_error: Option<String>,
     /// The config file the server was started with, for the rollback set.
     pub config_path: Option<String>,
+    /// The one gate before a file's content is read (ADR-011): the file
+    /// routes and `transfer_manager` share it.
+    pub file_gate: Arc<Gate>,
+}
+
+#[cfg(test)]
+impl AppState {
+    /// A state for route tests: `config` and `file_gate` as given, nothing
+    /// running, no tunnel, no infra, no install.
+    pub(crate) fn for_tests(config: Config, file_gate: Arc<Gate>) -> Self {
+        use crate::gawdxfer::types::TransferConfig;
+        let (session_events, _) = broadcast::channel(256);
+        let activity_log = Arc::new(ActivityLog::new(200, session_events.clone()));
+        let transfer_manager = Arc::new(TransferManager::new(
+            TransferConfig::new(
+                config.server.max_concurrent_transfers,
+                config.server.transfer_chunk_size,
+                config.server.transfer_max_file_size,
+                config.server.transfer_stale_timeout_secs,
+            ),
+            session_events.clone(),
+            activity_log.clone(),
+            file_gate.clone(),
+        ));
+        let upgrade = Arc::new(crate::upgrade::state::Handle::open(
+            config.server.state_dir(),
+        ));
+        Self {
+            session_manager: SessionManager::new(
+                config.server.max_sessions,
+                config.server.session_buffer_size,
+            ),
+            config: Arc::new(config),
+            start_time: Instant::now(),
+            session_events,
+            activity_log,
+            exec_results_cache: Arc::new(ExecResultsCache::new(16)),
+            tunnel_stats: Arc::new(TunnelStats::new()),
+            transfer_manager,
+            sse_connections: Arc::new(AtomicU32::new(0)),
+            comms_client: None,
+            comms_state: None,
+            comms_poll_notify: None,
+            relay_history: None,
+            device_snapshots: None,
+            relay_state: None,
+            infra_state: None,
+            api_router: Arc::new(std::sync::OnceLock::new()),
+            netwatch: None,
+            relay_route: None,
+            upgrade,
+            install: None,
+            install_error: None,
+            config_path: None,
+            file_gate,
+        }
+    }
 }
 
 /// Tunnel connection event types.

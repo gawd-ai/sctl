@@ -77,6 +77,13 @@ pub mod codes {
     pub const FILE_TOO_LARGE: &str = "FILE_TOO_LARGE";
     pub const IS_DIRECTORY: &str = "IS_DIRECTORY";
     pub const NOT_A_DIRECTORY: &str = "NOT_A_DIRECTORY";
+    /// A file read the agent refuses (ADR-011): its own keys, a process's
+    /// secrets, a kernel stream, a procfs or sysfs file off its list, or a
+    /// debugfs or tracefs file. The message names the rule.
+    pub const PROTECTED_PATH: &str = "PROTECTED_PATH";
+    /// A FIFO, a socket or a device, never opened; or a procfs or sysfs
+    /// file where only a regular file moves (`files/raw`, a transfer).
+    pub const NOT_A_REGULAR_FILE: &str = "NOT_A_REGULAR_FILE";
     pub const NOT_FOUND: &str = "NOT_FOUND";
     pub const PERMISSION_DENIED: &str = "PERMISSION_DENIED";
     pub const IO_ERROR: &str = "IO_ERROR";

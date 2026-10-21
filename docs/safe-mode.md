@@ -77,7 +77,10 @@ The flag tells you the loop happened; the why is on the device:
 
 - `<data_dir>/last_panic.log` — the panic hook persists the last panic with
   timestamp, thread, and (because the supervisor runs the child with
-  `RUST_BACKTRACE=full`) a full backtrace.
+  `RUST_BACKTRACE=full`) a full backtrace. Where `data_dir` is also
+  `state_dir` (the XE300, the BPIs, the relay), the file read routes refuse
+  it with the rest of the agent's state (ADR-011): read it through exec,
+  `POST /api/exec` with `cat <data_dir>/last_panic.log`.
 - The system log / logread around the crash timestamps.
 - `flag.reason` — the exit description the supervisor recorded.
 

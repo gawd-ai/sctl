@@ -3,7 +3,7 @@
 //! All functions stream data in 64 KiB blocks — never loads a full file into memory.
 
 use sha2::{Digest, Sha256};
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
 use tokio::io::AsyncReadExt;
 
@@ -20,6 +20,33 @@ pub async fn hash_file(path: &Path) -> io::Result<String> {
             break;
         }
         hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Compute SHA-256 of exactly `size` bytes of `reader`, from where it
+/// stands, in 64 KiB blocks. A download hashes the size its stat gave: a
+/// file that grows is hashed to that size, and one that ends first is an
+/// error, never a hash its chunks cannot match. Blocking.
+pub fn hash_exact(reader: &mut impl Read, size: u64) -> io::Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; BUF_SIZE];
+    let mut left = size;
+    while left > 0 {
+        let want = left.min(BUF_SIZE as u64) as usize;
+        let n = match reader.read(&mut buf[..want]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("the file ended {left} bytes before its size"),
+                ));
+            }
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        hasher.update(&buf[..n]);
+        left -= n as u64;
     }
     Ok(hex::encode(hasher.finalize()))
 }
@@ -42,5 +69,25 @@ mod hex {
                 s
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash_exact_reads_the_size_given_and_no_more() {
+        let data = vec![7u8; 200_000];
+        let hash = hash_exact(&mut &data[..], 150_000).unwrap();
+        assert_eq!(hash, hash_bytes(&data[..150_000]));
+        assert_eq!(hash_exact(&mut &data[..], 0).unwrap(), hash_bytes(b""));
+    }
+
+    #[test]
+    fn hash_exact_refuses_a_source_that_ends_first() {
+        let data = vec![7u8; 1000];
+        let e = hash_exact(&mut &data[..], 1001).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

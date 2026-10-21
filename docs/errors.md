@@ -100,6 +100,8 @@ one status depending on the route.
 | `FILE_TOO_LARGE` | 400 / 413 | Exceeds `max_file_size` (or the 1 MB playbook cap) |
 | `IS_DIRECTORY` | 400 | Path is a directory where a file was expected |
 | `NOT_A_DIRECTORY` | 400 | Upload target is not a directory |
+| `PROTECTED_PATH` | 403 | A file read the agent refuses (ADR-011): its own keys and their copies, a process's secrets (`/proc/<pid>/environ` and the like), a kernel stream, a procfs or sysfs file off its list, a debugfs or tracefs file. The message names the rule, never the content. Not worth a retry |
+| `NOT_A_REGULAR_FILE` | 400 | A FIFO, a socket or a device, refused before it is opened; on `GET /api/files/raw` and in a transfer, also a procfs or sysfs file (the message names its filesystem; `GET /api/files` reads it). Not worth a retry |
 | `NOT_FOUND` | 404 | Resource absent — activity result evicted, playbook missing, subsystem not present |
 | `PERMISSION_DENIED` | 403 | OS permission error |
 | `IO_ERROR` | 500 | Other I/O failure |
@@ -146,13 +148,16 @@ STP (gawdxfer) errors reuse the unified shape and always put
 | `TRANSFER_NOT_FOUND` | 404 | No such transfer (expired, completed, or never existed) |
 | `HASH_MISMATCH` | 400 | Whole-file hash check failed at finalize |
 | `CHUNK_INTEGRITY` | 400 | A chunk's hash did not match its header |
-| `FILE_CHANGED` | 400 | Source file changed under an active transfer |
+| `FILE_CHANGED` | 400 | Source file changed under an active transfer: a chunk is read only from the file the init hashed (the same device and inode, still a regular file, its mtime unchanged) |
 | `DISK_FULL` | 507 | Not enough space to stage the transfer |
-| `MAX_TRANSFERS` | 429 | `max_concurrent_transfers` reached |
+| `MAX_TRANSFERS` | 429 | `max_concurrent_transfers` reached; a download takes its place before it hashes |
+| `PROTECTED_PATH` | 403 | The read gate refused the download's file (see the device catalog) |
+| `NOT_A_REGULAR_FILE` | 400 | The download's file is a FIFO, a socket, a device, or a procfs or sysfs file |
 
 `FILE_NOT_FOUND` (404), `PERMISSION_DENIED` (403), `FILE_TOO_LARGE` /
 `INVALID_PATH` / `INVALID_REQUEST` (400) also appear with the same meanings
-as the device catalog.
+as the device catalog. The tunnel's own transfer frames (`gx.download.init`)
+answer `PROTECTED_PATH` with 403 and `NOT_A_REGULAR_FILE` with 400 too.
 
 ## Relay-only codes
 

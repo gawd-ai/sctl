@@ -320,6 +320,42 @@ All paths must be absolute, without `..` components or NUL bytes
 (`400` `INVALID_PATH` otherwise). Reads/writes are capped at
 `server.max_file_size` (default 50 MB) except `GET /api/files/raw`.
 
+**The read gate** (ADR-011). `GET /api/files`, `GET /api/files/raw` and
+`POST /api/stp/download` judge a file before they open it, and only then
+open it, through the handle they judged:
+
+- `403` `PROTECTED_PATH`: the agent's own keys and the copies the install,
+  the upgrade and the WE826's move leave (`/etc/sctl`; `state_dir`;
+  `data_dir` when it is also `state_dir`, else `<data_dir>/sessions`; the
+  rollback directory `install.json` names; the config file the agent was
+  started with; any file whose name begins with that file's name,
+  `sctl.toml`, `infra-secrets.json` or `infra-monitor.json`); a process's
+  secrets (`/proc/<pid>/environ`, `mem`, `cwd`, `fd`, `map_files`, also
+  under `task/<tid>`); `/proc/kcore`, `/proc/kmsg`, `/proc/sysrq-trigger`;
+  any procfs or sysfs file not on the agent's list; any debugfs or tracefs
+  file. Every rule is matched on the path as given, then on the real path
+  the links lead to; a directory or process rule matches its components
+  anywhere in the path, so `/overlay/upper/etc/sctl/...` and
+  `/proc/1/root/proc/self/environ` are refused too, and a name rule matches
+  the file's name. The message names the rule, never the content.
+- `400` `NOT_A_REGULAR_FILE`: a FIFO, a socket, a character or block
+  device, never opened; on `files/raw` and in a transfer, also a listed
+  procfs or sysfs file (the message names its filesystem).
+- A file with no link left (deleted, or a memory file a process holds) is
+  `404` `FILE_NOT_FOUND`.
+
+The procfs and sysfs files a read returns, matched on the path as given:
+`/proc/net/arp`, `/proc/net/route`, `/proc/net/dev`, `/proc/net/tcp`,
+`/proc/net/tcp6`, `/proc/meminfo`, `/proc/loadavg`, `/proc/uptime`,
+`/proc/cpuinfo`, `/proc/version`, `/proc/mounts`,
+`/proc/sys/kernel/hostname`, `/sys/class/net/<if>/address` and
+`/sys/class/net/<if>/operstate`. Each refusal is one `file_read` entry in
+`GET /api/activity` whose summary says the read was refused and whose
+`detail.rule` names the rule. Writes, deletes and listings are not gated.
+The gate keeps routine reads away from secrets and keeps a read from harming
+the unit; it is not an authorization boundary (`POST /api/exec` reads what
+it refuses, recorded as exec).
+
 ### `GET /api/files`
 
 Read a file, or list a directory. **Auth: API key Bearer.**
@@ -338,14 +374,28 @@ truncated?}` — `content` is UTF-8 text, or base64 with
 `"encoding": "base64"` for binary; `truncated: true` when the file extends
 beyond the returned bytes; `size` is the total file size. Without
 `offset`/`limit`, files over `max_file_size` are rejected instead of
-truncated.
+truncated. `path` is the path as given.
+
+A regular file is read until the size its stat gave (from `offset`, within
+the cap) or its end. A listed procfs or sysfs file reports no size, so it is
+read until it ends or the cap stops it: `size` is then the bytes to where
+the read stopped, and `truncated: true` says the cap stopped it. The cap is
+`max_file_size`, or `limit` below it.
+
+Through the relay (`/d/{serial}/api/files`, and the legacy
+`tunnel.file.read`) the cap is at most 4 MiB, half the tunnel's 8 MiB body,
+so the answer fits even as base64. A larger file with no range is `400`
+`FILE_TOO_LARGE` before it is read; ask for it by range. An answer that
+would still not fit (text that JSON escapes heavily) is `FILE_TOO_LARGE`
+too, never the tunnel's `502`.
 
 Response `200` (directory): `{path, entries: [{name, type, size, mode?,
 modified?, symlink_target?}]}` sorted by name; `type` is one of `file`,
 `dir`, `symlink`, `other`.
 
-Errors: `400` `INVALID_PATH` / `IS_DIRECTORY` / `FILE_TOO_LARGE`, `403`
-`PERMISSION_DENIED`, `404` `FILE_NOT_FOUND`, `500` `IO_ERROR`.
+Errors: `400` `INVALID_PATH` / `IS_DIRECTORY` / `FILE_TOO_LARGE` /
+`NOT_A_REGULAR_FILE`, `403` `PROTECTED_PATH` / `PERMISSION_DENIED`, `404`
+`FILE_NOT_FOUND`, `500` `IO_ERROR`.
 
 ### `PUT /api/files`
 
@@ -390,8 +440,14 @@ Response `200`: `application/octet-stream` body with
 `Content-Disposition: attachment` (RFC 6266/5987-safe filename) and
 `Content-Length`.
 
-Errors: `400` `INVALID_PATH` / `IS_DIRECTORY`, `403` `PERMISSION_DENIED`,
-`404` `FILE_NOT_FOUND`, `500` `IO_ERROR`.
+Only a regular file on a filesystem that reports its size moves, so not a
+procfs or sysfs file (`GET /api/files` reads those). The body is exactly the
+size its stat gave, with that `Content-Length`: a log that grows during the
+download is cut where its size was read.
+
+Errors: `400` `INVALID_PATH` / `IS_DIRECTORY` / `NOT_A_REGULAR_FILE`, `403`
+`PROTECTED_PATH` / `PERMISSION_DENIED`, `404` `FILE_NOT_FOUND`, `500`
+`IO_ERROR`.
 
 ### `POST /api/files/upload`
 
@@ -429,6 +485,13 @@ when omitted).
 Response `200`: `{transfer_id, file_size, file_hash, chunk_size,
 total_chunks, filename}`.
 
+The file passes the read gate first (see [Files](#files)): `403`
+`PROTECTED_PATH`, and `400` `NOT_A_REGULAR_FILE` for a FIFO, a socket, a
+device or a procfs or sysfs file. The download then takes its place under
+`max_concurrent_transfers` before it hashes the file (`429`
+`MAX_TRANSFERS` past it), so at most that many hashes run, and the hash
+reads exactly the size the stat gave. An empty file is one empty chunk.
+
 ### `POST /api/stp/upload`
 
 Initialize a chunked upload (client → device). **Auth: API key Bearer.**
@@ -446,6 +509,10 @@ Serve one download chunk. **Auth: API key Bearer.**
 Response `200`: binary chunk body (`application/octet-stream`) with headers
 `X-Gx-Chunk-Hash` (SHA-256 of the chunk), `X-Gx-Chunk-Index`,
 `X-Gx-Transfer-Id`, `Content-Length`.
+
+A chunk is read only from the file the init hashed: the same device and
+inode, still a regular file, its mtime unchanged. Anything else at the path
+is `400` `FILE_CHANGED`, and is never opened.
 
 ### `POST /api/stp/chunk/{xfer}/{idx}`
 
@@ -1047,7 +1114,9 @@ same path prefixed with `/d/{serial}` — e.g. `POST /d/{serial}/api/exec`,
   `http.request` frame over the device's tunnel; the device dispatches it
   into its own router, so behavior, parameters, and error bodies are the
   device route's own. New device endpoints are reachable the moment the
-  device ships them — no relay change needed.
+  device ships them, with no relay change. The device marks the requests
+  it dispatches this way, and `GET /api/files` returns at most 4 MiB to
+  them (see [Files](#files)).
 - **Streaming endpoints are excluded**: `/api/events` and `/api/ws` cannot
   ride a request/response frame; the passthrough refuses them with `404`
   `ROUTE_NOT_PROXIED`. Interactive streaming goes through the named

@@ -149,8 +149,9 @@ pub enum ApiProfile {
 
 /// A username and password a `http_api` check logs in with.
 ///
-/// Lives in `<data_dir>/infra-secrets.json` (mode 0600), never in the
-/// monitoring config and never in any response.
+/// Lives in `<state_dir>/infra-secrets.json` (mode 0600), never in the
+/// monitoring config and never in any response. The file read routes
+/// refuse it, its directory and any copy by its name (ADR-011).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Credential {
     pub username: String,

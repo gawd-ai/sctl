@@ -43,7 +43,7 @@ use sctl::{
     auth::ApiKey,
     comms,
     config::{Config, RelayRouteMode},
-    infra, lte_watchdog, netwatch, routes, sessions,
+    file_access, infra, lte_watchdog, netwatch, routes, sessions,
     sessions::SessionManager,
     state::{AppState, TunnelStats},
     tunnel, ws, ExecResultsCache,
@@ -719,6 +719,32 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
 
     let exec_results_cache = Arc::new(ExecResultsCache::new(config.server.exec_result_cache_size));
 
+    // How this box is installed: the file gate needs its rollback set.
+    let (install, install_error) = load_install_info();
+    if let Some(e) = &install_error {
+        warn!("upgrade: {e}; this device cannot upgrade itself until install.json is fixed");
+    }
+    match &install {
+        Some(i) => info!(
+            layout = i.layout.as_str(),
+            target = sctl::upgrade::TARGET,
+            "Install layout"
+        ),
+        None if install_error.is_none() => info!(
+            "No {}: installed before 0.6.7, upgrades by hand only",
+            install_json_path().display()
+        ),
+        None => {}
+    }
+
+    // The one gate before a file's content is read (ADR-011), for the file
+    // routes and every transfer.
+    let file_gate = Arc::new(file_access::Gate::for_agent(
+        &config,
+        config_path,
+        install.as_ref(),
+    ));
+
     let transfer_config = TransferConfig::new(
         config.server.max_concurrent_transfers,
         config.server.transfer_chunk_size,
@@ -729,6 +755,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         transfer_config,
         session_events.clone(),
         activity_log.clone(),
+        file_gate.clone(),
     ));
 
     if let Some(gc) = config.gps.as_ref() {
@@ -787,23 +814,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
             ))
         });
 
-    // How this box is installed, and where its last upgrade stands.
-    let (install, install_error) = load_install_info();
-    if let Some(e) = &install_error {
-        warn!("upgrade: {e}; this device cannot upgrade itself until install.json is fixed");
-    }
-    match &install {
-        Some(i) => info!(
-            layout = i.layout.as_str(),
-            target = sctl::upgrade::TARGET,
-            "Install layout"
-        ),
-        None if install_error.is_none() => info!(
-            "No {}: installed before 0.6.7, upgrades by hand only",
-            install_json_path().display()
-        ),
-        None => {}
-    }
+    // Where its last upgrade stands.
     let upgrade = Arc::new(sctl::upgrade::state::Handle::open(
         config.server.state_dir(),
     ));
@@ -839,6 +850,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         install: install.map(Arc::new),
         install_error,
         config_path: config_path.map(ToString::to_string),
+        file_gate,
     };
 
     // Build router

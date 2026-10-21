@@ -2383,15 +2383,22 @@ async fn handle_tunnel_http_request(
     send_response_async(ws_sink, out).await;
 }
 
+/// Response bodies ride a single tunnel text frame; cap them well below
+/// anything that could wedge the WS writer.
+pub const MAX_TUNNEL_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// The tunnel's mark on every request it dispatches into the device's own
+/// router: a route that builds a large answer reads it to keep the answer
+/// within [`MAX_TUNNEL_BODY_BYTES`] (ADR-011). A request extension, so no
+/// caller can set it or take it off.
+#[derive(Clone, Copy, Debug)]
+pub struct ViaTunnel;
+
 /// The dispatch core of [`handle_tunnel_http_request`]; errors become
 /// `(status, message)` pairs the relay surfaces as catalog-shaped JSON.
 async fn run_tunnel_http_request(state: &AppState, msg: &Value) -> Result<Value, (u16, String)> {
     use base64::Engine as _;
     use tower::ServiceExt as _;
-
-    /// Response bodies ride a single tunnel text frame; cap them well below
-    /// anything that could wedge the WS writer.
-    const MAX_TUNNEL_BODY_BYTES: usize = 8 * 1024 * 1024;
 
     let path = msg["path"].as_str().unwrap_or_default();
     if !path.starts_with("/api/") {
@@ -2427,6 +2434,7 @@ async fn run_tunnel_http_request(state: &AppState, msg: &Value) -> Result<Value,
     let mut req = axum::http::Request::new(axum::body::Body::from(body));
     *req.method_mut() = method;
     *req.uri_mut() = uri;
+    req.extensions_mut().insert(ViaTunnel);
     if let Some(headers) = msg["headers"].as_object() {
         for (k, v) in headers {
             if let (Ok(name), Some(Ok(value))) = (
@@ -2548,6 +2556,7 @@ async fn handle_tunnel_file_read(
 
     match crate::routes::files::get_file(
         axum::extract::State(state.clone()),
+        Some(axum::Extension(ViaTunnel)),
         tunnel_headers(msg),
         axum::extract::Query(query),
     )
@@ -3196,9 +3205,10 @@ fn gx_error_response(
 ) -> Value {
     let status = match e.code.as_str() {
         "FILE_NOT_FOUND" | "TRANSFER_NOT_FOUND" => 404,
-        "PERMISSION_DENIED" => 403,
+        "PERMISSION_DENIED" | "PROTECTED_PATH" => 403,
         "DISK_FULL" => 507,
         "MAX_TRANSFERS" => 429,
+        // Every other code, NOT_A_REGULAR_FILE among them.
         _ => 400,
     };
     json!({
@@ -5199,5 +5209,119 @@ mod rehome_tests {
         .await;
         assert!(woke);
         assert!(started.elapsed() < EARLY_DIAL_FLOOR);
+    }
+}
+
+#[cfg(test)]
+mod file_read_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use axum::routing::get;
+    use base64::Engine as _;
+    use serde_json::{json, Value};
+    use tower::ServiceExt as _;
+
+    use super::{gx_error_response, run_tunnel_http_request};
+    use crate::config::Config;
+    use crate::file_access::Gate;
+    use crate::gawdxfer::types::TransferError;
+    use crate::state::AppState;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sctl-tunnel-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A state whose router serves `GET /api/files`, as the device's does.
+    fn state_with_router(dir: &Path) -> (AppState, axum::Router) {
+        let mut config: Config = toml::from_str("").unwrap();
+        config.server.data_dir = dir.join("data").display().to_string();
+        let gate = Arc::new(Gate::for_agent(&config, None, None));
+        let state = AppState::for_tests(config, gate);
+        let router = axum::Router::new()
+            .route("/api/files", get(crate::routes::files::get_file))
+            .with_state(state.clone());
+        state.api_router.set(router.clone()).unwrap();
+        (state, router)
+    }
+
+    /// Dispatch as the relay's `http.request` frame does; the status and
+    /// the decoded JSON body.
+    async fn through_tunnel(state: &AppState, path: &str) -> (u64, Value) {
+        let out = run_tunnel_http_request(state, &json!({"method": "GET", "path": path}))
+            .await
+            .unwrap();
+        let body = base64::engine::general_purpose::STANDARD
+            .decode(out["body_b64"].as_str().unwrap())
+            .unwrap();
+        (
+            out["status"].as_u64().unwrap(),
+            serde_json::from_slice(&body).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_tunnel_marks_what_it_dispatches_and_a_read_stays_within_its_body() {
+        let dir = scratch("mark");
+        let (state, router) = state_with_router(&dir);
+        let big = dir.join("big.txt");
+        std::fs::write(&big, vec![b'a'; 5 * 1024 * 1024]).unwrap();
+        let uri = format!("/api/files?path={}", big.display());
+
+        let (status, body) = through_tunnel(&state, &uri).await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], "FILE_TOO_LARGE");
+
+        let (status, body) = through_tunnel(&state, &format!("{uri}&limit=1048576")).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["content"].as_str().unwrap().len(), 1024 * 1024);
+        assert_eq!(body["truncated"], true);
+
+        // The LAN port: the same router, no mark, the whole file.
+        let resp = router
+            .oneshot(
+                axum::http::Request::get(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["content"].as_str().unwrap().len(), 5 * 1024 * 1024);
+
+        // The neighbour table reads through the tunnel.
+        let (status, body) = through_tunnel(&state, "/api/files?path=/proc/net/arp").await;
+        assert_eq!(status, 200);
+        assert!(body["content"].as_str().unwrap().starts_with("IP address"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_tunnels_transfer_status_map_knows_the_gates_codes() {
+        let status = |code: &str| {
+            gx_error_response(
+                "gx.download.init.result",
+                Some("r1"),
+                &TransferError {
+                    transfer_id: String::new(),
+                    code: code.to_string(),
+                    message: "m".to_string(),
+                    recoverable: false,
+                },
+            )["status"]
+                .as_u64()
+                .unwrap()
+        };
+        assert_eq!(status("PROTECTED_PATH"), 403);
+        assert_eq!(status("NOT_A_REGULAR_FILE"), 400);
+        assert_eq!(status("PERMISSION_DENIED"), 403);
+        assert_eq!(status("MAX_TRANSFERS"), 429);
     }
 }

@@ -10,6 +10,7 @@
 //! - `ws` — WebSocket protocol handling
 //! - `shell` — process spawning and PTY management
 //! - `gawdxfer` — chunked file transfer
+//! - `file_access`: the one gate before a file's content is read
 
 /// Full version: `<cargo-version>.<git-commit-count>`. Bumps on every commit
 /// so a fresh binary is never mistaken for an older one.
@@ -22,6 +23,7 @@ pub mod auth;
 pub mod comms;
 pub mod config;
 pub mod error;
+pub mod file_access;
 pub mod gawdxfer;
 pub mod infra;
 pub mod lte_watchdog;
