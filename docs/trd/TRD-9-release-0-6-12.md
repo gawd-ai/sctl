@@ -388,7 +388,7 @@ Staff then read these with exec, not through the file routes: where `data_dir` i
 ## 7. Slices and status
 
 1. File reads (3.1): Implemented (2026-10-21, `0c0d520`, with the review's fixes in `57c298c`, `6634dfe` and `8dc749b`; 39 new tests, 404 in the library, the workspace, clippy and fmt green on 1.97.1 as CI runs them). Its acceptance on hardware (through a relay, 40 FIFO reads with relayed REST answering, each install layout's directories and `PUT /api/files` to `/etc/sctl/watchdog.sh` on the bench agent, the WE826's kernel, then each other unit kernel) runs with section 6.
-2. The proof (3.2): Planned.
+2. The proof (3.2): Implemented (2026-10-22, `14e0ddf`; 25 new tests, 429 in the library, the workspace, clippy and fmt green on 1.97.1 as CI runs them). Since a push that changes nothing moves no `seq`, it derives `PartialEq` on the config types ahead of 3.3; the rest of 3.3's identical push (the monitor kept, `unchanged`, `started`, version 0 refused) stays with slice 3. Its acceptance on hardware (`rounds` up by at least 5 over two polls 30 s apart, also while one check takes 60 s; a status change in the next `infra.state` within a second; the stall hook with `/api/info` answering) runs with section 6.
 3. The monitor (3.3): Planned.
 4. Net tools and `net_tools_netns` (3.4): Planned.
 5. Discovery (3.5): Planned.
