@@ -153,7 +153,7 @@ Query parameters:
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `groups` | string (CSV) | all | Any of `core`, `interfaces`, `disk`, `tunnel`, `gps`, `lte`, or `all`. Unknown names are ignored. |
+| `groups` | string (CSV) | all | Any of `core`, `interfaces`, `disk`, `tunnel`, `gps`, `lte`, `infra`, or `all`. Unknown names are ignored. |
 
 Response `200` — an object containing only the requested groups:
 
@@ -174,6 +174,56 @@ Response `200` — an object containing only the requested groups:
   (absent when GPS is not configured).
 - `lte` — the provider's signal object plus `modem` identity and
   `detected_path` (absent when LTE is not configured).
+- `infra`: the proof that the Infra monitor is checking (ADR-010), so a
+  unit that pushes [`infra.state`](#infrastate-the-devices-infra-results)
+  only on a change can stay quiet while its targets hold steady. Every
+  agent from 0.6.12 answers it, a unit that holds no config included; an
+  agent before 0.6.12 has no `infra` group, and its silence proves
+  nothing. It is read from a cell of its own, never under the Infra lock,
+  so a lock held for good shows as `rounds` standing still, never as a slow
+  answer. It is not in `GET /api/health`, which answers without the key. A
+  steady unit's group is about 60 bytes:
+
+  ```json
+  "infra": {"rounds": 17280, "seq": 42, "hash": "3f9a0c1d2e4b5a69"}
+  ```
+
+  - `rounds`: monitor rounds since the agent started. A round is counted at
+    the end of a tick (every 5 s), and only while every running check is
+    within 90 s plus one tick of taking its permit, so a monitor that is
+    gone, blocked, stuck on a check or panicking in its tick moves no
+    `rounds`. It never goes back while the agent runs. The same `rounds` at
+    two polls, with no `off`: the monitor completed no round between them.
+  - `seq`: 1 when the agent starts, +1 at every change it pushes: a
+    target's status, a config applied or removed, a recovery run logged. A
+    push or a removal that changes nothing is not a change.
+  - `hash`: the first 16 hex characters, lowercase, of the SHA-256 of this
+    text: the agent's `boot` in decimal, a newline, the config version in
+    decimal (0 for none), a newline, then per target in byte order of its
+    id: the id, a space, its status (`unknown`, `up`, `degraded` or
+    `down`), a newline. While the agent runs it changes only when `seq`
+    moves, and it can return to an earlier value. A release that hashes
+    other text names the field anew. Test vector: the 61 bytes
+    `1790000000000\n7\nSwitch down\napi-1 up\nt10 degraded\nt9 unknown\n`
+    (each `\n` one newline) hash to `42189b104bcb1637`, and
+    `1790000000000\n0\n`, a unit that holds nothing, to `c2ccc438d385f035`.
+  - `off`: present only when no monitor is expected: `safe_mode` in an
+    agent that started in safe mode, whatever the flag file says now, else
+    `no_config` when the unit holds none. When it is absent a monitor is
+    expected, and `rounds` moves every 5 s.
+
+  `infra.state` and [`GET /api/infra/results`](#get-apiinfraresults) carry
+  `boot`, `seq`, `hash` and `recoveries`, so a copy kept from either hashes
+  by the same text. A change is pushed within about a second: a `hash` that
+  differs from the copy's, or the same `hash` with a higher `seq`, that
+  outlasts that second means the copy missed a report, and one pull of the
+  results settles it. A matching `hash` also proves the copy's config
+  version. A new `boot` in a report means the agent restarted: `rounds`
+  and `seq` began again.
+
+  For tests and benches, `SCTL_INFRA_TEST_STALL_SECS=<n>` in the agent's
+  environment stops the monitor loop n seconds after it starts, with a
+  warning in the log, so `rounds` stands still while the agent answers.
 
 Errors: none in practice (missing subsystems simply omit their group).
 
@@ -835,17 +885,26 @@ Errors: `404` `INFRA_UNAVAILABLE`.
 
 Latest monitoring results. **Auth: API key Bearer.**
 
-Response `200`: `{ts, config_version, targets: {target_id: result...},
-recovery_log: [...]}`. Each result carries `status`, `latency_ms`, `since`,
-`consecutive_ok`, `consecutive_fail`, `last_check`, `detail`, `name`, and,
-for `http_api` targets, `http_status` and `data` (the profile's structured
-snapshot; after a failed check the last good snapshot stays, with the
-status and counters saying it is old). When the subsystem is unavailable
-or holds no config this returns an empty result set (`config_version: 0`),
-not an error. The same per-target fields minus `data` are pushed over the
-tunnel as [`infra.state`](#infrastate-the-devices-infra-results) whenever
-a status changes, so a collector on the relay's event stream need not poll
-this route.
+Response `200`: `{boot, seq, hash, recoveries, ts, config_version,
+targets: {target_id: result...}, recovery_log: [...]}`. `boot` (when the
+agent started, unix ms), `seq`, `hash` and `recoveries` (recovery runs
+logged since `boot`) name these results as `infra.state` names its
+message (ADR-010). They are read with the results, so `hash` is the hash
+of the picture these `targets` and this `config_version` show, and a
+pull settles a comparison with the `infra` group of
+[`GET /api/info`](#get-apiinfo). Each result carries `status`,
+`latency_ms`, `since`, `consecutive_ok`, `consecutive_fail`,
+`last_check`, `detail`, `name`, and, for `http_api` targets,
+`http_status` and `data` (the profile's structured snapshot; after a
+failed check the last good snapshot stays, with the status and counters
+saying it is old). When the subsystem is unavailable or holds no config
+this returns an empty result set (`config_version: 0`), not an error. The
+same per-target fields minus `data` are pushed over the tunnel as
+[`infra.state`](#infrastate-the-devices-infra-results) whenever `seq`
+moves, so a collector on the relay's event stream keeps a copy from the
+pushes, compares it on each poll with the `infra` group of
+`GET /api/info`, and pulls this route only when they disagree, or to read
+the log entry of a new recovery run.
 
 ### `GET /api/infra/history/{target_id}`
 
@@ -1228,15 +1287,21 @@ same message on demand.
 #### `infra.state`: the device's Infra results
 
 A device whose relay advertises `infra.state` sends this text frame right
-after the ack, then whenever a target's status changes or a monitoring
-config is applied or removed, if the content differs from the last one
-sent on that connection, at most one per second. A check that leaves the
-status alone (a latency reading, a counter) sends nothing. A collector
-that reads the stream can stop polling `GET /api/infra/results`.
+after the ack, then whenever `seq` has moved since the last one sent on
+that connection, at most one per second: a target's status changed, a
+monitoring config was applied or removed, or a recovery run was logged. A
+check that leaves the status alone (a latency reading, a counter) sends
+nothing, and neither does a push or a removal that changes nothing. A
+collector that reads the stream keeps the last message (or pull) as its
+copy and checks it on each poll against the `infra` group of
+[`GET /api/info`](#get-apiinfo), which proves that a quiet unit is still
+checking; it pulls `GET /api/infra/results` only when they disagree.
 
 ```json
 {
-  "type": "infra.state", "v": 1, "ts": "2026-09-30T12:00:00Z",
+  "type": "infra.state", "v": 1,
+  "boot": 1790000000000, "seq": 42, "hash": "3f9a0c1d2e4b5a69", "recoveries": 0,
+  "ts": "2026-09-30T12:00:00Z",
   "config_version": 7,
   "targets": {
     "6f0b2c4e-9d3a-4c1f-8e2b-1a2b3c4d5e6f": {
@@ -1250,6 +1315,15 @@ that reads the stream can stop polling `GET /api/infra/results`.
 }
 ```
 
+- `boot` (when the agent started, unix ms, the `boot` of `net.state`),
+  `seq`, `hash` and `recoveries` (recovery runs logged since `boot`), as
+  they stood when the message was built. `seq` and `hash` are those of
+  the `infra` group of [`GET /api/info`](#get-apiinfo), and
+  `GET /api/infra/results` carries all four. `hash` covers every target,
+  so a copy built from a message the cap cut does not match it, and a
+  pull settles it. `recoveries` moved: a recovery ran, and its log entry
+  is read once from `GET /api/infra/results`. The fields are additive and
+  `v` stays 1; a message from an agent before 0.6.12 has none of them.
 - `config_version` is the config the results reflect, `0` when the device
   holds none (then `targets` is empty). `ts` is the device's clock.
 - `targets`, sorted by id: each entry carries what
@@ -1317,11 +1391,13 @@ frames:
   connection follows its `device.disconnected`.
 - `serial` is always the one the relay registered, never a value from the
   device's payload.
-- The replay can repeat a frame that also arrives live; deduplicate by
-  `(relay_epoch, connection_id, state.boot, state.seq)` for `net.state` and
-  by `(relay_epoch, connection_id, state.ts, state.config_version)` for
-  `infra.state`: connection ids start at 1 again when the relay restarts, so
-  `relay_epoch` from the `hello` frame is part of the key.
+- The replay can repeat a frame that also arrives live; deduplicate
+  `net.state` and `infra.state` by
+  `(relay_epoch, connection_id, state.boot, state.seq)`: connection ids
+  start at 1 again when the relay restarts, so `relay_epoch` from the
+  `hello` frame is part of the key. An `infra.state` from an agent before
+  0.6.12 carries no `boot` or `seq`; deduplicate it by
+  `(relay_epoch, connection_id, state.ts, state.config_version)`.
 - A subscriber that falls more than 1024 frames behind gets
   `{"type": "resync"}` followed by a fresh replay and `replay.done`, and
   should rebuild its view from it.

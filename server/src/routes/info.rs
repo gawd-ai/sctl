@@ -15,6 +15,7 @@
 //! | `memory`       | `/proc/meminfo`                                     |
 //! | `disk`         | `statvfs("/")` syscall                              |
 //! | `interfaces`   | `/proc/net/dev` + sysfs (`master`, `bridge`), `getifaddrs` for addresses |
+//! | `infra`        | the Infra monitor's digest, its own cell, never the Infra lock (ADR-010) |
 
 use axum::{
     extract::{Query, State},
@@ -43,6 +44,7 @@ pub(crate) struct InfoGroups {
     tunnel: bool,
     gps: bool,
     lte: bool,
+    infra: bool,
 }
 
 impl InfoGroups {
@@ -54,6 +56,7 @@ impl InfoGroups {
             tunnel: true,
             gps: true,
             lte: true,
+            infra: true,
         }
     }
 
@@ -76,6 +79,7 @@ impl InfoGroups {
             tunnel: requested.contains("tunnel"),
             gps: requested.contains("gps"),
             lte: requested.contains("lte"),
+            infra: requested.contains("infra"),
         }
     }
 }
@@ -84,7 +88,8 @@ impl InfoGroups {
 ///
 /// Returns a JSON object with device serial, hostname, kernel version, uptime,
 /// CPU model, load averages, memory stats, disk usage, and network interfaces
-/// with IP addresses.
+/// with IP addresses, and the `infra` group: the proof that the Infra
+/// monitor is checking, which the fleet reads on the poll it already makes.
 pub async fn info(
     State(state): State<AppState>,
     Query(query): Query<InfoQuery>,
@@ -261,6 +266,12 @@ pub(crate) async fn info_with_groups(
             response["lte"] = lte;
             debug!(req_id, lte_lock_wait_ms, "api.info: phase lte complete");
         }
+    }
+
+    if groups.infra {
+        // Read from the digest's own cell, never under the Infra lock: a
+        // lock held for good shows as `rounds` standing still.
+        response["infra"] = serde_json::to_value(state.infra_digest.group()).unwrap_or_default();
     }
 
     let serialize_started = Instant::now();
@@ -686,6 +697,208 @@ fn disks_from_mounts(mounts: &str, usage_of: &dyn Fn(&str) -> Value) -> Vec<Valu
     }
 
     out
+}
+
+#[cfg(test)]
+mod infra_group_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use futures_util::FutureExt as _;
+    use serde_json::{json, Value};
+    use tokio::sync::Mutex;
+
+    use super::{info_with_groups, InfoGroups};
+    use crate::config::Config;
+    use crate::file_access::Gate;
+    use crate::infra::checks::{CheckContext, CheckResult};
+    use crate::infra::monitor::{spawn_monitor_with, Checker, Timing};
+    use crate::infra::{CheckSpec, Digest, Group, InfraConfig, InfraState, InfraTarget, Off};
+    use crate::AppState;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sctl-info-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A state whose digest is `digest`, with an Infra state that shares it.
+    fn state(dir: &std::path::Path, digest: Arc<Digest>) -> (AppState, Arc<Mutex<InfraState>>) {
+        let mut config: Config = toml::from_str("").unwrap();
+        config.server.data_dir = dir.join("data").display().to_string();
+        let gate = Arc::new(Gate::for_agent(&config, None, None));
+        let mut state = AppState::for_tests(config, gate);
+        let infra = Arc::new(Mutex::new(InfraState::with_digest(
+            &dir.join("state").display().to_string(),
+            digest.clone(),
+        )));
+        state.infra_state = Some(infra.clone());
+        state.infra_digest = digest;
+        (state, infra)
+    }
+
+    async fn info(state: &AppState, groups: Option<&str>) -> Value {
+        info_with_groups(state.clone(), InfoGroups::from_csv(groups))
+            .await
+            .unwrap()
+            .0
+    }
+
+    fn config() -> InfraConfig {
+        InfraConfig {
+            version: 7,
+            check_interval_secs: 60,
+            targets: vec![InfraTarget {
+                id: "t1".into(),
+                name: "Gateway".into(),
+                check: CheckSpec::Ping {
+                    host: "192.0.2.1".into(),
+                    timeout_ms: None,
+                },
+                degraded_threshold_ms: 200,
+                down_after_consecutive: 3,
+                up_after_consecutive: 2,
+                interval_secs: None,
+                recovery: None,
+            }],
+        }
+    }
+
+    /// Every check answers at once, and well; nothing is sent.
+    fn answers_ok() -> Checker {
+        Arc::new(|_: &InfraTarget, _: CheckContext| {
+            async {
+                CheckResult {
+                    ok: true,
+                    latency_ms: Some(3),
+                    detail: "OK 3ms".into(),
+                    ..CheckResult::default()
+                }
+            }
+            .boxed()
+        })
+    }
+
+    async fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + limit;
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "not within {limit:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_infra_group_comes_alone_with_all_and_not_with_core() {
+        let dir = scratch("groups");
+        let (state, _) = state(&dir, Arc::new(Digest::new(1_790_000_000_000, false)));
+
+        let alone = info(&state, Some("infra")).await;
+        assert_eq!(
+            alone,
+            json!({"infra": {"rounds": 0, "seq": 1, "hash": "c2ccc438d385f035", "off": "no_config"}}),
+            "a unit that holds no config answers it too"
+        );
+        for all in [None, Some("all"), Some("core,infra")] {
+            let answer = info(&state, all).await;
+            assert_eq!(answer["infra"], alone["infra"], "{all:?}");
+            assert!(answer.get("serial").is_some(), "{all:?}");
+        }
+        let core = info(&state, Some("core")).await;
+        assert!(core.get("serial").is_some());
+        assert!(core.get("infra").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `GET /api/health` answers without the key, and Infra state stays
+    /// behind it.
+    #[tokio::test]
+    async fn the_infra_group_is_not_in_health() {
+        let dir = scratch("health");
+        let (state, _) = state(&dir, Arc::new(Digest::new(1_790_000_000_000, false)));
+        let axum::Json(health) = crate::routes::health::health(axum::extract::State(state)).await;
+        assert_eq!(health["status"], "ok");
+        assert!(health.get("infra").is_none(), "{health}");
+        assert!(!health.to_string().contains("c2ccc438d385f035"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn off_reads_safe_mode_in_an_agent_that_started_in_safe_mode() {
+        let dir = scratch("safe-mode");
+        let (state, infra) = state(&dir, Arc::new(Digest::new(1, true)));
+        assert_eq!(
+            info(&state, Some("infra")).await["infra"]["off"],
+            "safe_mode"
+        );
+        // A config held changes nothing: safe mode keeps the monitor off.
+        infra.lock().await.hold_config(config());
+        assert_eq!(
+            info(&state, Some("infra")).await["infra"]["off"],
+            "safe_mode"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_steady_units_group_is_about_60_bytes() {
+        let group = Group {
+            rounds: 17280,
+            seq: 42,
+            hash: "3f9a0c1d2e4b5a69".into(),
+            off: None,
+        };
+        let text = serde_json::to_string(&group).unwrap();
+        assert_eq!(
+            text,
+            r#"{"rounds":17280,"seq":42,"hash":"3f9a0c1d2e4b5a69"}"#
+        );
+        assert_eq!(r#""infra":"#.len() + text.len(), 59);
+        let off = Group {
+            off: Some(Off::NoConfig),
+            ..group
+        };
+        assert!(serde_json::to_string(&off)
+            .unwrap()
+            .ends_with(r#","off":"no_config"}"#));
+    }
+
+    /// With the Infra lock held for 12 s, `/api/info` answers at once and
+    /// `rounds` stands still; once the lock is free, the rounds go on.
+    #[tokio::test]
+    async fn with_the_infra_lock_held_info_answers_at_once_and_rounds_stand_still() {
+        let dir = scratch("lock");
+        let digest = Arc::new(Digest::new(1_790_000_000_000, false));
+        let (state, infra) = state(&dir, digest.clone());
+        infra.lock().await.hold_config(config());
+        let monitor = spawn_monitor_with(infra.clone(), config(), Timing::default(), answers_ok());
+        wait_until(Duration::from_secs(5), || digest.group().rounds >= 1).await;
+        let group = info(&state, Some("infra")).await["infra"].clone();
+        assert!(
+            group.get("off").is_none(),
+            "absent while a monitor runs: {group}"
+        );
+
+        let guard = infra.lock().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let held = digest.group().rounds;
+        let until = std::time::Instant::now() + Duration::from_secs(12);
+        while std::time::Instant::now() < until {
+            let asked = std::time::Instant::now();
+            let group = info(&state, Some("infra")).await["infra"].clone();
+            assert!(
+                asked.elapsed() < Duration::from_millis(500),
+                "answered in {:?}",
+                asked.elapsed()
+            );
+            assert_eq!(group["rounds"], held, "no round while the lock is held");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        drop(guard);
+        wait_until(Duration::from_secs(10), || digest.group().rounds > held).await;
+        monitor.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[cfg(test)]

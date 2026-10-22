@@ -40,7 +40,9 @@ a crash-looping CGNAT unit that stayed fully down would need a site visit.
 - The comms provider plugin — and with it everything modem-shaped: AT
   access, GPS polling, LTE signal polling, and the LTE recovery watchdog.
   `/api/gps` and `/api/lte/*` answer `503 MODEM_UNAVAILABLE`.
-- The infra monitor (site target probing).
+- The infra monitor (site target probing). The `infra` group of
+  `GET /api/info` says so with `off: safe_mode` until the agent restarts,
+  even once the flag is cleared (ADR-010).
 
 **Still live:**
 

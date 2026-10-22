@@ -15,8 +15,15 @@
 //!
 //! Results are served via `GET /api/infra/results` for external health polling,
 //! and pushed over the tunnel as `infra.state` (see `tunnel::infra_state`)
-//! whenever a target's status changes or a config is applied: [`InfraState::changed`]
-//! is the signal, [`InfraState::watch_changes`] the way to wait on it.
+//! whenever a target's status changes, a config is applied or removed, or a
+//! recovery run is logged: [`InfraState::changed`] is the signal, and it
+//! moves `seq`; [`InfraState::watch_changes`] is the way to wait on it.
+//!
+//! A unit that pushes only changes is quiet while its targets hold steady,
+//! so it proves on every poll that its monitor is checking (ADR-010): the
+//! [`Digest`] is the `infra` group of `GET /api/info` (`rounds`, `seq`,
+//! `hash`, `off`), kept in a cell of its own that `GET /api/info` reads
+//! without the Infra lock.
 
 pub mod checks;
 pub mod discovery;
@@ -24,18 +31,25 @@ pub mod monitor;
 pub mod profiles;
 pub mod routes;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Digest as _;
 use tokio::sync::watch;
+use tokio::time::Instant;
 use tracing::warn;
 
 // ─── Config types (pushed from fleet server, persisted to disk) ──────
 
 /// Top-level monitoring configuration pushed via `POST /api/infra/config`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Compared whole: a push equal to the config held, every field and the
+/// version included, changes nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InfraConfig {
     /// Monotonically increasing version number. The fleet server bumps this
     /// on every config change so the health poller can detect stale configs
@@ -53,7 +67,7 @@ fn default_check_interval() -> u64 {
 }
 
 /// A single infrastructure device to monitor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InfraTarget {
     /// Stable identifier (UUID from the fleet DB).
     pub id: String,
@@ -87,7 +101,7 @@ fn default_up_after() -> u32 {
 }
 
 /// What kind of check to run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum CheckSpec {
     Ping {
@@ -159,7 +173,7 @@ pub struct Credential {
 }
 
 /// User-configured recovery action that fires when a target enters DOWN.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryConfig {
     pub enabled: bool,
     /// Shell command to execute locally on the BPI.
@@ -267,6 +281,280 @@ pub struct InfraResults {
     pub recovery_log: Vec<RecoveryLogEntry>,
 }
 
+// ─── The digest: proof that the monitor is checking (ADR-010) ────────
+
+/// Why no monitor is expected: the `off` of the `infra` group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Off {
+    /// The agent started in safe mode, which keeps the monitor off,
+    /// whatever the flag file says now.
+    SafeMode,
+    /// The unit holds no config.
+    NoConfig,
+}
+
+/// The `infra` group of `GET /api/info` (ADR-010 decision 2): the proof
+/// that the monitor is checking, and the name of the picture the unit
+/// holds. A steady unit's group is about 60 bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Group {
+    /// Monitor rounds since the agent started. It never goes back while
+    /// the agent runs.
+    pub rounds: u64,
+    /// 1 when the agent starts, +1 at every change it pushes.
+    pub seq: u64,
+    /// [`picture_hash`] of [`picture_text`]: changes only when `seq` moves.
+    pub hash: String,
+    /// Present only when no monitor is expected; then `rounds` stands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub off: Option<Off>,
+}
+
+/// What every report names beside its targets (ADR-010 decision 3), as it
+/// stood when the report was built: `infra.state` and
+/// `GET /api/infra/results` carry it, so a copy built from either can be
+/// compared with the `infra` group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stamp {
+    /// When the agent started, unix ms: the `boot` that `net.state` carries.
+    /// A new value means `seq` began again.
+    pub boot: u64,
+    /// 1 when the agent starts, +1 at every change it pushes.
+    pub seq: u64,
+    /// The picture's hash, as in the `infra` group.
+    pub hash: String,
+    /// Recovery runs logged since `boot`.
+    pub recoveries: u64,
+}
+
+/// The digest's cell. Every writer of the results updates it, under the
+/// Infra lock; `GET /api/info` reads it without that lock, so a lock held
+/// for good shows as `rounds` standing still, never as a slow answer.
+#[derive(Debug)]
+pub struct Digest {
+    /// When the agent started, unix ms.
+    boot: u64,
+    /// Whether the agent started in safe mode.
+    safe_mode: bool,
+    cell: StdMutex<Cell>,
+}
+
+#[derive(Debug)]
+struct Cell {
+    rounds: u64,
+    seq: u64,
+    hash: String,
+    recoveries: u64,
+    holds_config: bool,
+}
+
+impl Digest {
+    /// The digest of an agent that started at `boot` (unix ms), in safe
+    /// mode or not, before it holds a config: `seq` 1, no round, the hash
+    /// of a unit that holds nothing.
+    pub fn new(boot: u64, safe_mode: bool) -> Self {
+        Self {
+            boot,
+            safe_mode,
+            cell: StdMutex::new(Cell {
+                rounds: 0,
+                seq: 1,
+                hash: picture_hash(&picture_text(boot, 0, [])),
+                recoveries: 0,
+                holds_config: false,
+            }),
+        }
+    }
+
+    /// When the agent started, unix ms.
+    pub fn boot(&self) -> u64 {
+        self.boot
+    }
+
+    /// The `infra` group as it stands now.
+    pub fn group(&self) -> Group {
+        let cell = self.cell();
+        let off = if self.safe_mode {
+            Some(Off::SafeMode)
+        } else if cell.holds_config {
+            None
+        } else {
+            Some(Off::NoConfig)
+        };
+        Group {
+            rounds: cell.rounds,
+            seq: cell.seq,
+            hash: cell.hash.clone(),
+            off,
+        }
+    }
+
+    /// What a report names, as it stands now.
+    pub fn stamp(&self) -> Stamp {
+        let cell = self.cell();
+        Stamp {
+            boot: self.boot,
+            seq: cell.seq,
+            hash: cell.hash.clone(),
+            recoveries: cell.recoveries,
+        }
+    }
+
+    /// Count one monitor round: the end of a tick that met the round rule.
+    pub fn count_round(&self) {
+        let mut cell = self.cell();
+        cell.rounds = cell.rounds.saturating_add(1);
+    }
+
+    fn cell(&self) -> MutexGuard<'_, Cell> {
+        self.cell.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The text `hash` digests (ADR-010 decision 2): the agent's `boot` in
+/// decimal, a newline, the config version in decimal (0 for none), a
+/// newline, then per target in byte order of its id: the id, a space, its
+/// status (`unknown`, `up`, `degraded` or `down`), a newline. The fleet
+/// hashes its copy by the same text, so a release that hashes other text
+/// names the field anew.
+pub fn picture_text<'a>(
+    boot: u64,
+    config_version: u32,
+    targets: impl IntoIterator<Item = (&'a str, TargetStatus)>,
+) -> String {
+    let mut targets: Vec<(&str, TargetStatus)> = targets.into_iter().collect();
+    // A `str` orders by its bytes.
+    targets.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let mut text = format!("{boot}\n{config_version}\n");
+    for (id, status) in targets {
+        let _ = writeln!(text, "{id} {status}");
+    }
+    text
+}
+
+/// The first 16 hex characters, lowercase, of the SHA-256 of `text`.
+pub fn picture_hash(text: &str) -> String {
+    sha2::Sha256::digest(text.as_bytes()).iter().take(8).fold(
+        String::with_capacity(16),
+        |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        },
+    )
+}
+
+// ─── Checks in flight ────────────────────────────────────────────────
+
+/// The targets with a check in flight. The monitor never starts a target
+/// whose check is in flight, and its round rule reads when each running
+/// check took its permit. It lives in the Infra state, so every monitor the
+/// unit runs, a rebuilt one included, sees the same set.
+#[derive(Debug, Clone, Default)]
+pub struct InFlight(Arc<StdMutex<Flights>>);
+
+#[derive(Debug, Default)]
+struct Flights {
+    next_token: u64,
+    by_target: HashMap<String, FlightEntry>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FlightEntry {
+    /// Which [`Flight`] holds the place: only that one marks its permit
+    /// or frees it.
+    token: u64,
+    /// When the check took the permit it holds; `None` while it waits for
+    /// one, and once it gave it back.
+    permit_at: Option<Instant>,
+}
+
+/// A target's place in flight, held by its check until its result is
+/// applied. Dropping it, when the check ends or is aborted, frees the
+/// target.
+#[derive(Debug)]
+pub struct Flight {
+    set: InFlight,
+    target_id: String,
+    token: u64,
+}
+
+impl InFlight {
+    /// Take `target_id`'s place in flight; `None` while a check of it is.
+    pub fn start(&self, target_id: &str) -> Option<Flight> {
+        let mut flights = self.flights();
+        if flights.by_target.contains_key(target_id) {
+            return None;
+        }
+        flights.next_token = flights.next_token.wrapping_add(1);
+        let token = flights.next_token;
+        flights.by_target.insert(
+            target_id.to_string(),
+            FlightEntry {
+                token,
+                permit_at: None,
+            },
+        );
+        Some(Flight {
+            set: self.clone(),
+            target_id: target_id.to_string(),
+            token,
+        })
+    }
+
+    /// Whether a check of `target_id` is in flight.
+    pub fn contains(&self, target_id: &str) -> bool {
+        self.flights().by_target.contains_key(target_id)
+    }
+
+    /// When each running check took its permit.
+    pub fn permit_times(&self) -> Vec<Instant> {
+        self.flights()
+            .by_target
+            .values()
+            .filter_map(|entry| entry.permit_at)
+            .collect()
+    }
+
+    fn flights(&self) -> MutexGuard<'_, Flights> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Flight {
+    /// The check took its permit at `at`: it is running.
+    pub fn took_permit(&self, at: Instant) {
+        self.mark_permit(Some(at));
+    }
+
+    /// The check gave its permit back: it is no longer running, and its
+    /// target stays in flight until its result is applied.
+    pub fn left_permit(&self) {
+        self.mark_permit(None);
+    }
+
+    fn mark_permit(&self, at: Option<Instant>) {
+        if let Some(entry) = self.set.flights().by_target.get_mut(&self.target_id) {
+            if entry.token == self.token {
+                entry.permit_at = at;
+            }
+        }
+    }
+}
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        let mut flights = self.set.flights();
+        if flights
+            .by_target
+            .get(&self.target_id)
+            .is_some_and(|entry| entry.token == self.token)
+        {
+            flights.by_target.remove(&self.target_id);
+        }
+    }
+}
+
 // ─── Shared state ────────────────────────────────────────────────────
 
 /// Real-time progress of a running discovery scan.
@@ -296,8 +584,10 @@ pub struct InfraState {
     pub config: Option<InfraConfig>,
     /// Latest results snapshot.
     pub results: InfraResults,
-    /// Per-target recovery cooldown tracking: target_id → (last_exec_epoch, exec_count).
-    pub recovery_tracker: HashMap<String, (u64, u32)>,
+    /// Per-target recovery cooldown tracking: target_id → (when its last
+    /// run started, on the monotonic clock, and the runs since the count
+    /// last cleared).
+    pub recovery_tracker: HashMap<String, (Instant, u32)>,
     /// Path for persistent config storage.
     pub config_path: PathBuf,
     /// Handle to the monitoring task (so we can abort and restart on config change).
@@ -313,8 +603,15 @@ pub struct InfraState {
     pub sessions: HashMap<String, String>,
     /// Recent structured readings per target id (ring, newest last).
     pub data_history: HashMap<String, VecDeque<DataSample>>,
-    /// Bumped by [`Self::changed`]: a target's status changed or a config
-    /// was applied. What the tunnel's `infra.state` forwarder waits on.
+    /// The targets with a check in flight, shared by every monitor the
+    /// unit runs.
+    pub in_flight: InFlight,
+    /// The digest of the monitor, shared with `AppState` so that
+    /// `GET /api/info` reads it without this state's lock.
+    digest: Arc<Digest>,
+    /// Holds `seq`, set by [`Self::changed`]: a target's status changed, a
+    /// config was applied or removed, or a recovery run was logged. What
+    /// the tunnel's `infra.state` forwarder waits on.
     changes: watch::Sender<u64>,
 }
 
@@ -326,8 +623,18 @@ pub const MAX_DATA_HISTORY: usize = 30;
 
 impl InfraState {
     /// `state_dir` is where the config and the credentials persist; on a
-    /// RAM-booted unit it is the one directory that survives a reboot.
+    /// RAM-booted unit it is the one directory that survives a reboot. The
+    /// digest takes now as the agent's start, outside safe mode; the agent
+    /// itself builds its state with [`Self::with_digest`].
     pub fn new(state_dir: &str) -> Self {
+        Self::with_digest(state_dir, Arc::new(Digest::new(now_unix_ms(), false)))
+    }
+
+    /// The state of the agent whose digest is `digest`: `main` makes it
+    /// with the agent's `boot` and whether it started in safe mode, and
+    /// gives `AppState` the same one.
+    pub fn with_digest(state_dir: &str, digest: Arc<Digest>) -> Self {
+        let seq = digest.stamp().seq;
         Self {
             config: None,
             results: InfraResults {
@@ -344,21 +651,95 @@ impl InfraState {
             secrets_path: Path::new(state_dir).join("infra-secrets.json"),
             sessions: HashMap::new(),
             data_history: HashMap::new(),
-            changes: watch::channel(0).0,
+            in_flight: InFlight::default(),
+            digest,
+            changes: watch::channel(seq).0,
         }
     }
 
-    /// Say the results changed in a way worth pushing: a target's status
-    /// (not its latency or its counters alone), or the config. Every
-    /// receiver from [`Self::watch_changes`] wakes.
-    pub fn changed(&self) {
-        self.changes.send_modify(|n| *n = n.wrapping_add(1));
+    /// The digest of the monitor, the cell `GET /api/info` reads.
+    pub fn digest(&self) -> Arc<Digest> {
+        self.digest.clone()
     }
 
-    /// A receiver that wakes on every [`Self::changed`]; its value is how
-    /// many times the results changed since startup.
+    /// What a report built now names: read under this state's lock, it
+    /// matches the results beside it.
+    pub fn stamp(&self) -> Stamp {
+        self.digest.stamp()
+    }
+
+    /// Say the results changed in a way worth pushing: a target's status
+    /// (not its latency or its counters alone), a config applied or
+    /// removed, or a recovery run logged. `seq` moves by one, the digest
+    /// takes the hash of the picture the results now show, and every
+    /// receiver from [`Self::watch_changes`] wakes.
+    pub fn changed(&self) {
+        let seq = self.publish(true);
+        self.changes.send_modify(|n| *n = seq);
+    }
+
+    /// A receiver that wakes on every [`Self::changed`]; its value is `seq`.
     pub fn watch_changes(&self) -> watch::Receiver<u64> {
         self.changes.subscribe()
+    }
+
+    /// Bring the digest up to date with the results: the hash of their
+    /// picture and whether a config is held, `seq` moved by one when
+    /// `moved`. Returns `seq`.
+    fn publish(&self, moved: bool) -> u64 {
+        let text = picture_text(
+            self.digest.boot,
+            self.results.config_version,
+            self.results
+                .targets
+                .iter()
+                .map(|(id, target)| (id.as_str(), target.status)),
+        );
+        let hash = picture_hash(&text);
+        let mut cell = self.digest.cell();
+        if moved {
+            cell.seq += 1;
+        }
+        cell.hash = hash;
+        cell.holds_config = self.config.is_some();
+        cell.seq
+    }
+
+    /// Hold `cfg`, as a push does. The results reflect it at once: targets
+    /// that left are dropped, new ones appear as `unknown`, and the version
+    /// is the pushed one, so a collector reading the results between the
+    /// push and the first check sees the config it pushed. A config equal
+    /// to the one held, every field and the version included, changes
+    /// nothing and signals nothing. True when it changed what is held.
+    pub fn hold_config(&mut self, cfg: InfraConfig) -> bool {
+        if self.config.as_ref() == Some(&cfg) {
+            return false;
+        }
+        let keep: HashSet<&str> = cfg.targets.iter().map(|t| t.id.as_str()).collect();
+        self.results
+            .targets
+            .retain(|id, _| keep.contains(id.as_str()));
+        self.seed_results(&cfg);
+        self.config = Some(cfg);
+        self.changed();
+        true
+    }
+
+    /// Hold no config, as a removal does: no target, version 0, no
+    /// recovery count. True when there was something to remove; removing
+    /// nothing is not a change.
+    pub fn drop_config(&mut self) -> bool {
+        let held = self.config.take().is_some()
+            || !self.results.targets.is_empty()
+            || self.results.config_version != 0;
+        self.results.targets.clear();
+        self.results.config_version = 0;
+        self.results.ts = now_iso();
+        self.recovery_tracker.clear();
+        if held {
+            self.changed();
+        }
+        held
     }
 
     /// Load the credentials file (called at startup). Missing is normal.
@@ -410,12 +791,16 @@ impl InfraState {
     /// would otherwise report `config_version: 0` and no targets, which is
     /// exactly what a device that holds NOTHING reports, and a collector
     /// cannot tell the two apart. Now `0` means "holds nothing".
+    ///
+    /// The loaded config is the picture the agent starts with: the digest
+    /// takes its hash, and `seq` stays 1.
     pub fn load_config(&mut self) {
         match std::fs::read_to_string(&self.config_path) {
             Ok(data) => match serde_json::from_str::<InfraConfig>(&data) {
                 Ok(cfg) => {
                     self.seed_results(&cfg);
                     self.config = Some(cfg);
+                    self.publish(false);
                 }
                 Err(e) => warn!("Failed to parse infra config: {e}"),
             },
@@ -426,8 +811,9 @@ impl InfraState {
 
     /// Reflect a config in the results before any check has run: its
     /// version, and an `unknown` placeholder per target so the target set is
-    /// visible. Entries that already carry a result are left alone.
-    pub fn seed_results(&mut self, cfg: &InfraConfig) {
+    /// visible. Entries that already carry a result are left alone. It
+    /// signals nothing: its caller says whether this was a change.
+    fn seed_results(&mut self, cfg: &InfraConfig) {
         let now = now_iso();
         for target in &cfg.targets {
             self.results
@@ -451,7 +837,6 @@ impl InfraState {
         }
         self.results.config_version = cfg.version;
         self.results.ts = now;
-        self.changed();
     }
 
     /// Persist config to disk (atomic write via tmp + rename).
@@ -478,12 +863,19 @@ impl InfraState {
         true
     }
 
-    /// Push a recovery log entry, evicting oldest if over capacity.
+    /// Log a recovery run, evicting the oldest entry past the ring's size.
+    /// A logged run is a change worth pushing: `recoveries` and `seq` move,
+    /// so a collector that has stopped pulling learns of every run.
     pub fn push_recovery_log(&mut self, entry: RecoveryLogEntry) {
         if self.results.recovery_log.len() >= MAX_RECOVERY_LOG {
             self.results.recovery_log.remove(0);
         }
         self.results.recovery_log.push(entry);
+        {
+            let mut cell = self.digest.cell();
+            cell.recoveries = cell.recoveries.saturating_add(1);
+        }
+        self.changed();
     }
 }
 
@@ -548,6 +940,14 @@ pub fn now_epoch() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Current time as Unix epoch milliseconds.
+pub fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(test)]
@@ -701,6 +1101,238 @@ mod tests {
         assert_eq!(seeded.name, "Peplink MAX BR1");
         assert!(seeded.last_check.is_empty(), "no check has run");
         assert!(seeded.data.is_none());
+
+        // The loaded config is the picture the agent starts with: `seq`
+        // stays 1, and the hash names that picture.
+        let stamp = state.stamp();
+        assert_eq!(stamp.seq, 1);
+        assert_eq!(
+            stamp.hash,
+            picture_hash(&picture_text(
+                stamp.boot,
+                7,
+                [(
+                    "6f0b2c4e-9d3a-4c1f-8e2b-1a2b3c4d5e6f",
+                    TargetStatus::Unknown
+                )]
+            ))
+        );
+        assert_eq!(state.digest().group().off, None, "a monitor is expected");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ─── The digest (ADR-010) ────────────────────────────────────────
+
+    /// The test vector `docs/http-api.md` gives, for the fleet's tests too.
+    const VECTOR_TEXT: &str = "1790000000000\n7\nSwitch down\napi-1 up\nt10 degraded\nt9 unknown\n";
+    const VECTOR_HASH: &str = "42189b104bcb1637";
+
+    #[test]
+    fn the_hash_is_its_test_vector() {
+        let text = picture_text(
+            1_790_000_000_000,
+            7,
+            [
+                ("t9", TargetStatus::Unknown),
+                ("api-1", TargetStatus::Up),
+                ("t10", TargetStatus::Degraded),
+                ("Switch", TargetStatus::Down),
+            ],
+        );
+        // Byte order of the ids: an upper case letter before a lower case
+        // one, `t10` before `t9`.
+        assert_eq!(text, VECTOR_TEXT);
+        assert_eq!(picture_hash(&text), VECTOR_HASH);
+        // A unit that holds nothing: the start and version 0.
+        assert_eq!(picture_text(1_790_000_000_000, 0, []), "1790000000000\n0\n");
+        assert_eq!(
+            picture_hash("1790000000000\n0\n"),
+            "c2ccc438d385f035",
+            "16 lowercase hex characters"
+        );
+    }
+
+    fn ping_target(id: &str) -> InfraTarget {
+        InfraTarget {
+            id: id.into(),
+            name: format!("Target {id}"),
+            check: CheckSpec::Ping {
+                host: "192.0.2.1".into(),
+                timeout_ms: None,
+            },
+            degraded_threshold_ms: 200,
+            down_after_consecutive: 3,
+            up_after_consecutive: 2,
+            interval_secs: None,
+            recovery: None,
+        }
+    }
+
+    fn config(version: u32, ids: &[&str]) -> InfraConfig {
+        InfraConfig {
+            version,
+            check_interval_secs: 60,
+            targets: ids.iter().map(|id| ping_target(id)).collect(),
+        }
+    }
+
+    #[test]
+    fn the_hash_is_the_same_whatever_the_order_of_the_targets() {
+        let digest = Arc::new(Digest::new(1_790_000_000_000, false));
+        let mut forward = InfraState::with_digest("/tmp/sctl-infra-digest-test", digest);
+        forward.hold_config(config(7, &["t9", "api-1", "t10", "Switch"]));
+        let backward_digest = Arc::new(Digest::new(1_790_000_000_000, false));
+        let mut backward = InfraState::with_digest("/tmp/sctl-infra-digest-test", backward_digest);
+        backward.hold_config(config(7, &["Switch", "t10", "api-1", "t9"]));
+        assert_eq!(forward.stamp().hash, backward.stamp().hash);
+        assert_eq!(
+            forward.stamp().hash,
+            picture_hash(&picture_text(
+                1_790_000_000_000,
+                7,
+                ["t9", "api-1", "t10", "Switch"].map(|id| (id, TargetStatus::Unknown))
+            ))
+        );
+    }
+
+    #[test]
+    fn an_agent_starts_at_seq_1_holding_nothing() {
+        let state = InfraState::with_digest(
+            "/tmp/sctl-infra-digest-test",
+            Arc::new(Digest::new(1_790_000_000_000, false)),
+        );
+        let group = state.digest().group();
+        assert_eq!(
+            (group.rounds, group.seq, group.off),
+            (0, 1, Some(Off::NoConfig))
+        );
+        assert_eq!(group.hash, "c2ccc438d385f035");
+        assert_eq!(*state.watch_changes().borrow(), 1, "the watch holds `seq`");
+    }
+
+    #[test]
+    fn an_identical_push_moves_no_seq_and_a_changed_one_does() {
+        let mut state = InfraState::new("/tmp/sctl-infra-digest-test");
+        assert!(state.hold_config(config(7, &["t1"])));
+        let after_first = state.stamp();
+        assert_eq!(after_first.seq, 2, "a config applied is a change");
+
+        // Every field and the version equal: nothing changes.
+        assert!(!state.hold_config(config(7, &["t1"])));
+        assert_eq!(state.stamp(), after_first);
+
+        // One field changed under the same version: applied, a change,
+        // with the same picture.
+        let mut moved = config(7, &["t1"]);
+        moved.targets[0].check = CheckSpec::Ping {
+            host: "192.0.2.2".into(),
+            timeout_ms: None,
+        };
+        assert!(state.hold_config(moved));
+        assert_eq!(state.stamp().seq, 3);
+        assert_eq!(state.stamp().hash, after_first.hash);
+
+        // Another target set: a new picture.
+        assert!(state.hold_config(config(8, &["t1", "t2"])));
+        assert_eq!(state.stamp().seq, 4);
+        assert_ne!(state.stamp().hash, after_first.hash);
+        assert_eq!(state.results.targets.len(), 2);
+    }
+
+    #[test]
+    fn removing_a_config_is_a_change_removing_nothing_is_not() {
+        let mut state = InfraState::new("/tmp/sctl-infra-digest-test");
+        let empty = state.stamp();
+        assert!(!state.drop_config());
+        assert_eq!(state.stamp(), empty);
+
+        state.hold_config(config(7, &["t1"]));
+        assert_eq!(state.digest().group().off, None);
+        assert!(state.drop_config());
+        let removed = state.stamp();
+        assert_eq!(removed.seq, 3);
+        assert_eq!(removed.hash, empty.hash, "the picture of holding nothing");
+        assert_eq!(state.digest().group().off, Some(Off::NoConfig));
+        assert!(!state.drop_config());
+        assert_eq!(state.stamp(), removed);
+    }
+
+    #[test]
+    fn a_logged_run_moves_seq_and_recoveries() {
+        let mut state = InfraState::new("/tmp/sctl-infra-digest-test");
+        state.hold_config(config(7, &["t1"]));
+        let before = state.stamp();
+        state.push_recovery_log(RecoveryLogEntry {
+            ts: now_iso(),
+            target_id: "t1".into(),
+            command: "true".into(),
+            exit_code: 0,
+            stdout: String::new(),
+        });
+        let after = state.stamp();
+        assert_eq!(after.seq, before.seq + 1);
+        assert_eq!(after.recoveries, 1);
+        assert_eq!(after.hash, before.hash, "no status moved");
+        assert_eq!(*state.watch_changes().borrow(), after.seq);
+    }
+
+    #[test]
+    fn off_says_why_no_monitor_is_expected() {
+        let normal = InfraState::with_digest(
+            "/tmp/sctl-infra-digest-test",
+            Arc::new(Digest::new(1, false)),
+        );
+        assert_eq!(normal.digest().group().off, Some(Off::NoConfig));
+
+        // Safe mode, with or without a config: the monitor stays off.
+        let mut safe = InfraState::with_digest(
+            "/tmp/sctl-infra-digest-test",
+            Arc::new(Digest::new(1, true)),
+        );
+        assert_eq!(safe.digest().group().off, Some(Off::SafeMode));
+        safe.hold_config(config(7, &["t1"]));
+        assert_eq!(safe.digest().group().off, Some(Off::SafeMode));
+
+        let group = |off| {
+            serde_json::to_value(Group {
+                rounds: 3,
+                seq: 1,
+                hash: "c2ccc438d385f035".into(),
+                off,
+            })
+            .unwrap()
+        };
+        assert_eq!(group(Some(Off::SafeMode))["off"], "safe_mode");
+        assert_eq!(group(Some(Off::NoConfig))["off"], "no_config");
+        assert!(group(None).get("off").is_none(), "absent, not null");
+    }
+
+    #[test]
+    fn a_target_in_flight_is_not_started_twice_and_frees_itself() {
+        let in_flight = InFlight::default();
+        let flight = in_flight.start("t1").expect("free");
+        assert!(in_flight.start("t1").is_none(), "already in flight");
+        assert!(in_flight.contains("t1"));
+        assert!(
+            in_flight.permit_times().is_empty(),
+            "waiting for a permit is not running"
+        );
+        let at = Instant::now();
+        flight.took_permit(at);
+        assert_eq!(in_flight.permit_times(), vec![at]);
+
+        // A check that gave its permit back is no longer running, and its
+        // target stays in flight until its result is in.
+        flight.left_permit();
+        assert!(in_flight.permit_times().is_empty());
+        assert!(in_flight.start("t1").is_none(), "still in flight");
+        flight.took_permit(at);
+
+        // A clone is the same set: a rebuilt monitor sees it.
+        let seen_by_another = in_flight.clone();
+        assert!(seen_by_another.start("t1").is_none());
+        drop(flight);
+        assert!(!seen_by_another.contains("t1"));
+        assert!(seen_by_another.start("t1").is_some());
     }
 }

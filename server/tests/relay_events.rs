@@ -339,10 +339,17 @@ async fn net_state_is_kept_published_forwarded_and_reset_on_a_new_connection() {
     assert_eq!(frame["state"], payload);
 }
 
+/// An `infra.state` as a 0.6.12 agent sends it. The relay reads none of
+/// the fields that name its picture (`boot`, `seq`, `hash`, `recoveries`)
+/// and passes them through as they are.
 fn infra_state(status: &str) -> Value {
     json!({
         "type": "infra.state",
         "v": 1,
+        "boot": 1_790_000_000_000_u64,
+        "seq": 3,
+        "hash": "0123456789abcdef",
+        "recoveries": 0,
         "ts": "2026-09-30T12:00:00Z",
         // Never believed: the frame names the registered serial.
         "serial": "SOMEONE-ELSE",

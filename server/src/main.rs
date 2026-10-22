@@ -774,7 +774,17 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     tun_stats.events = tokio::sync::Mutex::new(TunnelStats::load_events(&events_path));
     tun_stats.events_path = Some(events_path);
 
+    // When this agent started, unix ms: the `boot` of `net.state` and of
+    // the Infra digest, so a reader tells a restart from either.
+    let boot_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
     // ─── Infra monitoring state ───────────────────────────────────
+    // The digest the fleet reads on every poll (ADR-010): it knows the
+    // agent started in safe mode, whatever the flag file says later.
+    let infra_digest = Arc::new(infra::Digest::new(boot_unix_ms, safe_mode_active));
     let infra_state = {
         // Reboot-surviving state (infra config, credentials, TLS pins) lives
         // in `state_dir`, which on a RAM-booted unit is the flash overlay
@@ -783,7 +793,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         if let Err(e) = create_private_dir(&state_dir) {
             warn!("Could not create state dir {state_dir}: {e}");
         }
-        let mut is = infra::InfraState::new(&state_dir);
+        let mut is = infra::InfraState::with_digest(&state_dir, infra_digest.clone());
         is.load_config();
         is.load_credentials();
         // The http_api profiles reach the pin store through this; set once.
@@ -792,10 +802,6 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     };
 
     // ─── Kernel network events (every mode but relay) ─────────────
-    let boot_unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
     let (net_publisher, net_rx) = if config.tunnel.as_ref().is_some_and(|tc| tc.relay) {
         (None, None)
     } else {
@@ -843,6 +849,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         device_snapshots: None,
         relay_state: None,
         infra_state: Some(infra_state.clone()),
+        infra_digest,
         api_router: Arc::new(std::sync::OnceLock::new()),
         netwatch: net_rx,
         relay_route,

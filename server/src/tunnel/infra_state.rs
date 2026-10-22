@@ -3,17 +3,22 @@
 //!
 //! The device offers the feature in `tunnel.register` and sends the message
 //! only when the relay's `tunnel.register.ack` advertises it too: once right
-//! after the ack, then after every change the infra module signals (a
-//! target's status, a config applied or removed; see
-//! [`InfraState::changed`]) whose content differs from the last message
-//! sent on this connection, at most one a second. A latency reading or a
-//! counter alone is not a change. It carries what `GET /api/infra/results`
-//! carries per target, minus `data` and the recovery log, so a collector
-//! that reads the stream can stop polling that route.
+//! after the ack, then whenever `seq` has moved since the last message sent
+//! on this connection, at most one a second. `seq` moves at every change
+//! the infra module signals: a target's status, a config applied or
+//! removed, a recovery run logged (see [`InfraState::changed`]). A latency
+//! reading or a counter alone is not a change. The message carries what
+//! `GET /api/infra/results` carries per target, minus `data` and the
+//! recovery log, and names the picture it carries (ADR-010): `boot`, `seq`,
+//! `hash` and `recoveries`, as they stood when it was built. A collector
+//! keeps it as its copy and compares it with the `infra` group of
+//! `GET /api/info`, which proves on every poll that a quiet unit is still
+//! checking; it pulls `GET /api/infra/results` only on a miss.
 //!
 //! ```json
-//! {"type": "infra.state", "v": 1, "ts": "2026-09-30T12:00:00Z",
-//!  "config_version": 7,
+//! {"type": "infra.state", "v": 1,
+//!  "boot": 1790000000000, "seq": 42, "hash": "3f9a0c1d2e4b5a69", "recoveries": 0,
+//!  "ts": "2026-09-30T12:00:00Z", "config_version": 7,
 //!  "targets": {
 //!    "6f0b2c4e-9d3a-4c1f-8e2b-1a2b3c4d5e6f": {
 //!      "status": "up", "latency_ms": 40, "since": "2026-09-30T11:58:00Z",
@@ -41,7 +46,7 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, warn};
 
-use crate::infra::{InfraResults, InfraState, TargetStatus};
+use crate::infra::{InfraResults, InfraState, Stamp, TargetStatus};
 
 /// The feature name in `tunnel.register` and `tunnel.register.ack`.
 pub const FEATURE: &str = "infra.state";
@@ -60,14 +65,17 @@ pub struct InfraStateMessage {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub v: u32,
+    /// `boot`, `seq`, `hash` and `recoveries` as they stood when the
+    /// message was built: a new `seq` is what makes it worth sending.
+    #[serde(flatten)]
+    pub stamp: Stamp,
     /// The device's clock when the message was built.
     pub ts: String,
     #[serde(flatten)]
     pub body: Body,
 }
 
-/// What a message says about the targets: the part compared to decide
-/// whether a new message is worth sending.
+/// What a message says about the targets.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Body {
     /// The config the results reflect; 0 when the device holds none.
@@ -112,8 +120,8 @@ fn fits(message: &InfraStateMessage) -> bool {
     serde_json::to_vec(message).is_ok_and(|bytes| bytes.len() <= MAX_BYTES)
 }
 
-/// Build the message for `results`, applying the cap.
-pub fn build(results: &InfraResults, ts: String) -> InfraStateMessage {
+/// Build the message for `results`, named by `stamp`, applying the cap.
+pub fn build(results: &InfraResults, stamp: Stamp, ts: String) -> InfraStateMessage {
     let targets: BTreeMap<String, TargetEntry> = results
         .targets
         .iter()
@@ -135,6 +143,7 @@ pub fn build(results: &InfraResults, ts: String) -> InfraStateMessage {
     let mut message = InfraStateMessage {
         kind: FEATURE,
         v: VERSION,
+        stamp,
         ts,
         body: Body {
             config_version: results.config_version,
@@ -192,17 +201,17 @@ pub fn spawn_forwarder(
     Some(tokio::spawn(forward(infra?, tx, MIN_INTERVAL)))
 }
 
-/// Send the results now, then after every signalled change whose message
-/// body differs from the last one sent, at most one per `min_interval`. A
-/// send waits for room in the writer's queue: a change is never dropped,
-/// only folded into the next message. Returns when the writer is gone.
+/// Send the results now, then whenever `seq` has moved since the last
+/// message sent, at most one per `min_interval`. A send waits for room in
+/// the writer's queue: a change is never dropped, only folded into the next
+/// message. Returns when the writer is gone.
 async fn forward(
     infra: Arc<Mutex<InfraState>>,
     tx: mpsc::Sender<WsMessage>,
     min_interval: Duration,
 ) {
     let mut changes = infra.lock().await.watch_changes();
-    let mut sent: Option<Body> = None;
+    let mut sent_seq: Option<u64> = None;
     let mut sent_at: Option<Instant> = None;
     loop {
         if let Some(at) = sent_at {
@@ -210,11 +219,13 @@ async fn forward(
         }
         // Changes signalled during the wait are in the results read now.
         changes.borrow_and_update();
+        // Read under the lock every writer of the results holds: the stamp
+        // names exactly these results.
         let message = {
             let infra = infra.lock().await;
-            build(&infra.results, crate::infra::now_iso())
+            build(&infra.results, infra.stamp(), crate::infra::now_iso())
         };
-        if sent.as_ref() != Some(&message.body) {
+        if sent_seq != Some(message.stamp.seq) {
             match serde_json::to_string(&message) {
                 Ok(text) if text.len() > MAX_BYTES => warn!(
                     bytes = text.len(),
@@ -225,11 +236,12 @@ async fn forward(
                         return;
                     }
                     debug!(
+                        seq = message.stamp.seq,
                         config_version = message.body.config_version,
                         targets = message.body.targets.len(),
                         "infra.state: sent"
                     );
-                    sent = Some(message.body);
+                    sent_seq = Some(message.stamp.seq);
                     sent_at = Some(Instant::now());
                 }
                 Err(e) => warn!("infra.state: serialize failed: {e}"),
@@ -277,6 +289,16 @@ mod tests {
         }
     }
 
+    /// The stamp of the documented example.
+    fn stamp() -> Stamp {
+        Stamp {
+            boot: 1_790_000_000_000,
+            seq: 42,
+            hash: "3f9a0c1d2e4b5a69".into(),
+            recoveries: 0,
+        }
+    }
+
     #[test]
     fn the_message_has_the_wire_shape() {
         let results = results(vec![
@@ -289,12 +311,16 @@ mod tests {
                 state("api-1", TargetStatus::Up, "API OK", "Peplink MAX BR1"),
             ),
         ]);
-        let message = build(&results, "2026-09-30T12:00:00Z".into());
+        let message = build(&results, stamp(), "2026-09-30T12:00:00Z".into());
         assert_eq!(
             serde_json::to_value(&message).unwrap(),
             json!({
                 "type": "infra.state",
                 "v": 1,
+                "boot": 1_790_000_000_000_u64,
+                "seq": 42,
+                "hash": "3f9a0c1d2e4b5a69",
+                "recoveries": 0,
                 "ts": "2026-09-30T12:00:00Z",
                 "config_version": 7,
                 "targets": {
@@ -321,7 +347,7 @@ mod tests {
     fn a_device_that_holds_nothing_says_version_zero_and_no_targets() {
         let mut empty = results(Vec::new());
         empty.config_version = 0;
-        let value = serde_json::to_value(build(&empty, String::new())).unwrap();
+        let value = serde_json::to_value(build(&empty, stamp(), String::new())).unwrap();
         assert_eq!(value["config_version"], 0);
         assert_eq!(value["targets"], json!({}));
         assert_eq!(value["truncated"], false);
@@ -334,7 +360,7 @@ mod tests {
             "t".into(),
             state("t", TargetStatus::Up, &detail, "gw"),
         )]);
-        let message = build(&results, String::new());
+        let message = build(&results, stamp(), String::new());
         let cut = message.body.targets["t"].detail.as_deref().unwrap();
         assert_eq!(cut.chars().count(), MAX_DETAIL_CHARS);
         assert!(cut.chars().all(|c| c == 'é'), "cut on a character boundary");
@@ -358,7 +384,7 @@ mod tests {
     #[test]
     fn over_the_cap_the_details_go_first() {
         let results = crowded(60, MAX_DETAIL_CHARS);
-        let message = build(&results, String::new());
+        let message = build(&results, stamp(), String::new());
         assert!(message.body.truncated);
         assert_eq!(message.body.targets.len(), 60, "every target kept");
         assert!(message.body.targets.values().all(|t| t.detail.is_none()));
@@ -369,7 +395,7 @@ mod tests {
     #[test]
     fn then_the_names_then_the_tail_of_the_list_sorted_by_id() {
         let results = crowded(300, MAX_DETAIL_CHARS);
-        let message = build(&results, String::new());
+        let message = build(&results, stamp(), String::new());
         assert!(message.body.truncated);
         let bytes = serde_json::to_string(&message).unwrap().len();
         assert!(bytes <= MAX_BYTES, "{bytes} bytes");
@@ -440,8 +466,7 @@ mod tests {
             check_interval_secs: 60,
             targets: targets.iter().map(|id| target(id)).collect(),
         };
-        state.seed_results(&config);
-        state.config = Some(config);
+        assert!(state.hold_config(config));
         Arc::new(Mutex::new(state))
     }
 
@@ -456,7 +481,17 @@ mod tests {
 
     async fn check(infra: &Arc<Mutex<InfraState>>, id: &str, result: CheckResult) {
         let mut guard = infra.lock().await;
-        apply_result(&mut guard, &target(id), result, 7, 1_000).await;
+        apply_result(&mut guard, &target(id), result, 7, Instant::now()).await;
+    }
+
+    /// The message's stamp, as numbers and the hash.
+    fn stamp_of(message: &Value) -> (u64, u64, String, u64) {
+        (
+            message["boot"].as_u64().unwrap(),
+            message["seq"].as_u64().unwrap(),
+            message["hash"].as_str().unwrap().to_string(),
+            message["recoveries"].as_u64().unwrap(),
+        )
     }
 
     fn start(infra: Arc<Mutex<InfraState>>, tx: mpsc::Sender<WsMessage>) -> JoinHandle<()> {
@@ -479,34 +514,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_forwarder_sends_at_start_and_on_a_status_change_only() {
+    async fn the_forwarder_sends_at_start_and_when_seq_moves_only() {
         let infra = infra(&["t1"]);
         let (tx, mut rx) = mpsc::channel(8);
         let task = start(infra.clone(), tx);
 
         let first = next_message(&mut rx).await;
         assert_eq!(first["type"], "infra.state");
-        assert_eq!(first["v"], 1);
+        assert_eq!(first["v"], 1, "the new fields are additive");
         assert_eq!(first["config_version"], 7);
         assert_eq!(first["targets"]["t1"]["status"], "unknown");
         assert_eq!(first["targets"]["t1"]["name"], "Target t1");
+        // It names the picture it carries, as the digest does.
+        let held = infra.lock().await.stamp();
+        let (boot, seq, hash, recoveries) = stamp_of(&first);
+        assert_eq!(
+            (boot, seq, hash.as_str(), recoveries),
+            (held.boot, held.seq, held.hash.as_str(), 0)
+        );
 
-        // The first check: unknown becomes up.
+        // The first check: unknown becomes up, a change: `seq` and `hash` move.
         check(&infra, "t1", ok(3)).await;
         let up = next_message(&mut rx).await;
         assert_eq!(up["targets"]["t1"]["status"], "up");
         assert_eq!(up["targets"]["t1"]["latency_ms"], 3);
         assert_eq!(up["targets"]["t1"]["detail"], "PING OK 3ms");
+        let (up_boot, up_seq, up_hash, _) = stamp_of(&up);
+        assert_eq!((up_boot, up_seq), (boot, seq + 1));
+        assert_ne!(up_hash, hash);
+        assert_eq!(up_hash, infra.lock().await.stamp().hash);
 
-        // Another good check with another latency changes nothing worth sending.
+        // Another good check with another latency moves no `seq`: nothing sent.
         check(&infra, "t1", ok(9)).await;
         assert!(silent(&mut rx).await);
+        assert_eq!(infra.lock().await.stamp().seq, seq + 1);
 
         check(&infra, "t1", CheckResult::failed("PING TIMEOUT")).await;
         let degraded = next_message(&mut rx).await;
         assert_eq!(degraded["targets"]["t1"]["status"], "degraded");
         assert_eq!(degraded["targets"]["t1"]["consecutive_fail"], 1);
         assert_eq!(degraded["targets"]["t1"]["detail"], "PING TIMEOUT");
+        assert_eq!(stamp_of(&degraded).1, seq + 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_logged_recovery_run_is_sent_though_no_status_moved() {
+        let infra = infra(&["t1"]);
+        let (tx, mut rx) = mpsc::channel(8);
+        let task = start(infra.clone(), tx);
+        let first = next_message(&mut rx).await;
+        let (_, seq, hash, recoveries) = stamp_of(&first);
+        assert_eq!(recoveries, 0);
+
+        infra
+            .lock()
+            .await
+            .push_recovery_log(crate::infra::RecoveryLogEntry {
+                ts: crate::infra::now_iso(),
+                target_id: "t1".into(),
+                command: "true".into(),
+                exit_code: 0,
+                stdout: String::new(),
+            });
+        let logged = next_message(&mut rx).await;
+        let (_, logged_seq, logged_hash, logged_recoveries) = stamp_of(&logged);
+        assert_eq!(logged_seq, seq + 1, "a logged run is a change");
+        assert_eq!(logged_recoveries, 1);
+        assert_eq!(logged_hash, hash, "the statuses are as they were");
+        assert_eq!(logged["targets"], first["targets"]);
+        assert!(silent(&mut rx).await);
         task.abort();
     }
 
@@ -524,8 +601,7 @@ mod tests {
                 check_interval_secs: 60,
                 targets: vec![target("t1"), target("t2")],
             };
-            guard.seed_results(&config);
-            guard.config = Some(config);
+            assert!(guard.hold_config(config));
         }
         let pushed = next_message(&mut rx).await;
         assert_eq!(pushed["config_version"], 8);
@@ -535,20 +611,18 @@ mod tests {
         {
             let mut guard = infra.lock().await;
             let config = guard.config.clone().unwrap();
-            guard.seed_results(&config);
+            assert!(!guard.hold_config(config));
         }
         assert!(silent(&mut rx).await);
 
-        {
-            let mut guard = infra.lock().await;
-            guard.config = None;
-            guard.results.targets.clear();
-            guard.results.config_version = 0;
-            guard.changed();
-        }
+        assert!(infra.lock().await.drop_config());
         let removed = next_message(&mut rx).await;
         assert_eq!(removed["config_version"], 0);
         assert_eq!(removed["targets"], json!({}));
+
+        // Removing nothing is not a change.
+        assert!(!infra.lock().await.drop_config());
+        assert!(silent(&mut rx).await);
         task.abort();
     }
 

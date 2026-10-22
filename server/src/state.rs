@@ -18,7 +18,7 @@ use crate::comms::{CommsClient, CommsState};
 use crate::config::Config;
 use crate::file_access::Gate;
 use crate::gawdxfer::manager::TransferManager;
-use crate::infra::InfraState;
+use crate::infra::{Digest, InfraState};
 use crate::netwatch::owner::RelayRoute;
 use crate::netwatch::NetWatch;
 use crate::sessions::SessionManager;
@@ -61,6 +61,9 @@ pub struct AppState {
     pub relay_state: Option<RelayState>,
     /// Infrastructure monitoring state (always present, activates on config push).
     pub infra_state: Option<Arc<Mutex<InfraState>>>,
+    /// The digest of the Infra monitor (ADR-010): the cell `GET /api/info`
+    /// reads without `infra_state`'s lock. `infra_state` holds the same one.
+    pub infra_digest: Arc<Digest>,
     /// The device's own HTTP router, set once at startup after the router is
     /// built (it needs the completed AppState to exist first). The tunnel
     /// client dispatches generic `http.request` frames into a clone of it —
@@ -92,7 +95,8 @@ pub struct AppState {
 #[cfg(test)]
 impl AppState {
     /// A state for route tests: `config` and `file_gate` as given, nothing
-    /// running, no tunnel, no infra, no install.
+    /// running, no tunnel, no infra (its digest says it holds no config),
+    /// no install.
     pub(crate) fn for_tests(config: Config, file_gate: Arc<Gate>) -> Self {
         use crate::gawdxfer::types::TransferConfig;
         let (session_events, _) = broadcast::channel(256);
@@ -131,6 +135,7 @@ impl AppState {
             device_snapshots: None,
             relay_state: None,
             infra_state: None,
+            infra_digest: Arc::new(Digest::new(crate::infra::now_unix_ms(), false)),
             api_router: Arc::new(std::sync::OnceLock::new()),
             netwatch: None,
             relay_route: None,
