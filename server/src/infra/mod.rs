@@ -1904,10 +1904,18 @@ mod tests {
             "until the last run ended"
         );
 
-        // A run that does not end: at most the limit.
+        // A run that does not end: at most the limit. Bounded a second past
+        // it: on the paused clock with no other timer, a wait that lost its
+        // limit would wait for good, and the run would hang.
         let stuck = runs.start("pdu").expect("free again");
         let at = Instant::now();
-        assert!(!runs.wait_idle(Duration::from_mins(5)).await);
+        let idle = tokio::time::timeout(
+            Duration::from_mins(5) + Duration::from_secs(1),
+            runs.wait_idle(Duration::from_mins(5)),
+        )
+        .await
+        .expect("bounded by the limit");
+        assert!(!idle);
         assert_eq!(at.elapsed(), Duration::from_mins(5));
         drop(stuck);
         assert!(runs.wait_idle(Duration::ZERO).await, "none in progress");

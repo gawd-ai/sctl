@@ -534,6 +534,7 @@ mod tests {
     // ─── The monitor (ADR-010 decisions 6 to 10) ─────────────────────
 
     use std::collections::HashMap as Map;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
 
@@ -899,8 +900,42 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The monitor's clock in the recovery tests: a tick of 100 ms and a
+    /// deadline of 500 ms, so a running check's permit held through a run
+    /// would stop the rounds 0.6 s after it was taken.
+    fn fast() -> Timing {
+        Timing {
+            tick: Duration::from_millis(100),
+            deadline: Duration::from_millis(500),
+            ..Timing::default()
+        }
+    }
+
+    /// A unit's power outlet that answers no check, Down at its second
+    /// failure, whose recovery runs `command` with `credential_ids`, and a
+    /// camera that answers: both due at every tick.
+    fn outlet_and_camera(command: &str, credential_ids: Vec<String>) -> InfraConfig {
+        let mut pdu = target("pdu");
+        pdu.interval_secs = Some(0);
+        pdu.down_after_consecutive = 1;
+        pdu.recovery = Some(RecoveryConfig {
+            enabled: true,
+            command: command.to_string(),
+            cooldown_secs: 3600,
+            max_retries: 5,
+            credential_ids,
+        });
+        let mut cam = target("cam");
+        cam.interval_secs = Some(0);
+        InfraConfig {
+            version: 7,
+            check_interval_secs: 60,
+            targets: vec![pdu, cam],
+        }
+    }
+
     /// A unit's power outlet that answers no check, with a recovery that
-    /// prints its saved record as it starts and then takes 3 s.
+    /// prints its saved record as it starts and then takes 4 s.
     #[tokio::test]
     async fn a_recovery_runs_after_the_down_outside_the_lock_and_a_push_does_not_cut_it() {
         let dir = scratch("recovery");
@@ -915,33 +950,13 @@ mod tests {
                 password: "unused".into(),
             },
         );
-        let command = "cat \"$SCTL_CRED_USER_1\"; sleep 3".to_string();
-        let mut pdu = target("pdu");
-        pdu.interval_secs = Some(0);
-        pdu.down_after_consecutive = 1;
-        pdu.recovery = Some(RecoveryConfig {
-            enabled: true,
-            command: command.clone(),
-            cooldown_secs: 3600,
-            max_retries: 5,
-            credential_ids: vec!["record".into()],
-        });
-        let mut cam = target("cam");
-        cam.interval_secs = Some(0);
+        let command = "cat \"$SCTL_CRED_USER_1\"; sleep 4".to_string();
         let (checker, calls) = counting(|id| answer(id != "pdu", 3));
         let calls_of = |id: &str| calls.lock().unwrap().get(id).copied().unwrap_or(0);
-        let fast = Timing {
-            tick: Duration::from_millis(100),
-            ..Timing::default()
-        };
-        use_checks(&infra, fast, checker).await;
+        use_checks(&infra, fast(), checker).await;
         let (task, mut rx) = forwarder(&infra);
         next_message(&mut rx).await;
-        let config = InfraConfig {
-            version: 7,
-            check_interval_secs: 60,
-            targets: vec![pdu, cam],
-        };
+        let config = outlet_and_camera(&command, vec!["record".into()]);
         push(&state, config.clone()).await.unwrap();
 
         // The Down leaves while the run is in progress, never after it.
@@ -949,6 +964,15 @@ mod tests {
         assert_eq!(down["recoveries"], 0, "not logged yet");
         let runs = state.infra_digest.runs();
         assert!(runs.contains("pdu"), "the run is in progress");
+
+        // The run holds the target's place, not the permit of a running
+        // check: the rounds go on past the deadline plus a tick.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let rounds = state.infra_digest.group().rounds;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let later = state.infra_digest.group().rounds;
+        assert!(later >= rounds + 3, "rounds {rounds}, then {later}");
+        assert!(runs.contains("pdu"), "both read during the run");
 
         // During the run: no check of pdu starts, cam's go on, and Check
         // now of pdu answers the Down check's result at once.
@@ -994,6 +1018,103 @@ mod tests {
 
         stop_monitor(&infra).await;
         task.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A removed config does not cut a recovery run: the run ends by
+    /// itself, logged once with the command's own exit code, and saved as
+    /// ended.
+    #[tokio::test]
+    async fn a_removed_config_does_not_cut_a_recovery_run() {
+        let dir = scratch("removed");
+        let (state, infra) = state(&dir);
+        let (checker, _) = counting(|id| answer(id != "pdu", 3));
+        use_checks(&infra, fast(), checker).await;
+        push(&state, outlet_and_camera("sleep 2; exit 7", Vec::new()))
+            .await
+            .unwrap();
+        let runs = state.infra_digest.runs();
+        wait_until(Duration::from_secs(5), || runs.contains("pdu")).await;
+
+        let removed = delete_config(State(state.clone())).await.unwrap().0;
+        assert_eq!(removed["status"], "ok");
+        assert!(infra.lock().await.config.is_none());
+        assert!(runs.contains("pdu"), "the run goes on");
+
+        wait_until(Duration::from_secs(10), || !runs.contains("pdu")).await;
+        let log = infra.lock().await.results.recovery_log.clone();
+        assert_eq!(log.len(), 1);
+        assert_eq!((log[0].target_id.as_str(), log[0].exit_code), ("pdu", 7));
+        assert!(
+            !dir.join("state/infra-recovery.json").exists(),
+            "saved as ended, and the removal cleared the count"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(infra.lock().await.results.recovery_log.len(), 1, "once");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A monitor that panics while a recovery run is in progress is rebuilt
+    /// after 5 s by the same supervisor, and the run, outside its task set,
+    /// goes on: it ends by itself, logged once with the command's own exit
+    /// code.
+    #[tokio::test]
+    async fn a_monitor_rebuilt_after_a_panic_does_not_cut_a_recovery_run() {
+        let dir = scratch("rebuilt-run");
+        let (state, infra) = state(&dir);
+        let runs = state.infra_digest.runs();
+        let panicked = Arc::new(AtomicBool::new(false));
+        let cam_checks: Arc<StdMutex<Vec<Instant>>> = Arc::default();
+        let checker: Checker = {
+            let (runs, panicked, cam_checks) = (runs.clone(), panicked.clone(), cam_checks.clone());
+            Arc::new(move |target: &InfraTarget, _: CheckContext| {
+                // The tick calls this as it starts a check: the first start
+                // of cam once pdu's run is in progress is a defect in the
+                // monitor's own loop.
+                let defect =
+                    target.id == "cam" && runs.contains("pdu") && !panicked.swap(true, SeqCst);
+                assert!(!defect, "a defect in the monitor's loop");
+                if target.id == "cam" {
+                    cam_checks.lock().unwrap().push(Instant::now());
+                }
+                let result = answer(target.id != "pdu", 3);
+                async move { result }.boxed()
+            })
+        };
+        use_checks(&infra, fast(), checker).await;
+        push(&state, outlet_and_camera("sleep 7; exit 7", Vec::new()))
+            .await
+            .unwrap();
+        let supervisor = monitor_task(&infra).await;
+        wait_until(Duration::from_secs(5), || panicked.load(SeqCst)).await;
+        let panicked_at = Instant::now();
+        assert!(runs.contains("pdu"), "the run goes on");
+
+        // Rebuilt after 5 s, while the run goes on: cam is checked again,
+        // pdu, whose place the run holds, is not.
+        wait_until(Duration::from_secs(10), || {
+            cam_checks
+                .lock()
+                .unwrap()
+                .last()
+                .is_some_and(|at| *at > panicked_at)
+        })
+        .await;
+        assert!(panicked_at.elapsed() >= Duration::from_secs(4));
+        assert!(runs.contains("pdu"), "the run is still in progress");
+        assert_eq!(
+            monitor_task(&infra).await,
+            supervisor,
+            "the same supervisor"
+        );
+
+        wait_until(Duration::from_secs(10), || !runs.contains("pdu")).await;
+        let log = infra.lock().await.results.recovery_log.clone();
+        assert_eq!(log.len(), 1);
+        assert_eq!((log[0].target_id.as_str(), log[0].exit_code), ("pdu", 7));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(infra.lock().await.results.recovery_log.len(), 1, "once");
+        stop_monitor(&infra).await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1152,7 +1273,10 @@ mod tests {
     }
 
     /// Check now runs under the monitor's 90 s deadline, and waits for a
-    /// check in flight at most that long.
+    /// check in flight at most that long. Each call is bounded a second
+    /// past it: on the paused clock with no other timer, a Check now that
+    /// lost its deadline would wait for good, and the run would hang
+    /// instead of failing.
     #[tokio::test(start_paused = true)]
     async fn check_now_answers_within_the_deadline() {
         let dir = scratch("deadline");
@@ -1165,9 +1289,14 @@ mod tests {
             check_interval_secs: 3600,
             targets: vec![target("t1")],
         });
+        let bounded = |state: AppState| async move {
+            tokio::time::timeout(Duration::from_secs(91), check_now(&state, "t1"))
+                .await
+                .expect("bounded by the deadline")
+        };
 
         let asked = Instant::now();
-        let answered = check_now(&state, "t1").await;
+        let answered = bounded(state.clone()).await;
         assert_eq!(asked.elapsed(), Duration::from_secs(90));
         assert_eq!(answered["detail"], "CHECK DEADLINE: no answer within 90s");
         let t1 = infra.lock().await.results.targets["t1"].clone();
@@ -1181,7 +1310,7 @@ mod tests {
         // applies nothing of its own.
         let held = infra.lock().await.in_flight.start("t1").unwrap();
         let asked = Instant::now();
-        let answered = check_now(&state, "t1").await;
+        let answered = bounded(state.clone()).await;
         assert_eq!(asked.elapsed(), Duration::from_secs(90));
         assert_eq!(
             answered["detail"],
