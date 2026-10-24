@@ -58,7 +58,8 @@ use tracing::{debug, error, info, warn};
 use super::checks::{self, CheckContext, CheckResult};
 use super::{
     now_iso, now_unix_ms, CheckSpec, DataSample, Flight, InfraConfig, InfraState, InfraTarget,
-    RecoveryConfig, RecoveryLogEntry, RunGuard, SavedRun, TargetState, TargetStatus,
+    RecoveryConfig, RecoveryLogEntry, RecoverySnapshot, RunGuard, SavedRun, TargetState,
+    TargetStatus,
 };
 
 /// How many checks may run at once. Small: these devices have one core and
@@ -972,15 +973,8 @@ struct Ended {
 }
 
 impl RecoveryRun {
-    /// Under the Infra lock: take the credentials the command names, and
-    /// save the run as not ended, synced, before the command starts.
+    /// Under the Infra lock: take the credentials the command names.
     fn prepare(&self, state: &InfraState) -> Prepared {
-        if !state.save_recoveries() {
-            warn!(
-                "Recovery for {}: its record did not reach the disk; it runs all the same",
-                self.target_id
-            );
-        }
         match recovery_env(&state.credentials, &self.credential_ids) {
             Err(missing) => {
                 Prepared::Refused(format!("ERROR: credential {missing} is not on this unit"))
@@ -1049,8 +1043,9 @@ impl RecoveryRun {
     }
 
     /// Under the Infra lock: log the run, which moves `seq` and
-    /// `recoveries` and is pushed, and save it as ended.
-    fn log(self, state: &mut InfraState, ended: Ended) {
+    /// `recoveries` and is pushed, and mark it ended. Returns the record
+    /// that saves it as ended, for the caller to write outside the lock.
+    fn log(&self, state: &mut InfraState, ended: Ended) -> RecoverySnapshot {
         info!(
             "Recovery for {}: exit={}, output={}",
             self.target_id, ended.exit_code, ended.stdout
@@ -1070,7 +1065,7 @@ impl RecoveryRun {
         {
             state.runs_not_ended.remove(&self.target_id);
         }
-        state.save_recoveries();
+        state.recoveries_snapshot()
     }
 }
 
@@ -1131,16 +1126,33 @@ fn start_recovery(
 }
 
 /// Run a recovery in a task of its own (ADR-010 decision 9). Under the
-/// Infra lock it takes the credentials the command names and saves the run
-/// as not ended, then releases the lock and runs the command, which only
-/// its 300 s limit or the agent's stop ends: no push, rebuilt monitor or
-/// removed config. Its output, masked and cut, is logged under the lock.
-/// `flight` is the target's place: no check of it starts until the run
-/// ends.
+/// Infra lock it takes the credentials the command names and the record
+/// that saves the run as not ended. It releases the lock, writes that
+/// record, synced, on the blocking pool, and only then runs the command,
+/// which only its 300 s limit or the agent's stop ends: no push, rebuilt
+/// monitor or removed config. Its output, masked and cut, is logged under
+/// the lock, and the record that saves it as ended is written outside it.
+/// The run is in progress, and `flight`, the target's place, held, until
+/// that record is written: no check of the target starts before, and a
+/// managed upgrade's restart waits for it.
 pub(crate) async fn run_recovery(infra: Arc<Mutex<InfraState>>, run: RecoveryRun, flight: Flight) {
-    let prepared = run.prepare(&*infra.lock().await);
+    let (prepared, record) = {
+        let state = infra.lock().await;
+        (run.prepare(&state), state.recoveries_snapshot())
+    };
+    // A synced write to flash can take hundreds of milliseconds: never on
+    // the async worker, never under the lock the forwarder needs to send
+    // the Down.
+    if !record.write().await {
+        warn!(
+            "Recovery for {}: its record did not reach the disk; it runs all the same",
+            run.target_id
+        );
+    }
     let ended = run.execute(prepared).await;
-    run.log(&mut *infra.lock().await, ended);
+    let record = run.log(&mut *infra.lock().await, ended);
+    record.write().await;
+    drop(run);
     drop(flight);
 }
 
@@ -1217,8 +1229,9 @@ mod tests {
     /// A recovery run's parts in turn, on a state the test holds.
     async fn run_inline(state: &mut InfraState, run: RecoveryRun) {
         let prepared = run.prepare(state);
+        state.recoveries_snapshot().write().await;
         let ended = run.execute(prepared).await;
-        run.log(state, ended);
+        run.log(state, ended).write().await;
     }
 
     /// A scratch `state_dir`, removed when it drops: the saved recovery
@@ -2369,11 +2382,95 @@ mod tests {
 
         apply(&mut state, &t, answer(true, 3), 1, Instant::now()).await;
         assert!(state.recovery_tracker.is_empty(), "out of unknown: afresh");
-        assert_eq!(
-            scratch.saved(),
-            serde_json::Value::Null,
-            "nothing left to save"
+        // The clear hands its save to the blocking pool: nothing is left to
+        // save, so the file goes.
+        wait_until(Duration::from_secs(5), || {
+            scratch.saved() == serde_json::Value::Null
+        })
+        .await;
+    }
+
+    /// A synced write to a unit's flash can take hundreds of milliseconds,
+    /// and a one-core unit has one async worker. A run's record is written
+    /// on the blocking pool, outside the Infra lock: while its write is
+    /// held, here by a FIFO in place of the temporary file it writes, the
+    /// lock is free and the worker goes on, and the command waits for the
+    /// record.
+    #[tokio::test]
+    async fn a_runs_record_is_written_outside_the_lock_and_off_the_async_worker() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let scratch = Scratch::new("slow-disk");
+        let mut t = target_every("pdu", 60);
+        t.recovery = Some(RecoveryConfig {
+            enabled: true,
+            command: "true".into(),
+            cooldown_secs: 0,
+            max_retries: 5,
+            credential_ids: Vec::new(),
+        });
+        let mut state = holding(&scratch, vec![t.clone()]);
+        let run = (0..5)
+            .find_map(|_| {
+                apply_result(
+                    &mut state,
+                    &t,
+                    answer(false, 0),
+                    1,
+                    Instant::now(),
+                    Reading::Monitor,
+                )
+            })
+            .expect("Down within five failures");
+        let flight = state.in_flight.start("pdu").expect("free");
+        let infra = Arc::new(Mutex::new(state));
+
+        // The write waits in its open until the FIFO has a reader. A thread
+        // opens one when the test says, or after 5 s whatever happens, so a
+        // write that holds the worker fails the test instead of hanging it.
+        let fifo = scratch.0.join("infra-recovery.json.tmp");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let (open, opened) = std::sync::mpsc::channel::<()>();
+        let (close, closed) = std::sync::mpsc::channel::<()>();
+        let reader = std::thread::spawn({
+            let fifo = fifo.clone();
+            move || {
+                let _ = opened.recv_timeout(Duration::from_secs(5));
+                // Opened without waiting for a writer; while it is open,
+                // every write opens at once.
+                let held = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&fifo);
+                let _ = closed.recv_timeout(Duration::from_secs(30));
+                drop(held);
+            }
+        });
+
+        let asked = std::time::Instant::now();
+        let task = tokio::spawn(run_recovery(infra.clone(), run, flight));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            asked.elapsed() < Duration::from_secs(1),
+            "the async worker waited for the disk: {:?}",
+            asked.elapsed()
         );
+        assert!(infra.try_lock().is_ok(), "the Infra lock is free");
+        assert!(
+            infra.lock().await.results.recovery_log.is_empty(),
+            "the command waits for its record"
+        );
+        assert!(!task.is_finished());
+
+        open.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the run ends once its write does")
+            .unwrap();
+        close.send(()).unwrap();
+        reader.join().unwrap();
+        let log = infra.lock().await.results.recovery_log.clone();
+        assert_eq!((log.len(), log[0].exit_code), (1, 0), "it ran, once");
     }
 
     #[tokio::test]

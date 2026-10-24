@@ -24,7 +24,9 @@
 //! but its own 300 s limit or the agent's stop ends it. Each target's count
 //! and each run not yet ended are saved in `<state_dir>/infra-recovery.json`
 //! before the command starts, so the count holds across the restarts a
-//! recovery causes, and the next start logs a run that did not end.
+//! recovery causes, and the next start logs a run that did not end. The run
+//! writes that file, synced, on the blocking pool and outside the Infra
+//! lock ([`RecoveryFile`]).
 //!
 //! Check now (`POST /api/infra/check/{target_id}`) is a reading: its result
 //! is applied as a monitor check's is, and it never starts a recovery.
@@ -50,6 +52,7 @@ pub mod routes;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -740,8 +743,9 @@ pub struct InfraState {
     /// The recovery runs started and not yet logged, by target id: saved
     /// as not ended before each command starts.
     pub runs_not_ended: HashMap<String, SavedRun>,
-    /// Path of the saved recovery counts and runs (mode 0600).
-    pub recovery_path: PathBuf,
+    /// The saved recovery counts and runs (mode 0600), and the order its
+    /// writes reach it in.
+    pub recovery_file: RecoveryFile,
     /// Path for persistent config storage.
     pub config_path: PathBuf,
     /// Whether the last save of the held config reached the disk; an
@@ -811,7 +815,7 @@ impl InfraState {
             },
             recovery_tracker: HashMap::new(),
             runs_not_ended: HashMap::new(),
-            recovery_path: Path::new(state_dir).join("infra-recovery.json"),
+            recovery_file: RecoveryFile::new(Path::new(state_dir).join("infra-recovery.json")),
             config_path: Path::new(state_dir).join("infra-monitor.json"),
             config_saved: false,
             config_generation: 0,
@@ -951,10 +955,11 @@ impl InfraState {
 
     /// Clear `target_id`'s recovery count, as a good answer that moves it
     /// out of Down or `unknown` does, and save the counts when one was
-    /// there.
+    /// there. The save goes to the blocking pool and nothing waits for it:
+    /// it comes on the check path, under the Infra lock.
     pub fn clear_recovery_count(&mut self, target_id: &str) {
         if self.recovery_tracker.remove(target_id).is_some() {
-            self.save_recoveries();
+            self.recoveries_snapshot().hand_off();
         }
     }
 
@@ -965,7 +970,7 @@ impl InfraState {
     /// not ended is logged with its outcome unknown, which moves `seq` and
     /// `recoveries`. Missing is normal.
     pub fn load_recoveries(&mut self) {
-        let saved = match std::fs::read_to_string(&self.recovery_path) {
+        let saved = match std::fs::read_to_string(self.recovery_file.path()) {
             Ok(data) => match serde_json::from_str::<SavedRecoveries>(&data) {
                 Ok(saved) => saved,
                 Err(e) => {
@@ -1017,44 +1022,33 @@ impl InfraState {
     }
 
     /// Save the recovery counts and the runs not yet ended, synced, owner
-    /// readable only; with neither, remove the file. False when the disk
-    /// did not take it.
+    /// readable only, here on this thread; with neither, remove the file.
+    /// False when the disk did not take it. A config applied or removed,
+    /// and the start, save this way; a recovery run writes its
+    /// [`Self::recoveries_snapshot`] on the blocking pool.
     pub fn save_recoveries(&self) -> bool {
-        let saved = SavedRecoveries {
-            counts: self
-                .recovery_tracker
-                .iter()
-                .map(|(id, (_, count))| (id.clone(), *count))
-                .collect(),
-            running: self
-                .runs_not_ended
-                .iter()
-                .map(|(id, run)| (id.clone(), run.clone()))
-                .collect(),
-        };
-        if saved.counts.is_empty() && saved.running.is_empty() {
-            return match std::fs::remove_file(&self.recovery_path) {
-                Ok(()) => true,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-                Err(e) => {
-                    warn!("Failed to remove infra recovery counts: {e}");
-                    false
-                }
-            };
-        }
-        let Ok(data) = serde_json::to_vec(&saved) else {
-            warn!("Failed to serialize infra recovery counts");
-            return false;
-        };
-        if let Some(parent) = self.recovery_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        match write_synced(&self.recovery_path, &data) {
-            Ok(()) => true,
-            Err(e) => {
-                warn!("Failed to save infra recovery counts: {e}");
-                false
-            }
+        self.recoveries_snapshot().write_here()
+    }
+
+    /// The recovery counts and the runs not yet ended as they stand,
+    /// numbered: what `infra-recovery.json` is to hold. Taken under the
+    /// Infra lock, it can be written outside it.
+    pub fn recoveries_snapshot(&self) -> RecoverySnapshot {
+        RecoverySnapshot {
+            number: self.recovery_file.0.taken.fetch_add(1, Ordering::Relaxed) + 1,
+            file: self.recovery_file.clone(),
+            saved: SavedRecoveries {
+                counts: self
+                    .recovery_tracker
+                    .iter()
+                    .map(|(id, (_, count))| (id.clone(), *count))
+                    .collect(),
+                running: self
+                    .runs_not_ended
+                    .iter()
+                    .map(|(id, run)| (id.clone(), run.clone()))
+                    .collect(),
+            },
         }
     }
 
@@ -1239,6 +1233,118 @@ fn write_synced(path: &Path, data: &[u8]) -> std::io::Result<()> {
         let _ = dir.sync_all();
     }
     Ok(())
+}
+
+/// `<state_dir>/infra-recovery.json` (ADR-010 decision 9), and the order
+/// its writes reach it in.
+///
+/// A save is a [`RecoverySnapshot`], taken under the Infra lock and
+/// numbered then. A recovery run writes its own on the blocking pool,
+/// outside that lock, and a count cleared on the check path hands its own
+/// to the pool: a synced write to a unit's flash can take hundreds of
+/// milliseconds, and a one-core unit has one async worker, which the
+/// forwarder, the checks and every route share. Writes go one at a time,
+/// and a snapshot never replaces a newer one on disk, whatever order the
+/// pool runs them in.
+#[derive(Debug, Clone)]
+pub struct RecoveryFile(Arc<RecoveryFileInner>);
+
+#[derive(Debug)]
+struct RecoveryFileInner {
+    path: PathBuf,
+    /// The number of the last snapshot taken.
+    taken: AtomicU64,
+    /// The number of the snapshot on disk, held while a write runs.
+    on_disk: StdMutex<u64>,
+}
+
+impl RecoveryFile {
+    fn new(path: PathBuf) -> Self {
+        Self(Arc::new(RecoveryFileInner {
+            path,
+            taken: AtomicU64::new(0),
+            on_disk: StdMutex::new(0),
+        }))
+    }
+
+    /// Where the file is.
+    pub fn path(&self) -> &Path {
+        &self.0.path
+    }
+}
+
+/// The recovery counts and the runs not yet ended as they stood when it
+/// was taken, numbered, for [`RecoveryFile`].
+#[derive(Debug)]
+#[must_use = "a snapshot reaches the disk only once it is written"]
+pub struct RecoverySnapshot {
+    file: RecoveryFile,
+    number: u64,
+    saved: SavedRecoveries,
+}
+
+impl RecoverySnapshot {
+    /// Write it on the blocking pool, and wait until the disk has it. True
+    /// when it, or a newer snapshot, is on disk.
+    pub async fn write(self) -> bool {
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => runtime
+                .spawn_blocking(move || self.write_here())
+                .await
+                .unwrap_or(false),
+            Err(_) => self.write_here(),
+        }
+    }
+
+    /// Hand it to the blocking pool, and do not wait.
+    pub fn hand_off(self) {
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(move || self.write_here())),
+            Err(_) => {
+                self.write_here();
+            }
+        }
+    }
+
+    /// Write it on this thread, synced, owner readable only; with nothing
+    /// to save, remove the file. True when it, or a newer snapshot, is on
+    /// disk: a newer one holds every run this one holds as not ended, since
+    /// only a run's end, saved after its command, marks it ended.
+    pub fn write_here(self) -> bool {
+        let file = &self.file.0;
+        let mut on_disk = file.on_disk.lock().unwrap_or_else(PoisonError::into_inner);
+        if *on_disk >= self.number {
+            return true;
+        }
+        let written = if self.saved.counts.is_empty() && self.saved.running.is_empty() {
+            match std::fs::remove_file(&file.path) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                Err(e) => {
+                    warn!("Failed to remove infra recovery counts: {e}");
+                    false
+                }
+            }
+        } else if let Ok(data) = serde_json::to_vec(&self.saved) {
+            if let Some(parent) = file.path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match write_synced(&file.path, &data) {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!("Failed to save infra recovery counts: {e}");
+                    false
+                }
+            }
+        } else {
+            warn!("Failed to serialize infra recovery counts");
+            false
+        };
+        if written {
+            *on_disk = self.number;
+        }
+        written
+    }
 }
 
 /// What `<state_dir>/infra-recovery.json` holds (ADR-010 decision 9).
@@ -1734,6 +1840,39 @@ mod tests {
         let mut waiting = in_flight.take_or_wait("t2").expect_err("in flight");
         drop(cancelled);
         assert!(waiting.wait_for(Option::is_some).await.is_err());
+    }
+
+    /// A run writes its record on the blocking pool, which runs writes in
+    /// any order: a snapshot never replaces a newer one on disk.
+    #[test]
+    fn an_older_recovery_snapshot_never_replaces_a_newer_one() {
+        let dir = std::env::temp_dir().join(format!("sctl-infra-snapshots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = InfraState::new(dir.to_str().unwrap());
+        let path = dir.join("infra-recovery.json");
+        let saved =
+            || -> Value { serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap() };
+
+        state
+            .recovery_tracker
+            .insert("pdu".into(), (Instant::now(), 1));
+        let older = state.recoveries_snapshot();
+        state
+            .recovery_tracker
+            .insert("cam".into(), (Instant::now(), 2));
+        let newer = state.recoveries_snapshot();
+        assert!(newer.write_here());
+        assert!(older.write_here(), "a newer one is on disk");
+        assert_eq!(
+            saved(),
+            serde_json::json!({"counts": {"cam": 2, "pdu": 1}, "running": {}})
+        );
+
+        // One taken after both is written, nothing left to save included.
+        state.recovery_tracker.clear();
+        assert!(state.save_recoveries());
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(start_paused = true)]
