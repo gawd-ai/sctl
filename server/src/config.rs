@@ -874,27 +874,52 @@ impl Config {
             }
         };
 
-        // Env var overrides
+        config.apply_env();
+        config
+    }
+
+    /// Environment variable overrides, which win over the file.
+    fn apply_env(&mut self) {
         if let Ok(key) = std::env::var("SCTL_API_KEY") {
-            config.auth.api_key = key;
+            self.auth.api_key = key;
         }
         if let Ok(listen) = std::env::var("SCTL_LISTEN") {
-            config.server.listen = listen;
+            self.server.listen = listen;
         }
         if let Ok(serial) = std::env::var("SCTL_DEVICE_SERIAL") {
-            config.device.serial = serial;
+            self.device.serial = serial;
         }
         if let Ok(dir) = std::env::var("SCTL_DATA_DIR") {
-            config.server.data_dir = dir;
+            self.server.data_dir = dir;
         }
         if let Ok(dir) = std::env::var("SCTL_STATE_DIR") {
-            config.server.state_dir = dir;
+            self.server.state_dir = dir;
         }
         if let Ok(dir) = std::env::var("SCTL_PLAYBOOKS_DIR") {
-            config.server.playbooks_dir = dir;
+            self.server.playbooks_dir = dir;
         }
+    }
 
-        config
+    /// Parse a config's text as `load` does, the environment's overrides
+    /// applied, or None when it is not one: never a panic, and nothing of
+    /// the text is quoted. `sctl net` reads the agent's config this way
+    /// (ADR-012); an empty text is the compiled defaults.
+    pub fn from_toml(text: &str) -> Option<Self> {
+        let mut config: Self = toml::from_str(text).ok()?;
+        config.apply_env();
+        Some(config)
+    }
+
+    /// The file `load(path)` reads, as an absolute path: `path`, else
+    /// `sctl.toml` in the working directory when it exists, else none (the
+    /// compiled defaults).
+    pub fn file_for(path: Option<&str>) -> Option<std::path::PathBuf> {
+        let file = match path {
+            Some(p) => Path::new(p).to_path_buf(),
+            None if Path::new("sctl.toml").exists() => Path::new("sctl.toml").to_path_buf(),
+            None => return None,
+        };
+        Some(std::path::absolute(&file).unwrap_or(file))
     }
 
     /// Effective external comms provider. Hardware-backed GPS/LTE configs must
@@ -929,6 +954,29 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_config_text_parses_without_a_panic_or_none() {
+        let defaults = Config::from_toml("").expect("an empty text is the defaults");
+        assert!(defaults.lte.is_none());
+        let with_lte = Config::from_toml("[lte]\ninterface = \"qmimux0\"\n").expect("a config");
+        assert_eq!(with_lte.lte.unwrap().interface, "qmimux0");
+        assert!(
+            Config::from_toml("{\"devices\": {}}").is_none(),
+            "JSON is not one"
+        );
+        assert!(Config::from_toml("[lte\n").is_none());
+        assert!(Config::from_toml("[lte]\ninterface = 7\n").is_none());
+    }
+
+    #[test]
+    fn the_file_load_reads_is_named_absolute() {
+        let given = Config::file_for(Some("/etc/sctl/sctl.toml")).unwrap();
+        assert_eq!(given, std::path::Path::new("/etc/sctl/sctl.toml"));
+        let relative = Config::file_for(Some("conf/sctl.toml")).unwrap();
+        assert!(relative.is_absolute(), "{}", relative.display());
+        assert!(relative.ends_with("conf/sctl.toml"));
+    }
 
     fn client(extra: &str) -> Config {
         toml::from_str(&format!(

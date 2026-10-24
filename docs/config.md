@@ -39,6 +39,14 @@ Configuration is resolved highest-wins:
    `sctl.toml` in the current working directory if present.
 3. **Compiled defaults** — the values listed below.
 
+The agent sets one variable itself, for the commands it runs:
+`SCTL_AGENT_CONFIG`, the absolute path of the config file it loaded, in the
+environment of every command a caller or a pushed config gives it to run
+(exec, sessions and their jobs, Infra checks and recoveries). `sctl net`
+reads the agent's `[lte] interface` from that file (ADR-012), unless
+`--config <path>` names another; it never reads `./sctl.toml`. An agent that
+loaded no file takes the variable out of those environments.
+
 Every section is optional. `[server]`, `[auth]`, `[shell]`, `[device]`,
 `[logging]`, and `[supervisor]` fall back to defaults field-by-field;
 `[tunnel]`, `[comms]`, `[gps]`, and `[lte]` are **absent-means-disabled** —
@@ -298,7 +306,7 @@ LTE/cellular signal monitoring and the autonomous recovery watchdog
 | `device` | *(none)* | AT serial device hint. `[comms].device` takes precedence; the Quectel provider autodetects via sysfs. |
 | `poll_interval_secs` | `60` | Seconds between LTE signal polls. |
 | `watchdog` | `true` | Enable the LTE watchdog for autonomous modem recovery. It only acts when the tunnel is down and grace has elapsed, and diagnoses from kernel truth (interface IPv4 + interface-bound ping). |
-| `interface` | `"wwan0"` | Network interface name for the LTE modem (IP checks, speed tests, interface-bound pings). |
+| `interface` | `"wwan0"` | Network interface name for the LTE modem (IP checks, speed tests, interface-bound pings). The net tools and the Infra checks that send a secret never send by it (ADR-012). |
 | `speed_test_url` | *(none)* | Download speed-test URL for band scans. |
 | `speed_test_upload_url` | *(none)* | Upload speed-test URL for band scans (server must accept POST data). |
 | `reachability_host` | *(derived)* | Host pinged for internet reachability before modem escalation. Default: the relay host from `tunnel.url`, else `8.8.8.8`. |

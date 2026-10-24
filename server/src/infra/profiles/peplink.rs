@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 use super::super::checks::{CheckContext, CheckResult};
+use crate::net_tools::guard::{Approved, Guard, Stop};
 use crate::routes::fetch::{execute, FetchError, FetchRequest, FetchResponse};
 
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
@@ -44,6 +45,14 @@ pub async fn check(
         return CheckResult::failed("API NO CREDENTIAL: peplink profile needs a credential");
     };
 
+    // The login is a stored secret: every request of the check goes where
+    // the guard approves, bound there, or none goes (ADR-012).
+    let approved = match approve(base).await {
+        Ok(approved) => approved,
+        Err(refused) => return refused,
+    };
+    let approved = &approved;
+
     let mut session = ctx.session.clone();
     let mut renewed: Option<String> = None;
     let start = Instant::now();
@@ -59,7 +68,14 @@ pub async fn check(
             Some(c) => c.clone(),
             None => match timed(
                 &mut login_ms,
-                login(base, pin_sha256, timeout, &cred.username, &cred.password),
+                login(
+                    base,
+                    approved,
+                    pin_sha256,
+                    timeout,
+                    &cred.username,
+                    &cred.password,
+                ),
             )
             .await
             {
@@ -73,7 +89,7 @@ pub async fn check(
         };
         match timed(
             &mut wan_ms,
-            get(base, WAN_PATH, &cookie, pin_sha256, timeout),
+            get(base, approved, WAN_PATH, &cookie, pin_sha256, timeout),
         )
         .await
         {
@@ -108,7 +124,7 @@ pub async fn check(
     let read = |path: &'static str| {
         let cookie = cookie.clone();
         async move {
-            match get(base, path, &cookie, pin_sha256, timeout).await {
+            match get(base, approved, path, &cookie, pin_sha256, timeout).await {
                 Ok(resp) => inner_response(&resp.body),
                 Err(r) => {
                     warn!("peplink {base}: {path} failed: {}", r.detail);
@@ -157,12 +173,44 @@ async fn timed<T>(slot: &mut u64, fut: impl std::future::Future<Output = T>) -> 
     out
 }
 
-fn request(base: &str, path: &str, pin: Option<&str>, timeout: u64) -> FetchRequest {
+/// The guard's approval of the router's address, or the check's failure:
+/// off the LAN the target reads down with the guard's reason.
+async fn approve(base: &str) -> Result<Approved, CheckResult> {
+    let host = base
+        .parse::<hyper::Uri>()
+        .ok()
+        .and_then(|u| u.host().map(|h| h.trim_matches(['[', ']']).to_string()))
+        .unwrap_or_default();
+    if host.is_empty() {
+        return Err(CheckResult::failed(format!(
+            "API INVALID: {base} has no host"
+        )));
+    }
+    Guard::for_agent()
+        .approve_host(&host)
+        .await
+        .map_err(|stop| match stop {
+            Stop::Refused(refusal) => CheckResult::failed(format!(
+                "API NOT SENT ({}): {}",
+                refusal.refused, refusal.reason
+            )),
+            Stop::Failed(reason) => CheckResult::failed(format!("API FAIL: {reason}")),
+        })
+}
+
+fn request(
+    base: &str,
+    approved: &Approved,
+    path: &str,
+    pin: Option<&str>,
+    timeout: u64,
+) -> FetchRequest {
     FetchRequest {
         url: format!("{base}{path}"),
         timeout_ms: Some(timeout),
         max_bytes: Some(MAX_BODY_BYTES),
         pin_sha256: pin.map(str::to_string),
+        approved: Some(approved.clone()),
         ..FetchRequest::default()
     }
 }
@@ -182,6 +230,7 @@ fn transport_failure(path: &str, e: &FetchError) -> CheckResult {
         FetchError::Timeout(_) => "API TIMEOUT",
         FetchError::Invalid(_) => "API INVALID",
         FetchError::Failed(_) => "API FAIL",
+        FetchError::Unsent(_) => "API NOT SENT (guard_failed)",
     };
     CheckResult {
         detail: format!("{label}: {path}: {e}"),
@@ -192,12 +241,13 @@ fn transport_failure(path: &str, e: &FetchError) -> CheckResult {
 
 async fn login(
     base: &str,
+    approved: &Approved,
     pin: Option<&str>,
     timeout: u64,
     username: &str,
     password: &str,
 ) -> Result<String, CheckResult> {
-    let mut req = request(base, LOGIN_PATH, pin, timeout);
+    let mut req = request(base, approved, LOGIN_PATH, pin, timeout);
     req.method = Some("POST".to_string());
     req.headers = Some(HashMap::from([(
         "Content-Type".to_string(),
@@ -232,12 +282,13 @@ async fn login(
 
 async fn get(
     base: &str,
+    approved: &Approved,
     path: &str,
     cookie: &str,
     pin: Option<&str>,
     timeout: u64,
 ) -> Result<FetchResponse, CheckResult> {
-    let mut req = request(base, path, pin, timeout);
+    let mut req = request(base, approved, path, pin, timeout);
     req.headers = Some(HashMap::from([("Cookie".to_string(), cookie.to_string())]));
     let dir = dir_of();
     let fut = Box::pin(execute(&dir, &req));

@@ -73,6 +73,8 @@ pub fn spawn_shell_pty(
     if let Some(vars) = env {
         cmd.envs(vars);
     }
+    // The session's `sctl net` reads the agent's `[lte] interface` (ADR-012).
+    crate::net_tools::pass_agent_config(&mut cmd);
 
     // SAFETY: All syscalls used here are async-signal-safe per POSIX.
     unsafe {

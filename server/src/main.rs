@@ -594,6 +594,11 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         std::process::exit(1);
     }
 
+    // The net tools' guard (ADR-012): the Infra checks read the LTE bearer
+    // this config names, and every command the agent runs gets the config's
+    // path as SCTL_AGENT_CONFIG, so its `sctl net` reads the same.
+    sctl::net_tools::declare_agent(&config, Config::file_for(config_path));
+
     // Acquire exclusive lock — prevents dual instances (e.g. upgrade race, cron watchdog).
     // Skipped when launched by supervisor (which holds its own lock).
     #[cfg(unix)]

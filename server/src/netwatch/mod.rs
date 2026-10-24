@@ -13,7 +13,7 @@
 //! nothing, so its readers behave as if the network never changed.
 
 pub mod mwan3;
-mod netlink;
+pub(crate) mod netlink;
 pub mod owner;
 pub mod route;
 pub mod source;

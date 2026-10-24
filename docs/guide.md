@@ -494,6 +494,89 @@ curl -X DELETE -H "Authorization: Bearer $KEY" \
 
 Or via MCP: `playbook_put` with the full markdown content.
 
+## Network tools
+
+`sctl net snmp|http|tcp` are the network tools a command, runbook or recovery action needs, the same on every unit whatever its firmware ships (ADR-006). Each prints one JSON object on stdout. `sctl help net` lists every option.
+
+```sh
+sctl net tcp 192.0.2.10 80
+sctl net http http://192.0.2.10/status.json --fail
+SCTL_SNMP_COMMUNITY="${SCTL_CRED_PASS_1}" sctl net snmp get 192.0.2.20 1.3.6.1.2.1.1.1.0
+```
+
+### They send only on the LAN side
+
+Before it sends anything, a tool asks the kernel for the route to the destination, as `ip route get` does, and sends only when that route is unicast, has no gateway and leaves by an interface on the LAN side that holds an IPv4 address (ADR-012). There is no flag that turns this off.
+
+- **The LAN side.** An interface is on the LAN side when it is up, is not the loopback, takes ARP, is not point-to-point and is not the LTE bearer. A wired WAN port is on the LAN side: on a probe, the site's network is there. WireGuard, tun, PPP and a raw-IP modem fall out by their flags.
+- **The LTE bearer** is the agent's `[lte] interface`. A modem framed like Ethernet, as the XE300's `wwan0`, falls out only by that name. With no config, a config without `[lte]`, or one whose `[lte] interface` the unit lacks, an interface named `wwan*`, `qmimux*` or `usb*` counts as LTE, and a refusal says the name decided it.
+- **The kernel's route, not a connected network.** A /32 address plus a host route passes, and so does a route a runbook adds one step earlier.
+- **The unit itself.** A destination the unit holds (one of its addresses, the loopback) passes: nothing leaves the unit.
+- **One device.** Broadcast and multicast destinations are refused, and so is IPv6. A host name is looked up once: the tool judges its first IPv4 address and connects to that address only. HTTP keeps the name for `Host` and TLS.
+- **Bound where it was checked.** The socket is bound to the approved interface (`SO_BINDTODEVICE`) and to the route's source address before anything is sent. An address that goes away during a run makes the send fail rather than move, and mwan3's marks cannot route it elsewhere.
+
+### Options every tool takes
+
+| Option | Meaning |
+|--------|---------|
+| `--dev <iface>` | Send by this interface. It must be on the LAN side and hold an address (a bridge port is named by its bridge), and the destination must lie under a main-table route through it with no gateway: its network, or a host route. It is judged from the routes, never from a lookup tied to the interface, which the kernel answers as if any address were on the link. |
+| `--expect-mac <mac>` | Send only to the device expected. After the route check, one ARP request for the destination goes out on the approved interface; the tool sends only when every answer, and the kernel's neighbour entry for the address if it holds one, names this MAC. Another MAC or two MACs is `mac_mismatch`, no answer is `no_answer`, and a destination the unit holds itself is `own_address`. Colons or hyphens, either case. The check proves that the device answering holds that MAC, no more: a generated, locally administered or shared MAC passes for whichever device holds it. |
+| `--config <path>` | The agent's config, for its `[lte] interface`. Default: `SCTL_AGENT_CONFIG`, which the agent sets for every command it runs. A tool never reads `./sctl.toml` from its working directory (`/tmp` on the units). |
+| `--timeout <ms>` | `snmp`: per request, default 3000. `http`: default 10000. `tcp`: default 3000. The ARP request waits within it, at most 1 s. |
+
+A runbook that brings its own address on the wired port, then sends to one device:
+
+```sh
+ip addr add 192.0.2.250/32 dev eth1
+ip route add 192.0.2.20/32 dev eth1
+SCTL_SNMP_COMMUNITY="${SCTL_CRED_PASS_1}" \
+  sctl net snmp set --dev eth1 --expect-mac 02:00:00:00:00:20 192.0.2.20 1.3.6.1.4.1.318.1.1.12.3.3.1.1.4.8 i 3
+ip route del 192.0.2.20/32 dev eth1
+ip addr del 192.0.2.250/32 dev eth1
+```
+
+### Secrets come from the environment
+
+- **SNMP.** The community comes from `SCTL_SNMP_COMMUNITY` only, so the shell puts it in the tool's environment and in no argv: `SCTL_SNMP_COMMUNITY="${SCTL_CRED_PASS_1}" sctl net snmp ...`. `-c` and `--community` are a usage error that shows that form, never the value. A variable set but empty (a reference to a credential the command does not carry) is a usage error too, never `public`. Unset, get and walk send `public`; set needs a community.
+- **Recoveries** name stored credentials by slot: entry n of `credential_ids` is in the command's environment as `SCTL_CRED_USER_n` and `SCTL_CRED_PASS_n`.
+- **HTTP.** `-u`, `-H Authorization`, `-d` and `-F` still take their values on the command line.
+- No answer, refusal or usage error carries a secret, and no usage error repeats an option's value.
+
+### HTTP redirects
+
+`sctl net http` follows up to `--max-redirects` redirects (default 5), and each hop passes the guard on its own, `--dev` and `--expect-mac` included. A 303, and a 301 or 302 after a POST, go on as a GET without a body; any other keeps the method and the body. A redirect to another scheme, host or port drops the Basic credentials, every header the caller set and the body, and is not followed when it would send the body again (a 307 or 308 after a request with one, or a 301 or 302 that keeps a PUT's). With `--expect-mac` a redirect to another address is not followed. A redirect not followed ends the request: the answer is that redirect, its `status` and `Location`, with `not_followed` (the `reason`, and `refused` when the guard refused its hop), exit 1.
+
+### Answers
+
+| Exit | Meaning |
+|------|---------|
+| 0 | Done. |
+| 1 | Failed; the object says why. |
+| 2 | Usage error, on stderr. |
+| 3 | Refused: the request never left. At most a name lookup and the ARP request did. |
+
+A refusal prints `ok: false`, `refused` (the code), a one-line `reason`, `host` (the address judged), `route` (the route the kernel would have used: its interface, that interface's `role` and what decided it, its gateway and type), `lan` (the LAN side by interface, a bridge's ports left to their bridge) and, after an ARP request, `macs` (the MACs that answered) and `neighbour` (the kernel's entry). A unit that lost its address on the site's network and runs on LTE answers an SNMP set to the site's power bar:
+
+```json
+{"ok":false,"refused":"not_on_lan","reason":"198.51.100.50 is not on a network this unit holds on its LAN side: the kernel would send it by wwan0 (lte) through a gateway. LAN side: br-lan 192.0.2.1/24; eth1 holds no address.","host":"198.51.100.50","route":{"dev":"wwan0","role":"lte","role_by":"config","gateway":"10.180.41.232","type":"unicast"},"lan":[{"dev":"br-lan","ipv4":["192.0.2.1/24"]},{"dev":"eth1","ipv4":[]}]}
+```
+
+| `refused` | Why |
+|-----------|-----|
+| `not_on_lan` | The kernel would send it through a gateway, by an interface off the LAN side, or nowhere; with `--dev`, no route through that interface without a gateway covers it, or the interface is not on the LAN side. |
+| `no_address` | The interface it would leave by holds no IPv4 address, or `--dev` names a bridge's port. |
+| `not_unicast` | A broadcast or multicast destination. |
+| `ipv6` | An IPv6 destination, or a name with only IPv6 addresses. |
+| `own_address` | `--expect-mac` with a destination the unit holds itself. |
+| `mac_mismatch` | Another MAC answered, two did, or the kernel's neighbour entry names another. |
+| `no_answer` | Nothing answered the ARP request. |
+| `config_unreadable` | The agent's config could not be read or parsed. The reason names the path and quotes nothing from the file. |
+| `guard_failed` | The tool could not read the routes, ask the wire (a packet socket) or bind. |
+
+### The Infra checks
+
+The SNMP check (its community, every interval) and the Peplink check (its login) send a stored secret, so they pass the same guard as the tools, with the agent's `[lte] interface`. Off the LAN such a target reads down with the guard's reason, as `SNMP NOT SENT (not_on_lan): ...` or `API NOT SENT (not_on_lan): ...`. The ping, HTTP and TCP checks and `POST /api/fetch` send no secret and keep their behaviour.
+
 ## Comms Providers, GPS & LTE
 
 sctl handles device communications hardware through dynamically loaded comms plugins. The main `sctl` server owns the HTTP/MCP/API surface and generic AT transport; plugins own hardware-specific command semantics. This keeps relay/VPS installs free of modem code and lets new comms hardware be added by deploying a target-specific shared library instead of rebuilding `sctl`.

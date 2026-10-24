@@ -48,10 +48,59 @@ pub fn route_to(dst: SocketAddrV4) -> io::Result<SourceRoute> {
 pub struct KernelRoute {
     /// The output interface.
     pub dev: String,
+    /// The output interface's kernel index.
+    pub oif: u32,
     /// The next hop; None when `dst` is on the link.
     pub via: Option<Ipv4Addr>,
     /// The source address a new connection would use.
     pub src: Option<Ipv4Addr>,
+    /// The route's type (`RTN_*`): see [`RouteKind`].
+    pub kind: RouteKind,
+}
+
+/// What kind of route the kernel answered with (`rtm_type`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteKind {
+    /// To one host, on the link or through a gateway.
+    Unicast,
+    /// To this unit itself: one of its addresses, loopback.
+    Local,
+    Broadcast,
+    Multicast,
+    Anycast,
+    /// Anything else (`RTN_*` as the kernel numbers it): a blackhole, an
+    /// unreachable or prohibit route, a NAT or throw route.
+    Other(u8),
+}
+
+impl RouteKind {
+    pub(crate) fn from_rtm_type(kind: u8) -> Self {
+        match kind {
+            netlink::RTN_UNICAST => Self::Unicast,
+            netlink::RTN_LOCAL => Self::Local,
+            netlink::RTN_BROADCAST => Self::Broadcast,
+            netlink::RTN_MULTICAST => Self::Multicast,
+            netlink::RTN_ANYCAST => Self::Anycast,
+            other => Self::Other(other),
+        }
+    }
+
+    /// The word `ip route` prints for the type.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unicast => "unicast",
+            Self::Local => "local",
+            Self::Broadcast => "broadcast",
+            Self::Multicast => "multicast",
+            Self::Anycast => "anycast",
+            Self::Other(6) => "blackhole",
+            Self::Other(7) => "unreachable",
+            Self::Other(8) => "prohibit",
+            Self::Other(9) => "throw",
+            Self::Other(10) => "nat",
+            Self::Other(_) => "unspec",
+        }
+    }
 }
 
 /// Look up the kernel's route to `dst` (`RTM_GETROUTE`, what `ip route get`
@@ -76,8 +125,10 @@ pub async fn route_get(dst: Ipv4Addr) -> io::Result<KernelRoute> {
         .ok_or_else(|| io::Error::other(format!("no interface with index {oif}")))?;
     Ok(KernelRoute {
         dev,
+        oif,
         via: route.gateway,
         src: route.prefsrc,
+        kind: RouteKind::from_rtm_type(route.kind),
     })
 }
 
@@ -184,8 +235,35 @@ mod tests {
     async fn the_kernel_routes_loopback_through_lo() {
         let route = route_get(Ipv4Addr::LOCALHOST).await.unwrap();
         assert_eq!(route.dev, "lo");
+        assert_eq!(route.oif, 1);
         assert_eq!(route.via, None);
         assert_eq!(route.src, Some(Ipv4Addr::LOCALHOST));
+        assert_eq!(route.kind, RouteKind::Local, "loopback is the unit's own");
+    }
+
+    #[test]
+    fn route_kinds_follow_the_kernel_numbers() {
+        assert_eq!(
+            RouteKind::from_rtm_type(libc::RTN_UNICAST),
+            RouteKind::Unicast
+        );
+        assert_eq!(RouteKind::from_rtm_type(libc::RTN_LOCAL), RouteKind::Local);
+        assert_eq!(
+            RouteKind::from_rtm_type(libc::RTN_BROADCAST),
+            RouteKind::Broadcast
+        );
+        assert_eq!(
+            RouteKind::from_rtm_type(libc::RTN_MULTICAST),
+            RouteKind::Multicast
+        );
+        assert_eq!(
+            RouteKind::from_rtm_type(libc::RTN_BLACKHOLE).as_str(),
+            "blackhole"
+        );
+        assert_eq!(
+            RouteKind::from_rtm_type(libc::RTN_UNREACHABLE).as_str(),
+            "unreachable"
+        );
     }
 
     #[tokio::test]

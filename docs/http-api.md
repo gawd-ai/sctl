@@ -919,6 +919,16 @@ it), `credential_id` (a key into the credentials store, below), and
 the client list leaves only as per-VLAN counts, and subscriber identifiers
 (IMSI, ICCID, IMEI) are never carried.
 
+An `snmp` check (its community) and an `http_api` check (its login) send a
+stored secret, so they go only where the net tools' guard lets them, from a
+socket bound there (ADR-012, the guide's "Network tools"): a unicast route
+with no gateway, by an interface on the unit's LAN side, the LTE bearer
+being the agent's `[lte] interface`. Off the LAN side the target reads down
+with the guard's reason, as `SNMP NOT SENT (not_on_lan): ...` or
+`API NOT SENT (not_on_lan): ...`, and nothing is sent. No detail quotes a
+community. The `ping`, `http`, `https` and `tcp_port` checks send no secret
+and are not guarded.
+
 Response `200`: `{status: "ok", config_version, target_count, unchanged,
 started}`. `unchanged` is true when the push equalled the config held;
 `started` is true when the push started a monitor: always for another

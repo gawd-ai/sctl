@@ -146,7 +146,9 @@ fn validate_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate SNMP community string (alphanumeric + basic punctuation).
+/// Validate SNMP community string (alphanumeric + basic punctuation). The
+/// error never quotes the community: it is a secret, and the detail it
+/// becomes is pushed to the fleet and shown.
 fn validate_community(community: &str) -> Result<(), String> {
     if community.is_empty() || community.len() > 64 {
         return Err(format!("invalid community length: {}", community.len()));
@@ -155,9 +157,9 @@ fn validate_community(community: &str) -> Result<(), String> {
         .chars()
         .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '!' | '@' | '#'))
     {
-        return Err(format!(
-            "community contains invalid characters: {community}"
-        ));
+        return Err(
+            "the community contains a character other than letters, digits and -_.!@#".into(),
+        );
     }
     Ok(())
 }
@@ -407,8 +409,13 @@ async fn check_tcp(host: &str, port: u16, timeout_ms: Option<u64>) -> CheckResul
 }
 
 /// SNMP check: a v2c GET of sysDescr through the agent's own client (ADR-006);
-/// the units do not ship `snmpget`.
+/// the units do not ship `snmpget`. The community is a stored secret, so the
+/// GET goes only where the net tools' guard approves, from a socket bound
+/// there (ADR-012): off the LAN the target reads down with the guard's
+/// reason. No detail quotes the community.
 async fn check_snmp(host: &str, community: &str, timeout_ms: Option<u64>) -> CheckResult {
+    use crate::net_tools::guard::{Guard, Stop};
+    use crate::net_tools::snmp;
     if let Err(e) = validate_host(host) {
         return CheckResult {
             ok: false,
@@ -427,15 +434,34 @@ async fn check_snmp(host: &str, community: &str, timeout_ms: Option<u64>) -> Che
             ..CheckResult::default()
         };
     }
-    let target = crate::net_tools::snmp::Target {
-        host: host.to_string(),
-        port: 161,
-        community: community.to_string(),
-        version: crate::net_tools::snmp::Version::V2c,
-        timeout: std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(500)),
+    let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(500));
+    let approved = match Guard::for_agent().approve_host(host).await {
+        Ok(approved) => approved,
+        Err(Stop::Refused(refusal)) => {
+            return CheckResult::failed(format!(
+                "SNMP NOT SENT ({}): {}",
+                refusal.refused, refusal.reason
+            ))
+        }
+        Err(Stop::Failed(reason)) => return CheckResult::failed(format!("SNMP FAIL: {reason}")),
     };
+    let socket = match approved.udp(161).await {
+        Ok(socket) => socket,
+        Err(e) => {
+            return CheckResult::failed(format!(
+                "SNMP NOT SENT (guard_failed): {}",
+                approved.bind_refusal(&e).reason
+            ))
+        }
+    };
+    let mut session = snmp::Session::new(
+        socket,
+        community.as_bytes().to_vec(),
+        snmp::Version::V2c,
+        timeout,
+    );
     let start = Instant::now();
-    let result = crate::net_tools::snmp::get(&target, &[SYS_DESCR.to_string()]).await;
+    let result = snmp::get(&mut session, &[SYS_DESCR.to_string()]).await;
     let elapsed = start.elapsed().as_millis() as u64;
     match result {
         Ok(bindings) => {
@@ -550,29 +576,33 @@ pub async fn exec_with_env(
     env: &[(String, String)],
     timeout_ms: u64,
 ) -> Result<(i32, String, String), String> {
-    let mut child = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(cmd)
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("spawn failed: {e}"))?;
+        .kill_on_drop(true);
+    // A recovery's `sctl net` reads the agent's `[lte] interface` (ADR-012).
+    crate::net_tools::pass_agent_config(&mut command);
+    let mut child = command.spawn().map_err(|e| format!("spawn failed: {e}"))?;
     read_child_output(&mut child, timeout_ms).await
 }
 
 /// Execute a shell command with timeout, returning (exit_code, stdout, stderr).
 /// Uses `sh -c` — only safe with trusted or pre-validated input.
 async fn exec_simple(cmd: &str, timeout_ms: u64) -> Result<(i32, String, String), String> {
-    let mut child = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(cmd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("spawn failed: {e}"))?;
+        .kill_on_drop(true);
+    // A custom_script check's `sctl net` reads the agent's `[lte] interface`.
+    crate::net_tools::pass_agent_config(&mut command);
+    let mut child = command.spawn().map_err(|e| format!("spawn failed: {e}"))?;
 
     read_child_output(&mut child, timeout_ms).await
 }
@@ -708,6 +738,41 @@ mod tests {
         assert!(validate_community("has spaces").is_err());
         assert!(validate_community("has;semicolon").is_err());
         assert!(validate_community("").is_err());
+    }
+
+    /// The detail is pushed to the fleet and shown: it never quotes the
+    /// community, valid or not, sent or refused.
+    #[tokio::test]
+    async fn no_snmp_check_detail_quotes_the_community() {
+        for community in ["s3cr3t c0mm", "s3cr3t;c0mm", "s3cr3t-c0mm"] {
+            for host in ["255.255.255.255", "127.0.0.1", "host with spaces"] {
+                let r = check_snmp(host, community, Some(600)).await;
+                assert!(!r.detail.contains("s3cr3t"), "{}", r.detail);
+                if host != "127.0.0.1" {
+                    assert!(!r.ok, "{host}: {}", r.detail);
+                }
+            }
+        }
+        let r = check_snmp("255.255.255.255", "s3cr3t-c0mm", Some(600)).await;
+        assert!(
+            r.detail.starts_with("SNMP NOT SENT (not_unicast): "),
+            "off the LAN it reads down with the guard's reason: {}",
+            r.detail
+        );
+    }
+
+    /// Nothing answers on loopback's port 161 here, unless an agent does;
+    /// either way the GET is sent from a socket bound to lo, and the detail
+    /// never carries the community.
+    #[tokio::test]
+    async fn the_snmp_check_reaches_the_unit_s_own_address() {
+        let r = check_snmp("127.0.0.1", "s3cr3t-c0mm", Some(600)).await;
+        assert!(
+            r.detail.starts_with("SNMP FAIL") || r.detail.starts_with("SNMP OK"),
+            "{}",
+            r.detail
+        );
+        assert!(!r.detail.contains("s3cr3t"), "{}", r.detail);
     }
 
     #[test]

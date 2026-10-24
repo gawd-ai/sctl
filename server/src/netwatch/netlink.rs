@@ -1,7 +1,8 @@
 //! The small slice of netlink that `netwatch` speaks: a socket, request
-//! encoding, and parsing of link, address and route messages (rtnetlink),
-//! plus the requests and replies generic netlink families such as
-//! WireGuard's are asked through.
+//! encoding, and parsing of link, address, route and neighbour messages
+//! (rtnetlink), plus the requests and replies generic netlink families such
+//! as WireGuard's are asked through. The net tools' guard
+//! (`net_tools::guard`) reads the same messages.
 //!
 //! Netlink messages are the kernel's own C structs in the host's byte order,
 //! every part aligned to 4 bytes. Everything here goes through byte slices,
@@ -43,11 +44,14 @@ pub(crate) const RTM_GETADDR: u16 = 22;
 pub(crate) const RTM_NEWROUTE: u16 = 24;
 pub(crate) const RTM_DELROUTE: u16 = 25;
 pub(crate) const RTM_GETROUTE: u16 = 26;
+pub(crate) const RTM_NEWNEIGH: u16 = 28;
+pub(crate) const RTM_GETNEIGH: u16 = 30;
 
 pub(crate) const RTMGRP_LINK: u32 = 0x1;
 pub(crate) const RTMGRP_IPV4_IFADDR: u32 = 0x10;
 pub(crate) const RTMGRP_IPV4_ROUTE: u32 = 0x40;
 
+pub(crate) const IFLA_ADDRESS: u16 = 1;
 pub(crate) const IFLA_IFNAME: u16 = 3;
 pub(crate) const IFLA_MASTER: u16 = 10;
 pub(crate) const IFLA_OPERSTATE: u16 = 16;
@@ -62,9 +66,16 @@ pub(crate) const RTA_PRIORITY: u16 = 6;
 pub(crate) const RTA_PREFSRC: u16 = 7;
 pub(crate) const RTA_TABLE: u16 = 15;
 
+pub(crate) const NDA_DST: u16 = 1;
+pub(crate) const NDA_LLADDR: u16 = 2;
+
 pub(crate) const AF_INET: u8 = 2;
 pub(crate) const RT_TABLE_MAIN: u8 = 254;
 pub(crate) const RTN_UNICAST: u8 = 1;
+pub(crate) const RTN_LOCAL: u8 = 2;
+pub(crate) const RTN_BROADCAST: u8 = 3;
+pub(crate) const RTN_ANYCAST: u8 = 4;
+pub(crate) const RTN_MULTICAST: u8 = 5;
 pub(crate) const RT_SCOPE_UNIVERSE: u8 = 0;
 pub(crate) const RT_SCOPE_LINK: u8 = 253;
 pub(crate) const RT_SCOPE_NOWHERE: u8 = 255;
@@ -72,7 +83,22 @@ pub(crate) const RT_SCOPE_NOWHERE: u8 = 255;
 /// route ... onlink`). From linux/rtnetlink.h; the libc crate does not carry
 /// the `RTNH_F_*` flags.
 pub(crate) const RTNH_F_ONLINK: u32 = 4;
+pub(crate) const IFF_UP: u32 = 0x1;
 pub(crate) const IFF_LOOPBACK: u32 = 0x8;
+pub(crate) const IFF_POINTOPOINT: u32 = 0x10;
+pub(crate) const IFF_NOARP: u32 = 0x80;
+/// `ifi_type` of an Ethernet-framed link (linux/if_arp.h).
+pub(crate) const ARPHRD_ETHER: u16 = 1;
+
+/// Neighbour states (`NUD_*`, linux/neighbour.h).
+pub(crate) const NUD_INCOMPLETE: u16 = 0x01;
+pub(crate) const NUD_REACHABLE: u16 = 0x02;
+pub(crate) const NUD_STALE: u16 = 0x04;
+pub(crate) const NUD_DELAY: u16 = 0x08;
+pub(crate) const NUD_PROBE: u16 = 0x10;
+pub(crate) const NUD_FAILED: u16 = 0x20;
+pub(crate) const NUD_NOARP: u16 = 0x40;
+pub(crate) const NUD_PERMANENT: u16 = 0x80;
 
 /// `struct ifinfomsg`: family, pad, type, index, flags, change.
 const IFINFOMSG_LEN: usize = 16;
@@ -80,6 +106,8 @@ const IFINFOMSG_LEN: usize = 16;
 const IFADDRMSG_LEN: usize = 8;
 /// `struct rtmsg`: family, dst_len, src_len, tos, table, protocol, scope, type, flags.
 const RTMSG_LEN: usize = 12;
+/// `struct ndmsg`: family, pad, pad, index, state, flags, type.
+const NDMSG_LEN: usize = 12;
 /// `struct rtattr`: len, type.
 const RTA_HDRLEN: usize = 4;
 /// Attribute type bits; the top two are the nested and byte-order flags.
@@ -207,6 +235,15 @@ pub(crate) fn dump_requests() -> [(u16, u16, Vec<u8>); 3] {
     ]
 }
 
+/// The dump of the IPv4 neighbour table, with the message type it answers
+/// with. Every kernel dumps every entry: filtering by interface in the
+/// request needs a 4.20 kernel, so the reader filters.
+pub(crate) fn neighbour_dump_request() -> (u16, u16, Vec<u8>) {
+    let mut ndmsg = vec![0; NDMSG_LEN];
+    ndmsg[0] = AF_INET;
+    (RTM_GETNEIGH, RTM_NEWNEIGH, ndmsg)
+}
+
 /// One netlink message inside a datagram.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Message<'a> {
@@ -294,6 +331,8 @@ fn c_string(data: &[u8]) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Link {
     pub index: u32,
+    /// `ifi_type`: the link's framing, [`ARPHRD_ETHER`] for Ethernet.
+    pub kind: u16,
     pub flags: u32,
     pub name: String,
     /// `IF_OPER_*`; 0 (unknown) when the attribute is absent.
@@ -303,17 +342,22 @@ pub(crate) struct Link {
     /// `IFLA_MASTER`: the index of the bridge or bond this link is a port
     /// of; absent when it is not enslaved.
     pub master: Option<u32>,
+    /// `IFLA_ADDRESS` when it is six bytes: the link's MAC. A tunnel has
+    /// none.
+    pub address: Option<[u8; 6]>,
 }
 
 pub(crate) fn parse_link(payload: &[u8], order: Order) -> Option<Link> {
     let body = payload.get(IFINFOMSG_LEN..)?;
     let mut link = Link {
         index: order.u32_at(payload, 4)?,
+        kind: order.u16_at(payload, 2)?,
         flags: order.u32_at(payload, 8)?,
         name: String::new(),
         operstate: 0,
         carrier: None,
         master: None,
+        address: None,
     };
     for (attr, data) in Attrs::new(body, order) {
         match attr {
@@ -321,6 +365,7 @@ pub(crate) fn parse_link(payload: &[u8], order: Order) -> Option<Link> {
             IFLA_OPERSTATE => link.operstate = data.first().copied().unwrap_or(0),
             IFLA_CARRIER => link.carrier = data.first().map(|&c| c != 0),
             IFLA_MASTER => link.master = order.u32_at(data, 0),
+            IFLA_ADDRESS => link.address = data.try_into().ok(),
             _ => {}
         }
     }
@@ -415,6 +460,67 @@ pub(crate) fn parse_route(payload: &[u8], order: Order) -> Option<Route> {
         }
     }
     Some(route)
+}
+
+/// An IPv4 `RTM_NEWNEIGH` message: one entry of the neighbour table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Neighbour {
+    /// The interface the entry is on.
+    pub index: u32,
+    /// `NUD_*`: [`NUD_REACHABLE`], [`NUD_STALE`] and the others.
+    pub state: u16,
+    pub dst: Ipv4Addr,
+    /// `NDA_LLADDR` when it is six bytes. An incomplete entry has none.
+    pub lladdr: Option<[u8; 6]>,
+}
+
+impl Neighbour {
+    /// The MAC the kernel would send to now: an entry that holds one and
+    /// is neither still resolving nor failed.
+    pub(crate) fn usable_lladdr(&self) -> Option<[u8; 6]> {
+        if self.state & (NUD_INCOMPLETE | NUD_FAILED) != 0 {
+            return None;
+        }
+        self.lladdr
+    }
+
+    /// The state as `ip neigh` words it.
+    pub(crate) fn state_word(&self) -> &'static str {
+        [
+            (NUD_PERMANENT, "permanent"),
+            (NUD_NOARP, "noarp"),
+            (NUD_REACHABLE, "reachable"),
+            (NUD_STALE, "stale"),
+            (NUD_DELAY, "delay"),
+            (NUD_PROBE, "probe"),
+            (NUD_FAILED, "failed"),
+            (NUD_INCOMPLETE, "incomplete"),
+        ]
+        .into_iter()
+        .find_map(|(bit, word)| (self.state & bit != 0).then_some(word))
+        .unwrap_or("none")
+    }
+}
+
+pub(crate) fn parse_neighbour(payload: &[u8], order: Order) -> Option<Neighbour> {
+    if *payload.first()? != AF_INET {
+        return None;
+    }
+    let body = payload.get(NDMSG_LEN..)?;
+    let (mut dst, mut lladdr) = (None, None);
+    for (attr, data) in Attrs::new(body, order) {
+        match attr {
+            NDA_DST => dst = ipv4(data),
+            NDA_LLADDR => lladdr = data.try_into().ok(),
+            _ => {}
+        }
+    }
+    Some(Neighbour {
+        index: order.u32_at(payload, 4)?,
+        state: order.u16_at(payload, 8)?,
+        dst: dst?,
+        lladdr,
+    })
 }
 
 /// A kernel error code (negative errno) as an `io::Error`.
@@ -861,6 +967,34 @@ pub(crate) mod tests {
         message
     }
 
+    /// `message`, one link message, with an IFLA_ADDRESS of `mac` appended,
+    /// as the kernel lists it for an Ethernet link.
+    pub(crate) fn with_mac(order: Order, mut message: Vec<u8>, mac: [u8; 6]) -> Vec<u8> {
+        message.extend(attr(order, IFLA_ADDRESS, &mac));
+        let len = message.len() as u32;
+        message[..4].copy_from_slice(&u32b(order, len));
+        message
+    }
+
+    /// `ndmsg` + NDA_DST and, when given, NDA_LLADDR: one neighbour entry.
+    pub(crate) fn neighbour_message(
+        order: Order,
+        index: u32,
+        state: u16,
+        dst: [u8; 4],
+        lladdr: Option<[u8; 6]>,
+    ) -> Vec<u8> {
+        let mut body = vec![AF_INET, 0, 0, 0];
+        body.extend(u32b(order, index));
+        body.extend(u16b(order, state));
+        body.extend([0, 1]); // flags, type (RTN_UNICAST)
+        body.extend(attr(order, NDA_DST, &dst));
+        if let Some(mac) = lladdr {
+            body.extend(attr(order, NDA_LLADDR, &mac));
+        }
+        message(order, RTM_NEWNEIGH, 2, 7, &body)
+    }
+
     /// `message`, one route message, with its `rtm_flags` set to `flags`.
     pub(crate) fn with_rtm_flags(order: Order, mut message: Vec<u8>, flags: u32) -> Vec<u8> {
         let at = NLMSG_HDRLEN + 8;
@@ -915,6 +1049,9 @@ pub(crate) mod tests {
             i64::from(RTMGRP_IPV4_ROUTE),
             i64::from(libc::RTMGRP_IPV4_ROUTE)
         );
+        assert_eq!(RTM_NEWNEIGH, libc::RTM_NEWNEIGH);
+        assert_eq!(RTM_GETNEIGH, libc::RTM_GETNEIGH);
+        assert_eq!(IFLA_ADDRESS, libc::IFLA_ADDRESS);
         assert_eq!(IFLA_IFNAME, libc::IFLA_IFNAME);
         assert_eq!(IFLA_MASTER, libc::IFLA_MASTER);
         assert_eq!(IFLA_OPERSTATE, libc::IFLA_OPERSTATE);
@@ -931,10 +1068,32 @@ pub(crate) mod tests {
         assert_eq!(i32::from(AF_INET), libc::AF_INET);
         assert_eq!(RT_TABLE_MAIN, libc::RT_TABLE_MAIN);
         assert_eq!(RTN_UNICAST, libc::RTN_UNICAST);
+        assert_eq!(RTN_LOCAL, libc::RTN_LOCAL);
+        assert_eq!(RTN_BROADCAST, libc::RTN_BROADCAST);
+        assert_eq!(RTN_ANYCAST, libc::RTN_ANYCAST);
+        assert_eq!(RTN_MULTICAST, libc::RTN_MULTICAST);
+        assert_eq!(NDA_DST, libc::NDA_DST);
+        assert_eq!(NDA_LLADDR, libc::NDA_LLADDR);
         assert_eq!(RT_SCOPE_UNIVERSE, libc::RT_SCOPE_UNIVERSE);
         assert_eq!(RT_SCOPE_LINK, libc::RT_SCOPE_LINK);
         assert_eq!(RT_SCOPE_NOWHERE, libc::RT_SCOPE_NOWHERE);
         assert_eq!(i64::from(IFF_LOOPBACK), i64::from(libc::IFF_LOOPBACK));
+        assert_eq!(i64::from(IFF_UP), i64::from(libc::IFF_UP));
+        assert_eq!(i64::from(IFF_POINTOPOINT), i64::from(libc::IFF_POINTOPOINT));
+        assert_eq!(i64::from(IFF_NOARP), i64::from(libc::IFF_NOARP));
+        assert_eq!(ARPHRD_ETHER, libc::ARPHRD_ETHER);
+        for (ours, theirs) in [
+            (NUD_INCOMPLETE, libc::NUD_INCOMPLETE),
+            (NUD_REACHABLE, libc::NUD_REACHABLE),
+            (NUD_STALE, libc::NUD_STALE),
+            (NUD_DELAY, libc::NUD_DELAY),
+            (NUD_PROBE, libc::NUD_PROBE),
+            (NUD_FAILED, libc::NUD_FAILED),
+            (NUD_NOARP, libc::NUD_NOARP),
+            (NUD_PERMANENT, libc::NUD_PERMANENT),
+        ] {
+            assert_eq!(ours, theirs);
+        }
     }
 
     #[test]
@@ -1003,11 +1162,13 @@ pub(crate) mod tests {
                 parse_link(message.payload, order).unwrap(),
                 Link {
                     index: 3,
+                    kind: ARPHRD_ETHER,
                     flags: 0x1_1043,
                     name: "eth1".into(),
                     operstate: 6,
                     carrier: Some(true),
                     master: None,
+                    address: None,
                 },
                 "{order:?}"
             );
@@ -1301,6 +1462,85 @@ pub(crate) mod tests {
             );
             assert_eq!(route.oif, Some(3), "{order:?}");
         }
+    }
+
+    #[test]
+    fn a_link_reads_its_type_and_mac_in_both_byte_orders() {
+        for order in ORDERS {
+            let link = with_mac(
+                order,
+                link_message(order, 4, 0x1_1043, "br-lan", 6, Some(1)),
+                [0x02, 0x00, 0x5e, 0x10, 0x20, 0x30],
+            );
+            let message = Messages::new(&link, order).next().unwrap();
+            assert_eq!(message.payload.len() + NLMSG_HDRLEN, link.len());
+            let parsed = parse_link(message.payload, order).unwrap();
+            assert_eq!(parsed.kind, ARPHRD_ETHER, "{order:?}");
+            assert_eq!(
+                parsed.address,
+                Some([0x02, 0x00, 0x5e, 0x10, 0x20, 0x30]),
+                "{order:?}"
+            );
+            // A tunnel has no six-byte address.
+            let tunnel = link_message(order, 9, 0x10d1, "wg0", 0, None);
+            let message = Messages::new(&tunnel, order).next().unwrap();
+            assert_eq!(parse_link(message.payload, order).unwrap().address, None);
+        }
+    }
+
+    #[test]
+    fn neighbour_entries_parse_with_their_interface_state_and_mac() {
+        for order in ORDERS {
+            let mut dump = neighbour_message(
+                order,
+                0x0102_0304,
+                NUD_STALE,
+                [192, 0, 2, 50],
+                Some([0x02, 0, 0, 0, 0, 0x0a]),
+            );
+            dump.extend(neighbour_message(
+                order,
+                5,
+                NUD_INCOMPLETE,
+                [192, 0, 2, 51],
+                None,
+            ));
+            dump.extend(neighbour_message(
+                order,
+                5,
+                NUD_FAILED,
+                [192, 0, 2, 52],
+                Some([0x02, 0, 0, 0, 0, 0x0b]),
+            ));
+            let entries: Vec<Neighbour> = Messages::new(&dump, order)
+                .filter_map(|m| parse_neighbour(m.payload, order))
+                .collect();
+            assert_eq!(
+                entries[0],
+                Neighbour {
+                    index: 0x0102_0304,
+                    state: NUD_STALE,
+                    dst: Ipv4Addr::new(192, 0, 2, 50),
+                    lladdr: Some([0x02, 0, 0, 0, 0, 0x0a]),
+                },
+                "{order:?}"
+            );
+            assert_eq!(entries[0].usable_lladdr(), entries[0].lladdr);
+            assert_eq!(entries[0].state_word(), "stale");
+            assert_eq!(entries[1].state_word(), "incomplete");
+            assert_eq!(entries[1].lladdr, None, "still resolving");
+            assert_eq!(entries[1].usable_lladdr(), None);
+            assert_eq!(
+                entries[2].usable_lladdr(),
+                None,
+                "a failed entry names no one the kernel would send to"
+            );
+        }
+        // An IPv6 entry is not an IPv4 neighbour.
+        let mut v6 = neighbour_message(Order::NATIVE, 2, NUD_REACHABLE, [0; 4], None);
+        v6[NLMSG_HDRLEN] = 10;
+        let message = Messages::new(&v6, Order::NATIVE).next().unwrap();
+        assert!(parse_neighbour(message.payload, Order::NATIVE).is_none());
     }
 
     #[test]

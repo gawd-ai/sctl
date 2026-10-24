@@ -3,7 +3,8 @@
 //! All shell interaction ultimately goes through the two functions here:
 //! [`spawn_shell`] for interactive sessions and [`exec_command`] for one-shot
 //! commands. Both set `kill_on_drop(true)` so orphaned processes are cleaned up
-//! if the owning task is cancelled.
+//! if the owning task is cancelled. Every child gets the agent's config as
+//! `SCTL_AGENT_CONFIG`, for `sctl net` (ADR-012).
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -46,6 +47,7 @@ pub fn spawn_shell_pgroup(
     if let Some(vars) = env {
         cmd.envs(vars);
     }
+    crate::net_tools::pass_agent_config(&mut cmd);
     // SAFETY: setpgid is async-signal-safe per POSIX.
     unsafe {
         cmd.pre_exec(|| {
@@ -80,6 +82,7 @@ pub fn spawn_command_pgroup(
     if let Some(vars) = env {
         cmd.envs(vars);
     }
+    crate::net_tools::pass_agent_config(&mut cmd);
     // SAFETY: setpgid is async-signal-safe per POSIX.
     unsafe {
         cmd.pre_exec(|| {
@@ -121,6 +124,7 @@ pub async fn exec_command(
     if let Some(vars) = env {
         cmd.envs(vars);
     }
+    crate::net_tools::pass_agent_config(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|e| ExecError::SpawnFailed(e.to_string()))?;

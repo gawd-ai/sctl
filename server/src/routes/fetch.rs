@@ -57,6 +57,7 @@ use tokio::net::TcpStream;
 use tracing::{info, warn};
 
 use crate::error::{codes, ApiError};
+use crate::net_tools::guard::Connect;
 use crate::pin_store::{fingerprint, fingerprints_match, PinOrigin, PinStore};
 use crate::AppState;
 
@@ -95,6 +96,12 @@ pub struct FetchRequest {
     /// cannot be negotiated via ALPN.
     #[serde(default)]
     pub http2: bool,
+    /// Where the net tools' guard let the request go (ADR-012): connect to
+    /// its address only, bound to its interface and source address; the
+    /// URL's name stays for `Host` and TLS. Never read from the wire:
+    /// `POST /api/fetch` leaves it empty and connects as before.
+    #[serde(skip)]
+    pub approved: Option<crate::net_tools::guard::Approved>,
 }
 
 #[derive(Debug, Serialize)]
@@ -331,12 +338,15 @@ pub enum FetchError {
     },
     /// Everything else: connect, TLS, protocol.
     Failed(String),
+    /// The socket could not be bound where the guard approved: nothing was
+    /// sent. Only a request with `approved` set meets it.
+    Unsent(String),
 }
 
 impl std::fmt::Display for FetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Invalid(m) | Self::Failed(m) => write!(f, "{m}"),
+            Self::Invalid(m) | Self::Failed(m) | Self::Unsent(m) => write!(f, "{m}"),
             Self::Timeout(ms) => write!(f, "fetch timed out after {ms}ms"),
             Self::PinMismatch { message, .. } | Self::Untrusted { message, .. } => {
                 write!(f, "{message}")
@@ -364,7 +374,9 @@ impl FetchError {
                 message.clone(),
                 StatusCode::BAD_GATEWAY,
             ),
-            Self::Failed(m) => bad(codes::FETCH_FAILED, m.clone(), StatusCode::BAD_GATEWAY),
+            Self::Failed(m) | Self::Unsent(m) => {
+                bad(codes::FETCH_FAILED, m.clone(), StatusCode::BAD_GATEWAY)
+            }
         }
     }
 }
@@ -427,6 +439,7 @@ pub async fn execute(data_dir: &str, req: &FetchRequest) -> Result<FetchResponse
 
     let (status, headers, body, truncated, http_version, alpn, set_cookies) = match outcome {
         Err(_) => return Err(FetchError::Timeout(timeout.as_millis() as u64)),
+        Ok(Err(e)) if e.is::<Unbound>() => return Err(FetchError::Unsent(e.to_string())),
         Ok(Err(e)) => {
             // rustls stringifies a custom verifier rejection as
             // "unexpected error: <ours>". These rejections are the opposite of
@@ -526,7 +539,19 @@ async fn perform(
     max_bytes: usize,
     observed: Arc<Mutex<Option<Observed>>>,
 ) -> Result<PerformOk, Box<dyn std::error::Error + Send + Sync>> {
-    let tcp = TcpStream::connect((target.host.as_str(), target.port)).await?;
+    let tcp = match &req.approved {
+        Some(approved) => match approved.connect_tcp(target.port).await {
+            Ok(tcp) => tcp,
+            Err(Connect::Bind(e)) => {
+                return Err(Box::new(Unbound(format!(
+                    "cannot bind to {} from {}: {e}",
+                    approved.dev, approved.src
+                ))))
+            }
+            Err(Connect::Connect(e)) => return Err(Box::new(e)),
+        },
+        None => TcpStream::connect((target.host.as_str(), target.port)).await?,
+    };
     tcp.set_nodelay(true).ok();
 
     let mut request = hyper::Request::builder()
@@ -587,6 +612,19 @@ async fn perform(
         Ok((status, headers, body, truncated, version, None, cookies))
     }
 }
+
+/// A socket that could not be bound where the guard approved: nothing was
+/// sent.
+#[derive(Debug)]
+struct Unbound(String);
+
+impl std::fmt::Display for Unbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unbound {}
 
 fn host_header(t: &Target) -> String {
     let default_port = if t.tls { 443 } else { 80 };
