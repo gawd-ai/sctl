@@ -974,6 +974,44 @@ mod tests {
         drop(waiting);
     }
 
+    /// The round rule through the monitor's own tick. A check that holds
+    /// its permit past its deadline plus a tick, as one that blocks its
+    /// thread would (no timeout cuts that), stops the rounds, and its
+    /// target is not started again. Once it lets go, the rounds go on.
+    #[tokio::test(start_paused = true)]
+    async fn a_check_held_past_its_deadline_stops_rounds_through_the_tick() {
+        let (infra, config) = held(vec![target_every("t1", 3600)]);
+        let digest = infra.lock().await.digest();
+        // The check of t1 took its permit at 0 s and does not let go.
+        let stuck = infra.lock().await.in_flight.start("t1").unwrap();
+        stuck.took_permit(Instant::now());
+        let starts = Arc::new(AtomicU32::new(0));
+        let checker: Checker = {
+            let starts = starts.clone();
+            Arc::new(move |_: &InfraTarget, _: CheckContext| {
+                starts.fetch_add(1, SeqCst);
+                async { good() }.boxed()
+            })
+        };
+        let monitor = spawn_monitor_with(infra.clone(), config, Timing::default(), checker);
+
+        tokio::time::sleep(Duration::from_secs(96)).await;
+        assert_eq!(
+            digest.group().rounds,
+            20,
+            "the ticks at 0 to 95 s, within 90 s plus a tick of the permit"
+        );
+        tokio::time::sleep(Duration::from_mins(1)).await;
+        assert_eq!(digest.group().rounds, 20, "none from the tick at 100 s on");
+        assert_eq!(starts.load(SeqCst), 0, "t1 is in flight: not started again");
+
+        drop(stuck);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(starts.load(SeqCst), 1, "started at the tick at 160 s");
+        assert_eq!(digest.group().rounds, 21, "and that tick counts its round");
+        monitor.abort();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_tick_that_panics_counts_no_round() {
         let (infra, config) = held(vec![target_every("t1", 60)]);

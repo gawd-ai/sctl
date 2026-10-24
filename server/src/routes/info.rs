@@ -864,7 +864,10 @@ mod infra_group_tests {
     }
 
     /// With the Infra lock held for 12 s, `/api/info` answers at once and
-    /// `rounds` stands still; once the lock is free, the rounds go on.
+    /// `rounds` stands still; once the lock is free, the rounds go on. Each
+    /// call made while the lock is held is bounded: an answer that waited
+    /// for the lock this test holds would never come, so the test fails
+    /// rather than hangs.
     #[tokio::test]
     async fn with_the_infra_lock_held_info_answers_at_once_and_rounds_stand_still() {
         let dir = scratch("lock");
@@ -884,13 +887,11 @@ mod infra_group_tests {
         let held = digest.group().rounds;
         let until = std::time::Instant::now() + Duration::from_secs(12);
         while std::time::Instant::now() < until {
-            let asked = std::time::Instant::now();
-            let group = info(&state, Some("infra")).await["infra"].clone();
-            assert!(
-                asked.elapsed() < Duration::from_millis(500),
-                "answered in {:?}",
-                asked.elapsed()
-            );
+            let answer =
+                tokio::time::timeout(Duration::from_millis(500), info(&state, Some("infra")))
+                    .await
+                    .expect("answered at once, without the Infra lock");
+            let group = &answer["infra"];
             assert_eq!(group["rounds"], held, "no round while the lock is held");
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
