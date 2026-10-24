@@ -283,19 +283,19 @@ finished state (the fleet does not need it; it is for a person at the box).
 5. **Write the rollback set**: the current files named by `install.json`, copied
    into `rollback_dir` (replacing an older set), plus `sctl.toml`. On
    `ramboot`, the current `ramboot.conf`.
-6. **Hand off to the helper.** First the agent waits for any Infra recovery
-   run in progress to end, at most the run's own 300 s limit (ADR-010): the
-   helper's restart ends the agent and a run with it, and a run may be a
-   power cycle between off and on. A run begun after the hand-off can still
-   be cut, and the next start logs it with its outcome unknown;
-   `sctl upgrade` from a shell is another process and does not wait. Then
-   the running binary copies itself to the stage (`<stage>/helper`) and
-   starts `helper upgrade-apply --stage <stage>` detached:
+6. **Hand off to the helper.** The running binary copies itself to the
+   stage (`<stage>/helper`). Then the agent waits for any Infra recovery run
+   in progress to end, at most the run's own 300 s limit (ADR-010), still
+   in `phase: staging`: the helper's restart ends the agent and a run with
+   it, and a run may be a power cycle between off and on. A run begun after
+   the hand-off can still be cut, and the next start logs it with its
+   outcome unknown; `sctl upgrade` from a shell is another process and does
+   not wait. Then the agent writes `phase: applying` to the state file,
+   pushes it, and starts `helper upgrade-apply --stage <stage>` detached:
    its own session (`setsid`), stdio to the stage's `log`, and on the `systemd`
    layout through `systemd-run --collect --unit sctl-upgrade-<version>` so it
-   lives outside the service's cgroup. The agent writes `phase: applying` to
-   the state file, pushes it, and does nothing more: the helper owns the device
-   from here.
+   lives outside the service's cgroup. The agent does nothing more: the
+   helper owns the device from here.
 7. **The helper** (state machine in `server/src/upgrade/apply.rs`, log in
    `<stage>/log`, state in `<state_dir>/upgrade/state.json`):
    1. waits 2 s so the 202 and the push leave;
@@ -346,7 +346,7 @@ and replayed after `net.state` and `infra.state`.
 | `phase` | `outcome` | Meaning |
 |---|---|---|
 | `idle` | `null` | Nothing in flight, nothing to report (cleared, or never asked). |
-| `staging` | `null` | Fetching and verifying. |
+| `staging` | `null` | Fetching and verifying; on the managed path, then waiting at most 300 s for an Infra recovery run in progress before the hand-off. |
 | `applying` | `null` | The helper has the device. |
 | `done` | `ok` | The new version answered health twice with the tunnel up. |
 | `done` | `not_applied` | Refused or failed before anything moved; `reason` says why (`window_passed`, `no_clock`, `downgrade`, `no_install_json`, `no_artifact_for_target`, `below_min_from_version`, `manifest_unsigned`, `manifest_bad_signature`, `download_failed`, `sha256_mismatch`, `no_space`, `binary_does_not_run`, `helper_lost`, `held`). |
@@ -434,7 +434,8 @@ later release reaches it as a rollout.
 
 - `sctl upgrade <version> [--manifest <url>] [--allow-downgrade]` does what the
   route does, from a shell on the box, reading `sctl.toml` for the relay and
-  the keys. It is the bring-up path for a bench unit and the way a person
+  the keys, except the wait for an Infra recovery run before the hand-off
+  (step 6). It is the bring-up path for a bench unit and the way a person
   finishes a `needs_hands` device.
 - `sctl upgrade-apply --stage <dir>` is the helper. Never run by hand.
 - `sctl target` prints the compile target, and `sctl install-info` prints what

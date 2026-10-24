@@ -188,8 +188,9 @@ pub struct ServerConfig {
     pub data_dir: String,
     /// Directory for the few small files that must survive a reboot even
     /// where `data_dir` is tmpfs (RAM-booted units): the infra monitoring
-    /// config, the infra credentials and the TLS pin store. Empty, the
-    /// default, means `data_dir`. Env: `SCTL_STATE_DIR`.
+    /// config, the infra credentials, the infra recovery counts, the TLS pin
+    /// store and the upgrade state. Empty, the default, means `data_dir`.
+    /// Env: `SCTL_STATE_DIR`.
     #[serde(default)]
     pub state_dir: String,
     /// Enable output journaling to disk (default true).
@@ -633,8 +634,9 @@ fn default_tunnel_proxy_timeout() -> u64 {
 
 impl ServerConfig {
     /// Where reboot-surviving state lives: `state_dir` when set, else
-    /// `data_dir`. Callers that persist infra config, credentials or TLS
-    /// pins go through this, never through `data_dir` directly.
+    /// `data_dir`. Callers that persist infra config, credentials or
+    /// recovery counts, TLS pins or the upgrade state go through this, never
+    /// through `data_dir` directly.
     pub fn state_dir(&self) -> &str {
         if self.state_dir.is_empty() {
             &self.data_dir

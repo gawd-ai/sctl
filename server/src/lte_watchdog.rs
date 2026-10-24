@@ -410,9 +410,9 @@ fn choose_action(
 
 /// Spawn the watchdog task. Returns immediately; the loop runs until shutdown.
 ///
-/// The loop is panic-supervised (same pattern as `spawn_supervised` in
-/// main.rs, which this library module cannot reach): under unwind a panic
-/// here would otherwise kill the watchdog silently and permanently.
+/// The loop is supervised by hand, the same pattern as
+/// `crate::supervise::spawn_supervised`: under unwind a panic here would
+/// otherwise kill the watchdog silently and permanently.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_watchdog(
     client: CommsClient,

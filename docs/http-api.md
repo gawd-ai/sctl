@@ -891,9 +891,13 @@ A `recovery` (`enabled`, `command`, `cooldown_secs` with a default of 300,
 `max_retries` with a default of 2, `credential_ids`) runs only on a failed
 check of the monitor that leaves the target `down`: the first `down` and every failed check after it, within
 the cooldown and `max_retries`, never on a good answer and never on Check
-now. The `down` is pushed first; the command then runs in a task of its
-own, outside the Infra lock, under a 300 s limit, one run per target at a
-time, and no check of the target starts until it ends. Before the command
+now. The `down` is signalled first, and the run never holds it back: it
+leaves within about a second, whatever the run takes. The command can
+start before that message leaves: when a recovery cuts the unit's own
+uplink, the next connection pushes the picture as it then stands. The
+command runs in a task of its own, outside the Infra lock, under a 300 s
+limit, one run per target at a time, and no check of the target starts
+until it ends. Before the command
 starts, the run is saved in `<state_dir>/infra-recovery.json`, synced: the
 count holds across restarts (after a start, a target with a saved count
 waits a full cooldown), and the next start logs a run that did not end,
@@ -956,13 +960,18 @@ among the command's credentials becomes `***`, as written and in its HTTP
 Basic form, the base64 of `username:password`, which a verbose HTTP client
 writes to stderr; the longest first, so a password that holds another is
 masked whole), then cut to 512 bytes on a character boundary, `...` marking
-a cut. `exit_code` is -1 when the run
-gave none, and `stdout` then says why: `ERROR: credential <id> is not on
-this unit`, `ERROR: timeout` at the 300 s limit, another `ERROR:` when the
-command could not start, `AGENT ERROR:` when the agent failed to finish
-the run, or `OUTCOME UNKNOWN: the agent stopped before this run ended (it
-started at <time>)` for a run the agent did not see end, logged at its
-next start. When the subsystem is unavailable or holds no config this
+a cut. `exit_code` is -1 when the run gave none. Either a signal ended the
+command (the out-of-memory killer, a crash, a kill from outside), and
+`stdout` and `stderr` are then its own output; a shell that outlives a
+command a signal ended exits 128 plus the signal's number instead. Or the
+agent says why in `stdout`: `ERROR: credential <id> is not on this unit`,
+`ERROR: spawn failed: ...` when the command could not start,
+`ERROR: timeout` at the 300 s limit, another `ERROR:` when the agent could
+not read the command's output or its end, `AGENT ERROR:` when the agent
+failed to finish the run, or `OUTCOME UNKNOWN: the agent stopped before
+this run ended (it started at <time>)` for a run the agent did not see
+end, logged at its next start. A command's own output can begin with the
+same words. When the subsystem is unavailable or holds no config this
 returns an empty result set (`config_version: 0`), not an error. The same
 per-target fields minus `data` are pushed over the tunnel as
 [`infra.state`](#infrastate-the-devices-infra-results) whenever `seq`

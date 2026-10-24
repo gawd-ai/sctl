@@ -30,10 +30,11 @@
 //! A recovery (ADR-010 decision 9) starts only on a failed check of the
 //! monitor that leaves its target Down, within its cooldown and
 //! `max_retries`. Under the Infra lock the result is folded and the Down
-//! signalled, so its push leaves first; the run then goes on in a task of
-//! its own, outside the monitor's task set, holding the target's place in
-//! flight until it ends. Nothing but its own 300 s limit or the agent's stop
-//! ends it: no push, rebuilt monitor or removed config.
+//! signalled first, so the run never holds it back: its push leaves within
+//! about a second, and the command may start before it does. The run goes
+//! on in a task of its own, outside the monitor's task set, holding the
+//! target's place in flight until it ends. Nothing but its own 300 s limit
+//! or the agent's stop ends it: no push, rebuilt monitor or removed config.
 //!
 //! Check now ([`check_now`], ADR-010 decision 10) is a reading: it runs under
 //! the same deadline, its result is applied as a monitor check's is, and it

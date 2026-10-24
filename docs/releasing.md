@@ -246,7 +246,9 @@ unit that runs an agent older than 0.6.7 or has no `/etc/sctl/install.json`
 or 0.6.8); each of them now writes that file, so the last hand upgrade leaves a unit
 that upgrades itself from then on. `relay deploy` remains for a first
 install; `relay upgrade` is the managed request above, no longer an scp. `sctl upgrade
-<version>` from a shell on the box does what the fleet does, for a bench.
+<version>` from a shell on the box does what the fleet does, for a bench,
+except the wait for an Infra recovery run before the hand-off
+(`docs/upgrade.md`, step 6).
 
 Release checklist additions:
 1. The tag must equal `server/Cargo.toml`'s version (`v0.6.7` for `0.6.7`);

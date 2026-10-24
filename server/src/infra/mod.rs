@@ -301,9 +301,12 @@ pub struct RecoveryLogEntry {
     pub ts: String,
     pub target_id: String,
     pub command: String,
-    /// -1 when the run gave no exit code: the agent could not start it, it
-    /// passed its 300 s limit, or its outcome is unknown; `stdout` says
-    /// which.
+    /// -1 when the run gave no exit code. Either a signal ended the
+    /// command, and `stdout` and `stderr` are its own output, or `stdout`
+    /// says which of these it was: a credential it names is not on this
+    /// unit, the agent could not start it, it passed its 300 s limit, the
+    /// agent could not read its output or its end, the agent failed to
+    /// finish the run (`AGENT ERROR:`), or its outcome is unknown.
     pub exit_code: i32,
     /// The command's output, each password of at least 4 bytes masked, as
     /// written and in its HTTP Basic form (the base64 of
@@ -794,10 +797,11 @@ const MAX_RECOVERY_LOG: usize = 50;
 pub const MAX_DATA_HISTORY: usize = 30;
 
 impl InfraState {
-    /// `state_dir` is where the config and the credentials persist; on a
-    /// RAM-booted unit it is the one directory that survives a reboot. The
-    /// digest takes now as the agent's start, outside safe mode; the agent
-    /// itself builds its state with [`Self::with_digest`].
+    /// `state_dir` is where the config, the credentials and the recovery
+    /// counts persist; on a RAM-booted unit it is the one directory that
+    /// survives a reboot. The digest takes now as the agent's start,
+    /// outside safe mode; the agent itself builds its state with
+    /// [`Self::with_digest`].
     pub fn new(state_dir: &str) -> Self {
         Self::with_digest(state_dir, Arc::new(Digest::new(now_unix_ms(), false)))
     }

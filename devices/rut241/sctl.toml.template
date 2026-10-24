@@ -2,8 +2,9 @@
 listen = "0.0.0.0:1337"
 data_dir = "/tmp/sctl/data"
 # data_dir is tmpfs: an ignition cycle wipes it. The infra monitoring config,
-# the infra credentials and the TLS pins go to flash instead (a few KB, written
-# only when the fleet pushes or an operator trusts a certificate).
+# its credentials and recovery counts, the TLS pins and the upgrade state go to
+# flash instead (a few KB, written when the fleet pushes, an operator trusts a
+# certificate, an Infra recovery runs or an upgrade runs).
 state_dir = "/etc/sctl/state"
 journal_enabled = false
 openwrt_persistent_logs = false
