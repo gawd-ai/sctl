@@ -157,6 +157,7 @@ mod cli {
     use serde_json::json;
 
     use super::guard::{self, Approved, Guard, Mac, Refusal, Stop};
+    use super::http::{form_body, request, HttpError, HttpRequest, DEFAULT_MAX_REDIRECTS};
     use super::snmp::{self, Session, SetValue, Version};
     use super::{print, usage, EXIT_REFUSED};
 
@@ -437,8 +438,10 @@ mod cli {
         i32::from(!open)
     }
 
-    pub async fn http(args: &[String]) -> i32 {
-        use super::http::{form_body, request, HttpError, HttpRequest, DEFAULT_MAX_REDIRECTS};
+    /// `http`'s arguments: one URL, its options and the common ones, in any
+    /// order. The request they make, its body and method settled, the
+    /// common options and `--fail`.
+    fn parse_http(args: &[String]) -> Result<(HttpRequest, Common, bool), String> {
         let mut req = HttpRequest {
             max_redirects: DEFAULT_MAX_REDIRECTS,
             ..HttpRequest::default()
@@ -448,69 +451,61 @@ mod cli {
         let mut fail = false;
         let mut it = args.iter();
         while let Some(a) = it.next() {
-            match common.take(a, &mut it) {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(e) => return usage(&e),
+            if common.take(a, &mut it)? {
+                continue;
             }
             let mut value = |name: &str| {
                 it.next()
                     .cloned()
                     .ok_or_else(|| format!("{name} needs a value"))
             };
-            let step: Result<(), String> = (|| {
-                match a.as_str() {
-                    "-X" | "--request" => req.method = value(a)?,
-                    "-H" | "--header" => {
-                        let h = value(a)?;
-                        let (k, v) = h
-                            .split_once(':')
-                            .ok_or_else(|| "a header must be 'Name: value'".to_string())?;
-                        req.headers
-                            .push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
-                    }
-                    "-d" | "--data" => req.body = Some(value(a)?),
-                    "-F" | "--form" => {
-                        let f = value(a)?;
-                        let (k, v) = f
-                            .split_once('=')
-                            .ok_or_else(|| "a form field must be name=value".to_string())?;
-                        form.push((k.to_string(), v.to_string()));
-                    }
-                    "-u" | "--user" => req.basic = Some(value(a)?),
-                    "-b" | "--cookie-jar" => req.cookie_jar = Some(value(a)?),
-                    "--max-redirects" => {
-                        req.max_redirects = value(a)?
-                            .parse()
-                            .map_err(|_| "--max-redirects must be a number".to_string())?;
-                    }
-                    "--max-bytes" => {
-                        req.max_bytes = Some(
-                            value(a)?
-                                .parse()
-                                .map_err(|_| "--max-bytes must be a number".to_string())?,
-                        );
-                    }
-                    "--pin" => req.pin_sha256 = Some(value(a)?),
-                    "--tofu" => req.allow_tofu = true,
-                    "--fail" => fail = true,
-                    other if other.starts_with('-') => return Err(unknown_option(other)),
-                    other if req.url.is_empty() => req.url = other.to_string(),
-                    _ => return Err("sctl net http takes one URL".to_string()),
+            match a.as_str() {
+                "-X" | "--request" => req.method = value(a)?,
+                "-H" | "--header" => {
+                    let h = value(a)?;
+                    let (k, v) = h
+                        .split_once(':')
+                        .ok_or_else(|| "a header must be 'Name: value'".to_string())?;
+                    req.headers
+                        .push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
                 }
-                Ok(())
-            })();
-            if let Err(e) = step {
-                return usage(&e);
+                "-d" | "--data" => req.body = Some(value(a)?),
+                "-F" | "--form" => {
+                    let f = value(a)?;
+                    let (k, v) = f
+                        .split_once('=')
+                        .ok_or_else(|| "a form field must be name=value".to_string())?;
+                    form.push((k.to_string(), v.to_string()));
+                }
+                "-u" | "--user" => req.basic = Some(value(a)?),
+                "-b" | "--cookie-jar" => req.cookie_jar = Some(value(a)?),
+                "--max-redirects" => {
+                    req.max_redirects = value(a)?
+                        .parse()
+                        .map_err(|_| "--max-redirects must be a number".to_string())?;
+                }
+                "--max-bytes" => {
+                    req.max_bytes = Some(
+                        value(a)?
+                            .parse()
+                            .map_err(|_| "--max-bytes must be a number".to_string())?,
+                    );
+                }
+                "--pin" => req.pin_sha256 = Some(value(a)?),
+                "--tofu" => req.allow_tofu = true,
+                "--fail" => fail = true,
+                other if other.starts_with('-') => return Err(unknown_option(other)),
+                other if req.url.is_empty() => req.url = other.to_string(),
+                _ => return Err("sctl net http takes one URL".to_string()),
             }
         }
         if req.url.is_empty() {
-            return usage("sctl net http <url>");
+            return Err("sctl net http <url>".to_string());
         }
         req.timeout_ms = common.timeout_ms;
         if !form.is_empty() {
             if req.body.is_some() {
-                return usage("-d and -F cannot be combined");
+                return Err("-d and -F cannot be combined".to_string());
             }
             req.body = Some(form_body(&form));
             if !req.headers.iter().any(|(k, _)| k == "content-type") {
@@ -523,6 +518,14 @@ mod cli {
         if req.method.is_empty() {
             req.method = if req.body.is_some() { "POST" } else { "GET" }.into();
         }
+        Ok((req, common, fail))
+    }
+
+    pub async fn http(args: &[String]) -> i32 {
+        let (req, common, fail) = match parse_http(args) {
+            Ok(parsed) => parsed,
+            Err(e) => return usage(&e),
+        };
         let timeout = Duration::from_millis(req.timeout_ms.unwrap_or(10_000));
         let extra = [("url", json!(req.url))];
         let host = super::http::host_of(&req.url);
@@ -776,6 +779,126 @@ mod cli {
             }
             let err = parse_tcp(&args(&["192.0.2.10", "80", "s3cr3t"])).unwrap_err();
             assert!(!err.contains("s3cr3t"), "{err}");
+        }
+
+        #[test]
+        fn http_takes_one_url_its_options_and_the_common_ones_anywhere() {
+            let (req, common, fail) = parse_http(&args(&[
+                "--dev",
+                "br-lan",
+                "http://192.0.2.10/login",
+                "-F",
+                "user=u",
+                "--expect-mac",
+                "02-00-00-00-00-0A",
+                "-F",
+                "pass=p",
+                "--timeout",
+                "4000",
+                "--config",
+                "/etc/sctl/sctl.toml",
+                "-b",
+                "/tmp/jar",
+                "--fail",
+            ]))
+            .unwrap();
+            assert_eq!(req.url, "http://192.0.2.10/login");
+            assert_eq!(req.method, "POST", "a form is a POST");
+            assert_eq!(req.body.as_deref(), Some("user=u&pass=p"));
+            assert!(req.headers.contains(&(
+                "content-type".to_string(),
+                "application/x-www-form-urlencoded".to_string()
+            )));
+            assert_eq!(req.timeout_ms, Some(4000));
+            assert_eq!(req.cookie_jar.as_deref(), Some("/tmp/jar"));
+            assert_eq!(req.max_redirects, DEFAULT_MAX_REDIRECTS);
+            assert_eq!(common.dev.as_deref(), Some("br-lan"));
+            assert_eq!(
+                common.expect_mac.map(|m| m.to_string()).as_deref(),
+                Some("02:00:00:00:00:0a")
+            );
+            assert_eq!(common.config.as_deref(), Some("/etc/sctl/sctl.toml"));
+            assert!(fail);
+
+            let (req, common, fail) = parse_http(&args(&[
+                "-X",
+                "put",
+                "-H",
+                "X-Custom:  kept ",
+                "http://192.0.2.10/x",
+                "-d",
+                "{}",
+                "-u",
+                "admin:p4ss",
+                "--max-redirects",
+                "0",
+                "--max-bytes",
+                "512",
+                "--pin",
+                "ab12",
+                "--tofu",
+            ]))
+            .unwrap();
+            assert_eq!(
+                (req.method.as_str(), req.body.as_deref()),
+                ("put", Some("{}"))
+            );
+            assert_eq!(req.headers, [("x-custom".to_string(), "kept".to_string())]);
+            assert_eq!(req.basic.as_deref(), Some("admin:p4ss"));
+            assert_eq!((req.max_redirects, req.max_bytes), (0, Some(512)));
+            assert_eq!(req.pin_sha256.as_deref(), Some("ab12"));
+            assert!(req.allow_tofu && !fail && common.dev.is_none());
+
+            let (req, ..) = parse_http(&args(&["http://192.0.2.10/"])).unwrap();
+            assert_eq!(
+                (req.method.as_str(), req.body, req.timeout_ms),
+                ("GET", None, None)
+            );
+        }
+
+        #[test]
+        fn no_http_usage_error_repeats_an_option_s_value() {
+            const URL: &str = "http://192.0.2.10/";
+            for (list, value) in [
+                (vec![URL, "-c", SECRET], SECRET),
+                (vec![URL, "--community", SECRET], SECRET),
+                (vec![URL, "--community=s3cr3t-c0mmunity"], SECRET),
+                (vec![URL, "-cs3cr3t-c0mmunity"], SECRET),
+                (vec![URL, "--secret=s3cr3t"], "s3cr3t"),
+                (vec![URL, "-us3cr3t"], "s3cr3t"),
+                (vec!["-us3cr3t", URL], "s3cr3t"),
+                (vec![URL, "-H", "s3cr3t"], "s3cr3t"),
+                (vec![URL, "-F", "s3cr3t"], "s3cr3t"),
+                (vec![URL, "--max-redirects", "s3cr3t"], "s3cr3t"),
+                (vec![URL, "--max-bytes", "s3cr3t"], "s3cr3t"),
+                (vec![URL, "--expect-mac", "s3cr3t"], "s3cr3t"),
+                (vec![URL, "--timeout", "s3cr3t"], "s3cr3t"),
+                (vec![URL, "--dev", "s3/cr3t"], "s3/cr3t"),
+                (vec![URL, "http://192.0.2.11/s3cr3t"], "s3cr3t"),
+                (vec![URL, "-d", "pass=s3cr3t", "-F", "user=u"], "s3cr3t"),
+                (vec![URL, "-F", "pass=s3cr3t", "-d", "x"], "s3cr3t"),
+            ] {
+                let err = parse_http(&args(&list)).expect_err("a usage error");
+                assert!(!err.contains(value), "{list:?}: {err}");
+            }
+            let err = |list: &[&str]| parse_http(&args(list)).expect_err("a usage error");
+            assert!(err(&[URL, "-c", SECRET]).contains("SCTL_SNMP_COMMUNITY="));
+            assert_eq!(err(&[URL, "--secret=s3cr3t"]), "unknown option --secret");
+            assert_eq!(
+                err(&[URL, "-us3cr3t"]),
+                "an unknown option",
+                "an attached value is not shown"
+            );
+            assert_eq!(
+                err(&[URL, "http://192.0.2.11/"]),
+                "sctl net http takes one URL"
+            );
+            assert_eq!(
+                err(&[URL, "-d", "x", "-F", "a=b"]),
+                "-d and -F cannot be combined"
+            );
+            assert_eq!(err(&[URL, "-H"]), "-H needs a value");
+            assert_eq!(err(&["--fail"]), "sctl net http <url>");
         }
 
         #[test]
