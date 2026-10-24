@@ -952,8 +952,11 @@ saying it is old). `consecutive_ok` counts good answers in a row, slow ones
 included. Each `recovery_log` entry (the last 50 runs) is `{ts, target_id,
 command, exit_code, stdout, stderr}`, `ts` being when the run was logged.
 `stdout` and `stderr` are each masked (every password of at least 4 bytes
-among the command's credentials becomes `***`), then cut to 512 bytes on a
-character boundary, `...` marking a cut. `exit_code` is -1 when the run
+among the command's credentials becomes `***`, as written and in its HTTP
+Basic form, the base64 of `username:password`, which a verbose HTTP client
+writes to stderr; the longest first, so a password that holds another is
+masked whole), then cut to 512 bytes on a character boundary, `...` marking
+a cut. `exit_code` is -1 when the run
 gave none, and `stdout` then says why: `ERROR: credential <id> is not on
 this unit`, `ERROR: timeout` at the 300 s limit, another `ERROR:` when the
 command could not start, `AGENT ERROR:` when the agent failed to finish

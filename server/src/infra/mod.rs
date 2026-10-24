@@ -305,8 +305,10 @@ pub struct RecoveryLogEntry {
     /// passed its 300 s limit, or its outcome is unknown; `stdout` says
     /// which.
     pub exit_code: i32,
-    /// The command's output, each password of at least 4 bytes masked, cut
-    /// to 512 bytes on a character boundary (`...` marks a cut).
+    /// The command's output, each password of at least 4 bytes masked, as
+    /// written and in its HTTP Basic form (the base64 of
+    /// `username:password`), then cut to 512 bytes on a character boundary
+    /// (`...` marks a cut).
     pub stdout: String,
     /// The command's error output, masked and cut as `stdout` is: a failed
     /// command says why there.

@@ -914,12 +914,39 @@ pub(crate) fn recovery_env(
     Ok(env)
 }
 
-/// A recovery's output with its passwords masked, before it is logged or
-/// kept. A password under 4 bytes and a username stay as they are.
-fn mask(text: &str, secrets: &[String]) -> String {
-    secrets
+/// The shortest password a recovery's output is masked of: a shorter one
+/// would mask common words of the output.
+const MASKED_FROM_BYTES: usize = 4;
+
+/// What a recovery's output is masked of: each password of at least 4 bytes
+/// among the credentials the command names, as written and in the form HTTP
+/// Basic sends it, the base64 of `username:password`, which a verbose HTTP
+/// client writes to stderr and which carries no password as written.
+/// Longest first, so a password that holds a shorter one is masked whole. A
+/// password under 4 bytes and a username stay as they are.
+fn masks<'a>(credentials: impl IntoIterator<Item = &'a super::Credential>) -> Vec<String> {
+    use base64::Engine as _;
+    let mut masks: Vec<String> = credentials
+        .into_iter()
+        .filter(|c| c.password.len() >= MASKED_FROM_BYTES)
+        .flat_map(|c| {
+            let basic = format!("{}:{}", c.username, c.password);
+            [
+                c.password.clone(),
+                base64::engine::general_purpose::STANDARD.encode(basic),
+            ]
+        })
+        .collect();
+    masks.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    masks.dedup();
+    masks
+}
+
+/// A recovery's output with each of `masks` replaced by `***`, in order,
+/// before it is logged or kept.
+fn mask(text: &str, masks: &[String]) -> String {
+    masks
         .iter()
-        .filter(|s| s.len() >= 4)
         .fold(text.to_string(), |acc, s| acc.replace(s.as_str(), "***"))
 }
 
@@ -935,8 +962,8 @@ fn cut(text: &str, max: usize) -> String {
 
 /// A recovery output as it is logged: masked first, so a cut never leaves
 /// part of a password, then cut to 512 bytes.
-fn for_the_log(text: &str, secrets: &[String]) -> String {
-    cut(&mask(text, secrets), RECOVERY_OUTPUT_BYTES)
+fn for_the_log(text: &str, masks: &[String]) -> String {
+    cut(&mask(text, masks), RECOVERY_OUTPUT_BYTES)
 }
 
 /// A recovery run a failed check of the monitor started: recorded (the
@@ -958,8 +985,8 @@ enum Prepared {
     /// The command and the credentials it names, as environment.
     Ready {
         env: Vec<(String, String)>,
-        /// The passwords its output is masked of.
-        secrets: Vec<String>,
+        /// What its output is masked of ([`masks`]).
+        masks: Vec<String>,
     },
     /// The command cannot start: a credential is not on this unit.
     Refused(String),
@@ -980,12 +1007,12 @@ impl RecoveryRun {
                 Prepared::Refused(format!("ERROR: credential {missing} is not on this unit"))
             }
             Ok(env) => {
-                let secrets = env
-                    .iter()
-                    .filter(|(k, _)| k.starts_with("SCTL_CRED_PASS_"))
-                    .map(|(_, v)| v.clone())
-                    .collect();
-                Prepared::Ready { env, secrets }
+                let masks = masks(
+                    self.credential_ids
+                        .iter()
+                        .filter_map(|id| state.credentials.get(id)),
+                );
+                Prepared::Ready { env, masks }
             }
         }
     }
@@ -994,7 +1021,7 @@ impl RecoveryRun {
     /// cut what it said. A panic here is the agent's, and still ends the
     /// run with a log entry.
     async fn execute(&self, prepared: Prepared) -> Ended {
-        let (env, secrets) = match prepared {
+        let (env, masks) = match prepared {
             Prepared::Refused(why) => {
                 return Ended {
                     exit_code: -1,
@@ -1002,7 +1029,7 @@ impl RecoveryRun {
                     stderr: String::new(),
                 }
             }
-            Prepared::Ready { env, secrets } => (env, secrets),
+            Prepared::Ready { env, masks } => (env, masks),
         };
         info!(
             "Executing recovery for {}: {}",
@@ -1013,8 +1040,8 @@ impl RecoveryRun {
             match checks::exec_with_env(&self.command, &env, limit_ms).await {
                 Ok((exit_code, out, err)) => Ended {
                     exit_code,
-                    stdout: for_the_log(&out, &secrets),
-                    stderr: for_the_log(&err, &secrets),
+                    stdout: for_the_log(&out, &masks),
+                    stderr: for_the_log(&err, &masks),
                 },
                 Err(e) => Ended {
                     exit_code: -1,
@@ -2290,6 +2317,55 @@ mod tests {
         for text in [&entry.stdout, &entry.stderr] {
             assert!(!text.contains("S3c"), "{text}");
         }
+    }
+
+    /// A verbose HTTP client (`curl -v -u "$SCTL_CRED_USER_1:$SCTL_CRED_PASS_1"`)
+    /// writes its request's headers to stderr, the Basic credential among
+    /// them: the base64 of `admin:S3cret-pw`, which holds no password as
+    /// written. It is masked too. The command only prints fixed text.
+    #[tokio::test]
+    async fn a_recoverys_output_is_masked_of_the_http_basic_form_too() {
+        let scratch = Scratch::new("basic");
+        let entry = logged_output(
+            &scratch,
+            "printf '%s\\n' '> GET /outlet?1=off HTTP/1.1' \
+             '> Authorization: Basic YWRtaW46UzNjcmV0LXB3' >&2"
+                .to_string(),
+        )
+        .await;
+        assert_eq!(
+            entry.stderr,
+            "> GET /outlet?1=off HTTP/1.1\n> Authorization: Basic ***\n"
+        );
+    }
+
+    #[test]
+    fn the_masks_are_each_password_and_its_basic_form_longest_first() {
+        let credential = |username: &str, password: &str| super::super::Credential {
+            username: username.into(),
+            password: password.into(),
+        };
+        let pdu = [credential("admin", "S3cret-pw")];
+        assert_eq!(masks(&pdu), ["YWRtaW46UzNjcmV0LXB3", "S3cret-pw"]);
+
+        // A password that holds a shorter one is masked whole, whatever
+        // the order of the credentials.
+        let nested = [credential("a", "pass"), credential("b", "password1")];
+        assert_eq!(
+            mask("password1 pass YjpwYXNzd29yZDE= YTpwYXNz", &masks(&nested)),
+            "*** *** *** ***"
+        );
+
+        // A password under 4 bytes and a username stay as they are, in
+        // either form.
+        assert!(masks(&[credential("admin", "abc")]).is_empty());
+        assert_eq!(
+            mask("admin S3cret-pw", &masks(&pdu)),
+            "admin ***",
+            "the username stays"
+        );
+        // The same credential twice is one mask each.
+        assert_eq!(masks(&[pdu[0].clone(), pdu[0].clone()]).len(), 2);
     }
 
     /// A unit whose recovery cuts its own power restarts the agent. The
