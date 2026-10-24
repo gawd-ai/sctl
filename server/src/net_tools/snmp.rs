@@ -272,16 +272,21 @@ fn answers<'a>(bytes: &'a [u8], request_id: i32, community: &[u8]) -> Option<Pdu
         .then_some(pdu)
 }
 
-/// A random positive request id, so an answer to an earlier run never
-/// matches.
+/// A positive request id that differs from run to run, so an answer to an
+/// earlier run never matches. Ids only tell answers apart, so the draw needs
+/// no cryptographic generator and must never wait: std's hash keys come
+/// from the kernel without waiting, from `/dev/urandom` where getrandom(2)
+/// is missing. ring's generator, there (the WE826 runs Linux 3.3.8), first
+/// polls `/dev/random` with no limit until the kernel credits enough
+/// entropy, and a run started early after a boot could wait there.
 fn first_request_id() -> i32 {
-    let mut bytes = [0u8; 4];
-    let random = ring::rand::SystemRandom::new();
-    if ring::rand::SecureRandom::fill(&random, &mut bytes).is_err() {
-        // A fixed start still works: ids only tell answers apart.
-        return 1;
+    use std::hash::{BuildHasher, Hasher};
+    let mut draw = std::collections::hash_map::RandomState::new().build_hasher();
+    draw.write_u32(std::process::id());
+    if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        draw.write_u128(now.as_nanos());
     }
-    i32::from_be_bytes(bytes) & 0x7fff_ffff
+    i32::try_from(draw.finish() & 0x7fff_ffff).unwrap_or(1)
 }
 
 // ─── the session ────────────────────────────────────────────────────────
@@ -779,6 +784,12 @@ mod tests {
     async fn request_ids_differ_between_sessions_and_count_up() {
         let (port, agent) = echo_agent(0).await;
         let mut s = session(port, "public").await;
+        let other = session(port, "public").await;
+        // A false failure has odds of 1 in 2^31.
+        assert_ne!(s.next_id, other.next_id, "each session starts afresh");
+        let draws: std::collections::HashSet<i32> = (0..8).map(|_| first_request_id()).collect();
+        assert!(draws.len() > 1, "{draws:?}");
+        assert!(draws.iter().all(|id| *id >= 0), "{draws:?}");
         let first = s.next_id;
         get(
             &mut s,
