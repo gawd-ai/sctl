@@ -724,60 +724,85 @@ mod tests {
         drop(sock);
     }
 
-    /// An agent that first answers with the wrong request id, the wrong
-    /// community, the wrong PDU type and bytes that are no SNMP at all, and
-    /// only then with the answer.
+    /// Replies to `request` that are not its answer, each with error-status
+    /// genErr, so one taken by mistake reads as the agent's refusal, never
+    /// as the answer: another request id, another community, another PDU
+    /// type (a GetRequest with the request's id and community), and bytes
+    /// that are no SNMP at all.
+    fn wrong_replies(request: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
+        let mut refused = request.to_vec();
+        respond_in_place(&mut refused, 5);
+        // Another request id: its last byte changed.
+        let mut wrong_id = refused.clone();
+        let (inner, _) = tlv(&wrong_id, pdu_at(&wrong_id));
+        let (id_at, id_len) = tlv(&wrong_id, inner);
+        wrong_id[id_at + id_len - 1] ^= 0x01;
+        // Another community of the same length.
+        let mut wrong_community = refused.clone();
+        let (community_at, community_len) = {
+            let (message, _) = tlv(&wrong_community, 0);
+            let (version_at, version_len) = tlv(&wrong_community, message);
+            tlv(&wrong_community, version_at + version_len)
+        };
+        wrong_community[community_at..community_at + community_len].copy_from_slice(b"PUBLIC");
+        // A GetRequest, not a Response.
+        let mut wrong_type = refused;
+        let at = pdu_at(&wrong_type);
+        wrong_type[at] = 0xA0;
+        vec![
+            ("another request id", wrong_id),
+            ("another community", wrong_community),
+            ("another PDU type", wrong_type),
+            ("no SNMP", b"no snmp here".to_vec()),
+        ]
+    }
+
+    /// Only the answer to the request is taken: a Response with its request
+    /// id and its community, what `snmp2` checks only inside its crate.
     #[tokio::test]
     async fn only_an_answer_to_the_request_is_taken() {
         let agent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let port = agent.local_addr().unwrap().port();
-        let mut session_a = session(port, "public").await;
+        let oids = ["1.3.6.1.2.1.1.5.0".to_string()];
         let mut buf = [0u8; 2048];
+
+        // Each wrong reply alone: the wait ends only at the timeout.
+        for which in 0..4 {
+            let mut s = session(port, "public").await;
+            let serve = async {
+                let (len, from) = agent.recv_from(&mut buf).await.unwrap();
+                let (what, reply) = wrong_replies(&buf[..len]).swap_remove(which);
+                agent.send_to(&reply, from).await.unwrap();
+                what
+            };
+            let (got, what) = tokio::join!(get(&mut s, &oids), serve);
+            assert!(
+                matches!(got, Err(SnmpError::Timeout)),
+                "{what} was taken: {got:?}"
+            );
+        }
+
+        // Every wrong reply, then the answer: the answer is taken.
+        let mut s = session(port, "public").await;
         let serve = async {
             let (len, from) = agent.recv_from(&mut buf).await.unwrap();
             let request = buf[..len].to_vec();
-            let mut good = request.clone();
-            respond_in_place(&mut good, 0);
-            // Another request id: its last byte changed.
-            let mut wrong_id = good.clone();
-            let (inner, _) = tlv(&wrong_id, pdu_at(&wrong_id));
-            let (id_at, id_len) = tlv(&wrong_id, inner);
-            wrong_id[id_at + id_len - 1] ^= 0x01;
-            // Another community of the same length.
-            let mut wrong_community = good.clone();
-            let (community_at, community_len) = {
-                let (message, _) = tlv(&wrong_community, 0);
-                let (version_at, version_len) = tlv(&wrong_community, message);
-                tlv(&wrong_community, version_at + version_len)
-            };
-            wrong_community[community_at..community_at + community_len].copy_from_slice(b"PUBLIC");
-            // The request itself: a GetRequest, not a Response.
-            let wrong_type = request;
-            for reply in [
-                wrong_id,
-                wrong_community,
-                wrong_type,
-                b"no snmp here".to_vec(),
-                good,
-            ] {
+            for (_, reply) in wrong_replies(&request) {
                 agent.send_to(&reply, from).await.unwrap();
             }
+            let mut answer = request;
+            respond_in_place(&mut answer, 0);
+            agent.send_to(&answer, from).await.unwrap();
         };
-        let oids = ["1.3.6.1.2.1.1.5.0".to_string()];
-        let (got, ()) = tokio::join!(get(&mut session_a, &oids), serve);
-        assert_eq!(got.unwrap()[0].oid, "1.3.6.1.2.1.1.5.0");
-
-        // Without the good one: a timeout, whatever else arrived.
-        let mut session_b = session(port, "public").await;
-        let serve = async {
-            let (len, from) = agent.recv_from(&mut buf).await.unwrap();
-            let mut wrong_type = buf[..len].to_vec();
-            let at = pdu_at(&wrong_type);
-            wrong_type[at] = 0xA3; // a SetRequest
-            agent.send_to(&wrong_type, from).await.unwrap();
-        };
-        let (got, ()) = tokio::join!(get(&mut session_b, &oids), serve);
-        assert!(matches!(got, Err(SnmpError::Timeout)), "{got:?}");
+        let (got, ()) = tokio::join!(get(&mut s, &oids), serve);
+        assert_eq!(
+            got.unwrap(),
+            vec![Binding {
+                oid: "1.3.6.1.2.1.1.5.0".into(),
+                kind: "null",
+                value: Json::Null
+            }]
+        );
     }
 
     #[tokio::test]
