@@ -544,7 +544,7 @@ ip addr del 192.0.2.250/32 dev eth1
 
 ### HTTP redirects
 
-`sctl net http` follows up to `--max-redirects` redirects (default 5), and each hop passes the guard on its own, `--dev` and `--expect-mac` included. A 303, and a 301 or 302 after a POST, go on as a GET without a body; any other keeps the method and the body. A redirect to another scheme, host or port drops the Basic credentials, every header the caller set and the body, and is not followed when it would send the body again (a 307 or 308 after a request with one, or a 301 or 302 that keeps a PUT's). With `--expect-mac` a redirect to another address is not followed. A redirect not followed ends the request: the answer is that redirect, its `status` and `Location`, with `not_followed` (the `reason`, and `refused` when the guard refused its hop), exit 1.
+`sctl net http` follows up to `--max-redirects` redirects (default 5), and each hop passes the guard on its own, `--dev` and `--expect-mac` included, its host looked up once: the address judged is the address sent to. A 303, and a 301 or 302 after a POST, go on as a GET without a body; any other keeps the method and the body. A redirect to another scheme, host or port drops the Basic credentials, every header the caller set and the body, and is not followed when it would send the body again (a 307 or 308 after a request with one, or a 301 or 302 that keeps a PUT's). With `--expect-mac` a redirect to another address is not followed. A redirect not followed ends the request: the answer is that redirect, its `status` and `Location`, with `not_followed` (the `reason`, and `refused` when the guard refused its hop), exit 1.
 
 ### Answers
 

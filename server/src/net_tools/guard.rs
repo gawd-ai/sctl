@@ -1076,9 +1076,20 @@ impl Guard {
         }
     }
 
-    /// Resolve `host` and approve its first IPv4 address.
+    /// Resolve `host` once and approve its first IPv4 address.
     pub async fn approve_host(&self, host: &str) -> Result<Approved, Stop> {
         let (address, name) = resolve(host).await?;
+        self.approve_resolved(address, name).await
+    }
+
+    /// Approve `address`, the answer a lookup of `name` gave when the host
+    /// was a name: a refusal names it. The address judged is the one the
+    /// caller looked up, never a second lookup's.
+    pub async fn approve_resolved(
+        &self,
+        address: Ipv4Addr,
+        name: Option<String>,
+    ) -> Result<Approved, Stop> {
         self.approve(address).await.map_err(|mut refusal| {
             refusal.name = name;
             Stop::Refused(refusal)
@@ -1198,6 +1209,10 @@ pub async fn resolve(host: &str) -> Result<(Ipv4Addr, Option<String>), Stop> {
         }
         Err(_) => {}
     }
+    #[cfg(test)]
+    if let Some(ip) = steer::take(host) {
+        return Ok((ip, Some(host.to_string())));
+    }
     let found: Vec<SocketAddr> = tokio::net::lookup_host((host, 0))
         .await
         .map_err(|e| Stop::Failed(format!("cannot resolve {host}: {e}")))?
@@ -1221,6 +1236,45 @@ pub async fn resolve(host: &str) -> Result<(Ipv4Addr, Option<String>), Stop> {
             Err(Stop::Refused(Box::new(refusal)))
         }
         None => Err(Stop::Failed(format!("cannot resolve {host}: no address"))),
+    }
+}
+
+/// Answers a test gives names on its own thread, one per lookup, in order:
+/// a test can count a name's lookups and change its answer between two.
+#[cfg(test)]
+pub(crate) mod steer {
+    use std::cell::RefCell;
+    use std::net::Ipv4Addr;
+
+    thread_local! {
+        static ANSWERS: RefCell<Vec<(String, Ipv4Addr)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Answer `name` with `answers`, one per lookup, on this thread.
+    pub(crate) fn set(name: &str, answers: &[Ipv4Addr]) {
+        ANSWERS.with(|all| {
+            all.borrow_mut()
+                .extend(answers.iter().map(|ip| (name.to_string(), *ip)));
+        });
+    }
+
+    /// The next answer for `name`, taken by a lookup.
+    pub(super) fn take(name: &str) -> Option<Ipv4Addr> {
+        ANSWERS.with(|all| {
+            let mut all = all.borrow_mut();
+            let at = all.iter().position(|(n, _)| n == name)?;
+            Some(all.remove(at).1)
+        })
+    }
+
+    /// How many answers for `name` no lookup has taken.
+    pub(crate) fn left(name: &str) -> usize {
+        ANSWERS.with(|all| all.borrow().iter().filter(|(n, _)| n == name).count())
+    }
+
+    /// Forget every answer not taken.
+    pub(crate) fn clear() {
+        ANSWERS.with(|all| all.borrow_mut().clear());
     }
 }
 

@@ -4,14 +4,14 @@
 //! between steps, and redirects followed (ADR-006).
 //!
 //! Every hop passes the guard on its own (ADR-012 decision 6), `--dev` and
-//! `--expect-mac` included, and connects bound where the guard approved, to
-//! the address it judged; the URL's name stays for `Host` and TLS. A
-//! redirect to another scheme, host or port drops the Basic credentials,
-//! every header the caller set and the body, and is not followed when it
-//! would send the body again (a 307 or 308 after a request with one, or a
-//! 301 or 302 that keeps a PUT's), nor, with `--expect-mac`, to another
-//! address. A redirect not followed ends the request: the answer is that
-//! redirect, with `not_followed`.
+//! `--expect-mac` included, its host looked up once, and connects bound
+//! where the guard approved, to the address it judged; the URL's name stays
+//! for `Host` and TLS. A redirect to another scheme, host or port drops the
+//! Basic credentials, every header the caller set and the body, and is not
+//! followed when it would send the body again (a 307 or 308 after a request
+//! with one, or a 301 or 302 that keeps a PUT's), nor, with `--expect-mac`,
+//! to another address. A redirect not followed ends the request: the answer
+//! is that redirect, with `not_followed`.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -271,13 +271,18 @@ pub fn resolve(base: &str, location: &str) -> String {
     )
 }
 
-/// A hop's approval: the guard's on its host.
-async fn approve_hop(guard: &Guard, url: &str) -> Result<Approved, Stop> {
+/// Only an http or https URL with a host is sent.
+fn sendable(url: &str) -> Result<(), Stop> {
     match origin_of(url) {
-        Some((scheme, _, _)) if scheme == "http" || scheme == "https" => {}
-        Some(_) => return Err(Stop::Failed("only http and https URLs are sent".into())),
-        None => return Err(Stop::Failed("not a URL with a host".into())),
+        Some((scheme, _, _)) if scheme == "http" || scheme == "https" => Ok(()),
+        Some(_) => Err(Stop::Failed("only http and https URLs are sent".into())),
+        None => Err(Stop::Failed("not a URL with a host".into())),
     }
+}
+
+/// The first request's approval: the guard's on its host, looked up once.
+async fn approve_hop(guard: &Guard, url: &str) -> Result<Approved, Stop> {
+    sendable(url)?;
     guard.approve_host(&host_of(url)).await
 }
 
@@ -439,25 +444,27 @@ pub async fn request(
     }
 }
 
-/// The next hop's approval. With `--expect-mac` it must lead to the
-/// address the first request was judged at: the MAC is that device's.
+/// The next hop's approval, its host looked up once (ADR-012 decision 1).
+/// With `--expect-mac` that address must be the one the first request was
+/// judged at, since the MAC is that device's; it is then the address the
+/// guard judges and the hop is sent to.
 async fn approve_next(guard: &Guard, next: &str, first: Ipv4Addr) -> Result<Approved, NotFollowed> {
-    if guard.expect_mac.is_some() {
-        let host = host_of(next);
-        match super::guard::resolve(&host).await {
-            Ok((address, _)) if address != first => {
-                return Err(NotFollowed {
-                    reason: format!(
-                        "the redirect leads to {address}, not {first}: --expect-mac names the device at {first}"
-                    ),
-                    refused: None,
-                });
-            }
-            Ok(_) => {}
-            Err(stop) => return Err(not_followed(stop)),
-        }
+    sendable(next).map_err(not_followed)?;
+    let (address, name) = super::guard::resolve(&host_of(next))
+        .await
+        .map_err(not_followed)?;
+    if guard.expect_mac.is_some() && address != first {
+        return Err(NotFollowed {
+            reason: format!(
+                "the redirect leads to {address}, not {first}: --expect-mac names the device at {first}"
+            ),
+            refused: None,
+        });
     }
-    approve_hop(guard, next).await.map_err(not_followed)
+    guard
+        .approve_resolved(address, name)
+        .await
+        .map_err(not_followed)
 }
 
 #[cfg(test)]
@@ -792,6 +799,54 @@ mod tests {
                 .is_err(),
             "the other host received nothing"
         );
+    }
+
+    /// ADR-012 decisions 1 and 6: a hop's host is looked up once, and with
+    /// `--expect-mac` the address compared with the first request's is the
+    /// address judged and sent to. The name here answers the first
+    /// request's address, then another: the hop is judged at the first
+    /// answer (the unit's own, so `--expect-mac` refuses it there), and the
+    /// second is never asked for.
+    #[tokio::test]
+    async fn a_redirect_s_host_is_looked_up_once_and_judged_where_it_was_compared() {
+        use crate::net_tools::guard::{steer, Mac};
+        let first = Ipv4Addr::LOCALHOST;
+        let other = Ipv4Addr::new(127, 0, 0, 2);
+        let guard = Guard {
+            expect_mac: Some(Mac([0x02, 0, 0, 0, 0, 0x0a])),
+            ..Guard::default()
+        };
+        let next = "http://rotating.test:8080/next";
+
+        steer::set("rotating.test", &[first, other]);
+        let why = approve_next(&guard, next, first).await.unwrap_err();
+        assert_eq!(why.refused, Some(Code::OwnAddress), "{}", why.reason);
+        assert!(
+            why.reason
+                .starts_with("127.0.0.1 is this unit's own address"),
+            "judged where it was compared: {}",
+            why.reason
+        );
+        assert_eq!(steer::left("rotating.test"), 1, "one lookup");
+
+        // Another address on the one lookup: not followed, nothing judged.
+        let why = approve_next(&guard, next, first).await.unwrap_err();
+        assert_eq!(why.refused, None, "{}", why.reason);
+        assert!(
+            why.reason.contains("leads to 127.0.0.2, not 127.0.0.1"),
+            "{}",
+            why.reason
+        );
+        assert_eq!(steer::left("rotating.test"), 0);
+
+        // The scheme first: a hop that is never sent costs no lookup.
+        steer::set("rotating.test", &[first]);
+        let why = approve_next(&guard, "ftp://rotating.test/next", first)
+            .await
+            .unwrap_err();
+        assert_eq!(why.reason, "only http and https URLs are sent");
+        assert_eq!(steer::left("rotating.test"), 1, "no lookup");
+        steer::clear();
     }
 
     #[tokio::test]
