@@ -494,10 +494,18 @@ pub async fn apply_result(
         }
     }
 
-    // Reset recovery tracker on recovery
-    if new_status == TargetStatus::Up && prev_status == TargetStatus::Down {
+    // A good answer that moves the target out of Down or `unknown` clears
+    // its recovery count (ADR-010 decision 9). A target that answers again
+    // starts afresh, also when the agent failed to check it in between: a
+    // check that panics leaves the target `unknown` and the count standing.
+    if result.ok
+        && new_status != prev_status
+        && matches!(prev_status, TargetStatus::Down | TargetStatus::Unknown)
+    {
         state.recovery_tracker.remove(&target.id);
-        info!("Target {} ({}) recovered to UP", target.id, target.name);
+        if prev_status == TargetStatus::Down {
+            info!("Target {} ({}) recovered to UP", target.id, target.name);
+        }
     }
 }
 
@@ -1249,5 +1257,103 @@ mod tests {
         // Still down inside the cooldown: no run, no change.
         apply_result(&mut state, &t, failed(), 1, Instant::now()).await;
         assert_eq!(state.stamp(), down);
+    }
+
+    /// `target` with a recovery that starts no process: it names a
+    /// credential this unit does not hold, so each run is logged and
+    /// counted, and nothing runs.
+    fn with_inert_recovery(mut target: InfraTarget) -> InfraTarget {
+        target.recovery = Some(RecoveryConfig {
+            enabled: true,
+            command: "true".into(),
+            cooldown_secs: 60,
+            max_retries: 2,
+            credential_ids: vec!["not-on-this-unit".into()],
+        });
+        target
+    }
+
+    /// The state of `target` after an outage that used up its recovery:
+    /// Down, two runs logged, its count at `max_retries`. `at` turns the
+    /// seconds since the first check into the monotonic clock.
+    async fn exhausted(target: &InfraTarget, at: impl Fn(u64) -> Instant) -> InfraState {
+        let mut state = InfraState::new("/tmp/sctl-infra-proof-test");
+        assert!(state.hold_config(InfraConfig {
+            version: 1,
+            check_interval_secs: 60,
+            targets: vec![target.clone()],
+        }));
+        apply_result(&mut state, target, good(), 1, at(0)).await;
+        // Degraded twice, then Down with the first run, the second run once
+        // the cooldown has passed, then none.
+        for secs in [60, 120, 180, 240, 300] {
+            let failed = CheckResult::failed("PING TIMEOUT");
+            apply_result(&mut state, target, failed, 1, at(secs)).await;
+        }
+        assert_eq!(state.results.targets[&target.id].status, TargetStatus::Down);
+        assert_eq!(state.results.recovery_log.len(), 2);
+        assert_eq!(
+            state.recovery_tracker[&target.id].1, 2,
+            "max_retries used up"
+        );
+        state
+    }
+
+    /// A check that panics while its target is Down leaves the target
+    /// `unknown` and the recovery count standing. The good answer that
+    /// takes it out of `unknown` clears the count (ADR-010 decision 9), so
+    /// its next outage runs the recovery again.
+    #[tokio::test]
+    async fn a_good_answer_out_of_unknown_clears_the_recovery_count() {
+        let t = with_inert_recovery(target_every("t1", 60));
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let mut state = exhausted(&t, at).await;
+
+        apply_check_panic(&mut state, &t, 1);
+        assert_eq!(state.results.targets["t1"].status, TargetStatus::Unknown);
+        assert_eq!(
+            state.recovery_tracker["t1"].1, 2,
+            "the agent's own defect is no answer"
+        );
+
+        apply_result(&mut state, &t, good(), 1, at(360)).await;
+        assert_eq!(state.results.targets["t1"].status, TargetStatus::Up);
+        assert!(
+            !state.recovery_tracker.contains_key("t1"),
+            "it answered: the count is clear"
+        );
+
+        // The next outage, an hour later: Down, and the recovery runs.
+        for secs in [3600, 3660, 3720] {
+            let failed = CheckResult::failed("PING TIMEOUT");
+            apply_result(&mut state, &t, failed, 1, at(secs)).await;
+        }
+        assert_eq!(state.results.targets["t1"].status, TargetStatus::Down);
+        assert_eq!(state.results.recovery_log.len(), 3, "the recovery ran");
+        assert_eq!(state.recovery_tracker["t1"].1, 1);
+    }
+
+    /// A failure out of `unknown` is no answer: the outage goes on, the
+    /// count stands, and `max_retries` still holds.
+    #[tokio::test]
+    async fn a_failure_out_of_unknown_leaves_the_recovery_count() {
+        let t = with_inert_recovery(target_every("t1", 60));
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let mut state = exhausted(&t, at).await;
+
+        apply_check_panic(&mut state, &t, 1);
+        for secs in [3600, 3660, 3720] {
+            let failed = CheckResult::failed("PING TIMEOUT");
+            apply_result(&mut state, &t, failed, 1, at(secs)).await;
+        }
+        assert_eq!(state.results.targets["t1"].status, TargetStatus::Down);
+        assert_eq!(state.recovery_tracker["t1"].1, 2, "the count stands");
+        assert_eq!(
+            state.results.recovery_log.len(),
+            2,
+            "no run past max_retries"
+        );
     }
 }

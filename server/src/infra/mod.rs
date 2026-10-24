@@ -181,7 +181,8 @@ pub struct RecoveryConfig {
     /// Minimum seconds between consecutive executions.
     #[serde(default = "default_cooldown")]
     pub cooldown_secs: u64,
-    /// Maximum number of executions before exhaustion (resets on recovery).
+    /// Maximum number of executions before exhaustion. The count clears when
+    /// a good answer moves the target out of Down or `unknown`.
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
     /// Credentials the command names (ADR-006, fleet ADR-0017): entry `n`
