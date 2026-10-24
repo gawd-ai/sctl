@@ -173,11 +173,12 @@ pub struct Refusal {
     /// `--dev`, as given.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dev: Option<String>,
-    /// The route the kernel would have used; absent when it has none or the
-    /// routes were not read.
+    /// The route the kernel would have used; absent when it has none (an
+    /// IPv6 destination has none it is asked for) or it could not be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub route: Option<RouteView>,
-    /// The unit's LAN side, by interface; absent when it was not read.
+    /// The unit's LAN side, by interface; absent when the unit's network,
+    /// or the config that gives its roles, could not be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lan: Option<Vec<LanView>>,
     /// After an ARP request: the MACs that answered.
@@ -203,12 +204,31 @@ impl Refusal {
         }
     }
 
+    /// The refusal with what the guard read about the request.
+    #[must_use]
+    pub fn with_seen(mut self, seen: &Seen) -> Self {
+        self.dev.clone_from(&seen.dev);
+        self.route.clone_from(&seen.route);
+        self.lan.clone_from(&seen.lan);
+        self
+    }
+
     /// The object a tool prints: `ok: false` and the refusal's fields.
     pub fn to_json(&self) -> Value {
         let mut value = serde_json::to_value(self).unwrap_or_else(|_| json!({}));
         value["ok"] = json!(false);
         value
     }
+}
+
+/// What the guard read about a request, as a refusal of it shows (ADR-012
+/// decision 5): `--dev` as given, the route the kernel would have used and
+/// the unit's LAN side. Each is None when the guard did not read it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Seen {
+    pub dev: Option<String>,
+    pub route: Option<RouteView>,
+    pub lan: Option<Vec<LanView>>,
 }
 
 /// Why a guarded request did not start.
@@ -543,6 +563,9 @@ pub struct Approved {
     pub src: Ipv4Addr,
     /// The destination is the unit's own: nothing leaves it.
     pub own: bool,
+    /// What the guard read while it approved: a refusal after the approval,
+    /// a socket that cannot be bound, shows it.
+    pub seen: Seen,
 }
 
 /// Why a bound TCP connection did not open.
@@ -580,13 +603,18 @@ impl Approved {
         Ok(socket)
     }
 
+    /// A refusal of this request after the guard approved it: it shows what
+    /// the guard read.
+    pub fn refusal(&self, code: Code, reason: String) -> Box<Refusal> {
+        Box::new(Refusal::new(code, reason, self.address.to_string()).with_seen(&self.seen))
+    }
+
     /// A refusal for a socket that could not be bound.
     pub fn bind_refusal(&self, error: &io::Error) -> Box<Refusal> {
-        Box::new(Refusal::new(
+        self.refusal(
             Code::GuardFailed,
             format!("cannot bind to {} from {}: {error}", self.dev, self.src),
-            self.address.to_string(),
-        ))
+        )
     }
 }
 
@@ -614,12 +642,13 @@ pub fn judge(
     dev: Option<&str>,
     expect_mac: bool,
 ) -> Result<Approved, Box<Refusal>> {
+    let seen = Seen {
+        dev: dev.map(str::to_string),
+        route: route_view(net, answer),
+        lan: Some(net.lan_views()),
+    };
     let refuse = |code: Code, reason: String| {
-        let mut refusal = Refusal::new(code, reason, address.to_string());
-        refusal.dev = dev.map(str::to_string);
-        refusal.route = route_view(net, answer);
-        refusal.lan = Some(net.lan_views());
-        Box::new(refusal)
+        Box::new(Refusal::new(code, reason, address.to_string()).with_seen(&seen))
     };
     let kind = match answer {
         Answer::Route(route) => Some(route.kind),
@@ -654,7 +683,14 @@ pub fn judge(
         ));
     }
     if let Some(name) = dev {
-        return judge_dev(net, address, name, own, refuse);
+        let (dev, src) = judge_dev(net, address, name, refuse)?;
+        return Ok(Approved {
+            address,
+            dev,
+            src,
+            own,
+            seen,
+        });
     }
     let lan = net.lan_words();
     let not_on_lan = |how: String| {
@@ -680,6 +716,7 @@ pub fn judge(
                 dev,
                 src,
                 own: true,
+                seen,
             });
         }
         RouteKind::Unicast => {}
@@ -723,17 +760,18 @@ pub fn judge(
         dev: iface.name.clone(),
         src,
         own: false,
+        seen,
     })
 }
 
-/// `--dev`: the named interface, judged from the routes.
+/// `--dev`: the named interface, judged from the routes. The interface and
+/// the source address to bind to.
 fn judge_dev(
     net: &Network,
     address: Ipv4Addr,
     name: &str,
-    own: bool,
     refuse: impl Fn(Code, String) -> Box<Refusal>,
-) -> Result<Approved, Box<Refusal>> {
+) -> Result<(String, Ipv4Addr), Box<Refusal>> {
     let lan = net.lan_words();
     let Some(iface) = net.iface(name) else {
         return Err(refuse(
@@ -802,12 +840,7 @@ fn judge_dev(
             }
         }
     };
-    Ok(Approved {
-        address,
-        dev: name.to_string(),
-        src,
-        own,
-    })
+    Ok((name.to_string(), src))
 }
 
 // ─── the ARP request ────────────────────────────────────────────────────
@@ -1076,9 +1109,30 @@ impl Guard {
         }
     }
 
+    /// Look `host` up once: an IPv4 literal, or a name's first IPv4
+    /// address. An IPv6 destination is refused with `--dev` as given and
+    /// the LAN side, read now; it has no route, since the kernel is asked
+    /// only about IPv4 ones.
+    pub async fn resolve(&self, host: &str) -> Result<(Ipv4Addr, Option<String>), Stop> {
+        match resolve(host).await {
+            Err(Stop::Refused(refusal)) => {
+                let seen = Seen {
+                    dev: self.dev.clone(),
+                    route: None,
+                    lan: Network::read(&self.lte)
+                        .await
+                        .ok()
+                        .map(|net| net.lan_views()),
+                };
+                Err(Stop::Refused(Box::new((*refusal).with_seen(&seen))))
+            }
+            other => other,
+        }
+    }
+
     /// Resolve `host` once and approve its first IPv4 address.
     pub async fn approve_host(&self, host: &str) -> Result<Approved, Stop> {
-        let (address, name) = resolve(host).await?;
+        let (address, name) = self.resolve(host).await?;
         self.approve_resolved(address, name).await
     }
 
@@ -1099,22 +1153,36 @@ impl Guard {
     /// Judge `address` against the unit's routes now and, with
     /// `--expect-mac`, ask the wire who holds it.
     pub async fn approve(&self, address: Ipv4Addr) -> Result<Approved, Box<Refusal>> {
-        let failed = |what: &str, e: &io::Error| {
-            let mut refusal = Refusal::new(
-                Code::GuardFailed,
-                format!("cannot {what}: {e}"),
-                address.to_string(),
-            );
-            refusal.dev.clone_from(&self.dev);
-            Box::new(refusal)
+        // What the guard could not read is left out: the LAN side when the
+        // network could not be read, the route when it was not answered.
+        let failed = |what: &str, e: &io::Error, lan: Option<Vec<LanView>>| {
+            let seen = Seen {
+                dev: self.dev.clone(),
+                route: None,
+                lan,
+            };
+            Box::new(
+                Refusal::new(
+                    Code::GuardFailed,
+                    format!("cannot {what}: {e}"),
+                    address.to_string(),
+                )
+                .with_seen(&seen),
+            )
         };
         let net = Network::read(&self.lte)
             .await
-            .map_err(|e| failed("read this unit's network", &e))?;
+            .map_err(|e| failed("read this unit's network", &e, None))?;
         let answer = match source::route_get(address).await {
             Ok(route) => Answer::Route(route),
             Err(e) if is_no_route(&e) => Answer::NoRoute,
-            Err(e) => return Err(failed("ask the kernel for the route", &e)),
+            Err(e) => {
+                return Err(failed(
+                    "ask the kernel for the route",
+                    &e,
+                    Some(net.lan_views()),
+                ))
+            }
         };
         let approved = judge(
             &net,
@@ -1127,13 +1195,10 @@ impl Guard {
             return Ok(approved);
         };
         let refuse = |code: Code, reason: String, macs: Option<Vec<Mac>>, entry: Option<Mac>| {
-            let mut refusal = Refusal::new(code, reason, address.to_string());
-            refusal.dev.clone_from(&self.dev);
-            refusal.route = route_view(&net, &answer);
-            refusal.lan = Some(net.lan_views());
+            let mut refusal = approved.refusal(code, reason);
             refusal.macs = macs;
             refusal.neighbour = entry;
-            Box::new(refusal)
+            refusal
         };
         let Some((iface, mac)) = net
             .iface(&approved.dev)
@@ -1193,7 +1258,7 @@ fn is_no_route(e: &io::Error) -> bool {
 
 /// The address to judge for `host`: an IPv4 literal, or a name's first IPv4
 /// address, looked up once; with the name when it was one.
-pub async fn resolve(host: &str) -> Result<(Ipv4Addr, Option<String>), Stop> {
+async fn resolve(host: &str) -> Result<(Ipv4Addr, Option<String>), Stop> {
     let bare = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
@@ -1523,6 +1588,27 @@ mod tests {
                 dev: "br-lan".into(),
                 src: ip([192, 0, 2, 1]),
                 own: false,
+                // Kept for a refusal after the approval: a failed bind.
+                seen: Seen {
+                    dev: None,
+                    route: Some(RouteView {
+                        dev: "br-lan".into(),
+                        role: Some(Role::Lan),
+                        role_by: Some(RoleBy::Flags),
+                        gateway: None,
+                        kind: "unicast",
+                    }),
+                    lan: Some(vec![
+                        LanView {
+                            dev: "br-lan".into(),
+                            ipv4: vec!["192.0.2.1/24".into()],
+                        },
+                        LanView {
+                            dev: "eth1".into(),
+                            ipv4: vec![],
+                        },
+                    ]),
+                },
             }
         );
     }
@@ -1722,14 +1808,15 @@ mod tests {
         );
         let approved = judge(&net, ip([192, 168, 1, 50]), &answer, Some("eth1"), false).unwrap();
         assert_eq!(
-            approved,
-            Approved {
-                address: ip([192, 168, 1, 50]),
-                dev: "eth1".into(),
-                src: ip([192, 168, 1, 250]),
-                own: false,
-            }
+            (
+                approved.address,
+                approved.dev.as_str(),
+                approved.src,
+                approved.own
+            ),
+            (ip([192, 168, 1, 50]), "eth1", ip([192, 168, 1, 250]), false)
         );
+        assert_eq!(approved.seen.dev.as_deref(), Some("eth1"));
         // An address under no route through eth1: refused, whatever the
         // kernel would answer for a lookup tied to it.
         let refusal = judge(&net, ip([192, 168, 1, 51]), &answer, Some("eth1"), false).unwrap_err();
@@ -1744,6 +1831,45 @@ mod tests {
         );
         let refusal = judge(&net, ip([8, 8, 8, 8]), &answer, Some("eth1"), false).unwrap_err();
         assert_eq!(refusal.refused, Code::NotOnLan, "an internet address");
+    }
+
+    /// ADR-012 decision 5: a refusal after the approval, a bind that fails
+    /// because the runbook's address went first, shows what the guard read:
+    /// `--dev` as given, the kernel's route and the LAN side.
+    #[test]
+    fn a_bind_refused_after_the_approval_shows_dev_the_route_and_the_lan_side() {
+        let mut net = site(&Lte::named("wwan0"));
+        net.ifaces[2].ipv4 = vec![(ip([192, 168, 1, 250]), 32)];
+        net.routes
+            .push(route(Some(([192, 168, 1, 50], 32)), None, 3));
+        let answer = kernel(
+            "wwan0",
+            5,
+            Some([10, 180, 41, 232]),
+            [10, 180, 41, 231],
+            RouteKind::Unicast,
+        );
+        let approved = judge(&net, ip([192, 168, 1, 50]), &answer, Some("eth1"), false).unwrap();
+        let refusal = approved.bind_refusal(&io::Error::from_raw_os_error(libc::EADDRNOTAVAIL));
+        assert_eq!(refusal.refused, Code::GuardFailed);
+        assert!(
+            refusal
+                .reason
+                .starts_with("cannot bind to eth1 from 192.168.1.250: "),
+            "{}",
+            refusal.reason
+        );
+        let json = refusal.to_json();
+        assert_eq!(json["host"], "192.168.1.50");
+        assert_eq!(json["dev"], "eth1");
+        assert_eq!(
+            json["route"],
+            json!({"dev": "wwan0", "role": "lte", "role_by": "config", "gateway": "10.180.41.232", "type": "unicast"})
+        );
+        assert_eq!(
+            json["lan"],
+            json!([{"dev": "br-lan", "ipv4": ["192.0.2.1/24"]}, {"dev": "eth1", "ipv4": ["192.168.1.250/32"]}])
+        );
     }
 
     #[test]
@@ -1980,13 +2106,13 @@ mod tests {
         let guard = Guard::default();
         let approved = guard.approve(Ipv4Addr::LOCALHOST).await.unwrap();
         assert_eq!(
-            approved,
-            Approved {
-                address: Ipv4Addr::LOCALHOST,
-                dev: "lo".into(),
-                src: Ipv4Addr::LOCALHOST,
-                own: true,
-            }
+            (
+                approved.address,
+                approved.dev.as_str(),
+                approved.src,
+                approved.own
+            ),
+            (Ipv4Addr::LOCALHOST, "lo", Ipv4Addr::LOCALHOST, true)
         );
         let refusal = guard.approve(Ipv4Addr::BROADCAST).await.unwrap_err();
         assert_eq!(refusal.refused, Code::NotUnicast);
@@ -2013,16 +2139,46 @@ mod tests {
             udp.peer_addr().unwrap(),
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
         );
-        // An interface the unit lacks cannot be bound: nothing is sent.
+        // An interface the unit lacks cannot be bound: nothing is sent, and
+        // the refusal shows the route and the LAN side the guard read.
         let gone = Approved {
             dev: "sctl-none0".into(),
             ..approved
         };
-        assert!(matches!(
-            gone.connect_tcp(port).await,
-            Err(Connect::Bind(_))
-        ));
+        let Err(Connect::Bind(error)) = gone.connect_tcp(port).await else {
+            panic!("the bind fails");
+        };
         assert!(gone.udp(port).await.is_err());
+        let refusal = gone.bind_refusal(&error);
+        assert_eq!(refusal.refused, Code::GuardFailed);
+        assert_eq!(
+            refusal.route,
+            Some(RouteView {
+                dev: "lo".into(),
+                role: None,
+                role_by: None,
+                gateway: None,
+                kind: "local",
+            })
+        );
+        assert!(refusal.lan.is_some(), "the LAN side was read");
+    }
+
+    /// An IPv6 destination has no route the guard asks for, but its refusal
+    /// shows `--dev` as given and the LAN side.
+    #[tokio::test]
+    async fn an_ipv6_refusal_shows_dev_and_the_lan_side() {
+        let guard = Guard {
+            dev: Some("eth9".into()),
+            ..Guard::default()
+        };
+        let Err(Stop::Refused(refusal)) = guard.approve_host("2001:db8::7").await else {
+            panic!("refused");
+        };
+        assert_eq!(refusal.refused, Code::Ipv6);
+        assert_eq!(refusal.dev.as_deref(), Some("eth9"));
+        assert!(refusal.lan.is_some(), "the LAN side was read");
+        assert!(refusal.route.is_none(), "{refusal:?}");
     }
 
     #[tokio::test]

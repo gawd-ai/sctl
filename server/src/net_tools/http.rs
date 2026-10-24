@@ -328,6 +328,22 @@ pub async fn request(
     req: &HttpRequest,
     guard: &Guard,
 ) -> Result<HttpOutcome, HttpError> {
+    let approved = match approve_hop(guard, &req.url).await {
+        Ok(approved) => approved,
+        Err(Stop::Refused(refusal)) => return Err(HttpError::Refused(refusal)),
+        Err(Stop::Failed(reason)) => return Err(HttpError::Failed(reason)),
+    };
+    follow(state_dir, req, guard, approved).await
+}
+
+/// Send the request from where the guard approved its first hop, and
+/// follow its redirects, each hop approved by `guard`.
+async fn follow(
+    state_dir: &str,
+    req: &HttpRequest,
+    guard: &Guard,
+    mut approved: Approved,
+) -> Result<HttpOutcome, HttpError> {
     let mut jar = req.cookie_jar.as_deref().map(Jar::load).unwrap_or_default();
     let save_jar = |jar: &Jar| match &req.cookie_jar {
         Some(path) => jar
@@ -344,11 +360,6 @@ pub async fn request(
     let mut body = req.body.clone();
     let mut keep_caller = true;
     let mut redirects = Vec::new();
-    let mut approved = match approve_hop(guard, &url).await {
-        Ok(approved) => approved,
-        Err(Stop::Refused(refusal)) => return Err(HttpError::Refused(refusal)),
-        Err(Stop::Failed(reason)) => return Err(HttpError::Failed(reason)),
-    };
     let first_address: Ipv4Addr = approved.address;
     // The redirect being followed, kept to answer with if its hop is not
     // sent after all.
@@ -382,11 +393,10 @@ pub async fn request(
             Ok(resp) => resp,
             Err(FetchError::Unsent(reason)) => {
                 let Some((redirect_url, redirect_resp)) = following.take() else {
-                    return Err(HttpError::Refused(Box::new(Refusal::new(
-                        Code::GuardFailed,
-                        reason,
-                        approved.address.to_string(),
-                    ))));
+                    // The first request: refused, with what the guard read.
+                    return Err(HttpError::Refused(
+                        approved.refusal(Code::GuardFailed, reason),
+                    ));
                 };
                 redirects.pop();
                 save_jar(&jar)?;
@@ -450,9 +460,7 @@ pub async fn request(
 /// guard judges and the hop is sent to.
 async fn approve_next(guard: &Guard, next: &str, first: Ipv4Addr) -> Result<Approved, NotFollowed> {
     sendable(next).map_err(not_followed)?;
-    let (address, name) = super::guard::resolve(&host_of(next))
-        .await
-        .map_err(not_followed)?;
+    let (address, name) = guard.resolve(&host_of(next)).await.map_err(not_followed)?;
     if guard.expect_mac.is_some() && address != first {
         return Err(NotFollowed {
             reason: format!(
@@ -847,6 +855,37 @@ mod tests {
         assert_eq!(why.reason, "only http and https URLs are sent");
         assert_eq!(steer::left("rotating.test"), 1, "no lookup");
         steer::clear();
+    }
+
+    /// The first request approved, then its socket cannot be bound: refused
+    /// (exit 3), with the route and the LAN side the guard read.
+    #[tokio::test]
+    async fn a_first_request_that_cannot_be_bound_is_refused_with_what_the_guard_read() {
+        let approved = Guard::default().approve(Ipv4Addr::LOCALHOST).await.unwrap();
+        let gone = Approved {
+            dev: "sctl-none0".into(),
+            ..approved
+        };
+        let req = HttpRequest {
+            url: "http://127.0.0.1:9/".into(),
+            max_redirects: DEFAULT_MAX_REDIRECTS,
+            timeout_ms: Some(3000),
+            ..HttpRequest::default()
+        };
+        match follow("/tmp", &req, &Guard::default(), gone).await {
+            Err(HttpError::Refused(r)) => {
+                assert_eq!(r.refused, Code::GuardFailed);
+                assert!(
+                    r.reason
+                        .starts_with("cannot bind to sctl-none0 from 127.0.0.1: "),
+                    "{}",
+                    r.reason
+                );
+                assert_eq!(r.route.as_ref().map(|v| v.kind), Some("local"), "{r:?}");
+                assert!(r.lan.is_some(), "{r:?}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[tokio::test]
