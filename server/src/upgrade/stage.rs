@@ -776,28 +776,43 @@ async fn stage(ctx: &Context, req: &Request, handle: &Handle) -> Result<(), Refu
     set_mode(&helper, 0o755).map_err(|e| Refusal::new(Reason::Internal, e))?;
     // The old helper's log starts afresh for this attempt.
     let _ = std::fs::remove_file(&plan.log_path);
-    // The helper restarts the agent: a recovery run in progress, maybe a
-    // power cycle between off and on, ends first.
-    wait_for_recovery_runs(ctx).await;
-    handle.set(
+    let applying = || {
         UpgradeState::staging(
             req.request_id.clone(),
             &ctx.running_version,
             &manifest.version,
         )
-        .with_phase(Phase::Applying),
-    );
-    spawn_helper(
-        &helper,
-        &stage,
-        install.layout,
-        &manifest.version,
-        &plan.log_path,
-        &install.helper_prefix,
-    )
-    .map_err(|e| Refusal::new(Reason::Internal, e))?;
+        .with_phase(Phase::Applying)
+    };
+    hand_off(ctx, handle, applying, || {
+        spawn_helper(
+            &helper,
+            &stage,
+            install.layout,
+            &manifest.version,
+            &plan.log_path,
+            &install.helper_prefix,
+        )
+    })
+    .await?;
     info!(version = %manifest.version, "upgrade: handed off to the helper");
     Ok(())
+}
+
+/// The hand-off (step 6 of `docs/upgrade.md`): wait for the Infra recovery
+/// runs in progress, then write the state `applying` builds, stamped then,
+/// and start the helper with `spawn`. The helper restarts the agent: a
+/// recovery run in progress, maybe a power cycle between off and on, ends
+/// first.
+async fn hand_off(
+    ctx: &Context,
+    handle: &Handle,
+    applying: impl FnOnce() -> UpgradeState,
+    spawn: impl FnOnce() -> Result<(), String>,
+) -> Result<(), Refusal> {
+    wait_for_recovery_runs(ctx).await;
+    handle.set(applying());
+    spawn().map_err(|e| Refusal::new(Reason::Internal, e))
 }
 
 /// Before the hand-off, wait for the Infra recovery runs in progress to
@@ -1127,39 +1142,84 @@ mod tests {
         assert_eq!(conf_value(conf, "BINARY"), None);
     }
 
+    /// Hand off as `stage` does, with a `spawn` that starts nothing: it
+    /// notes how long after `at` it was called, and the phase the agent had
+    /// written by then. Bounded a second past a run's limit: on the paused
+    /// clock with no other timer, a hand-off that lost its limit would wait
+    /// for good, and the run would hang instead of failing.
+    async fn handed_off(
+        ctx: &Context,
+        handle: &Handle,
+        at: tokio::time::Instant,
+    ) -> (std::time::Duration, Phase) {
+        let started = std::cell::Cell::new(None);
+        let staging = UpgradeState::staging(None, "0.6.11", "0.6.12");
+        handle.set(staging.clone());
+        let applying = || staging.with_phase(Phase::Applying);
+        let bound = crate::infra::monitor::RECOVERY_LIMIT + std::time::Duration::from_secs(1);
+        tokio::time::timeout(
+            bound,
+            hand_off(ctx, handle, applying, || {
+                started.set(Some((at.elapsed(), handle.current().phase)));
+                Ok(())
+            }),
+        )
+        .await
+        .expect("bounded by a run's limit")
+        .expect("handed off");
+        started.get().expect("the helper was started")
+    }
+
     /// The helper's restart ends the agent, and a recovery run with it: a
-    /// power cycle cut between off and on. The hand-off waits for every run
-    /// in progress, at most a run's own limit. Nothing here starts a helper.
+    /// power cycle cut between off and on. The hand-off writes `applying`
+    /// and starts the helper only once every run in progress has ended, at
+    /// most a run's own limit later. Nothing here starts a helper.
     #[tokio::test(start_paused = true)]
-    async fn the_hand_off_waits_for_a_recovery_run_in_progress() {
+    async fn the_hand_off_starts_the_helper_once_the_recovery_runs_end() {
         use std::time::Duration;
         use tokio::time::Instant;
 
+        let dir = std::env::temp_dir().join(format!("sctl-stage-hand-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let handle = Handle::open(dir.to_str().unwrap());
         let runs = crate::infra::Runs::default();
         let mut ctx = ctx(None);
-        let at = Instant::now();
-        wait_for_recovery_runs(&ctx).await;
         ctx.recovery_runs = Some(runs.clone());
-        wait_for_recovery_runs(&ctx).await;
-        assert_eq!(at.elapsed(), Duration::ZERO, "no run: no wait");
+
+        let at = Instant::now();
+        assert_eq!(
+            handed_off(&ctx, &handle, at).await,
+            (Duration::ZERO, Phase::Applying),
+            "no run: no wait"
+        );
 
         let run = runs.start("pdu").unwrap();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(40)).await;
             drop(run);
         });
-        wait_for_recovery_runs(&ctx).await;
-        assert_eq!(at.elapsed(), Duration::from_secs(40), "until the run ended");
+        let at = Instant::now();
+        assert_eq!(
+            handed_off(&ctx, &handle, at).await,
+            (Duration::from_secs(40), Phase::Applying),
+            "once the run ended, `applying` written first"
+        );
 
         let stuck = runs.start("pdu").unwrap();
         let at = Instant::now();
-        wait_for_recovery_runs(&ctx).await;
         assert_eq!(
-            at.elapsed(),
+            handed_off(&ctx, &handle, at).await.0,
             Duration::from_mins(5),
             "at most the run's limit"
         );
+
+        // `sctl upgrade` from a shell is another process, with no runs in
+        // reach: it does not wait (docs/upgrade.md, step 6).
+        ctx.recovery_runs = None;
+        let at = Instant::now();
+        assert_eq!(handed_off(&ctx, &handle, at).await.0, Duration::ZERO);
         drop(stuck);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

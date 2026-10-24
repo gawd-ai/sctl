@@ -141,3 +141,86 @@ pub async fn post_upgrade(
         Json(json!({"accepted": true, "state": staging})),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::time::Instant;
+
+    use super::*;
+    use crate::config::Config;
+    use crate::file_access::Gate;
+    use crate::infra::checks::CheckResult;
+    use crate::infra::monitor::{apply_result, Reading};
+    use crate::infra::{CheckSpec, Digest, InfraConfig, InfraState, InfraTarget, RecoveryConfig};
+
+    /// A managed upgrade waits for the recovery runs of the agent's own
+    /// Infra state (ADR-010 decision 9): the context `POST /api/upgrade`
+    /// builds carries the runs of the digest that state starts its runs
+    /// on, the one `main` gives both. With no runs, or another set, the
+    /// hand-off would not wait, and its restart could cut a power cycle
+    /// between off and on.
+    #[tokio::test]
+    async fn the_context_carries_the_recovery_runs_of_the_agents_infra_state() {
+        let dir = std::env::temp_dir().join(format!("sctl-upgrade-context-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config: Config = toml::from_str("").unwrap();
+        config.server.data_dir = dir.join("data").display().to_string();
+        let gate = Arc::new(Gate::for_agent(&config, None, None));
+        let mut state = AppState::for_tests(config, gate);
+        let digest = Arc::new(Digest::new(1_790_000_000_000, false));
+        let mut infra =
+            InfraState::with_digest(&dir.join("state").display().to_string(), digest.clone());
+        state.infra_digest = digest;
+
+        let runs = context(&state)
+            .expect("a context")
+            .recovery_runs
+            .expect("the managed path waits for the runs");
+        assert_eq!(runs.in_progress(), 0);
+
+        // A failed check of the monitor takes the outlet Down and starts
+        // its recovery run. Nothing runs it here.
+        let outlet = InfraTarget {
+            id: "pdu".into(),
+            name: "Outlet".into(),
+            check: CheckSpec::Ping {
+                host: "192.0.2.1".into(),
+                timeout_ms: None,
+            },
+            degraded_threshold_ms: 200,
+            down_after_consecutive: 1,
+            up_after_consecutive: 2,
+            interval_secs: None,
+            recovery: Some(RecoveryConfig {
+                enabled: true,
+                command: "true".into(),
+                cooldown_secs: 300,
+                max_retries: 2,
+                credential_ids: Vec::new(),
+            }),
+        };
+        assert!(infra.hold_config(InfraConfig {
+            version: 7,
+            check_interval_secs: 60,
+            targets: vec![outlet.clone()],
+        }));
+        let run = (0..3)
+            .find_map(|_| {
+                apply_result(
+                    &mut infra,
+                    &outlet,
+                    CheckResult::failed("NO ANSWER"),
+                    7,
+                    Instant::now(),
+                    Reading::Monitor,
+                )
+            })
+            .expect("Down: a run");
+        assert_eq!(runs.in_progress(), 1, "the run the Infra state started");
+        drop(run);
+        assert_eq!(runs.in_progress(), 0, "and only while it is in progress");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
