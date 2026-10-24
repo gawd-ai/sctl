@@ -116,10 +116,10 @@ Staff then read these with exec, not through the file routes: where `data_dir` i
 
 - The group: `groups=infra` alone, `all` with it, `core` without it; `off` reads `no_config` with no config, is absent while a monitor runs, and reads `safe_mode` in safe mode; the example above serializes to about 60 bytes.
 - `rounds` moves every tick while a `custom_script` check sleeps 12 s, and that target does not start again before its check ends.
-- The round rule as a function of the in-flight checks and their permit times; a tick that panics counts no round.
-- With the Infra lock held by the test for 12 s, `/api/info` answers at once and `rounds` stands still.
-- A panicking check (a test hook): its target reads `unknown` with the detail, no recovery runs, and `rounds` goes on.
-- `seq` moves by one on a status change and on a logged run, not on a latency reading and not on an identical push; `hash` is the same whatever the order of the targets; the test vector.
+- The round rule as a function of the in-flight checks and their permit times, and through the monitor's own tick: a check that holds its permit past 90 s plus a tick stops `rounds`, its target is not started again, and the rounds go on once it lets go; a tick that panics counts no round.
+- With the Infra lock held by the test for 12 s, `/api/info` answers at once and `rounds` stands still; each call made while the lock is held is bounded, so an answer that waited for the lock fails the test rather than hanging it.
+- A panicking check (a test hook): its target reads `unknown` with the detail, no recovery runs, and `rounds` goes on. A target Down with its recovery count at `max_retries`, then a check that panics, then a good answer: the count clears, and the next outage runs the recovery; a failure out of `unknown` leaves the count.
+- `seq` moves by one on a status change and on a logged run, not on a latency reading and not on an identical push; `hash` is the same whatever the order of the targets; the test vector; the `infra.state` example in `docs/http-api.md` is the message the agent builds for the picture it shows, `hash` included.
 - `infra.state` goes out when `seq` moves and not on a latency reading, and carries `boot`, `seq`, `hash` and `recoveries`; so does `GET /api/infra/results`.
 - The stall hook stops `rounds` within one tick.
 
@@ -388,7 +388,7 @@ Staff then read these with exec, not through the file routes: where `data_dir` i
 ## 7. Slices and status
 
 1. File reads (3.1): Implemented (2026-10-21, `0c0d520`, with the review's fixes in `57c298c`, `6634dfe` and `8dc749b`; 39 new tests, 404 in the library, the workspace, clippy and fmt green on 1.97.1 as CI runs them). Its acceptance on hardware (through a relay, 40 FIFO reads with relayed REST answering, each install layout's directories and `PUT /api/files` to `/etc/sctl/watchdog.sh` on the bench agent, the WE826's kernel, then each other unit kernel) runs with section 6.
-2. The proof (3.2): Implemented (2026-10-22, `14e0ddf`; 25 new tests, 429 in the library, the workspace, clippy and fmt green on 1.97.1 as CI runs them). Since a push that changes nothing moves no `seq`, it derives `PartialEq` on the config types ahead of 3.3; the rest of 3.3's identical push (the monitor kept, `unchanged`, `started`, version 0 refused) stays with slice 3. Its acceptance on hardware (`rounds` up by at least 5 over two polls 30 s apart, also while one check takes 60 s; a status change in the next `infra.state` within a second; the stall hook with `/api/info` answering) runs with section 6.
+2. The proof (3.2): Implemented (2026-10-22, `14e0ddf`, with the review's fixes in `a30a0c8`, `92d1c6b` and `7cd550c`; 29 new tests, 433 in the library, the workspace, clippy and fmt green on 1.97.1 as CI runs them). Since a push that changes nothing moves no `seq`, it derives `PartialEq` on the config types ahead of 3.3; the rest of 3.3's identical push (the monitor kept, `unchanged`, `started`, version 0 refused) stays with slice 3. Since a check that panics leaves its target `unknown`, a good answer out of `unknown` clears the recovery count, as out of Down, also ahead of 3.3 (ADR-010 decision 9); the saved count and a target dropped by a push losing its own stay with slice 3. Its acceptance on hardware (`rounds` up by at least 5 over two polls 30 s apart, also while one check takes 60 s; a status change in the next `infra.state` within a second; the stall hook with `/api/info` answering) runs with section 6.
 3. The monitor (3.3): Planned.
 4. Net tools and `net_tools_netns` (3.4): Planned.
 5. Discovery (3.5): Planned.
