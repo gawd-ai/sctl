@@ -66,6 +66,7 @@ pub fn context(state: &AppState) -> Result<Context, String> {
         hold: state.config.upgrade.hold,
         hold_file: std::path::PathBuf::from(super::install::HOLD_PATH),
         running_version: crate::VERSION.to_string(),
+        recovery_runs: Some(state.infra_digest.runs()),
     })
 }
 

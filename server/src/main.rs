@@ -15,7 +15,6 @@
 mod sctlin_proxy;
 mod supervisor;
 
-use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::AtomicU32;
@@ -30,7 +29,6 @@ use axum::{
     routing::{delete, get, post},
     Extension, Router,
 };
-use futures_util::FutureExt;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
@@ -46,6 +44,7 @@ use sctl::{
     file_access, infra, lte_watchdog, netwatch, routes, sessions,
     sessions::SessionManager,
     state::{AppState, TunnelStats},
+    supervise::{self, spawn_supervised, supervise_spawned},
     tunnel, ws, ExecResultsCache,
 };
 
@@ -210,6 +209,8 @@ async fn run_upgrade_cli(
         hold: config.upgrade.hold,
         hold_file: std::path::PathBuf::from(sctl::upgrade::install::HOLD_PATH),
         running_version: VERSION.to_string(),
+        // Another process: the agent's recovery runs are not in reach here.
+        recovery_runs: None,
     };
     let req = sctl::upgrade::stage::Request {
         version: version.clone(),
@@ -546,60 +547,6 @@ fn acquire_process_lock(data_dir: &str) -> std::fs::File {
     std::process::exit(99);
 }
 
-/// How long a panicked background loop waits before it is rebuilt.
-const SUPERVISED_RESTART_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Spawn a background loop that survives panics: a panic is logged and the
-/// loop is rebuilt after `restart_delay`. Under `panic=abort` these panics
-/// took the whole daemon down and the external supervisor restarted
-/// everything; under unwind the task would otherwise die silently and
-/// permanently. A loop that returns normally (shutdown) is not respawned, and
-/// aborting the returned handle remains the shutdown mechanism.
-fn spawn_supervised<F, Fut>(
-    name: &'static str,
-    restart_delay: std::time::Duration,
-    mut mk: F,
-) -> tokio::task::JoinHandle<()>
-where
-    F: FnMut() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + Send + 'static,
-{
-    tokio::spawn(async move {
-        loop {
-            if AssertUnwindSafe(mk()).catch_unwind().await.is_ok() {
-                // Normal completion (shutdown) — do not respawn.
-                break;
-            }
-            tracing::error!(
-                task = name,
-                "background task panicked; restarting in {restart_delay:?}"
-            );
-            tokio::time::sleep(restart_delay).await;
-        }
-    })
-}
-
-/// Bridge a loop the library spawns itself (comms poller, infra monitor) into
-/// `spawn_supervised`: a panic in the inner task is re-raised here so the
-/// supervisor rebuilds it, and dropping this future (the supervisor handle's
-/// `.abort()` on shutdown or config change) aborts the inner task, keeping
-/// the handle semantics identical to a directly spawned loop.
-async fn supervise_spawned(inner: tokio::task::JoinHandle<()>) {
-    struct AbortOnDrop(tokio::task::JoinHandle<()>);
-    impl Drop for AbortOnDrop {
-        fn drop(&mut self) {
-            self.0.abort();
-        }
-    }
-    let mut inner = AbortOnDrop(inner);
-    if let Err(e) = (&mut inner.0).await {
-        if e.is_panic() {
-            std::panic::resume_unwind(e.into_panic());
-        }
-        // Cancelled externally — treat as shutdown.
-    }
-}
-
 async fn run_supervisor_mode(config_path: Option<&str>) -> ! {
     let config = Config::load(config_path);
 
@@ -786,9 +733,10 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     // agent started in safe mode, whatever the flag file says later.
     let infra_digest = Arc::new(infra::Digest::new(boot_unix_ms, safe_mode_active));
     let infra_state = {
-        // Reboot-surviving state (infra config, credentials, TLS pins) lives
-        // in `state_dir`, which on a RAM-booted unit is the flash overlay
-        // while `data_dir` is tmpfs. Owner-only: it holds credentials.
+        // Reboot-surviving state (infra config, credentials, recovery
+        // counts, TLS pins) lives in `state_dir`, which on a RAM-booted unit
+        // is the flash overlay while `data_dir` is tmpfs. Owner-only: it
+        // holds credentials.
         let state_dir = config.server.state_dir().to_string();
         if let Err(e) = create_private_dir(&state_dir) {
             warn!("Could not create state dir {state_dir}: {e}");
@@ -796,6 +744,9 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         let mut is = infra::InfraState::with_digest(&state_dir, infra_digest.clone());
         is.load_config();
         is.load_credentials();
+        // Each target's recovery count, and any run the agent did not see
+        // end, logged now with its outcome unknown (ADR-010 decision 9).
+        is.load_recoveries();
         // The http_api profiles reach the pin store through this; set once.
         let _ = infra::profiles::peplink::DATA_DIR.set(state_dir);
         Arc::new(tokio::sync::Mutex::new(is))
@@ -1038,7 +989,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
                 let poller_notify = notify.clone();
                 comms_task = Some(spawn_supervised(
                     "comms_poller",
-                    SUPERVISED_RESTART_DELAY,
+                    supervise::RESTART_DELAY,
                     move || {
                         supervise_spawned(comms::spawn_poller(
                             poller_client.clone(),
@@ -1135,7 +1086,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     // state is on its way when the tunnel dials. The publisher lives in the
     // closure, so a restart after a panic keeps the same channel and `seq`.
     let netwatch_task = net_publisher.map(|tx| {
-        spawn_supervised("netwatch", SUPERVISED_RESTART_DELAY, move || {
+        spawn_supervised("netwatch", supervise::RESTART_DELAY, move || {
             netwatch::run(tx.clone(), boot_unix_ms)
         })
     });
@@ -1158,7 +1109,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
                 .map_or(netwatch::owner::Probe::Connect, |tc| {
                     netwatch::owner::Probe::for_tunnel(tc)
                 });
-            spawn_supervised("relay_route", SUPERVISED_RESTART_DELAY, move || {
+            spawn_supervised("relay_route", supervise::RESTART_DELAY, move || {
                 netwatch::owner::run(
                     route.clone(),
                     net.clone(),
@@ -1207,24 +1158,18 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         None
     };
 
-    // Start infra monitor if config was loaded from disk (skipped in safe mode)
-    if !safe_mode_active {
+    // The Infra monitor for a config loaded from disk, through the one start
+    // path a push also takes: supervised, and not in safe mode (ADR-010).
+    {
         let mut guard = infra_state.lock().await;
-        if let Some(ref cfg) = guard.config {
-            info!(
-                "Infra: resuming monitoring with {} targets (config v{})",
-                cfg.targets.len(),
-                cfg.version
-            );
-            let monitor_state = infra_state.clone();
-            let monitor_cfg = cfg.clone();
-            let handle = spawn_supervised("infra_monitor", SUPERVISED_RESTART_DELAY, move || {
-                supervise_spawned(infra::monitor::spawn_monitor(
-                    monitor_state.clone(),
-                    monitor_cfg.clone(),
-                ))
-            });
-            guard.monitor_handle = Some(handle);
+        if infra::monitor::start(&infra_state, &mut guard) {
+            if let Some(cfg) = &guard.config {
+                info!(
+                    "Infra: resuming monitoring with {} targets (config v{})",
+                    cfg.targets.len(),
+                    cfg.version
+                );
+            }
         }
     }
 
@@ -1232,7 +1177,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     let mgr = state.session_manager.clone();
     let sweep_tx = state.session_events.clone();
     let sweep_transfers = state.transfer_manager.clone();
-    let sweep_task = spawn_supervised("session_sweep", SUPERVISED_RESTART_DELAY, move || {
+    let sweep_task = spawn_supervised("session_sweep", supervise::RESTART_DELAY, move || {
         let mgr = mgr.clone();
         let sweep_tx = sweep_tx.clone();
         let sweep_transfers = sweep_transfers.clone();
@@ -1269,7 +1214,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     let relay_sweep_task = relay_state_opt.clone().map(|rs| {
         spawn_supervised(
             "relay_dead_device_sweep",
-            SUPERVISED_RESTART_DELAY,
+            supervise::RESTART_DELAY,
             move || {
                 let rs = rs.clone();
                 async move {
@@ -1287,7 +1232,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     let relay_snapshot_task = relay_state_opt.clone().map(|rs| {
         spawn_supervised(
             "relay_snapshot_persist",
-            SUPERVISED_RESTART_DELAY,
+            supervise::RESTART_DELAY,
             move || {
                 let rs = rs.clone();
                 async move {
@@ -1304,7 +1249,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     // Tunnel events: periodic persistence (60s, debounced via dirty flag)
     let tunnel_events_flush_task = {
         let flush_stats = state.tunnel_stats.clone();
-        spawn_supervised("tunnel_events_flush", SUPERVISED_RESTART_DELAY, move || {
+        spawn_supervised("tunnel_events_flush", supervise::RESTART_DELAY, move || {
             let flush_stats = flush_stats.clone();
             async move {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_mins(1));
@@ -1392,6 +1337,18 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     info!("Goodbye");
 }
 
+/// Create a directory readable by its owner only (no-op when it exists).
+fn create_private_dir(path: &str) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
 #[cfg(test)]
 mod cli_tests {
     use super::{parse_cli, parse_log_level, serve_help, Command};
@@ -1474,44 +1431,4 @@ mod cli_tests {
         assert_eq!(parse_log_level("off"), LevelFilter::OFF);
         assert_eq!(parse_log_level("not-a-level"), LevelFilter::INFO);
     }
-}
-
-#[cfg(test)]
-mod supervision_tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-
-    #[tokio::test]
-    async fn supervised_loop_restarts_after_panics_then_stops_on_completion() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counter = calls.clone();
-        let handle = super::spawn_supervised(
-            "test_task",
-            std::time::Duration::from_millis(10),
-            move || {
-                let counter = counter.clone();
-                async move {
-                    // Panics on the first two invocations, completes on the third.
-                    assert!(
-                        counter.fetch_add(1, Ordering::SeqCst) >= 2,
-                        "induced test panic"
-                    );
-                }
-            },
-        );
-        handle.await.expect("supervisor task must not panic");
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
-    }
-}
-
-/// Create a directory readable by its owner only (no-op when it exists).
-fn create_private_dir(path: &str) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        builder.mode(0o700);
-    }
-    builder.create(path)
 }

@@ -540,7 +540,11 @@ pub async fn exec_simple_pub(cmd: &str, timeout_ms: u64) -> Result<(i32, String,
     exec_simple(cmd, timeout_ms).await
 }
 
-/// `exec_simple` with extra environment (a recovery's credentials).
+/// `exec_simple` with extra environment (a recovery's credentials). Both
+/// streams come back: a recovery logs its stdout and its stderr, where a
+/// failed command says why, each masked and cut by the caller (ADR-010).
+/// The child dies with the future, so a recovery runs in a task nothing
+/// aborts: only its limit or the agent's stop ends it.
 pub async fn exec_with_env(
     cmd: &str,
     env: &[(String, String)],

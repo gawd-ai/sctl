@@ -7,11 +7,27 @@
 //! ## Architecture
 //!
 //! Config is pushed from an external controller and persisted under the server
-//! data directory so monitoring survives sctl restarts.
+//! data directory so monitoring survives sctl restarts. A push equal to the
+//! config held, every field and the version included, changes nothing.
 //! A tokio interval task runs checks (ping, HTTP, TCP, SNMP) against each
 //! target and maintains a per-target state machine (UNKNOWN → UP / DEGRADED
-//! → DOWN). Recovery actions execute locally on the BPI when a target
-//! transitions to DOWN.
+//! → DOWN). A good answer slower than the target's threshold never makes it
+//! Up, so a slow, steady target stays Degraded (ADR-010 decision 8). The
+//! monitor runs under a supervisor, at boot and for a push, and never in an
+//! agent that started in safe mode.
+//!
+//! A recovery action runs on the unit when a failed check of the monitor
+//! leaves its target Down: the first Down and every failed check after it,
+//! within `cooldown_secs` and `max_retries`, never on a good answer (ADR-010
+//! decision 9). It runs in a task of its own, outside the Infra lock and
+//! after the Down is signalled, one run per target at a time, and nothing
+//! but its own 300 s limit or the agent's stop ends it. Each target's count
+//! and each run not yet ended are saved in `<state_dir>/infra-recovery.json`
+//! before the command starts, so the count holds across the restarts a
+//! recovery causes, and the next start logs a run that did not end.
+//!
+//! Check now (`POST /api/infra/check/{target_id}`) is a reading: its result
+//! is applied as a monitor check's is, and it never starts a recovery.
 //!
 //! Results are served via `GET /api/infra/results` for external health polling,
 //! and pushed over the tunnel as `infra.state` (see `tunnel::infra_state`)
@@ -31,10 +47,11 @@ pub mod monitor;
 pub mod profiles;
 pub mod routes;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -51,9 +68,10 @@ use tracing::warn;
 /// version included, changes nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InfraConfig {
-    /// Monotonically increasing version number. The fleet server bumps this
-    /// on every config change so the health poller can detect stale configs
-    /// on the BPI and re-push.
+    /// The caller's name for this config, not a counter: the fleet sends a
+    /// fingerprint of it. 0 means the unit holds no config, so a push of
+    /// version 0 is refused. Reported back in the results, so a collector
+    /// sees which config the unit holds.
     pub version: u32,
     /// Global check interval fallback (individual targets can override).
     #[serde(default = "default_check_interval")]
@@ -75,13 +93,16 @@ pub struct InfraTarget {
     pub name: String,
     /// Check type.
     pub check: CheckSpec,
-    /// Milliseconds above which the target is considered degraded.
+    /// A good answer above this many milliseconds is slow: it makes Up
+    /// Degraded, and it never makes a target Up.
     #[serde(default = "default_degraded_ms")]
     pub degraded_threshold_ms: u64,
-    /// Consecutive failures before transitioning to DOWN.
+    /// Failures in a row that take Degraded to Down.
     #[serde(default = "default_down_after")]
     pub down_after_consecutive: u32,
-    /// Consecutive successes required to transition back to UP (hysteresis).
+    /// Good answers within the threshold in a row that take Degraded back
+    /// to Up. From Down, good answers in a row that end it: Up when all
+    /// were within the threshold, Degraded otherwise.
     #[serde(default = "default_up_after")]
     pub up_after_consecutive: u32,
     /// Optional per-target check interval override.
@@ -172,17 +193,22 @@ pub struct Credential {
     pub password: String,
 }
 
-/// User-configured recovery action that fires when a target enters DOWN.
+/// A recovery action: a command the unit runs when a failed check of the
+/// monitor leaves the target Down, the first Down and every failed check
+/// after it, within `cooldown_secs` and `max_retries`. Never on a good
+/// answer, and never on Check now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryConfig {
     pub enabled: bool,
-    /// Shell command to execute locally on the BPI.
+    /// Shell command run on the unit, under a 300 s limit.
     pub command: String,
-    /// Minimum seconds between consecutive executions.
+    /// Minimum seconds between the starts of two runs. After the agent
+    /// starts, a target with a saved count waits a full cooldown.
     #[serde(default = "default_cooldown")]
     pub cooldown_secs: u64,
-    /// Maximum number of executions before exhaustion. The count clears when
-    /// a good answer moves the target out of Down or `unknown`.
+    /// Runs before the recovery gives up. The count is saved, so it holds
+    /// across restarts, and it clears when a good answer moves the target
+    /// out of Down or `unknown`.
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
     /// Credentials the command names (ADR-006, fleet ADR-0017): entry `n`
@@ -230,8 +256,13 @@ pub struct TargetState {
     pub latency_ms: Option<u64>,
     /// ISO 8601 timestamp of when the current status began.
     pub since: String,
+    /// Good answers in a row, slow ones included.
     pub consecutive_ok: u32,
     pub consecutive_fail: u32,
+    /// Good answers within the threshold in a row: what takes Degraded back
+    /// to Up. It stays inside the agent: no report carries it.
+    #[serde(skip)]
+    pub consecutive_within: u32,
     /// ISO 8601 timestamp of the last check.
     pub last_check: String,
     /// Human-readable detail of the last check result.
@@ -262,11 +293,22 @@ pub struct DataSample {
 /// A single recovery action execution log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryLogEntry {
+    /// When the run was logged: at its end, or at the start that found it
+    /// not ended.
     pub ts: String,
     pub target_id: String,
     pub command: String,
+    /// -1 when the run gave no exit code: the agent could not start it, it
+    /// passed its 300 s limit, or its outcome is unknown; `stdout` says
+    /// which.
     pub exit_code: i32,
+    /// The command's output, each password of at least 4 bytes masked, cut
+    /// to 512 bytes on a character boundary (`...` marks a cut).
     pub stdout: String,
+    /// The command's error output, masked and cut as `stdout` is: a failed
+    /// command says why there.
+    #[serde(default)]
+    pub stderr: String,
 }
 
 /// Full results payload returned by `GET /api/infra/results`.
@@ -331,7 +373,9 @@ pub struct Stamp {
 
 /// The digest's cell. Every writer of the results updates it, under the
 /// Infra lock; `GET /api/info` reads it without that lock, so a lock held
-/// for good shows as `rounds` standing still, never as a slow answer.
+/// for good shows as `rounds` standing still, never as a slow answer. It
+/// also holds the recovery runs in progress, which a managed upgrade waits
+/// for without that lock.
 #[derive(Debug)]
 pub struct Digest {
     /// When the agent started, unix ms.
@@ -339,6 +383,7 @@ pub struct Digest {
     /// Whether the agent started in safe mode.
     safe_mode: bool,
     cell: StdMutex<Cell>,
+    runs: Runs,
 }
 
 #[derive(Debug)]
@@ -365,12 +410,24 @@ impl Digest {
                 recoveries: 0,
                 holds_config: false,
             }),
+            runs: Runs::default(),
         }
     }
 
     /// When the agent started, unix ms.
     pub fn boot(&self) -> u64 {
         self.boot
+    }
+
+    /// Whether the agent started in safe mode, which keeps the monitor off
+    /// whatever the flag file says now.
+    pub fn safe_mode(&self) -> bool {
+        self.safe_mode
+    }
+
+    /// The recovery runs in progress.
+    pub fn runs(&self) -> Runs {
+        self.runs.clone()
     }
 
     /// The `infra` group as it stands now.
@@ -445,12 +502,77 @@ pub fn picture_hash(text: &str) -> String {
     )
 }
 
+// ─── Recovery runs in progress ───────────────────────────────────────
+
+/// The recovery runs in progress, by target id (ADR-010 decision 9). A
+/// target has at most one at a time, and a managed upgrade waits for every
+/// one to end before it hands off to its helper. Read without the Infra
+/// lock.
+#[derive(Debug, Clone)]
+pub struct Runs(Arc<watch::Sender<BTreeSet<String>>>);
+
+/// A run in progress: it ends when this drops, however its task ends.
+#[derive(Debug)]
+pub struct RunGuard {
+    runs: Runs,
+    target_id: String,
+}
+
+impl Default for Runs {
+    fn default() -> Self {
+        Self(Arc::new(watch::channel(BTreeSet::new()).0))
+    }
+}
+
+impl Runs {
+    /// Mark a run of `target_id` in progress; `None` while one is.
+    pub fn start(&self, target_id: &str) -> Option<RunGuard> {
+        let mut started = false;
+        self.0.send_if_modified(|runs| {
+            started = runs.insert(target_id.to_string());
+            started
+        });
+        started.then(|| RunGuard {
+            runs: self.clone(),
+            target_id: target_id.to_string(),
+        })
+    }
+
+    /// Whether a run of `target_id` is in progress.
+    pub fn contains(&self, target_id: &str) -> bool {
+        self.0.borrow().contains(target_id)
+    }
+
+    /// How many runs are in progress.
+    pub fn in_progress(&self) -> usize {
+        self.0.borrow().len()
+    }
+
+    /// Wait until no run is in progress, at most `limit`. True when none
+    /// is.
+    pub async fn wait_idle(&self, limit: Duration) -> bool {
+        let mut runs = self.0.subscribe();
+        let idle = tokio::time::timeout(limit, runs.wait_for(BTreeSet::is_empty)).await;
+        matches!(idle, Ok(Ok(_)))
+    }
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        self.runs
+            .0
+            .send_if_modified(|runs| runs.remove(&self.target_id));
+    }
+}
+
 // ─── Checks in flight ────────────────────────────────────────────────
 
 /// The targets with a check in flight. The monitor never starts a target
 /// whose check is in flight, and its round rule reads when each running
 /// check took its permit. It lives in the Infra state, so every monitor the
-/// unit runs, a rebuilt one included, sees the same set.
+/// unit runs, a rebuilt one included, and Check now see the same set. A
+/// target whose failed check started a recovery stays in flight until the
+/// run ends.
 #[derive(Debug, Clone, Default)]
 pub struct InFlight(Arc<StdMutex<Flights>>);
 
@@ -460,18 +582,27 @@ struct Flights {
     by_target: HashMap<String, FlightEntry>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct FlightEntry {
-    /// Which [`Flight`] holds the place: only that one marks its permit
-    /// or frees it.
+    /// Which [`Flight`] holds the place: only that one marks its permit,
+    /// publishes its result or frees it.
     token: u64,
     /// When the check took the permit it holds; `None` while it waits for
     /// one, and once it gave it back.
     permit_at: Option<Instant>,
+    /// The check's result once it has one, for a Check now that waits for
+    /// it.
+    result: watch::Sender<Option<checks::CheckResult>>,
 }
 
+/// What a check in flight will answer: its result, once it has one. The
+/// channel closes without one when the check is cancelled with its
+/// monitor.
+pub type Answer = watch::Receiver<Option<checks::CheckResult>>;
+
 /// A target's place in flight, held by its check until its result is
-/// applied. Dropping it, when the check ends or is aborted, frees the
+/// applied, then by the recovery run that result started, if any.
+/// Dropping it, when the check or the run ends or is aborted, frees the
 /// target.
 #[derive(Debug)]
 pub struct Flight {
@@ -483,9 +614,16 @@ pub struct Flight {
 impl InFlight {
     /// Take `target_id`'s place in flight; `None` while a check of it is.
     pub fn start(&self, target_id: &str) -> Option<Flight> {
+        self.take_or_wait(target_id).ok()
+    }
+
+    /// Take `target_id`'s place in flight or, while a check of it is in
+    /// flight, a receiver for that check's result: one decision, so a
+    /// target never has two checks in flight.
+    pub fn take_or_wait(&self, target_id: &str) -> Result<Flight, Answer> {
         let mut flights = self.flights();
-        if flights.by_target.contains_key(target_id) {
-            return None;
+        if let Some(entry) = flights.by_target.get(target_id) {
+            return Err(entry.result.subscribe());
         }
         flights.next_token = flights.next_token.wrapping_add(1);
         let token = flights.next_token;
@@ -494,9 +632,10 @@ impl InFlight {
             FlightEntry {
                 token,
                 permit_at: None,
+                result: watch::channel(None).0,
             },
         );
-        Some(Flight {
+        Ok(Flight {
             set: self.clone(),
             target_id: target_id.to_string(),
             token,
@@ -525,19 +664,27 @@ impl InFlight {
 impl Flight {
     /// The check took its permit at `at`: it is running.
     pub fn took_permit(&self, at: Instant) {
-        self.mark_permit(Some(at));
+        self.with_entry(|entry| entry.permit_at = Some(at));
     }
 
     /// The check gave its permit back: it is no longer running, and its
     /// target stays in flight until its result is applied.
     pub fn left_permit(&self) {
-        self.mark_permit(None);
+        self.with_entry(|entry| entry.permit_at = None);
     }
 
-    fn mark_permit(&self, at: Option<Instant>) {
+    /// The check's result: every Check now waiting for this check answers
+    /// it, and so does one that comes while the place is still held.
+    pub fn publish(&self, result: &checks::CheckResult) {
+        self.with_entry(|entry| {
+            entry.result.send_replace(Some(result.clone()));
+        });
+    }
+
+    fn with_entry(&self, f: impl FnOnce(&mut FlightEntry)) {
         if let Some(entry) = self.set.flights().by_target.get_mut(&self.target_id) {
             if entry.token == self.token {
-                entry.permit_at = at;
+                f(entry);
             }
         }
     }
@@ -587,12 +734,30 @@ pub struct InfraState {
     pub results: InfraResults,
     /// Per-target recovery cooldown tracking: target_id → (when its last
     /// run started, on the monotonic clock, and the runs since the count
-    /// last cleared).
+    /// last cleared). A count loaded at start takes the start as its last
+    /// run, so the target waits a full cooldown.
     pub recovery_tracker: HashMap<String, (Instant, u32)>,
+    /// The recovery runs started and not yet logged, by target id: saved
+    /// as not ended before each command starts.
+    pub runs_not_ended: HashMap<String, SavedRun>,
+    /// Path of the saved recovery counts and runs (mode 0600).
+    pub recovery_path: PathBuf,
     /// Path for persistent config storage.
     pub config_path: PathBuf,
-    /// Handle to the monitoring task (so we can abort and restart on config change).
+    /// Whether the last save of the held config reached the disk; an
+    /// identical push writes it again only when it did not.
+    pub config_saved: bool,
+    /// Which config the unit holds: it moves at every config applied or
+    /// removed, so a check's result is applied only while the config it
+    /// ran under is still held.
+    pub config_generation: u64,
+    /// The supervisor of the monitoring task, aborted when the config
+    /// changes or is removed. Aborting it ends the monitor and its checks,
+    /// never a recovery run.
     pub monitor_handle: Option<tokio::task::JoinHandle<()>>,
+    /// How the monitor is built: the agent's own clock and checks, or a
+    /// test's.
+    pub(crate) monitor_kit: monitor::Kit,
     /// Real-time discovery scan progress (polled by UI).
     pub discovery_progress: DiscoveryProgress,
     /// Credentials for `http_api` targets, keyed by credential id.
@@ -645,8 +810,13 @@ impl InfraState {
                 recovery_log: Vec::new(),
             },
             recovery_tracker: HashMap::new(),
+            runs_not_ended: HashMap::new(),
+            recovery_path: Path::new(state_dir).join("infra-recovery.json"),
             config_path: Path::new(state_dir).join("infra-monitor.json"),
+            config_saved: false,
+            config_generation: 0,
             monitor_handle: None,
+            monitor_kit: monitor::Kit::default(),
             discovery_progress: DiscoveryProgress::default(),
             credentials: HashMap::new(),
             secrets_path: Path::new(state_dir).join("infra-secrets.json"),
@@ -667,6 +837,27 @@ impl InfraState {
     /// matches the results beside it.
     pub fn stamp(&self) -> Stamp {
         self.digest.stamp()
+    }
+
+    /// Whether the agent started in safe mode: a push then stores the
+    /// config and starts no monitor.
+    pub fn safe_mode(&self) -> bool {
+        self.digest.safe_mode
+    }
+
+    /// The recovery runs in progress.
+    pub fn runs(&self) -> Runs {
+        self.digest.runs()
+    }
+
+    /// Whether the unit still holds the config of `generation`, and
+    /// `target_id` is in it: a check's result is applied only then.
+    pub fn holds(&self, generation: u64, target_id: &str) -> bool {
+        self.config_generation == generation
+            && self
+                .config
+                .as_ref()
+                .is_some_and(|cfg| cfg.targets.iter().any(|t| t.id == target_id))
     }
 
     /// Say the results changed in a way worth pushing: a target's status
@@ -709,9 +900,10 @@ impl InfraState {
     /// Hold `cfg`, as a push does. The results reflect it at once: targets
     /// that left are dropped, new ones appear as `unknown`, and the version
     /// is the pushed one, so a collector reading the results between the
-    /// push and the first check sees the config it pushed. A config equal
-    /// to the one held, every field and the version included, changes
-    /// nothing and signals nothing. True when it changed what is held.
+    /// push and the first check sees the config it pushed. A target that
+    /// left loses its recovery count. A config equal to the one held, every
+    /// field and the version included, changes nothing and signals nothing.
+    /// True when it changed what is held; the caller saves it.
     pub fn hold_config(&mut self, cfg: InfraConfig) -> bool {
         if self.config.as_ref() == Some(&cfg) {
             return false;
@@ -720,15 +912,25 @@ impl InfraState {
         self.results
             .targets
             .retain(|id, _| keep.contains(id.as_str()));
+        let counts = self.recovery_tracker.len();
+        self.recovery_tracker
+            .retain(|id, _| keep.contains(id.as_str()));
+        let counts_dropped = self.recovery_tracker.len() != counts;
         self.seed_results(&cfg);
         self.config = Some(cfg);
+        self.config_saved = false;
+        self.config_generation += 1;
+        if counts_dropped {
+            self.save_recoveries();
+        }
         self.changed();
         true
     }
 
     /// Hold no config, as a removal does: no target, version 0, no
-    /// recovery count. True when there was something to remove; removing
-    /// nothing is not a change.
+    /// recovery count. A run in progress goes on and is logged when it
+    /// ends. True when there was something to remove; removing nothing is
+    /// not a change.
     pub fn drop_config(&mut self) -> bool {
         let held = self.config.take().is_some()
             || !self.results.targets.is_empty()
@@ -736,11 +938,124 @@ impl InfraState {
         self.results.targets.clear();
         self.results.config_version = 0;
         self.results.ts = now_iso();
-        self.recovery_tracker.clear();
+        if !self.recovery_tracker.is_empty() {
+            self.recovery_tracker.clear();
+            self.save_recoveries();
+        }
         if held {
+            self.config_generation += 1;
             self.changed();
         }
         held
+    }
+
+    /// Clear `target_id`'s recovery count, as a good answer that moves it
+    /// out of Down or `unknown` does, and save the counts when one was
+    /// there.
+    pub fn clear_recovery_count(&mut self, target_id: &str) {
+        if self.recovery_tracker.remove(target_id).is_some() {
+            self.save_recoveries();
+        }
+    }
+
+    /// Load the saved recovery counts and runs (called at startup, after
+    /// the config). A saved count stands and waits a full cooldown from
+    /// now, so `max_retries` holds across the restarts a recovery causes;
+    /// one for a target the held config lacks is dropped. Each run saved as
+    /// not ended is logged with its outcome unknown, which moves `seq` and
+    /// `recoveries`. Missing is normal.
+    pub fn load_recoveries(&mut self) {
+        let saved = match std::fs::read_to_string(&self.recovery_path) {
+            Ok(data) => match serde_json::from_str::<SavedRecoveries>(&data) {
+                Ok(saved) => saved,
+                Err(e) => {
+                    warn!("Failed to parse infra recovery counts: {e}");
+                    return;
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                warn!("Failed to read infra recovery counts: {e}");
+                return;
+            }
+        };
+        let now = Instant::now();
+        // A target the held config lacks has no count to keep. With no
+        // config held (one that did not load), the counts wait for a push.
+        let held: Option<HashSet<&str>> = self
+            .config
+            .as_ref()
+            .map(|cfg| cfg.targets.iter().map(|t| t.id.as_str()).collect());
+        let mut counts = HashMap::new();
+        for (id, count) in &saved.counts {
+            if *count > 0 && held.as_ref().is_none_or(|held| held.contains(id.as_str())) {
+                counts.insert(id.clone(), (now, *count));
+            }
+        }
+        let changed = counts.len() != saved.counts.len() || !saved.running.is_empty();
+        self.recovery_tracker = counts;
+        for (target_id, run) in saved.running {
+            let started = iso_from_unix_ms(run.started_ms);
+            warn!(
+                "Infra: the recovery run of {target_id} started at {started} did not end \
+                 before the agent stopped; its outcome is unknown"
+            );
+            self.push_recovery_log(RecoveryLogEntry {
+                ts: now_iso(),
+                target_id,
+                command: run.command,
+                exit_code: -1,
+                stdout: format!(
+                    "OUTCOME UNKNOWN: the agent stopped before this run ended (it started at {started})"
+                ),
+                stderr: String::new(),
+            });
+        }
+        if changed {
+            self.save_recoveries();
+        }
+    }
+
+    /// Save the recovery counts and the runs not yet ended, synced, owner
+    /// readable only; with neither, remove the file. False when the disk
+    /// did not take it.
+    pub fn save_recoveries(&self) -> bool {
+        let saved = SavedRecoveries {
+            counts: self
+                .recovery_tracker
+                .iter()
+                .map(|(id, (_, count))| (id.clone(), *count))
+                .collect(),
+            running: self
+                .runs_not_ended
+                .iter()
+                .map(|(id, run)| (id.clone(), run.clone()))
+                .collect(),
+        };
+        if saved.counts.is_empty() && saved.running.is_empty() {
+            return match std::fs::remove_file(&self.recovery_path) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                Err(e) => {
+                    warn!("Failed to remove infra recovery counts: {e}");
+                    false
+                }
+            };
+        }
+        let Ok(data) = serde_json::to_vec(&saved) else {
+            warn!("Failed to serialize infra recovery counts");
+            return false;
+        };
+        if let Some(parent) = self.recovery_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match write_synced(&self.recovery_path, &data) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Failed to save infra recovery counts: {e}");
+                false
+            }
+        }
     }
 
     /// Load the credentials file (called at startup). Missing is normal.
@@ -801,6 +1116,8 @@ impl InfraState {
                 Ok(cfg) => {
                     self.seed_results(&cfg);
                     self.config = Some(cfg);
+                    self.config_saved = true;
+                    self.config_generation += 1;
                     self.publish(false);
                 }
                 Err(e) => warn!("Failed to parse infra config: {e}"),
@@ -826,6 +1143,7 @@ impl InfraState {
                     since: now.clone(),
                     consecutive_ok: 0,
                     consecutive_fail: 0,
+                    consecutive_within: 0,
                     // Empty: no check has produced a timestamp yet. A
                     // collector that records observations keys on this
                     // and must skip an empty one.
@@ -840,8 +1158,14 @@ impl InfraState {
         self.results.ts = now;
     }
 
-    /// Persist config to disk (atomic write via tmp + rename).
-    pub fn save_config(&self) -> bool {
+    /// Persist config to disk (atomic write via tmp + rename), and
+    /// remember whether it reached the disk.
+    pub fn save_config(&mut self) -> bool {
+        self.config_saved = self.write_config();
+        self.config_saved
+    }
+
+    fn write_config(&self) -> bool {
         let Some(ref cfg) = self.config else {
             return false;
         };
@@ -902,14 +1226,58 @@ fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
+/// Write a file owner-readable only, synced, through a temporary file
+/// renamed over it, then sync its directory: a power cut leaves either the
+/// old file or this one, never a part of it.
+fn write_synced(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    write_private(&tmp, data)?;
+    std::fs::rename(&tmp, path)?;
+    // The rename itself, on a filesystem that keeps it only once its
+    // directory is synced; best effort, since not every one takes it.
+    if let Some(dir) = path.parent().and_then(|dir| std::fs::File::open(dir).ok()) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// What `<state_dir>/infra-recovery.json` holds (ADR-010 decision 9).
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SavedRecoveries {
+    /// Each target's recovery runs since its count last cleared.
+    #[serde(default)]
+    counts: BTreeMap<String, u32>,
+    /// The runs started and not yet logged: not ended.
+    #[serde(default)]
+    running: BTreeMap<String, SavedRun>,
+}
+
+/// A recovery run saved as not ended, written and synced before its
+/// command starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedRun {
+    /// When it started, unix ms: for its log entry only, since the wall
+    /// clock can step. The cooldown reads the monotonic clock.
+    pub started_ms: u64,
+    pub command: String,
+}
+
 /// Current time as ISO 8601 string (no chrono dependency).
-#[allow(clippy::many_single_char_names)]
 pub fn now_iso() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let secs = dur.as_secs();
+    iso_from_unix_secs(dur.as_secs())
+}
+
+/// A unix time in milliseconds as an ISO 8601 string, to the second.
+fn iso_from_unix_ms(ms: u64) -> String {
+    iso_from_unix_secs(ms / 1000)
+}
+
+#[allow(clippy::many_single_char_names)]
+fn iso_from_unix_secs(secs: u64) -> String {
     let days = secs / 86400;
     let time_of_day = secs % 86400;
     let hours = time_of_day / 3600;
@@ -1024,6 +1392,7 @@ mod tests {
             since: now_iso(),
             consecutive_ok: 1,
             consecutive_fail: 0,
+            consecutive_within: 1,
             last_check: now_iso(),
             detail: "PING OK 3ms".into(),
             name: "gw".into(),
@@ -1269,6 +1638,7 @@ mod tests {
             command: "true".into(),
             exit_code: 0,
             stdout: String::new(),
+            stderr: String::new(),
         });
         let after = state.stamp();
         assert_eq!(after.seq, before.seq + 1);
@@ -1335,5 +1705,70 @@ mod tests {
         drop(flight);
         assert!(!seen_by_another.contains("t1"));
         assert!(seen_by_another.start("t1").is_some());
+    }
+
+    #[tokio::test]
+    async fn check_now_gets_the_result_of_the_check_in_flight() {
+        let in_flight = InFlight::default();
+        let flight = in_flight.take_or_wait("t1").expect("free");
+        let mut early = in_flight.take_or_wait("t1").expect_err("in flight");
+        assert!(early.borrow().is_none(), "no result yet");
+
+        flight.publish(&checks::CheckResult {
+            ok: true,
+            latency_ms: Some(42),
+            ..checks::CheckResult::default()
+        });
+        // One that comes after the result, while the place is held (as a
+        // recovery run holds it), has it at once.
+        let late = in_flight.take_or_wait("t1").expect_err("still held");
+        assert_eq!(late.borrow().as_ref().and_then(|r| r.latency_ms), Some(42));
+        drop(flight);
+        let seen = early.wait_for(Option::is_some).await.expect("published");
+        assert_eq!(seen.as_ref().and_then(|r| r.latency_ms), Some(42));
+        drop(seen);
+        assert!(in_flight.take_or_wait("t1").is_ok(), "free again");
+
+        // A check cancelled with its monitor ends with no result.
+        let cancelled = in_flight.start("t2").expect("free");
+        let mut waiting = in_flight.take_or_wait("t2").expect_err("in flight");
+        drop(cancelled);
+        assert!(waiting.wait_for(Option::is_some).await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_run_per_target_and_an_upgrade_waits_for_every_run() {
+        let runs = Runs::default();
+        let pdu = runs.start("pdu").expect("free");
+        assert!(runs.start("pdu").is_none(), "one run per target at a time");
+        let cam = runs.start("cam").expect("another target");
+        assert!(runs.contains("pdu") && runs.contains("cam"));
+        assert_eq!(runs.in_progress(), 2);
+
+        let waiter = {
+            let runs = runs.clone();
+            tokio::spawn(async move {
+                let at = Instant::now();
+                (runs.wait_idle(Duration::from_mins(5)).await, at.elapsed())
+            })
+        };
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        drop(pdu);
+        assert!(!runs.contains("pdu"));
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        drop(cam);
+        assert_eq!(
+            waiter.await.unwrap(),
+            (true, Duration::from_secs(20)),
+            "until the last run ended"
+        );
+
+        // A run that does not end: at most the limit.
+        let stuck = runs.start("pdu").expect("free again");
+        let at = Instant::now();
+        assert!(!runs.wait_idle(Duration::from_mins(5)).await);
+        assert_eq!(at.elapsed(), Duration::from_mins(5));
+        drop(stuck);
+        assert!(runs.wait_idle(Duration::ZERO).await, "none in progress");
     }
 }

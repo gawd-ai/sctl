@@ -51,6 +51,10 @@ pub struct Context {
     pub hold: bool,
     pub hold_file: PathBuf,
     pub running_version: String,
+    /// The Infra recovery runs in progress, which the hand-off waits for
+    /// (ADR-010 decision 9); `None` where no agent's runs are in reach, as
+    /// in `sctl upgrade` from a shell.
+    pub recovery_runs: Option<crate::infra::Runs>,
 }
 
 /// One file the helper moves into place.
@@ -772,6 +776,9 @@ async fn stage(ctx: &Context, req: &Request, handle: &Handle) -> Result<(), Refu
     set_mode(&helper, 0o755).map_err(|e| Refusal::new(Reason::Internal, e))?;
     // The old helper's log starts afresh for this attempt.
     let _ = std::fs::remove_file(&plan.log_path);
+    // The helper restarts the agent: a recovery run in progress, maybe a
+    // power cycle between off and on, ends first.
+    wait_for_recovery_runs(ctx).await;
     handle.set(
         UpgradeState::staging(
             req.request_id.clone(),
@@ -791,6 +798,35 @@ async fn stage(ctx: &Context, req: &Request, handle: &Handle) -> Result<(), Refu
     .map_err(|e| Refusal::new(Reason::Internal, e))?;
     info!(version = %manifest.version, "upgrade: handed off to the helper");
     Ok(())
+}
+
+/// Before the hand-off, wait for the Infra recovery runs in progress to
+/// end, at most a run's own limit (ADR-010 decision 9): the helper's
+/// restart ends the agent, and a run with it. A run begun after this can
+/// still be cut, and the next start logs it with its outcome unknown.
+pub async fn wait_for_recovery_runs(ctx: &Context) {
+    let Some(runs) = &ctx.recovery_runs else {
+        return;
+    };
+    let running = runs.in_progress();
+    if running == 0 {
+        return;
+    }
+    let limit = crate::infra::monitor::RECOVERY_LIMIT;
+    info!(
+        running,
+        "upgrade: waiting for the Infra recovery runs in progress to end, at most {}s",
+        limit.as_secs()
+    );
+    if runs.wait_idle(limit).await {
+        info!("upgrade: no recovery run in progress; handing off");
+    } else {
+        warn!(
+            running = runs.in_progress(),
+            "upgrade: a recovery run is still in progress after {}s; handing off",
+            limit.as_secs()
+        );
+    }
 }
 
 /// Start `helper upgrade-apply --stage <stage>` in its own session with
@@ -910,6 +946,7 @@ mod tests {
             hold: false,
             hold_file: PathBuf::from("/nonexistent/upgrade-hold"),
             running_version: "0.6.7.100".into(),
+            recovery_runs: None,
         }
     }
 
@@ -1088,6 +1125,41 @@ mod tests {
         assert_eq!(conf_value(conf, "MIN_TMP_KB").as_deref(), Some("24576"));
         assert_eq!(conf_value(conf, "EMPTY"), None);
         assert_eq!(conf_value(conf, "BINARY"), None);
+    }
+
+    /// The helper's restart ends the agent, and a recovery run with it: a
+    /// power cycle cut between off and on. The hand-off waits for every run
+    /// in progress, at most a run's own limit. Nothing here starts a helper.
+    #[tokio::test(start_paused = true)]
+    async fn the_hand_off_waits_for_a_recovery_run_in_progress() {
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        let runs = crate::infra::Runs::default();
+        let mut ctx = ctx(None);
+        let at = Instant::now();
+        wait_for_recovery_runs(&ctx).await;
+        ctx.recovery_runs = Some(runs.clone());
+        wait_for_recovery_runs(&ctx).await;
+        assert_eq!(at.elapsed(), Duration::ZERO, "no run: no wait");
+
+        let run = runs.start("pdu").unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(40)).await;
+            drop(run);
+        });
+        wait_for_recovery_runs(&ctx).await;
+        assert_eq!(at.elapsed(), Duration::from_secs(40), "until the run ended");
+
+        let stuck = runs.start("pdu").unwrap();
+        let at = Instant::now();
+        wait_for_recovery_runs(&ctx).await;
+        assert_eq!(
+            at.elapsed(),
+            Duration::from_mins(5),
+            "at most the run's limit"
+        );
+        drop(stuck);
     }
 
     #[test]

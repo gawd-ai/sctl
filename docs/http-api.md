@@ -849,11 +849,58 @@ return `404` `INFRA_UNAVAILABLE`.
 
 ### `POST /api/infra/config`
 
-Push monitoring config: persists to disk, restarts the monitor loop with
-the new config. **Auth: API key Bearer.**
+Push monitoring config: persists it to disk and runs the monitor loop for
+it. **Auth: API key Bearer.**
 
 Request body: an `InfraConfig` object — `version` (integer) and `targets`
 (array of monitored targets, each with an `id` and a `check` spec).
+`version` is the caller's name for the config, not a counter: the agent
+reports it back in the results and the `infra` group's `hash`, and the
+fleet sends a fingerprint of the config. It must not be 0, which means
+the unit holds no config.
+
+A push equal to the config the unit holds, every field and the version
+included, changes nothing: the running monitor keeps running, no target is
+checked again, nothing is pushed, and the config is written again only if
+its last save failed. Any other config replaces the one held, and its
+monitor replaces the running one. A recovery run in progress is not cut by
+a push, a rebuilt monitor or a removal: it ends by itself or at its 300 s
+limit. Outside safe mode a push starts a monitor whenever none runs for the
+config held. In an agent that started in safe mode a push stores and saves
+the config and starts nothing (`docs/safe-mode.md`). The monitor runs under
+a supervisor, which rebuilds a loop that panicked after 5 s from the config
+the unit then holds.
+
+Each target's status follows its answers (ADR-010). A good answer above
+`degraded_threshold_ms` is slow, and a slow answer never makes a target
+Up:
+
+| From | Good, within the threshold | Good, slow | Failure |
+|---|---|---|---|
+| `unknown` | `up` | `degraded` | `degraded` |
+| `up` | `up` | `degraded` | `degraded` |
+| `degraded` | `up` at `up_after_consecutive` such answers in a row | `degraded` | `down` at `down_after_consecutive` failures in a row |
+| `down` | see below | see below | `down` |
+
+From `down`, `up_after_consecutive` good answers in a row lead to `up` when
+all were within the threshold, and to `degraded` otherwise; until then the
+target stays `down`. A check that panics leaves its target `unknown`, its
+detail saying the agent failed to check it.
+
+A `recovery` (`enabled`, `command`, `cooldown_secs` with a default of 300,
+`max_retries` with a default of 2, `credential_ids`) runs only on a failed
+check of the monitor that leaves the target `down`: the first `down` and every failed check after it, within
+the cooldown and `max_retries`, never on a good answer and never on Check
+now. The `down` is pushed first; the command then runs in a task of its
+own, outside the Infra lock, under a 300 s limit, one run per target at a
+time, and no check of the target starts until it ends. Before the command
+starts, the run is saved in `<state_dir>/infra-recovery.json`, synced: the
+count holds across restarts (after a start, a target with a saved count
+waits a full cooldown), and the next start logs a run that did not end,
+its outcome unknown. The count clears when a good answer moves the target
+out of `down` or `unknown`; a removed config clears every count, and a
+target a push removes loses its own. A managed upgrade waits for a run in
+progress, at most 300 s, before it hands off (`docs/upgrade.md`).
 
 Check kinds (`check.method`): `ping`, `http`, `https`, `tcp_port`, `snmp`,
 `custom_script`, and `http_api`. An `http_api` check logs into a device's
@@ -868,14 +915,18 @@ it), `credential_id` (a key into the credentials store, below), and
 the client list leaves only as per-VLAN counts, and subscriber identifiers
 (IMSI, ICCID, IMEI) are never carried.
 
-Response `200`: `{status: "ok", config_version, target_count}`.
+Response `200`: `{status: "ok", config_version, target_count, unchanged,
+started}`. `unchanged` is true when the push equalled the config held;
+`started` is true when the push started a monitor: always for another
+config outside safe mode, for the same config only when none was running.
 
-Errors: `404` `INFRA_UNAVAILABLE`.
+Errors: `404` `INFRA_UNAVAILABLE`, `400` `INVALID_REQUEST` (version 0).
 
 ### `DELETE /api/infra/config`
 
-Stop monitoring, clear results, remove the persisted config. **Auth: API
-key Bearer.**
+Stop monitoring, clear results and every recovery count, remove the
+persisted config. A recovery run in progress goes on and is logged when it
+ends. **Auth: API key Bearer.**
 
 Response `200`: `{status: "ok", message: "Monitoring stopped"}`.
 
@@ -897,9 +948,20 @@ pull settles a comparison with the `infra` group of
 `last_check`, `detail`, `name`, and, for `http_api` targets,
 `http_status` and `data` (the profile's structured snapshot; after a
 failed check the last good snapshot stays, with the status and counters
-saying it is old). When the subsystem is unavailable or holds no config
-this returns an empty result set (`config_version: 0`), not an error. The
-same per-target fields minus `data` are pushed over the tunnel as
+saying it is old). `consecutive_ok` counts good answers in a row, slow ones
+included. Each `recovery_log` entry (the last 50 runs) is `{ts, target_id,
+command, exit_code, stdout, stderr}`, `ts` being when the run was logged.
+`stdout` and `stderr` are each masked (every password of at least 4 bytes
+among the command's credentials becomes `***`), then cut to 512 bytes on a
+character boundary, `...` marking a cut. `exit_code` is -1 when the run
+gave none, and `stdout` then says why: `ERROR: credential <id> is not on
+this unit`, `ERROR: timeout` at the 300 s limit, another `ERROR:` when the
+command could not start, `AGENT ERROR:` when the agent failed to finish
+the run, or `OUTCOME UNKNOWN: the agent stopped before this run ended (it
+started at <time>)` for a run the agent did not see end, logged at its
+next start. When the subsystem is unavailable or holds no config this
+returns an empty result set (`config_version: 0`), not an error. The same
+per-target fields minus `data` are pushed over the tunnel as
 [`infra.state`](#infrastate-the-devices-infra-results) whenever `seq`
 moves, so a collector on the relay's event stream keeps a copy from the
 pushes, compares it on each poll with the `infra` group of
@@ -916,8 +978,20 @@ Response `200`: `{target_id, samples: [{ts, status, latency_ms, data}]}`.
 
 ### `POST /api/infra/check/{target_id}`
 
-Run an immediate on-demand check for one configured target. No request
-body. **Auth: API key Bearer.**
+Check now: an immediate reading of one configured target. No request body.
+**Auth: API key Bearer.**
+
+The check runs under the monitor's 90 s deadline, and its result is
+applied as a monitor check's is: `last_check`, the latency, the detail, the
+counters, the status and, for an `http_api` target, a data sample. A status
+change is pushed like any other, so a few readings of a failing target
+bring its `down` sooner. Check now counts no round and never starts a
+recovery. A target has at most one check in flight: while one is, Check
+now waits for that check, at most 90 s, and answers its result, and no
+second check runs. While a recovery of the target runs, it answers at once
+the result of the check that started the run. A result is applied only
+while the unit still holds the config the check ran under and the target
+is in it; otherwise it is answered and nothing is applied.
 
 Response `200`: `{target_id, ok, latency_ms, detail, http_status, data,
 presented_sha256}`. `presented_sha256` is set when a TLS target offered a

@@ -11,6 +11,7 @@
 //! - `shell` — process spawning and PTY management
 //! - `gawdxfer` — chunked file transfer
 //! - `file_access`: the one gate before a file's content is read
+//! - `supervise`: background loops that survive their own panics
 
 /// Full version: `<cargo-version>.<git-commit-count>`. Bumps on every commit
 /// so a fresh binary is never mistaken for an older one.
@@ -35,6 +36,7 @@ pub mod routes;
 pub mod sessions;
 pub mod shell;
 pub mod state;
+pub mod supervise;
 pub mod tunnel;
 pub mod upgrade;
 pub mod util;

@@ -1,7 +1,11 @@
-//! Monitoring loop: a long-lived tokio task per config.
+//! Monitoring loop: a long-lived tokio task per config, under a supervisor.
 //!
-//! Spawned when a config is pushed or loaded from disk at startup, aborted
-//! and spawned again on a config change.
+//! [`start`] is the one start path, at boot and for a push (ADR-010 decision
+//! 6). It runs the loop under the library's supervisor, which rebuilds a
+//! panicked loop after 5 s from the config the unit then holds, and starts
+//! nothing in an agent that started in safe mode. A push of another config
+//! aborts the monitor and starts a new one; a push of the config held keeps
+//! it.
 //!
 //! Every tick (5 s) starts each due target that has no check in flight and
 //! does not wait for them, so a slow target holds back neither the tick nor
@@ -16,10 +20,24 @@
 //! the Infra lock, stuck on a check or panicking in its tick moves no
 //! `rounds`; one that checks moves it every tick.
 //!
-//! Due times and cooldowns use the monotonic clock, so a step of the wall
-//! clock cannot stop the checks. A check that panics leaves its target
-//! `unknown`, saying the agent failed to check it, and never fires a
-//! recovery.
+//! A result is applied only while the unit still holds the config the check
+//! ran under, the target in it. Due times and cooldowns use the monotonic
+//! clock, so a step of the wall clock cannot stop the checks. A check that
+//! panics leaves its target `unknown`, saying the agent failed to check it,
+//! and never fires a recovery. A good answer slower than the target's
+//! threshold never makes it Up (ADR-010 decision 8).
+//!
+//! A recovery (ADR-010 decision 9) starts only on a failed check of the
+//! monitor that leaves its target Down, within its cooldown and
+//! `max_retries`. Under the Infra lock the result is folded and the Down
+//! signalled, so its push leaves first; the run then goes on in a task of
+//! its own, outside the monitor's task set, holding the target's place in
+//! flight until it ends. Nothing but its own 300 s limit or the agent's stop
+//! ends it: no push, rebuilt monitor or removed config.
+//!
+//! Check now ([`check_now`], ADR-010 decision 10) is a reading: it runs under
+//! the same deadline, its result is applied as a monitor check's is, and it
+//! counts no round and starts no recovery.
 //!
 //! `SCTL_INFRA_TEST_STALL_SECS`, for tests and benches, stops the loop that
 //! many seconds after it starts, so a stopped monitor can be seen while the
@@ -33,14 +51,14 @@ use std::time::Duration;
 use futures_util::future::BoxFuture;
 use futures_util::FutureExt as _;
 use tokio::sync::{Mutex, Semaphore};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
 use super::checks::{self, CheckContext, CheckResult};
 use super::{
-    now_iso, CheckSpec, DataSample, Flight, InfraConfig, InfraState, InfraTarget, RecoveryLogEntry,
-    TargetState, TargetStatus,
+    now_iso, now_unix_ms, CheckSpec, DataSample, Flight, InfraConfig, InfraState, InfraTarget,
+    RecoveryConfig, RecoveryLogEntry, RunGuard, SavedRun, TargetState, TargetStatus,
 };
 
 /// How many checks may run at once. Small: these devices have one core and
@@ -50,6 +68,11 @@ const CHECK_CONCURRENCY: usize = 3;
 const TICK: Duration = Duration::from_secs(5);
 /// Hard ceiling on one check, whatever its own timeouts say.
 const CHECK_DEADLINE: Duration = Duration::from_secs(90);
+/// A recovery run's own limit. Nothing else ends a run, and a managed
+/// upgrade waits at most this long for one before it hands off.
+pub const RECOVERY_LIMIT: Duration = Duration::from_mins(5);
+/// A recovery's stdout and stderr are each cut to this many bytes.
+const RECOVERY_OUTPUT_BYTES: usize = 512;
 /// The bench's stall hook: the loop stops ticking this many seconds after
 /// it starts.
 const STALL_ENV: &str = "SCTL_INFRA_TEST_STALL_SECS";
@@ -113,40 +136,118 @@ fn run_checks() -> Checker {
     })
 }
 
-/// Spawn the infra monitoring loop. Returns a `JoinHandle` that the caller
-/// should store so it can be aborted on config change or shutdown.
-pub fn spawn_monitor(
-    infra_state: Arc<Mutex<InfraState>>,
-    config: InfraConfig,
-) -> tokio::task::JoinHandle<()> {
-    spawn_monitor_with(infra_state, config, Timing::from_env(), run_checks())
+/// How the unit's monitors and Check now are built: the agent's own clock,
+/// its stall hook read from the environment at each start, and its own
+/// checks; or a test's.
+#[derive(Clone, Default)]
+pub(crate) enum Kit {
+    #[default]
+    Agent,
+    /// A test's clock and checks.
+    #[cfg(test)]
+    Given { timing: Timing, checker: Checker },
 }
 
-/// [`spawn_monitor`] with its clock and its checker given.
+impl Kit {
+    fn timing(&self) -> Timing {
+        match self {
+            Self::Agent => Timing::from_env(),
+            #[cfg(test)]
+            Self::Given { timing, .. } => *timing,
+        }
+    }
+
+    fn checker(&self) -> Checker {
+        match self {
+            Self::Agent => run_checks(),
+            #[cfg(test)]
+            Self::Given { checker, .. } => checker.clone(),
+        }
+    }
+
+    /// How long one check may run: the monitor's checks and Check now.
+    fn deadline(&self) -> Duration {
+        match self {
+            Self::Agent => CHECK_DEADLINE,
+            #[cfg(test)]
+            Self::Given { timing, .. } => timing.deadline,
+        }
+    }
+}
+
+/// Start the monitor for the config the unit holds, supervised, unless the
+/// agent started in safe mode, the unit holds no config, or a monitor runs
+/// already. The one start path, at boot and for a push (ADR-010 decision
+/// 6). `state` is `infra`'s, locked by the caller. True when it started one.
+pub fn start(infra: &Arc<Mutex<InfraState>>, state: &mut InfraState) -> bool {
+    if state.safe_mode() || state.config.is_none() {
+        return false;
+    }
+    if state
+        .monitor_handle
+        .as_ref()
+        .is_some_and(|handle| !handle.is_finished())
+    {
+        return false;
+    }
+    state.monitor_handle = Some(supervised(infra.clone()));
+    true
+}
+
+/// The monitor under the library's supervisor. Each build reads the config
+/// the unit holds then, so a loop rebuilt after a panic watches that config,
+/// never a copy kept from before. With no config held there is nothing to
+/// watch, and the supervisor ends.
+fn supervised(infra: Arc<Mutex<InfraState>>) -> JoinHandle<()> {
+    crate::supervise::spawn_supervised(
+        "infra_monitor",
+        crate::supervise::RESTART_DELAY,
+        move || {
+            let infra = infra.clone();
+            async move {
+                let built = {
+                    let state = infra.lock().await;
+                    state
+                        .config
+                        .clone()
+                        .map(|config| (config, state.config_generation, state.monitor_kit.clone()))
+                };
+                let Some((config, generation, kit)) = built else {
+                    return;
+                };
+                Monitor::new(infra, config, generation, kit.timing(), kit.checker())
+                    .run()
+                    .await;
+            }
+        },
+    )
+}
+
+/// A monitor of `config` with its clock and its checker given, outside any
+/// supervisor, for the tests.
+#[cfg(test)]
 pub(crate) fn spawn_monitor_with(
     infra: Arc<Mutex<InfraState>>,
     config: InfraConfig,
     timing: Timing,
     checker: Checker,
-) -> tokio::task::JoinHandle<()> {
-    let monitor = Monitor {
-        infra,
-        config: Arc::new(config),
-        timing,
-        checker,
-        limiter: Arc::new(Semaphore::new(CHECK_CONCURRENCY)),
-        last_start: HashMap::new(),
-        checks: JoinSet::new(),
-    };
-    tokio::spawn(monitor.run())
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let generation = infra.lock().await.config_generation;
+        Monitor::new(infra, config, generation, timing, checker)
+            .run()
+            .await;
+    })
 }
 
 /// One monitor: its config, its clock, and the checks it started. Its
 /// checks end with it: aborting the monitor aborts them, and each frees its
-/// target as it goes.
+/// target as it goes. A recovery run is not one of them.
 struct Monitor {
     infra: Arc<Mutex<InfraState>>,
     config: Arc<InfraConfig>,
+    /// The config generation its checks ran under.
+    generation: u64,
     timing: Timing,
     checker: Checker,
     limiter: Arc<Semaphore>,
@@ -156,6 +257,25 @@ struct Monitor {
 }
 
 impl Monitor {
+    fn new(
+        infra: Arc<Mutex<InfraState>>,
+        config: InfraConfig,
+        generation: u64,
+        timing: Timing,
+        checker: Checker,
+    ) -> Self {
+        Self {
+            infra,
+            config: Arc::new(config),
+            generation,
+            timing,
+            checker,
+            limiter: Arc::new(Semaphore::new(CHECK_CONCURRENCY)),
+            last_start: HashMap::new(),
+            checks: JoinSet::new(),
+        }
+    }
+
     async fn run(mut self) {
         info!(
             "Infra monitor started: {} targets, config v{}",
@@ -212,23 +332,25 @@ impl Monitor {
                 continue; // not due yet
             }
             let Some(flight) = guard.in_flight.start(&target.id) else {
-                // Still being checked: due again at the next tick.
-                debug!(
-                    "Infra: {} is still being checked; not started again",
-                    target.id
-                );
+                // Still being checked, or its recovery runs: due again at
+                // the next tick.
+                debug!("Infra: {} is still in flight; not started again", target.id);
                 continue;
             };
             self.last_start.insert(target.id.clone(), at);
             let check = (self.checker)(target, context_for(&guard, target));
+            let job = Job {
+                target: target.clone(),
+                config_version: self.config.version,
+                generation: self.generation,
+                deadline: self.timing.deadline,
+            };
             self.checks.spawn(run_check(
                 self.infra.clone(),
-                target.clone(),
-                self.config.version,
+                job,
                 check,
                 flight,
                 self.limiter.clone(),
-                self.timing.deadline,
             ));
         }
         let permits = guard.in_flight.permit_times();
@@ -263,51 +385,127 @@ pub(crate) fn round_counts(now: Instant, permits: &[Instant], limit: Duration) -
         .all(|at| now.saturating_duration_since(*at) <= limit)
 }
 
-/// One check, from its permit to its result applied. It holds its target's
-/// place in flight until the result is in, and its permit only while the
-/// check runs.
+/// One check of one target, as it was started.
+#[derive(Debug, Clone)]
+struct Job {
+    target: InfraTarget,
+    /// The version of the config it ran under.
+    config_version: u32,
+    /// The generation of that config: its result is applied only while the
+    /// unit still holds it.
+    generation: u64,
+    deadline: Duration,
+}
+
+/// How a check ended.
+enum Outcome {
+    Answered(CheckResult),
+    /// It panicked; the panic's text.
+    Panicked(String),
+    /// No answer within its deadline.
+    TimedOut,
+}
+
+impl Outcome {
+    /// Run `check` under `deadline`, catching its panic.
+    async fn of(check: BoxFuture<'static, CheckResult>, deadline: Duration) -> Self {
+        match tokio::time::timeout(deadline, AssertUnwindSafe(check).catch_unwind()).await {
+            Ok(Ok(result)) => Self::Answered(result),
+            Ok(Err(panic)) => Self::Panicked(panic_text(panic.as_ref()).to_string()),
+            Err(_) => Self::TimedOut,
+        }
+    }
+}
+
+/// Whose reading a result is: only a failed check of the monitor starts a
+/// recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reading {
+    /// A check the monitor started.
+    Monitor,
+    /// A person's Check now.
+    CheckNow,
+}
+
+/// One check of the monitor, from its permit to its result applied. It
+/// holds its target's place in flight until the result is in, and its
+/// permit only while the check runs. A failed check that leaves the target
+/// Down and starts a recovery hands the place to the run.
 async fn run_check(
     infra: Arc<Mutex<InfraState>>,
-    target: InfraTarget,
-    config_version: u32,
+    job: Job,
     check: BoxFuture<'static, CheckResult>,
     flight: Flight,
     limiter: Arc<Semaphore>,
-    deadline: Duration,
 ) {
     let Ok(permit) = limiter.acquire_owned().await else {
         return;
     };
     flight.took_permit(Instant::now());
-    debug!("Checking target {}: {}", target.id, target.name);
-    let outcome = tokio::time::timeout(deadline, AssertUnwindSafe(check).catch_unwind()).await;
+    debug!("Checking target {}: {}", job.target.id, job.target.name);
+    let outcome = Outcome::of(check, job.deadline).await;
     drop(permit);
     // No longer running: the round rule stops reading its permit time.
     flight.left_permit();
-    let mut guard = infra.lock().await;
-    match outcome {
-        Ok(Ok(result)) => {
-            apply_result(&mut guard, &target, result, config_version, Instant::now()).await;
-        }
-        Ok(Err(panic)) => {
-            error!(
-                "Infra: the check of {} ({}) panicked: {}",
-                target.id,
-                target.name,
-                panic_text(panic.as_ref())
-            );
-            apply_check_panic(&mut guard, &target, config_version);
-        }
-        Err(_) => {
-            let result = CheckResult::failed(format!(
-                "CHECK DEADLINE: no answer within {}s",
-                deadline.as_secs()
-            ));
-            apply_result(&mut guard, &target, result, config_version, Instant::now()).await;
-        }
+    let recovery = {
+        let mut state = infra.lock().await;
+        let (result, recovery) = settle(&mut state, &job, outcome, Reading::Monitor);
+        flight.publish(&result);
+        recovery
+    };
+    match recovery {
+        // The Down is signalled and the lock released: the run goes on in a
+        // task of its own, with the target's place.
+        Some(run) => drop(tokio::spawn(run_recovery(infra, run, flight))),
+        // Out of flight only once its result is in.
+        None => drop(flight),
     }
-    // Out of flight only once its result is in.
-    drop(flight);
+}
+
+/// Apply a check's outcome, when the unit still holds the config the check
+/// ran under and the target is in it, and say what it answers. Returns the
+/// recovery run that a failed check of the monitor started, if any.
+fn settle(
+    state: &mut InfraState,
+    job: &Job,
+    outcome: Outcome,
+    reading: Reading,
+) -> (CheckResult, Option<RecoveryRun>) {
+    let target = &job.target;
+    let holds = state.holds(job.generation, &target.id);
+    let result = match outcome {
+        Outcome::Answered(result) => result,
+        Outcome::TimedOut => CheckResult::failed(format!(
+            "CHECK DEADLINE: no answer within {}s",
+            job.deadline.as_secs()
+        )),
+        Outcome::Panicked(text) => {
+            error!(
+                "Infra: the check of {} ({}) panicked: {text}",
+                target.id, target.name
+            );
+            if holds {
+                apply_check_panic(state, target, job.config_version);
+            }
+            return (CheckResult::failed(CHECK_PANICKED), None);
+        }
+    };
+    if !holds {
+        debug!(
+            "Infra: the config changed during the check of {}; its result is not applied",
+            target.id
+        );
+        return (result, None);
+    }
+    let run = apply_result(
+        state,
+        target,
+        result.clone(),
+        job.config_version,
+        Instant::now(),
+        reading,
+    );
+    (result, run)
 }
 
 /// What a panic said, for the log.
@@ -338,6 +536,99 @@ fn context_for(state: &InfraState, target: &InfraTarget) -> CheckContext {
     }
 }
 
+// ─── Check now ───────────────────────────────────────────────────────
+
+/// Why Check now did not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckNowError {
+    /// The unit holds no config.
+    NoConfig,
+    /// The config the unit holds has no such target.
+    UnknownTarget,
+}
+
+/// Check now (`POST /api/infra/check/{target_id}`, ADR-010 decision 10): a
+/// reading of one target, under the monitor's deadline, applied as a
+/// monitor check's is. It counts no round and never starts a recovery. A
+/// target has at most one check in flight: while one is, Check now waits
+/// for it, at most the deadline, and answers its result, and no second
+/// check runs. A result is applied only while the unit still holds the
+/// config the check ran under, the target in it; otherwise it is answered
+/// and nothing is applied.
+pub async fn check_now(
+    infra: &Arc<Mutex<InfraState>>,
+    target_id: &str,
+) -> Result<CheckResult, CheckNowError> {
+    let mut waiting_since: Option<Instant> = None;
+    loop {
+        let (taken, deadline) = {
+            let state = infra.lock().await;
+            let config = state.config.as_ref().ok_or(CheckNowError::NoConfig)?;
+            let target = config
+                .targets
+                .iter()
+                .find(|t| t.id == target_id)
+                .ok_or(CheckNowError::UnknownTarget)?;
+            let deadline = state.monitor_kit.deadline();
+            let taken = state.in_flight.take_or_wait(target_id).map(|flight| {
+                let check = (state.monitor_kit.checker())(target, context_for(&state, target));
+                let job = Job {
+                    target: target.clone(),
+                    config_version: config.version,
+                    generation: state.config_generation,
+                    deadline,
+                };
+                (job, check, flight)
+            });
+            (taken, deadline)
+        };
+        let mut answer = match taken {
+            Ok((job, check, flight)) => return Ok(check_now_with(infra, &job, check, flight).await),
+            Err(answer) => answer,
+        };
+        // A check of the target is in flight: its result is the answer.
+        let since = *waiting_since.get_or_insert_with(Instant::now);
+        let left = deadline.saturating_sub(since.elapsed());
+        let waited = tokio::time::timeout(left, answer.wait_for(Option::is_some))
+            .await
+            .map(|answered| answered.ok().and_then(|result| Option::clone(&result)));
+        match waited {
+            Ok(Some(result)) => return Ok(result),
+            // It ended without a result, cancelled with its monitor: the
+            // place is free, so take it.
+            Ok(None) => {}
+            Err(_) => {
+                return Ok(CheckResult::failed(format!(
+                    "CHECK DEADLINE: the check in flight gave no answer within {}s",
+                    deadline.as_secs()
+                )));
+            }
+        }
+    }
+}
+
+/// Check now's own check, from its start to its result applied.
+async fn check_now_with(
+    infra: &Arc<Mutex<InfraState>>,
+    job: &Job,
+    check: BoxFuture<'static, CheckResult>,
+    flight: Flight,
+) -> CheckResult {
+    // A running check, as the round rule reads it: one held past its
+    // deadline plus a tick stops the rounds, as the monitor's do.
+    flight.took_permit(Instant::now());
+    let outcome = Outcome::of(check, job.deadline).await;
+    flight.left_permit();
+    let mut state = infra.lock().await;
+    let (result, recovery) = settle(&mut state, job, outcome, Reading::CheckNow);
+    debug_assert!(recovery.is_none(), "Check now never starts a recovery");
+    drop(recovery);
+    flight.publish(&result);
+    result
+}
+
+// ─── Results and the state machine ───────────────────────────────────
+
 /// What a check that panicked leaves (ADR-010 decision 5): the target reads
 /// `unknown`, its detail saying the agent failed to check it. The agent's
 /// own defect never counts against the target and never fires its
@@ -365,6 +656,7 @@ fn apply_check_panic(state: &mut InfraState, target: &InfraTarget, config_versio
             since,
             consecutive_ok: 0,
             consecutive_fail: 0,
+            consecutive_within: 0,
             last_check: ts.clone(),
             detail: CHECK_PANICKED.to_string(),
             name: target.name.clone(),
@@ -385,41 +677,43 @@ fn apply_check_panic(state: &mut InfraState, target: &InfraTarget, config_versio
     }
 }
 
-/// Fold one check result into the target's state, run the state machine,
-/// fire recovery, keep the session and the data history. `now` is the
-/// monotonic clock, which the recovery's cooldown reads.
-pub async fn apply_result(
+/// Fold one check result into the target's state: the state machine, the
+/// session and the data history, a status change signalled. `now` is the
+/// monotonic clock, which the recovery's cooldown reads. A failed check of
+/// the monitor (`reading`) that leaves the target Down returns the recovery
+/// run it starts, recorded already: the caller runs it with
+/// `run_recovery`, after the Infra lock is released.
+#[must_use = "a recovery run started must run, holding its target's place"]
+pub fn apply_result(
     state: &mut InfraState,
     target: &InfraTarget,
     result: CheckResult,
     config_version: u32,
     now: Instant,
-) {
+    reading: Reading,
+) -> Option<RecoveryRun> {
     let current = state.results.targets.get(&target.id);
     let shown = current.is_some();
     let prev_status = current.map_or(TargetStatus::Unknown, |t| t.status);
     let version_before = state.results.config_version;
+    let within = result.ok
+        && result
+            .latency_ms
+            .is_none_or(|ms| ms <= target.degraded_threshold_ms);
+    let streak = Streak::after(current, result.ok, within);
     let new_status = compute_status(
         prev_status,
-        &result,
-        target.degraded_threshold_ms,
+        result.ok,
+        within,
+        streak,
         target.down_after_consecutive,
         target.up_after_consecutive,
-        current,
     );
 
     let since = if new_status == prev_status {
         current.map_or_else(now_iso, |t| t.since.clone())
     } else {
         now_iso()
-    };
-
-    let (consecutive_ok, consecutive_fail) = if result.ok {
-        let prev_ok = current.map_or(0, |t| t.consecutive_ok);
-        (prev_ok.saturating_add(1), 0)
-    } else {
-        let prev_fail = current.map_or(0, |t| t.consecutive_fail);
-        (0, prev_fail.saturating_add(1))
     };
 
     // A failed API check keeps the last good snapshot visible, marked by the
@@ -438,8 +732,9 @@ pub async fn apply_result(
             status: new_status,
             latency_ms: result.latency_ms,
             since,
-            consecutive_ok,
-            consecutive_fail,
+            consecutive_ok: streak.ok,
+            consecutive_fail: streak.fail,
+            consecutive_within: streak.within,
             last_check: ts.clone(),
             detail: result.detail.clone(),
             name: target.name.clone(),
@@ -478,88 +773,130 @@ pub async fn apply_result(
         }
     }
     // The push rides changes of the picture only, signalled before any
-    // recovery: a status, or the version and the target set when the result
-    // is for a config the results no longer show. A check that leaves them
-    // alone (a latency reading, a counter) is not one.
+    // recovery starts: a status, or the version and the target set when the
+    // result is for a config the results no longer show. A check that
+    // leaves them alone (a latency reading, a counter) is not one.
     if new_status != prev_status || !shown || version_before != config_version {
         state.changed();
     }
 
-    // Recovery action: fire on any DOWN state (new transition or sustained)
-    if new_status == TargetStatus::Down {
-        if let Some(ref recovery) = target.recovery {
-            if recovery.enabled {
-                try_recovery(state, &target.id, recovery, now).await;
-            }
-        }
-    }
-
     // A good answer that moves the target out of Down or `unknown` clears
     // its recovery count (ADR-010 decision 9). A target that answers again
-    // starts afresh, also when the agent failed to check it in between: a
-    // check that panics leaves the target `unknown` and the count standing.
+    // starts afresh, also when the agent failed to check it in between, or
+    // restarted: a check that panics, and a start, leave the target
+    // `unknown` and the count standing.
     if result.ok
         && new_status != prev_status
         && matches!(prev_status, TargetStatus::Down | TargetStatus::Unknown)
     {
-        state.recovery_tracker.remove(&target.id);
+        state.clear_recovery_count(&target.id);
         if prev_status == TargetStatus::Down {
-            info!("Target {} ({}) recovered to UP", target.id, target.name);
+            info!("Target {} ({}) recovered", target.id, target.name);
+        }
+    }
+
+    // A recovery fires only on a failed check of the monitor that leaves
+    // the target Down: the first Down and every failed check after it,
+    // never a good answer and never Check now.
+    if reading == Reading::Monitor && !result.ok && new_status == TargetStatus::Down {
+        if let Some(recovery) = target.recovery.as_ref().filter(|r| r.enabled) {
+            return start_recovery(state, &target.id, recovery, now);
+        }
+    }
+    None
+}
+
+/// The answers in a row, the latest one counted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Streak {
+    /// Good answers, slow ones included.
+    ok: u32,
+    /// Failures.
+    fail: u32,
+    /// Good answers within the threshold.
+    within: u32,
+}
+
+impl Streak {
+    /// The streak after an answer: `ok` says it was good, `within` that it
+    /// was good and within the threshold.
+    fn after(current: Option<&TargetState>, ok: bool, within: bool) -> Self {
+        let before = current.map_or_else(Self::default, |t| Self {
+            ok: t.consecutive_ok,
+            fail: t.consecutive_fail,
+            within: t.consecutive_within,
+        });
+        if ok {
+            Self {
+                ok: before.ok.saturating_add(1),
+                fail: 0,
+                within: if within {
+                    before.within.saturating_add(1)
+                } else {
+                    0
+                },
+            }
+        } else {
+            Self {
+                ok: 0,
+                fail: before.fail.saturating_add(1),
+                within: 0,
+            }
         }
     }
 }
 
-/// Compute the new status based on the state machine rules.
+/// The state machine (ADR-010 decision 8). A good answer above the
+/// threshold is slow, and a slow answer never makes a target Up.
+///
+/// | From     | Good, within             | Good, slow | Failure                    |
+/// |----------|--------------------------|------------|----------------------------|
+/// | Unknown  | Up                       | Degraded   | Degraded                   |
+/// | Up       | Up                       | Degraded   | Degraded                   |
+/// | Degraded | Up at `up_after` in a row | Degraded  | Down at `down_after` in a row |
+/// | Down     | below                    | below      | Down                       |
+///
+/// From Down, `up_after` good answers in a row lead to Up when all were
+/// within the threshold, and to Degraded otherwise; until then the target
+/// stays Down.
 fn compute_status(
     prev: TargetStatus,
-    result: &CheckResult,
-    degraded_threshold_ms: u64,
+    ok: bool,
+    within: bool,
+    streak: Streak,
     down_after: u32,
     up_after: u32,
-    current_state: Option<&TargetState>,
 ) -> TargetStatus {
-    let consecutive_fail = current_state.map_or(0, |s| s.consecutive_fail);
-    let consecutive_ok = current_state.map_or(0, |s| s.consecutive_ok);
-
     match prev {
-        TargetStatus::Unknown => {
-            if result.ok {
+        TargetStatus::Unknown | TargetStatus::Up => {
+            if within {
                 TargetStatus::Up
             } else {
                 TargetStatus::Degraded
-            }
-        }
-        TargetStatus::Up => {
-            if !result.ok {
-                return TargetStatus::Degraded;
-            }
-            if result
-                .latency_ms
-                .is_some_and(|ms| ms > degraded_threshold_ms)
-            {
-                TargetStatus::Degraded
-            } else {
-                TargetStatus::Up
             }
         }
         TargetStatus::Degraded => {
-            if result.ok && consecutive_ok + 1 >= up_after {
+            if within && streak.within >= up_after {
                 TargetStatus::Up
-            } else if !result.ok && consecutive_fail + 1 >= down_after {
+            } else if !ok && streak.fail >= down_after {
                 TargetStatus::Down
             } else {
                 TargetStatus::Degraded
             }
         }
         TargetStatus::Down => {
-            if result.ok && consecutive_ok + 1 >= up_after {
+            if !ok || streak.ok < up_after {
+                TargetStatus::Down
+            } else if within && streak.within >= up_after {
                 TargetStatus::Up
             } else {
-                TargetStatus::Down
+                TargetStatus::Degraded
             }
         }
     }
 }
+
+// ─── Recovery runs ───────────────────────────────────────────────────
 
 /// `SCTL_CRED_USER_n` / `SCTL_CRED_PASS_n` for each credential id, in order
 /// (n from 1); the first id this unit does not hold is the error.
@@ -576,7 +913,8 @@ pub(crate) fn recovery_env(
     Ok(env)
 }
 
-/// A recovery's output with its passwords masked, before it is logged or kept.
+/// A recovery's output with its passwords masked, before it is logged or
+/// kept. A password under 4 bytes and a username stay as they are.
 fn mask(text: &str, secrets: &[String]) -> String {
     secrets
         .iter()
@@ -584,29 +922,179 @@ fn mask(text: &str, secrets: &[String]) -> String {
         .fold(text.to_string(), |acc, s| acc.replace(s.as_str(), "***"))
 }
 
-/// Attempt to execute a recovery action (respecting cooldown and max
-/// retries). `now` is the monotonic clock.
-async fn try_recovery(
+/// `text` cut to at most `max` bytes on a character boundary, as `at.rs`
+/// cuts, with `...` when something was cut. Byte `max` can fall inside a
+/// character: a slice there would panic.
+fn cut(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    format!("{}...", &text[..text.floor_char_boundary(max)])
+}
+
+/// A recovery output as it is logged: masked first, so a cut never leaves
+/// part of a password, then cut to 512 bytes.
+fn for_the_log(text: &str, secrets: &[String]) -> String {
+    cut(&mask(text, secrets), RECOVERY_OUTPUT_BYTES)
+}
+
+/// A recovery run a failed check of the monitor started: recorded (the
+/// cooldown begun, the count up, the run marked as not ended), and not yet
+/// run. `run_recovery` runs it in a task of its own.
+#[derive(Debug)]
+pub struct RecoveryRun {
+    target_id: String,
+    command: String,
+    credential_ids: Vec<String>,
+    started_ms: u64,
+    /// The run is in progress until this drops: one run per target at a
+    /// time, and what a managed upgrade waits for.
+    _in_progress: RunGuard,
+}
+
+/// What a run needs once the Infra lock is released.
+enum Prepared {
+    /// The command and the credentials it names, as environment.
+    Ready {
+        env: Vec<(String, String)>,
+        /// The passwords its output is masked of.
+        secrets: Vec<String>,
+    },
+    /// The command cannot start: a credential is not on this unit.
+    Refused(String),
+}
+
+/// How a run ended.
+struct Ended {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+impl RecoveryRun {
+    /// Under the Infra lock: take the credentials the command names, and
+    /// save the run as not ended, synced, before the command starts.
+    fn prepare(&self, state: &InfraState) -> Prepared {
+        if !state.save_recoveries() {
+            warn!(
+                "Recovery for {}: its record did not reach the disk; it runs all the same",
+                self.target_id
+            );
+        }
+        match recovery_env(&state.credentials, &self.credential_ids) {
+            Err(missing) => {
+                Prepared::Refused(format!("ERROR: credential {missing} is not on this unit"))
+            }
+            Ok(env) => {
+                let secrets = env
+                    .iter()
+                    .filter(|(k, _)| k.starts_with("SCTL_CRED_PASS_"))
+                    .map(|(_, v)| v.clone())
+                    .collect();
+                Prepared::Ready { env, secrets }
+            }
+        }
+    }
+
+    /// Without the lock: run the command under its 300 s limit, and mask and
+    /// cut what it said. A panic here is the agent's, and still ends the
+    /// run with a log entry.
+    async fn execute(&self, prepared: Prepared) -> Ended {
+        let (env, secrets) = match prepared {
+            Prepared::Refused(why) => {
+                return Ended {
+                    exit_code: -1,
+                    stdout: why,
+                    stderr: String::new(),
+                }
+            }
+            Prepared::Ready { env, secrets } => (env, secrets),
+        };
+        info!(
+            "Executing recovery for {}: {}",
+            self.target_id, self.command
+        );
+        let limit_ms = RECOVERY_LIMIT.as_millis() as u64;
+        let run = async {
+            match checks::exec_with_env(&self.command, &env, limit_ms).await {
+                Ok((exit_code, out, err)) => Ended {
+                    exit_code,
+                    stdout: for_the_log(&out, &secrets),
+                    stderr: for_the_log(&err, &secrets),
+                },
+                Err(e) => Ended {
+                    exit_code: -1,
+                    stdout: format!("ERROR: {e}"),
+                    stderr: String::new(),
+                },
+            }
+        };
+        match AssertUnwindSafe(run).catch_unwind().await {
+            Ok(ended) => ended,
+            Err(panic) => {
+                error!(
+                    "Recovery for {}: the agent failed to finish the run: {}",
+                    self.target_id,
+                    panic_text(panic.as_ref())
+                );
+                Ended {
+                    exit_code: -1,
+                    stdout:
+                        "AGENT ERROR: the agent failed to finish this run (see the agent's log)"
+                            .to_string(),
+                    stderr: String::new(),
+                }
+            }
+        }
+    }
+
+    /// Under the Infra lock: log the run, which moves `seq` and
+    /// `recoveries` and is pushed, and save it as ended.
+    fn log(self, state: &mut InfraState, ended: Ended) {
+        info!(
+            "Recovery for {}: exit={}, output={}",
+            self.target_id, ended.exit_code, ended.stdout
+        );
+        state.push_recovery_log(RecoveryLogEntry {
+            ts: now_iso(),
+            target_id: self.target_id.clone(),
+            command: self.command.clone(),
+            exit_code: ended.exit_code,
+            stdout: ended.stdout,
+            stderr: ended.stderr,
+        });
+        if state
+            .runs_not_ended
+            .get(&self.target_id)
+            .is_some_and(|run| run.started_ms == self.started_ms)
+        {
+            state.runs_not_ended.remove(&self.target_id);
+        }
+        state.save_recoveries();
+    }
+}
+
+/// Start a recovery run of `target_id` if its count and its cooldown allow
+/// one and none of it is in progress: the cooldown begins and the count
+/// goes up now, and the run is marked as not ended. Its task saves that
+/// record before the command starts.
+fn start_recovery(
     state: &mut InfraState,
     target_id: &str,
-    recovery: &super::RecoveryConfig,
+    recovery: &RecoveryConfig,
     now: Instant,
-) {
+) -> Option<RecoveryRun> {
     let (last_run, count) = state
         .recovery_tracker
         .get(target_id)
         .map_or((None, 0), |&(at, count)| (Some(at), count));
-
-    // Check max retries
     if count >= recovery.max_retries {
         debug!(
             "Recovery for {target_id}: exhausted ({count}/{} retries)",
             recovery.max_retries
         );
-        return;
+        return None;
     }
-
-    // Check cooldown
     if let Some(last) = last_run {
         let since = now.saturating_duration_since(last);
         if since < Duration::from_secs(recovery.cooldown_secs) {
@@ -615,53 +1103,45 @@ async fn try_recovery(
                 since.as_secs(),
                 recovery.cooldown_secs
             );
-            return;
+            return None;
         }
     }
-
-    info!("Executing recovery for {target_id}: {}", recovery.command);
-
-    // Run the recovery command (5-minute hard timeout), with the credentials
-    // it names as environment; a credential this unit does not hold is a
-    // failed run, never a command run without it.
-    let (exit_code, stdout) = match recovery_env(&state.credentials, &recovery.credential_ids) {
-        Err(missing) => (
-            -1,
-            format!("ERROR: credential {missing} is not on this unit"),
-        ),
-        Ok(env) => {
-            let secrets: Vec<String> = env
-                .iter()
-                .filter(|(k, _)| k.starts_with("SCTL_CRED_PASS_"))
-                .map(|(_, v)| v.clone())
-                .collect();
-            match super::checks::exec_with_env(&recovery.command, &env, 300_000).await {
-                Ok((exit, out, _err)) => (exit, mask(&out, &secrets)),
-                Err(e) => (-1, format!("ERROR: {e}")),
-            }
-        }
+    let Some(in_progress) = state.runs().start(target_id) else {
+        debug!("Recovery for {target_id}: a run is in progress");
+        return None;
     };
-
-    // Truncate stdout for the log
-    let stdout_trunc = if stdout.len() > 512 {
-        format!("{}...", &stdout[..512])
-    } else {
-        stdout
-    };
-
-    info!("Recovery for {target_id}: exit={exit_code}, output={stdout_trunc}");
-
-    state.push_recovery_log(RecoveryLogEntry {
-        ts: now_iso(),
-        target_id: target_id.to_string(),
-        command: recovery.command.clone(),
-        exit_code,
-        stdout: stdout_trunc,
-    });
-
+    let started_ms = now_unix_ms();
     state
         .recovery_tracker
         .insert(target_id.to_string(), (now, count + 1));
+    state.runs_not_ended.insert(
+        target_id.to_string(),
+        SavedRun {
+            started_ms,
+            command: recovery.command.clone(),
+        },
+    );
+    Some(RecoveryRun {
+        target_id: target_id.to_string(),
+        command: recovery.command.clone(),
+        credential_ids: recovery.credential_ids.clone(),
+        started_ms,
+        _in_progress: in_progress,
+    })
+}
+
+/// Run a recovery in a task of its own (ADR-010 decision 9). Under the
+/// Infra lock it takes the credentials the command names and saves the run
+/// as not ended, then releases the lock and runs the command, which only
+/// its 300 s limit or the agent's stop ends: no push, rebuilt monitor or
+/// removed config. Its output, masked and cut, is logged under the lock.
+/// `flight` is the target's place: no check of it starts until the run
+/// ends.
+pub(crate) async fn run_recovery(infra: Arc<Mutex<InfraState>>, run: RecoveryRun, flight: Flight) {
+    let prepared = run.prepare(&*infra.lock().await);
+    let ended = run.execute(prepared).await;
+    run.log(&mut *infra.lock().await, ended);
+    drop(flight);
 }
 
 #[cfg(test)]
@@ -719,6 +1199,64 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Apply `result` as a check of the monitor does, at `now`, and run any
+    /// recovery it starts to its end, here, outside any task.
+    async fn apply(
+        state: &mut InfraState,
+        target: &InfraTarget,
+        result: CheckResult,
+        config_version: u32,
+        now: Instant,
+    ) {
+        let run = apply_result(state, target, result, config_version, now, Reading::Monitor);
+        if let Some(run) = run {
+            run_inline(state, run).await;
+        }
+    }
+
+    /// A recovery run's parts in turn, on a state the test holds.
+    async fn run_inline(state: &mut InfraState, run: RecoveryRun) {
+        let prepared = run.prepare(state);
+        let ended = run.execute(prepared).await;
+        run.log(state, ended);
+    }
+
+    /// A scratch `state_dir`, removed when it drops: the saved recovery
+    /// counts land there.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("sctl-monitor-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+
+        fn state(&self) -> InfraState {
+            InfraState::new(self.path())
+        }
+
+        /// What `infra-recovery.json` holds now; `Null` when it is absent.
+        fn saved(&self) -> serde_json::Value {
+            std::fs::read_to_string(self.0.join("infra-recovery.json"))
+                .map_or(serde_json::Value::Null, |text| {
+                    serde_json::from_str(&text).unwrap()
+                })
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn target(check: CheckSpec) -> InfraTarget {
         InfraTarget {
             id: "t1".into(),
@@ -754,7 +1292,7 @@ mod tests {
             session: Some("bauth=abc".into()),
             ..CheckResult::default()
         };
-        apply_result(&mut state, &t, result, 7, Instant::now()).await;
+        apply(&mut state, &t, result, 7, Instant::now()).await;
         let ts = state.results.targets.get("t1").unwrap();
         assert_eq!(ts.status, TargetStatus::Up);
         assert_eq!(ts.data.as_ref().unwrap()["ap_wan_up"], 1);
@@ -777,8 +1315,8 @@ mod tests {
             session: Some("bauth=abc".into()),
             ..CheckResult::default()
         };
-        apply_result(&mut state, &t, good, 7, Instant::now()).await;
-        apply_result(
+        apply(&mut state, &t, good, 7, Instant::now()).await;
+        apply(
             &mut state,
             &t,
             CheckResult::failed("API TIMEOUT"),
@@ -817,7 +1355,7 @@ mod tests {
                 data: Some(json!({"i": i})),
                 ..CheckResult::default()
             };
-            apply_result(&mut state, &t, r, 1, Instant::now()).await;
+            apply(&mut state, &t, r, 1, Instant::now()).await;
         }
         let ring = state.data_history.get("t1").unwrap();
         assert_eq!(ring.len(), super::super::MAX_DATA_HISTORY);
@@ -843,16 +1381,16 @@ mod tests {
         };
 
         // unknown -> up
-        apply_result(&mut state, &t, ok(3), 1, Instant::now()).await;
+        apply(&mut state, &t, ok(3), 1, Instant::now()).await;
         assert!(changes.has_changed().unwrap());
         changes.borrow_and_update();
 
         // up stays up: a new latency, a new counter, a new last_check
-        apply_result(&mut state, &t, ok(9), 1, Instant::now()).await;
+        apply(&mut state, &t, ok(9), 1, Instant::now()).await;
         assert!(!changes.has_changed().unwrap(), "not a status change");
 
         // up -> degraded
-        apply_result(
+        apply(
             &mut state,
             &t,
             CheckResult::failed("PING TIMEOUT"),
@@ -878,7 +1416,7 @@ mod tests {
                 detail: "PING OK".into(),
                 ..CheckResult::default()
             };
-            apply_result(&mut state, &t, r, 1, Instant::now()).await;
+            apply(&mut state, &t, r, 1, Instant::now()).await;
             assert!(state.results.targets.get("t1").unwrap().data.is_none());
         });
     }
@@ -1259,7 +1797,8 @@ mod tests {
             max_retries: 2,
             credential_ids: Vec::new(),
         });
-        let mut state = InfraState::new("/tmp/sctl-infra-proof-test");
+        let scratch = Scratch::new("seq");
+        let mut state = scratch.state();
         assert!(state.hold_config(InfraConfig {
             version: 1,
             check_interval_secs: 60,
@@ -1269,21 +1808,21 @@ mod tests {
         let failed = || CheckResult::failed("PING TIMEOUT");
 
         // Unknown to up: one change.
-        apply_result(&mut state, &t, good(), 1, Instant::now()).await;
+        apply(&mut state, &t, good(), 1, Instant::now()).await;
         assert_eq!(state.stamp().seq, start.seq + 1);
         // A latency reading alone: none.
         let mut slower = good();
         slower.latency_ms = Some(9);
-        apply_result(&mut state, &t, slower, 1, Instant::now()).await;
+        apply(&mut state, &t, slower, 1, Instant::now()).await;
         assert_eq!(state.stamp().seq, start.seq + 1);
         // Up to degraded: one.
-        apply_result(&mut state, &t, failed(), 1, Instant::now()).await;
+        apply(&mut state, &t, failed(), 1, Instant::now()).await;
         assert_eq!(state.stamp().seq, start.seq + 2);
         // Still degraded: none.
-        apply_result(&mut state, &t, failed(), 1, Instant::now()).await;
+        apply(&mut state, &t, failed(), 1, Instant::now()).await;
         assert_eq!(state.stamp().seq, start.seq + 2);
         // Degraded to down, and the recovery runs and is logged: one each.
-        apply_result(&mut state, &t, failed(), 1, Instant::now()).await;
+        apply(&mut state, &t, failed(), 1, Instant::now()).await;
         let down = state.stamp();
         assert_eq!(down.seq, start.seq + 4);
         assert_eq!(down.recoveries, 1);
@@ -1293,7 +1832,7 @@ mod tests {
             picture_hash(&picture_text(down.boot, 1, [("t1", TargetStatus::Down)]))
         );
         // Still down inside the cooldown: no run, no change.
-        apply_result(&mut state, &t, failed(), 1, Instant::now()).await;
+        apply(&mut state, &t, failed(), 1, Instant::now()).await;
         assert_eq!(state.stamp(), down);
     }
 
@@ -1314,19 +1853,23 @@ mod tests {
     /// The state of `target` after an outage that used up its recovery:
     /// Down, two runs logged, its count at `max_retries`. `at` turns the
     /// seconds since the first check into the monotonic clock.
-    async fn exhausted(target: &InfraTarget, at: impl Fn(u64) -> Instant) -> InfraState {
-        let mut state = InfraState::new("/tmp/sctl-infra-proof-test");
+    async fn exhausted(
+        scratch: &Scratch,
+        target: &InfraTarget,
+        at: impl Fn(u64) -> Instant,
+    ) -> InfraState {
+        let mut state = scratch.state();
         assert!(state.hold_config(InfraConfig {
             version: 1,
             check_interval_secs: 60,
             targets: vec![target.clone()],
         }));
-        apply_result(&mut state, target, good(), 1, at(0)).await;
+        apply(&mut state, target, good(), 1, at(0)).await;
         // Degraded twice, then Down with the first run, the second run once
         // the cooldown has passed, then none.
         for secs in [60, 120, 180, 240, 300] {
             let failed = CheckResult::failed("PING TIMEOUT");
-            apply_result(&mut state, target, failed, 1, at(secs)).await;
+            apply(&mut state, target, failed, 1, at(secs)).await;
         }
         assert_eq!(state.results.targets[&target.id].status, TargetStatus::Down);
         assert_eq!(state.results.recovery_log.len(), 2);
@@ -1346,7 +1889,8 @@ mod tests {
         let t = with_inert_recovery(target_every("t1", 60));
         let t0 = Instant::now();
         let at = |secs| t0 + Duration::from_secs(secs);
-        let mut state = exhausted(&t, at).await;
+        let scratch = Scratch::new("clears");
+        let mut state = exhausted(&scratch, &t, at).await;
 
         apply_check_panic(&mut state, &t, 1);
         assert_eq!(state.results.targets["t1"].status, TargetStatus::Unknown);
@@ -1355,7 +1899,7 @@ mod tests {
             "the agent's own defect is no answer"
         );
 
-        apply_result(&mut state, &t, good(), 1, at(360)).await;
+        apply(&mut state, &t, good(), 1, at(360)).await;
         assert_eq!(state.results.targets["t1"].status, TargetStatus::Up);
         assert!(
             !state.recovery_tracker.contains_key("t1"),
@@ -1365,7 +1909,7 @@ mod tests {
         // The next outage, an hour later: Down, and the recovery runs.
         for secs in [3600, 3660, 3720] {
             let failed = CheckResult::failed("PING TIMEOUT");
-            apply_result(&mut state, &t, failed, 1, at(secs)).await;
+            apply(&mut state, &t, failed, 1, at(secs)).await;
         }
         assert_eq!(state.results.targets["t1"].status, TargetStatus::Down);
         assert_eq!(state.results.recovery_log.len(), 3, "the recovery ran");
@@ -1379,12 +1923,13 @@ mod tests {
         let t = with_inert_recovery(target_every("t1", 60));
         let t0 = Instant::now();
         let at = |secs| t0 + Duration::from_secs(secs);
-        let mut state = exhausted(&t, at).await;
+        let scratch = Scratch::new("stands");
+        let mut state = exhausted(&scratch, &t, at).await;
 
         apply_check_panic(&mut state, &t, 1);
         for secs in [3600, 3660, 3720] {
             let failed = CheckResult::failed("PING TIMEOUT");
-            apply_result(&mut state, &t, failed, 1, at(secs)).await;
+            apply(&mut state, &t, failed, 1, at(secs)).await;
         }
         assert_eq!(state.results.targets["t1"].status, TargetStatus::Down);
         assert_eq!(state.recovery_tracker["t1"].1, 2, "the count stands");
@@ -1393,5 +1938,516 @@ mod tests {
             2,
             "no run past max_retries"
         );
+    }
+
+    // ─── The monitor (ADR-010 decisions 8 to 10) ─────────────────────
+
+    use tokio::sync::mpsc;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    /// The next `infra.state` the forwarder sends.
+    async fn next_message(rx: &mut mpsc::Receiver<WsMessage>) -> serde_json::Value {
+        let message = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("a message")
+            .expect("the forwarder is running");
+        match message {
+            WsMessage::Text(text) => serde_json::from_str(&text).unwrap(),
+            other => panic!("not text: {other:?}"),
+        }
+    }
+
+    /// Nothing sent for longer than the forwarder's one second.
+    async fn silent(rx: &mut mpsc::Receiver<WsMessage>) -> bool {
+        tokio::time::timeout(Duration::from_millis(1500), rx.recv())
+            .await
+            .is_err()
+    }
+
+    fn answer(ok: bool, latency_ms: u64) -> CheckResult {
+        if ok {
+            CheckResult {
+                ok: true,
+                latency_ms: Some(latency_ms),
+                detail: format!("OK {latency_ms}ms"),
+                ..CheckResult::default()
+            }
+        } else {
+            CheckResult::failed("TIMEOUT")
+        }
+    }
+
+    /// A state in `scratch` holding `targets` at version 1.
+    fn holding(scratch: &Scratch, targets: Vec<InfraTarget>) -> InfraState {
+        let mut state = scratch.state();
+        assert!(state.hold_config(InfraConfig {
+            version: 1,
+            check_interval_secs: 60,
+            targets,
+        }));
+        state
+    }
+
+    #[test]
+    fn the_state_machine_is_the_table() {
+        use TargetStatus::{Degraded, Down, Unknown, Up};
+        // The streak after the answer, with down_after 3 and up_after 2.
+        let streak = |ok, fail, within| Streak { ok, fail, within };
+        let next = |from, ok, within, streak| compute_status(from, ok, within, streak, 3, 2);
+
+        // Unknown and Up: within is Up, slow or a failure is Degraded.
+        assert_eq!(next(Unknown, true, true, streak(1, 0, 1)), Up);
+        assert_eq!(next(Unknown, true, false, streak(1, 0, 0)), Degraded);
+        assert_eq!(next(Unknown, false, false, streak(0, 1, 0)), Degraded);
+        assert_eq!(next(Up, true, true, streak(7, 0, 7)), Up);
+        assert_eq!(next(Up, true, false, streak(8, 0, 0)), Degraded);
+        assert_eq!(next(Up, false, false, streak(0, 1, 0)), Degraded);
+
+        // Degraded: Up at up_after answers within in a row, Down at
+        // down_after failures in a row, Degraded otherwise.
+        assert_eq!(next(Degraded, true, true, streak(1, 0, 1)), Degraded);
+        assert_eq!(next(Degraded, true, true, streak(2, 0, 2)), Up);
+        assert_eq!(
+            next(Degraded, true, true, streak(9, 0, 1)),
+            Degraded,
+            "good answers before it, but slow"
+        );
+        assert_eq!(next(Degraded, true, false, streak(50, 0, 0)), Degraded);
+        assert_eq!(next(Degraded, false, false, streak(0, 2, 0)), Degraded);
+        assert_eq!(next(Degraded, false, false, streak(0, 3, 0)), Down);
+
+        // Down: Down until up_after good answers in a row, then Up when all
+        // were within, Degraded otherwise.
+        assert_eq!(next(Down, true, true, streak(1, 0, 1)), Down);
+        assert_eq!(
+            next(Down, true, false, streak(1, 0, 0)),
+            Down,
+            "one slow answer leaves Down as Down"
+        );
+        assert_eq!(next(Down, true, true, streak(2, 0, 2)), Up);
+        assert_eq!(
+            next(Down, true, true, streak(2, 0, 1)),
+            Degraded,
+            "one slow before"
+        );
+        assert_eq!(
+            next(Down, true, false, streak(2, 0, 0)),
+            Degraded,
+            "the last slow"
+        );
+        assert_eq!(next(Down, false, false, streak(0, 9, 0)), Down);
+    }
+
+    /// A camera answering steadily at 1.5 times its threshold was one flap
+    /// and one push per check. Now it is one Degraded span: one change, one
+    /// push, for 50 answers.
+    #[tokio::test]
+    async fn a_target_steady_at_one_and_a_half_times_its_threshold_stays_degraded() {
+        let scratch = Scratch::new("slow");
+        let cam = target_every("cam", 60);
+        let infra = Arc::new(Mutex::new(holding(&scratch, vec![cam.clone()])));
+        let (tx, mut rx) = mpsc::channel(16);
+        let forwarder =
+            crate::tunnel::infra_state::spawn_forwarder(true, Some(infra.clone()), tx).unwrap();
+        assert_eq!(
+            next_message(&mut rx).await["targets"]["cam"]["status"],
+            "unknown"
+        );
+        let start = infra.lock().await.stamp();
+
+        for _ in 0..50 {
+            let mut state = infra.lock().await;
+            apply(&mut state, &cam, answer(true, 300), 1, Instant::now()).await;
+            assert_eq!(state.results.targets["cam"].status, TargetStatus::Degraded);
+        }
+        assert_eq!(infra.lock().await.stamp().seq, start.seq + 1, "one change");
+        let pushed = next_message(&mut rx).await;
+        assert_eq!(pushed["targets"]["cam"]["status"], "degraded");
+        assert!(silent(&mut rx).await, "one push");
+        assert!(
+            pushed["targets"]["cam"].get("consecutive_within").is_none(),
+            "the count stays inside the agent"
+        );
+
+        // up_after answers within the threshold bring it Up, not one.
+        {
+            let mut state = infra.lock().await;
+            apply(&mut state, &cam, answer(true, 100), 1, Instant::now()).await;
+            assert_eq!(state.results.targets["cam"].status, TargetStatus::Degraded);
+            apply(&mut state, &cam, answer(true, 100), 1, Instant::now()).await;
+            assert_eq!(state.results.targets["cam"].status, TargetStatus::Up);
+        }
+        assert_eq!(
+            next_message(&mut rx).await["targets"]["cam"]["status"],
+            "up"
+        );
+        forwarder.abort();
+    }
+
+    #[tokio::test]
+    async fn a_slow_answer_never_makes_a_target_up() {
+        let scratch = Scratch::new("never-up");
+        let t = target_every("t1", 60);
+        let mut state = holding(&scratch, vec![t.clone()]);
+        let status = |state: &InfraState| state.results.targets["t1"].status;
+
+        // A slow first answer takes Unknown to Degraded.
+        apply(&mut state, &t, answer(true, 300), 1, Instant::now()).await;
+        assert_eq!(status(&state), TargetStatus::Degraded);
+
+        // From Down: one slow good answer leaves it Down.
+        for _ in 0..3 {
+            apply(&mut state, &t, answer(false, 0), 1, Instant::now()).await;
+        }
+        assert_eq!(status(&state), TargetStatus::Down);
+        apply(&mut state, &t, answer(true, 300), 1, Instant::now()).await;
+        assert_eq!(status(&state), TargetStatus::Down);
+        // up_after good answers with one slow take it to Degraded.
+        apply(&mut state, &t, answer(true, 100), 1, Instant::now()).await;
+        assert_eq!(status(&state), TargetStatus::Degraded);
+
+        // The slow one last: Degraded too.
+        for _ in 0..3 {
+            apply(&mut state, &t, answer(false, 0), 1, Instant::now()).await;
+        }
+        assert_eq!(status(&state), TargetStatus::Down);
+        apply(&mut state, &t, answer(true, 100), 1, Instant::now()).await;
+        assert_eq!(status(&state), TargetStatus::Down);
+        apply(&mut state, &t, answer(true, 300), 1, Instant::now()).await;
+        assert_eq!(status(&state), TargetStatus::Degraded);
+
+        // All within: Up.
+        for _ in 0..3 {
+            apply(&mut state, &t, answer(false, 0), 1, Instant::now()).await;
+        }
+        apply(&mut state, &t, answer(true, 100), 1, Instant::now()).await;
+        apply(&mut state, &t, answer(true, 100), 1, Instant::now()).await;
+        assert_eq!(status(&state), TargetStatus::Up);
+    }
+
+    /// A target with an inert recovery whose cooldown is `cooldown_secs`.
+    fn pdu(cooldown_secs: u64) -> InfraTarget {
+        let mut t = with_inert_recovery(target_every("pdu", 60));
+        if let Some(recovery) = t.recovery.as_mut() {
+            recovery.cooldown_secs = cooldown_secs;
+            recovery.max_retries = 5;
+        }
+        t
+    }
+
+    /// A good answer while Down is a device coming back: it fires no
+    /// recovery, whatever the cooldown says. A failed check of the monitor
+    /// past the cooldown does; Check now's never does.
+    #[tokio::test]
+    async fn only_a_failed_check_of_the_monitor_fires_a_recovery() {
+        let scratch = Scratch::new("fires");
+        let t = pdu(60);
+        let mut state = holding(&scratch, vec![t.clone()]);
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let fold = |state: &mut InfraState, ok: bool, secs: u64, reading: Reading| {
+            apply_result(state, &t, answer(ok, 300), 1, at(secs), reading)
+        };
+
+        assert!(fold(&mut state, false, 0, Reading::Monitor).is_none());
+        assert!(fold(&mut state, false, 10, Reading::Monitor).is_none());
+        let first = fold(&mut state, false, 20, Reading::Monitor).expect("the first Down");
+        run_inline(&mut state, first).await;
+        assert_eq!(state.results.targets["pdu"].status, TargetStatus::Down);
+
+        // Past the cooldown, a good answer that leaves it Down: no run.
+        assert!(fold(&mut state, true, 100, Reading::Monitor).is_none());
+        assert_eq!(state.results.targets["pdu"].status, TargetStatus::Down);
+        assert_eq!(state.recovery_tracker["pdu"].1, 1);
+        // Check now's failure past the cooldown: no run either.
+        assert!(fold(&mut state, false, 110, Reading::CheckNow).is_none());
+        // The monitor's failure past the cooldown: a run.
+        let second = fold(&mut state, false, 120, Reading::Monitor).expect("past the cooldown");
+        run_inline(&mut state, second).await;
+        assert_eq!(state.recovery_tracker["pdu"].1, 2);
+        assert_eq!(state.results.recovery_log.len(), 2);
+    }
+
+    /// One run per target at a time: a Down check while its run is in
+    /// progress starts no second run, even with no cooldown.
+    #[tokio::test]
+    async fn a_down_check_while_a_run_is_in_progress_starts_no_second_run() {
+        let scratch = Scratch::new("one-run");
+        let t = pdu(0);
+        let mut state = holding(&scratch, vec![t.clone()]);
+        let failed = |state: &mut InfraState| {
+            apply_result(
+                state,
+                &t,
+                answer(false, 0),
+                1,
+                Instant::now(),
+                Reading::Monitor,
+            )
+        };
+        for _ in 0..2 {
+            assert!(failed(&mut state).is_none());
+        }
+        let run = failed(&mut state).expect("Down: the first run");
+        assert!(state.runs().contains("pdu"));
+        assert_eq!(state.runs_not_ended["pdu"].command, "true");
+        assert!(failed(&mut state).is_none(), "its run is in progress");
+        assert_eq!(state.recovery_tracker["pdu"].1, 1);
+
+        run_inline(&mut state, run).await;
+        assert!(!state.runs().contains("pdu"));
+        assert!(state.runs_not_ended.is_empty(), "logged: ended");
+        assert!(failed(&mut state).is_some(), "the next one may run");
+    }
+
+    /// What a recovery wrote, as its log entry keeps it.
+    async fn logged_output(scratch: &Scratch, command: String) -> RecoveryLogEntry {
+        let mut t = pdu(0);
+        if let Some(recovery) = t.recovery.as_mut() {
+            recovery.command = command;
+            recovery.credential_ids = vec!["pdu-login".into()];
+        }
+        let mut state = holding(scratch, vec![t.clone()]);
+        state.credentials.insert(
+            "pdu-login".into(),
+            super::super::Credential {
+                username: "admin".into(),
+                password: "S3cret-pw".into(),
+            },
+        );
+        let run = (0..5)
+            .find_map(|_| {
+                apply_result(
+                    &mut state,
+                    &t,
+                    answer(false, 0),
+                    1,
+                    Instant::now(),
+                    Reading::Monitor,
+                )
+            })
+            .expect("Down within five failures");
+        run_inline(&mut state, run).await;
+        state.results.recovery_log.pop().expect("logged")
+    }
+
+    /// 600 bytes of three-byte characters: byte 512 falls inside one, and a
+    /// slice there panicked before the run was logged or counted, so the
+    /// recovery ran again at every Down check.
+    #[tokio::test]
+    async fn a_recoverys_output_is_cut_on_a_character_boundary() {
+        let scratch = Scratch::new("cut");
+        let euros = "€".repeat(200);
+        assert_eq!(euros.len(), 600);
+        // printf only, with fixed text.
+        let entry = logged_output(
+            &scratch,
+            format!("printf '%s' '{euros}'; printf '%s' '{euros}' >&2; exit 3"),
+        )
+        .await;
+        assert_eq!(entry.exit_code, 3);
+        for (stream, text) in [("stdout", &entry.stdout), ("stderr", &entry.stderr)] {
+            assert_eq!(text.len(), 510 + 3, "{stream}: 170 characters and `...`");
+            assert_eq!(
+                text.strip_suffix("...").unwrap(),
+                "€".repeat(170),
+                "{stream}"
+            );
+        }
+    }
+
+    /// stdout and stderr are masked before they are cut, so a cut never
+    /// leaves part of a password. stderr gets stdout's mask: a shell trace
+    /// writes expanded commands there.
+    #[tokio::test]
+    async fn a_recoverys_stdout_and_stderr_are_masked_before_the_cut() {
+        let scratch = Scratch::new("mask");
+        let pad = "x".repeat(508);
+        // The password's bytes would straddle byte 512 if it were cut first.
+        let entry = logged_output(
+            &scratch,
+            format!(
+                "printf '%s%s' '{pad}' \"$SCTL_CRED_PASS_1\"; \
+                 printf '%s%s' '{pad}' \"$SCTL_CRED_PASS_1\" >&2; printf '%s' '{pad}' >&2"
+            ),
+        )
+        .await;
+        assert_eq!(entry.stdout, format!("{pad}***"));
+        assert_eq!(entry.stderr, format!("{pad}***x..."));
+        for text in [&entry.stdout, &entry.stderr] {
+            assert!(!text.contains("S3c"), "{text}");
+        }
+    }
+
+    /// A unit whose recovery cuts its own power restarts the agent. The
+    /// saved count stands, a full cooldown runs from the start, and a run
+    /// the agent did not see end is logged with its outcome unknown.
+    #[tokio::test]
+    async fn at_start_a_run_not_ended_is_logged_and_the_count_stands() {
+        let scratch = Scratch::new("restart");
+        let config = InfraConfig {
+            version: 7,
+            check_interval_secs: 60,
+            targets: vec![pdu(300), target_every("cam", 60)],
+        };
+        std::fs::write(
+            scratch.0.join("infra-monitor.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let saved = json!({
+            "counts": {"pdu": 1, "gone": 2},
+            "running": {"pdu": {"started_ms": 1_790_000_000_000_u64, "command": "true"}},
+        });
+        std::fs::write(scratch.0.join("infra-recovery.json"), saved.to_string()).unwrap();
+
+        let mut state = scratch.state();
+        state.load_config();
+        let loaded = Instant::now();
+        state.load_recoveries();
+
+        let entry = &state.results.recovery_log[0];
+        assert_eq!(state.results.recovery_log.len(), 1);
+        assert_eq!((entry.target_id.as_str(), entry.exit_code), ("pdu", -1));
+        assert_eq!(
+            entry.stdout,
+            "OUTCOME UNKNOWN: the agent stopped before this run ended (it started at 2026-09-21T14:13:20Z)"
+        );
+        let stamp = state.stamp();
+        assert_eq!(
+            (stamp.seq, stamp.recoveries),
+            (2, 1),
+            "a logged run moves both"
+        );
+        assert_eq!(
+            scratch.saved(),
+            json!({"counts": {"pdu": 1}, "running": {}}),
+            "logged now, and a target the config lacks loses its count"
+        );
+
+        // The count stands, and the cooldown runs from the start.
+        let t = &config.targets[0];
+        assert!(state.recovery_tracker["pdu"].0 >= loaded);
+        let at = |secs| loaded + Duration::from_secs(secs);
+        for secs in [10, 20, 30, 299] {
+            let run = apply_result(
+                &mut state,
+                t,
+                answer(false, 0),
+                7,
+                at(secs),
+                Reading::Monitor,
+            );
+            assert!(run.is_none(), "cooling down at {secs}s");
+        }
+        assert_eq!(state.results.targets["pdu"].status, TargetStatus::Down);
+        let run = apply_result(
+            &mut state,
+            t,
+            answer(false, 0),
+            7,
+            at(301),
+            Reading::Monitor,
+        );
+        assert!(run.is_some(), "a full cooldown after the start");
+        assert_eq!(state.recovery_tracker["pdu"].1, 2, "the count stood");
+    }
+
+    #[tokio::test]
+    async fn the_first_good_answer_after_a_start_clears_the_saved_count() {
+        let scratch = Scratch::new("answered");
+        let t = pdu(300);
+        let mut state = holding(&scratch, vec![t.clone()]);
+        std::fs::write(
+            scratch.0.join("infra-recovery.json"),
+            json!({"counts": {"pdu": 2}}).to_string(),
+        )
+        .unwrap();
+        state.load_recoveries();
+        assert_eq!(state.recovery_tracker["pdu"].1, 2);
+        assert_eq!(state.results.targets["pdu"].status, TargetStatus::Unknown);
+
+        apply(&mut state, &t, answer(true, 3), 1, Instant::now()).await;
+        assert!(state.recovery_tracker.is_empty(), "out of unknown: afresh");
+        assert_eq!(
+            scratch.saved(),
+            serde_json::Value::Null,
+            "nothing left to save"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_target_a_push_drops_loses_its_saved_count() {
+        let scratch = Scratch::new("dropped");
+        let mut state = holding(&scratch, vec![pdu(300), target_every("cam", 60)]);
+        std::fs::write(
+            scratch.0.join("infra-recovery.json"),
+            json!({"counts": {"pdu": 2, "cam": 1}}).to_string(),
+        )
+        .unwrap();
+        state.load_recoveries();
+        assert_eq!(state.recovery_tracker.len(), 2);
+
+        assert!(state.hold_config(InfraConfig {
+            version: 2,
+            check_interval_secs: 60,
+            targets: vec![target_every("cam", 60)],
+        }));
+        assert!(!state.recovery_tracker.contains_key("pdu"));
+        assert_eq!(
+            scratch.saved(),
+            json!({"counts": {"cam": 1}, "running": {}})
+        );
+
+        // A removed config clears every count.
+        assert!(state.drop_config());
+        assert!(state.recovery_tracker.is_empty());
+        assert_eq!(scratch.saved(), serde_json::Value::Null);
+    }
+
+    /// A result is applied only while the unit holds the config the check
+    /// ran under, the target in it: a monitor replaced during its check, or
+    /// a Check now whose config changed, is answered and applies nothing.
+    #[test]
+    fn a_result_for_a_config_no_longer_held_is_answered_and_not_applied() {
+        let scratch = Scratch::new("stale");
+        let t = pdu(0);
+        let mut state = holding(&scratch, vec![t.clone()]);
+        let job = Job {
+            target: t.clone(),
+            config_version: 1,
+            generation: state.config_generation,
+            deadline: CHECK_DEADLINE,
+        };
+        assert!(state.hold_config(InfraConfig {
+            version: 2,
+            check_interval_secs: 60,
+            targets: vec![t.clone()],
+        }));
+        let seq = state.stamp().seq;
+        for reading in [Reading::Monitor, Reading::CheckNow] {
+            let (result, run) = settle(&mut state, &job, Outcome::Answered(good()), reading);
+            assert!(result.ok, "answered");
+            assert!(run.is_none());
+            let (result, _) = settle(&mut state, &job, Outcome::Panicked("x".into()), reading);
+            assert_eq!(result.detail, CHECK_PANICKED);
+        }
+        let target = &state.results.targets["pdu"];
+        assert_eq!(target.status, TargetStatus::Unknown);
+        assert!(target.last_check.is_empty(), "nothing applied");
+        assert_eq!(state.results.config_version, 2);
+        assert_eq!(state.stamp().seq, seq);
+
+        // The config it ran under: applied.
+        let held = Job {
+            generation: state.config_generation,
+            config_version: 2,
+            ..job
+        };
+        let (_, run) = settle(&mut state, &held, Outcome::TimedOut, Reading::Monitor);
+        assert!(run.is_none());
+        let target = &state.results.targets["pdu"];
+        assert_eq!(target.status, TargetStatus::Degraded);
+        assert_eq!(target.detail, "CHECK DEADLINE: no answer within 90s");
     }
 }

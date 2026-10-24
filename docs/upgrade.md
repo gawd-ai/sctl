@@ -283,8 +283,14 @@ finished state (the fleet does not need it; it is for a person at the box).
 5. **Write the rollback set**: the current files named by `install.json`, copied
    into `rollback_dir` (replacing an older set), plus `sctl.toml`. On
    `ramboot`, the current `ramboot.conf`.
-6. **Hand off to the helper.** The running binary copies itself to the stage
-   (`<stage>/helper`) and starts `helper upgrade-apply --stage <stage>` detached:
+6. **Hand off to the helper.** First the agent waits for any Infra recovery
+   run in progress to end, at most the run's own 300 s limit (ADR-010): the
+   helper's restart ends the agent and a run with it, and a run may be a
+   power cycle between off and on. A run begun after the hand-off can still
+   be cut, and the next start logs it with its outcome unknown;
+   `sctl upgrade` from a shell is another process and does not wait. Then
+   the running binary copies itself to the stage (`<stage>/helper`) and
+   starts `helper upgrade-apply --stage <stage>` detached:
    its own session (`setsid`), stdio to the stage's `log`, and on the `systemd`
    layout through `systemd-run --collect --unit sctl-upgrade-<version>` so it
    lives outside the service's cgroup. The agent writes `phase: applying` to

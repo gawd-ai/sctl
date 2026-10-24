@@ -262,7 +262,7 @@ mod tests {
 
     use super::*;
     use crate::infra::checks::CheckResult;
-    use crate::infra::monitor::apply_result;
+    use crate::infra::monitor::{apply_result, Reading};
     use crate::infra::{
         picture_hash, picture_text, CheckSpec, Digest, InfraConfig, InfraTarget, TargetState,
     };
@@ -274,6 +274,7 @@ mod tests {
             since: "2026-09-30T11:58:00Z".into(),
             consecutive_ok: 3,
             consecutive_fail: 0,
+            consecutive_within: 3,
             last_check: "2026-09-30T12:00:00Z".into(),
             detail: detail.into(),
             name: name.into(),
@@ -402,6 +403,7 @@ mod tests {
                 since: "2026-09-30T11:58:00Z".into(),
                 consecutive_ok: 3,
                 consecutive_fail: 0,
+                consecutive_within: 3,
                 last_check: "2026-09-30T12:00:00Z".into(),
                 detail: "API OK".into(),
                 name: "Peplink MAX BR1".into(),
@@ -577,7 +579,15 @@ mod tests {
 
     async fn check(infra: &Arc<Mutex<InfraState>>, id: &str, result: CheckResult) {
         let mut guard = infra.lock().await;
-        apply_result(&mut guard, &target(id), result, 7, Instant::now()).await;
+        let run = apply_result(
+            &mut guard,
+            &target(id),
+            result,
+            7,
+            Instant::now(),
+            Reading::Monitor,
+        );
+        assert!(run.is_none(), "these targets have no recovery");
     }
 
     /// The message's stamp, as numbers and the hash.
@@ -672,6 +682,7 @@ mod tests {
                 command: "true".into(),
                 exit_code: 0,
                 stdout: String::new(),
+                stderr: String::new(),
             });
         let logged = next_message(&mut rx).await;
         let (_, logged_seq, logged_hash, logged_recoveries) = stamp_of(&logged);
