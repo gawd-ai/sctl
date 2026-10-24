@@ -1405,8 +1405,9 @@ async fn connect_and_run(
         },
     );
 
-    // The device's Infra results, pushed the same way: now, then whenever a
-    // target's status changes or a config is applied.
+    // The device's Infra results, pushed the same way: now, then whenever
+    // `seq` has moved (a target's status, a config applied or removed, a
+    // recovery run logged), at most one a second.
     let infra_state_task = infra_state::spawn_forwarder(
         relay_takes_infra_state,
         state.infra_state.clone(),

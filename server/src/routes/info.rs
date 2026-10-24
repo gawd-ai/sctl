@@ -840,18 +840,19 @@ mod infra_group_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The group example of `docs/http-api.md`.
     #[test]
     fn a_steady_units_group_is_about_60_bytes() {
         let group = Group {
             rounds: 17280,
             seq: 42,
-            hash: "3f9a0c1d2e4b5a69".into(),
+            hash: "1666903c369dff7f".into(),
             off: None,
         };
         let text = serde_json::to_string(&group).unwrap();
         assert_eq!(
             text,
-            r#"{"rounds":17280,"seq":42,"hash":"3f9a0c1d2e4b5a69"}"#
+            r#"{"rounds":17280,"seq":42,"hash":"1666903c369dff7f"}"#
         );
         assert_eq!(r#""infra":"#.len() + text.len(), 59);
         let off = Group {

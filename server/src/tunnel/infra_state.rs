@@ -17,7 +17,7 @@
 //!
 //! ```json
 //! {"type": "infra.state", "v": 1,
-//!  "boot": 1790000000000, "seq": 42, "hash": "3f9a0c1d2e4b5a69", "recoveries": 0,
+//!  "boot": 1790000000000, "seq": 42, "hash": "1666903c369dff7f", "recoveries": 0,
 //!  "ts": "2026-09-30T12:00:00Z", "config_version": 7,
 //!  "targets": {
 //!    "6f0b2c4e-9d3a-4c1f-8e2b-1a2b3c4d5e6f": {
@@ -263,7 +263,9 @@ mod tests {
     use super::*;
     use crate::infra::checks::CheckResult;
     use crate::infra::monitor::apply_result;
-    use crate::infra::{CheckSpec, InfraConfig, InfraTarget, TargetState};
+    use crate::infra::{
+        picture_hash, picture_text, CheckSpec, Digest, InfraConfig, InfraTarget, TargetState,
+    };
 
     fn state(id: &str, status: TargetStatus, detail: &str, name: &str) -> TargetState {
         TargetState {
@@ -289,12 +291,18 @@ mod tests {
         }
     }
 
-    /// The stamp of the documented example.
+    /// When the agent of these tests started.
+    const BOOT: u64 = 1_790_000_000_000;
+
+    /// The stamp of the documented example: its `boot`, `seq` 42, and the
+    /// hash of its picture, one target up at version 7. `build` carries a
+    /// stamp as given, so a test of another part of the message uses this
+    /// one whatever its picture.
     fn stamp() -> Stamp {
         Stamp {
-            boot: 1_790_000_000_000,
+            boot: BOOT,
             seq: 42,
-            hash: "3f9a0c1d2e4b5a69".into(),
+            hash: "1666903c369dff7f".into(),
             recoveries: 0,
         }
     }
@@ -311,7 +319,16 @@ mod tests {
                 state("api-1", TargetStatus::Up, "API OK", "Peplink MAX BR1"),
             ),
         ]);
-        let message = build(&results, stamp(), "2026-09-30T12:00:00Z".into());
+        // A stamp that names this picture.
+        let named = Stamp {
+            hash: picture_hash(&picture_text(
+                BOOT,
+                7,
+                [("ping-1", TargetStatus::Down), ("api-1", TargetStatus::Up)],
+            )),
+            ..stamp()
+        };
+        let message = build(&results, named, "2026-09-30T12:00:00Z".into());
         assert_eq!(
             serde_json::to_value(&message).unwrap(),
             json!({
@@ -319,7 +336,7 @@ mod tests {
                 "v": 1,
                 "boot": 1_790_000_000_000_u64,
                 "seq": 42,
-                "hash": "3f9a0c1d2e4b5a69",
+                "hash": "be9f0511a214e881",
                 "recoveries": 0,
                 "ts": "2026-09-30T12:00:00Z",
                 "config_version": 7,
@@ -341,6 +358,85 @@ mod tests {
             }),
             "sorted by id, no data, no recovery log, http_status only when present"
         );
+    }
+
+    /// The first `json` block in `text`.
+    fn first_json_block(text: &str) -> &str {
+        let block = text.split("```json").nth(1).expect("a json block");
+        block.split("```").next().expect("its end")
+    }
+
+    /// The first `json` block in `text` after `heading`.
+    fn json_after<'a>(text: &'a str, heading: &str) -> &'a str {
+        first_json_block(&text[text.find(heading).expect("the heading")..])
+    }
+
+    /// The `infra.state` example of `docs/http-api.md` is the message the
+    /// agent builds for the picture it shows, its `hash` included, so a copy
+    /// kept from it hashes as the page says. This module's doc shows the
+    /// same message, and the page's `infra` group example, at the same
+    /// `seq`, names the same picture.
+    #[test]
+    fn the_documented_example_is_the_message_the_agent_builds() {
+        let page =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/http-api.md"))
+                .expect("docs/http-api.md");
+        let example: Value = serde_json::from_str(json_after(&page, "#### `infra.state`")).unwrap();
+
+        // The picture it shows, held by an agent that started at its `boot`.
+        let id = "6f0b2c4e-9d3a-4c1f-8e2b-1a2b3c4d5e6f";
+        let mut agent = InfraState::with_digest(
+            "/tmp/sctl-infra-state-test",
+            Arc::new(Digest::new(BOOT, false)),
+        );
+        assert!(agent.hold_config(InfraConfig {
+            version: 7,
+            check_interval_secs: 60,
+            targets: vec![target(id)],
+        }));
+        agent.results.targets.insert(
+            id.into(),
+            TargetState {
+                status: TargetStatus::Up,
+                latency_ms: Some(40),
+                since: "2026-09-30T11:58:00Z".into(),
+                consecutive_ok: 3,
+                consecutive_fail: 0,
+                last_check: "2026-09-30T12:00:00Z".into(),
+                detail: "API OK".into(),
+                name: "Peplink MAX BR1".into(),
+                http_status: Some(200),
+                data: Some(json!({"ap_wan_up": 1})),
+            },
+        );
+        agent.changed();
+        // The agent's own hash of that picture, at the example's `seq`.
+        let named = Stamp {
+            seq: 42,
+            ..agent.stamp()
+        };
+        assert_eq!(named, stamp(), "the stamp of the documented example");
+        let message = build(&agent.results, named, "2026-09-30T12:00:00Z".into());
+        assert_eq!(serde_json::to_value(&message).unwrap(), example);
+
+        // This module's doc shows the same message.
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/tunnel/infra_state.rs"
+        ))
+        .expect("this module's source");
+        let module_doc: Vec<&str> = source
+            .lines()
+            .map_while(|line| line.strip_prefix("//!"))
+            .collect();
+        let shown: Value = serde_json::from_str(first_json_block(&module_doc.join("\n"))).unwrap();
+        assert_eq!(shown, example, "this module's doc");
+
+        // The page's `infra` group shows the same `seq`, so the same picture.
+        let group = format!("{{{}}}", json_after(&page, "### `GET /api/info`"));
+        let group: Value = serde_json::from_str(&group).unwrap();
+        assert_eq!(group["infra"]["seq"], example["seq"]);
+        assert_eq!(group["infra"]["hash"], example["hash"]);
     }
 
     #[test]

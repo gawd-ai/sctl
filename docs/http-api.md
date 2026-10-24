@@ -185,7 +185,7 @@ Response `200` — an object containing only the requested groups:
   steady unit's group is about 60 bytes:
 
   ```json
-  "infra": {"rounds": 17280, "seq": 42, "hash": "3f9a0c1d2e4b5a69"}
+  "infra": {"rounds": 17280, "seq": 42, "hash": "1666903c369dff7f"}
   ```
 
   - `rounds`: monitor rounds since the agent started. A round is counted at
@@ -1300,7 +1300,7 @@ checking; it pulls `GET /api/infra/results` only when they disagree.
 ```json
 {
   "type": "infra.state", "v": 1,
-  "boot": 1790000000000, "seq": 42, "hash": "3f9a0c1d2e4b5a69", "recoveries": 0,
+  "boot": 1790000000000, "seq": 42, "hash": "1666903c369dff7f", "recoveries": 0,
   "ts": "2026-09-30T12:00:00Z",
   "config_version": 7,
   "targets": {
