@@ -2373,6 +2373,107 @@ mod tests {
         assert!(fake.log().is_empty(), "{:?}", fake.log());
     }
 
+    /// ADR-012 decision 10: the port probe judges each host by the guard,
+    /// one found by ARP alone in a subnet off the LAN side too. With a
+    /// runbook's /32 on the wired port and a host route to one device, the
+    /// named /24 is not swept, the device under the host route gets the
+    /// port probe from the /32, and another host ARP found there, behind
+    /// the LTE gateway by the routes, gets none. With a gateway route
+    /// splitting br-lan's network, a host in its on-link part gets the
+    /// probe and one behind the gateway does not. Each keeps its answer's
+    /// MAC.
+    #[tokio::test]
+    async fn a_host_found_by_arp_alone_gets_the_port_probe_where_the_guard_approves_it() {
+        let mut addrs = unit_addrs();
+        addrs.retain(|a| a.index != 3);
+        addrs.push(addr(3, [192, 168, 1, 250], 32));
+        let mut routes = unit_routes();
+        routes.retain(|r| r.oif != Some(3));
+        routes.push(route(Some(([192, 168, 1, 50], 32)), None, 3, 0));
+        let mut fake = Fake::on(network(&unit_links(), &addrs, &routes));
+        fake.arp_scan = Some(HashMap::from([(
+            ("eth1".to_string(), cidr("192.168.1.0/24")),
+            vec![
+                Answered {
+                    ip: ip("192.168.1.50"),
+                    mac: Some(MAC_A),
+                },
+                Answered {
+                    ip: ip("192.168.1.60"),
+                    mac: Some(MAC_B),
+                },
+            ],
+        )]));
+        let scanned = scan(&fake, &requested(&["192.168.1.0/24"]), &no_progress())
+            .await
+            .unwrap();
+        assert_eq!(
+            scanned.not_swept,
+            [NotSwept {
+                cidr: "192.168.1.0/24".into(),
+                reason: NotSweptReason::NotOnLan,
+            }]
+        );
+        assert_eq!(
+            fake.log_of("ports"),
+            ["ports eth1 192.168.1.50 from 192.168.1.250"]
+        );
+        let mac = |scanned: &Scanned, at: &str| device(scanned, at).mac.clone();
+        assert_eq!(
+            mac(&scanned, "192.168.1.50").as_deref(),
+            Some("02:00:00:00:00:0a")
+        );
+        assert_eq!(
+            mac(&scanned, "192.168.1.60").as_deref(),
+            Some("02:00:00:00:00:0b")
+        );
+
+        let mut routes = unit_routes();
+        routes.push(route(
+            Some(([192, 0, 2, 128], 25)),
+            Some([192, 0, 2, 5]),
+            4,
+            0,
+        ));
+        let mut fake = Fake::on(network(&unit_links(), &unit_addrs(), &routes));
+        fake.arp_scan = Some(HashMap::from([(
+            ("br-lan".to_string(), cidr("192.0.2.0/24")),
+            vec![
+                Answered {
+                    ip: ip("192.0.2.20"),
+                    mac: Some(MAC_C),
+                },
+                Answered {
+                    ip: ip("192.0.2.200"),
+                    mac: Some(MAC_D),
+                },
+            ],
+        )]));
+        let scanned = scan(&fake, &requested(&["192.0.2.0/24"]), &no_progress())
+            .await
+            .unwrap();
+        assert_eq!(
+            scanned.not_swept,
+            [NotSwept {
+                cidr: "192.0.2.0/24".into(),
+                reason: NotSweptReason::NotOnLan,
+            }]
+        );
+        assert_eq!(
+            fake.log_of("ports"),
+            ["ports br-lan 192.0.2.20 from 192.0.2.1"]
+        );
+        assert_eq!(
+            mac(&scanned, "192.0.2.20").as_deref(),
+            Some("02:00:00:00:00:0c")
+        );
+        assert_eq!(
+            mac(&scanned, "192.0.2.200").as_deref(),
+            Some("02:00:00:00:00:0d")
+        );
+        assert!(fake.log_of("ping").is_empty() && fake.log_of("nmap").is_empty());
+    }
+
     /// ADR-012 decision 13: a LAN subnet larger than the fallback's 254
     /// hosts is swept by nmap or arp-scan, else is `too_large`.
     #[tokio::test]
