@@ -956,14 +956,23 @@ mod tests {
         );
     }
 
-    /// Exec, a job, an Infra recovery and a custom_script check: each
-    /// command the agent runs reads the agent's config, and a caller's own
-    /// value does not replace it.
+    /// Exec, a job, a pipe and a PTY session, an Infra recovery and a
+    /// custom_script check: each command the agent runs reads the agent's
+    /// config, and a caller's own value does not replace it. The Infra
+    /// checks the agent runs itself take its `[lte] interface`.
     #[tokio::test]
     async fn every_command_the_agent_runs_gets_its_config() {
         let file = std::env::temp_dir().join("sctl-agent-config-for-children.toml");
-        declare_agent(&Config::from_toml("").unwrap(), Some(file.clone()));
+        // An interface no test host has: the other tests' checks, which
+        // share this process, still find no configured bearer.
+        let config = Config::from_toml("[lte]\ninterface = \"lte-test0\"\n").unwrap();
+        declare_agent(&config, Some(file.clone()));
         let want = file.display().to_string();
+        assert_eq!(
+            guard::Guard::for_agent().lte,
+            guard::Lte::named("lte-test0"),
+            "the Infra SNMP and Peplink checks' guard"
+        );
 
         let r = crate::shell::process::exec_command("/bin/sh", "/", PRINT, 5_000, None)
             .await
@@ -979,6 +988,63 @@ mod tests {
         let job = crate::shell::process::spawn_command_pgroup("/bin/sh", "/", PRINT, None).unwrap();
         let out = job.wait_with_output().await.unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), want, "a job");
+
+        // The console's sessions, through the session manager: a pipe
+        // session and a PTY session, whose login shell reads no profile of
+        // this host's user (HOME is an empty directory). The shell is given
+        // the constant line; its echo on the PTY carries only the name.
+        let home = std::env::temp_dir().join(format!("sctl-session-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let session_env = HashMap::from([
+            (AGENT_CONFIG_ENV.to_string(), "/elsewhere.toml".to_string()),
+            ("HOME".to_string(), home.display().to_string()),
+            ("ENV".to_string(), String::new()),
+        ]);
+        let sessions = crate::sessions::SessionManager::new(4, 1000);
+        for pty in [false, true] {
+            let (id, _) = sessions
+                .create_session_with_pty(
+                    "/bin/sh",
+                    "/",
+                    Some(&session_env),
+                    false,
+                    pty,
+                    24,
+                    80,
+                    0,
+                    None,
+                )
+                .await
+                .unwrap();
+            sessions.exec_command(&id, PRINT).await.unwrap();
+            let buffer = sessions.get_buffer(&id).await.unwrap();
+            let started = std::time::Instant::now();
+            let seen = loop {
+                let text: String = buffer
+                    .lock()
+                    .await
+                    .read_since(0)
+                    .0
+                    .into_iter()
+                    .map(|entry| entry.data)
+                    .collect();
+                if text.contains(&want) || started.elapsed() > std::time::Duration::from_secs(10) {
+                    break text;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            };
+            // An interactive shell ignores SIGTERM: it leaves by itself.
+            sessions.exec_command(&id, "exit").await.ok();
+            sessions.kill_session(&id).await;
+            let kind = if pty {
+                "a PTY session"
+            } else {
+                "a pipe session"
+            };
+            assert!(seen.contains(&want), "{kind}: {seen:?}");
+            assert!(!seen.contains("/elsewhere.toml"), "{kind}: {seen:?}");
+        }
+        std::fs::remove_dir_all(&home).ok();
 
         let (_, out, _) = crate::infra::checks::exec_with_env(PRINT, &[], 5_000)
             .await
