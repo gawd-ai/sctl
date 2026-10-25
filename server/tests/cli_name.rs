@@ -12,7 +12,8 @@
 //!
 //! `rundev.sh`'s paths that write `/usr/bin/sctl` first ask the unit whether
 //! the name is the agent's: the question answers yes for the link and the
-//! wrapper the agent writes, and no for the agent's own binary.
+//! wrapper the agent writes, and no for a file whose marker line is past its
+//! second line, a script's or the agent's own binary.
 //!
 //! An agent started on the bench layout `gz-tmp` (`SCTL_INSTALL_JSON`) makes
 //! the name where `SCTL_CLI_PATH` puts it, `/api/health` names it as `cli`,
@@ -266,9 +267,11 @@ fn ask(busybox: Option<&Path>, question: &str) -> String {
 }
 
 /// What `rundev.sh` asks before it writes `/usr/bin/sctl` answers yes for
-/// the link and the wrapper the agent writes, and no for the agent's own
-/// binary, which holds the marker line too: only a file's first two lines
-/// are read.
+/// the link and the wrapper the agent writes, and no for a file that holds
+/// the marker line only past its second line: only a file's first two lines
+/// are read. A script whose third line is the marker shows it whatever the
+/// build; the agent's own binary, which in this build holds the marker as a
+/// line of its own too, is the case met on a unit.
 #[test]
 fn rundev_knows_the_agents_name_and_not_its_binary() {
     let scratch = Scratch::new("rundev-question");
@@ -279,6 +282,23 @@ fn rundev_knows_the_agents_name_and_not_its_binary() {
         "--library-path".to_string(),
         "/tmp/sctl/lib".to_string(),
     ];
+    // A script of a person's own whose third line is the marker. A read of
+    // the whole file finds that line (grep, as an argument vector), so only
+    // the two-line read answers plain.
+    let third_line = scratch.path("third-line");
+    std::fs::write(
+        &third_line,
+        format!("#!/bin/sh\n# a script of one's own\n{MARKER}\n"),
+    )
+    .unwrap();
+    let whole_file = Command::new("grep")
+        .args(["-qxF", MARKER])
+        .arg(&third_line)
+        .env_clear()
+        .env("PATH", PATH)
+        .status()
+        .expect("grep runs");
+    assert!(whole_file.success(), "the third line is the marker, whole");
     let busybox = busybox();
     let mut shells = vec![None];
     if let Some(busybox) = busybox.as_deref() {
@@ -307,6 +327,11 @@ fn rundev_knows_the_agents_name_and_not_its_binary() {
             ask(shell, &rundev_question(&name)),
             "agent-cli",
             "{shell:?}: the wrapper"
+        );
+        assert_eq!(
+            ask(shell, &rundev_question(&third_line)),
+            "plain",
+            "{shell:?}: the marker on a third line"
         );
         assert_eq!(
             ask(shell, &rundev_question(&binary)),
