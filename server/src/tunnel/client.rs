@@ -145,6 +145,94 @@ struct WsSink {
     stream_tx: mpsc::Sender<tokio_tungstenite::tungstenite::Message>,
 }
 
+/// The writer's ends of the three lanes.
+#[allow(clippy::struct_field_names)]
+struct Lanes {
+    priority_rx: mpsc::Receiver<tokio_tungstenite::tungstenite::Message>,
+    request_rx: mpsc::Receiver<tokio_tungstenite::tungstenite::Message>,
+    stream_rx: mpsc::Receiver<tokio_tungstenite::tungstenite::Message>,
+}
+
+impl Lanes {
+    /// The next message to send: the priority lane's first, then the
+    /// request lane's, then the stream lane's. `None` once all three are
+    /// closed.
+    async fn next(&mut self) -> Option<tokio_tungstenite::tungstenite::Message> {
+        tokio::select! {
+            biased;
+            Some(msg) = self.priority_rx.recv() => Some(msg),
+            Some(msg) = self.request_rx.recv() => Some(msg),
+            Some(msg) = self.stream_rx.recv() => Some(msg),
+            else => None,
+        }
+    }
+}
+
+/// The three lanes, holding at most this many messages each.
+fn ws_lanes(priority: usize, request: usize, stream: usize) -> (WsSink, Lanes) {
+    let (priority_tx, priority_rx) = mpsc::channel(priority);
+    let (request_tx, request_rx) = mpsc::channel(request);
+    let (stream_tx, stream_rx) = mpsc::channel(stream);
+    (
+        WsSink {
+            priority_tx,
+            request_tx,
+            stream_tx,
+        },
+        Lanes {
+            priority_rx,
+            request_rx,
+            stream_rx,
+        },
+    )
+}
+
+/// A session's output subscriber on one tunnel connection. One feeds every
+/// relay client watching the session.
+struct Subscriber {
+    task: tokio::task::JoinHandle<()>,
+    /// The seq of the last entry the subscriber took from the session's
+    /// buffer. It moves under the buffer's lock as the entries are taken,
+    /// before they are sent, so whoever holds that lock reads exactly where
+    /// the subscriber stands: no batch it sends later holds an entry at or
+    /// below it, and no batch it took before holds one above it.
+    cursor: Arc<AtomicU64>,
+}
+
+/// A tunnel connection's subscribers, by session id.
+type Subscribers = Arc<Mutex<HashMap<String, Subscriber>>>;
+
+/// Start a subscriber that forwards the session's entries above `from`.
+fn spawn_subscriber(
+    state: &AppState,
+    session_id: &str,
+    buffer: Arc<Mutex<OutputBuffer>>,
+    ws_sink: &WsSink,
+    from: u64,
+) -> Subscriber {
+    let cursor = Arc::new(AtomicU64::new(from));
+    let task = tokio::spawn(tunnel_subscriber_task(
+        state.clone(),
+        session_id.to_string(),
+        buffer,
+        ws_sink.clone(),
+        Arc::clone(&cursor),
+    ));
+    Subscriber { task, cursor }
+}
+
+/// Keep `subscriber` as the session's, ending any it replaces: a replaced
+/// subscriber left running would send the session's output twice.
+fn keep_subscriber(
+    subscribers: &mut HashMap<String, Subscriber>,
+    session_id: &str,
+    subscriber: Subscriber,
+) {
+    if let Some(replaced) = subscribers.insert(session_id.to_string(), subscriber) {
+        replaced.task.abort();
+    }
+}
+
 /// Spawn the tunnel client task. Returns a `JoinHandle` that runs until cancelled.
 pub fn spawn(state: AppState, tunnel_config: TunnelConfig) -> tokio::task::JoinHandle<()> {
     tokio::spawn(tunnel_client_loop(state, tunnel_config))
@@ -1051,7 +1139,7 @@ struct CleanupGuard {
     net_state: Option<tokio::task::AbortHandle>,
     infra_state: Option<tokio::task::AbortHandle>,
     upgrade_state: Option<tokio::task::AbortHandle>,
-    subscribers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    subscribers: Subscribers,
     session_manager: crate::sessions::SessionManager,
     transfer_manager: Arc<crate::gawdxfer::manager::TransferManager>,
 }
@@ -1078,11 +1166,11 @@ impl Drop for CleanupGuard {
         let transfers = self.transfer_manager.clone();
         tokio::spawn(async move {
             let ids: Vec<String> = {
-                let tasks = subscribers.lock().await;
-                for task in tasks.values() {
-                    task.abort();
+                let subscribers = subscribers.lock().await;
+                for subscriber in subscribers.values() {
+                    subscriber.task.abort();
                 }
-                tasks.keys().cloned().collect()
+                subscribers.keys().cloned().collect()
             };
             if !ids.is_empty() {
                 sessions.detach_all(&ids).await;
@@ -1335,27 +1423,11 @@ async fn connect_and_run(
     // frames (heartbeat ping/pong) use a small priority lane. Without this,
     // session output can fill the main queue and cause relay pongs to be
     // dropped, which looks like a dead write path and forces a reconnect.
-    let (request_tx, mut request_rx) =
-        mpsc::channel::<tokio_tungstenite::tungstenite::Message>(256);
-    let (stream_tx, mut stream_rx) = mpsc::channel::<tokio_tungstenite::tungstenite::Message>(1024);
-    let (priority_tx, mut priority_rx) =
-        mpsc::channel::<tokio_tungstenite::tungstenite::Message>(16);
-    let ws_sink = WsSink {
-        priority_tx: priority_tx.clone(),
-        request_tx: request_tx.clone(),
-        stream_tx: stream_tx.clone(),
-    };
+    let (ws_sink, mut lanes) = ws_lanes(16, 256, 1024);
     let (writer_exit_tx, mut writer_exit_rx) = oneshot::channel::<()>();
     let writer_stats = state.tunnel_stats.clone();
     let writer_task = tokio::spawn(async move {
-        loop {
-            let msg = tokio::select! {
-                biased;
-                Some(msg) = priority_rx.recv() => msg,
-                Some(msg) = request_rx.recv() => msg,
-                Some(msg) = stream_rx.recv() => msg,
-                else => break,
-            };
+        while let Some(msg) = lanes.next().await {
             match tokio::time::timeout(
                 Duration::from_secs(TUNNEL_WRITER_SEND_TIMEOUT_SECS),
                 raw_ws_sink.send(msg),
@@ -1427,8 +1499,7 @@ async fn connect_and_run(
     let mut broadcast_rx = state.session_events.subscribe();
 
     // Track subscriber tasks for session output forwarding
-    let subscriber_tasks: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let subscriber_tasks: Subscribers = Arc::new(Mutex::new(HashMap::new()));
     let handler_permits = Arc::new(Semaphore::new(32));
 
     // Heartbeat failure notification channel
@@ -1676,7 +1747,7 @@ async fn connect_and_run(
                 }
             }
             _ = reap_interval.tick() => {
-                subscriber_tasks.lock().await.retain(|_, h| !h.is_finished());
+                subscriber_tasks.lock().await.retain(|_, s| !s.task.is_finished());
             }
             _ = heartbeat_cancel_rx.changed() => {
                 warn!("Tunnel: heartbeat failure detected, disconnecting");
@@ -1723,10 +1794,10 @@ async fn connect_and_run(
         task.abort();
     }
     let attached_sessions: Vec<String> = {
-        let tasks = subscriber_tasks.lock().await;
-        let ids = tasks.keys().cloned().collect();
-        for task in tasks.values() {
-            task.abort();
+        let subscribers = subscriber_tasks.lock().await;
+        let ids = subscribers.keys().cloned().collect();
+        for subscriber in subscribers.values() {
+            subscriber.task.abort();
         }
         ids
     };
@@ -1767,7 +1838,7 @@ async fn connect_and_run(
 async fn handle_relay_message(
     state: &AppState,
     ws_sink: &WsSink,
-    subscriber_tasks: &Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    subscriber_tasks: &Subscribers,
     msg: Value,
 ) {
     let msg_type = msg["type"].as_str().unwrap_or("");
@@ -3232,7 +3303,7 @@ fn gx_error_response(
 async fn handle_forwarded_session_message(
     state: &AppState,
     ws_sink: &WsSink,
-    subscriber_tasks: &Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    subscriber_tasks: &Subscribers,
     msg: &Value,
 ) {
     let msg_type = msg["type"].as_str().unwrap_or("");
@@ -3342,16 +3413,12 @@ async fn handle_forwarded_session_message(
 
                     // Now start subscriber for output forwarding
                     if let Some(buffer) = state.session_manager.get_buffer(&session_id).await {
-                        let sink_clone = ws_sink.clone();
-                        let sid = session_id.clone();
-                        let task = tokio::spawn(tunnel_subscriber_task(
-                            state.clone(),
-                            sid.clone(),
-                            buffer,
-                            sink_clone,
-                            0,
-                        ));
-                        subscriber_tasks.lock().await.insert(sid, task);
+                        let subscriber = spawn_subscriber(state, &session_id, buffer, ws_sink, 0);
+                        keep_subscriber(
+                            &mut *subscriber_tasks.lock().await,
+                            &session_id,
+                            subscriber,
+                        );
                         info!(
                             request_id = request_id.as_deref().unwrap_or(""),
                             session_id = %session_id,
@@ -3469,17 +3536,13 @@ async fn handle_forwarded_session_message(
                         // terminals use. No `session.created` broadcast — jobs stay
                         // out of the terminal/tabs UI.
                         if let Some(buffer) = state.session_manager.get_buffer(&session_id).await {
-                            let task = tokio::spawn(tunnel_subscriber_task(
-                                state.clone(),
-                                session_id.clone(),
-                                buffer,
-                                ws_sink.clone(),
-                                0,
-                            ));
-                            subscriber_tasks
-                                .lock()
-                                .await
-                                .insert(session_id.clone(), task);
+                            let subscriber =
+                                spawn_subscriber(state, &session_id, buffer, ws_sink, 0);
+                            keep_subscriber(
+                                &mut *subscriber_tasks.lock().await,
+                                &session_id,
+                                subscriber,
+                            );
                         }
                     }
                     Err(e) => {
@@ -3574,8 +3637,8 @@ async fn handle_forwarded_session_message(
                         "reason": "killed",
                     }));
                     // Abort subscriber
-                    if let Some(task) = subscriber_tasks.lock().await.remove(session_id) {
-                        task.abort();
+                    if let Some(subscriber) = subscriber_tasks.lock().await.remove(session_id) {
+                        subscriber.task.abort();
                     }
                 } else {
                     let mut resp = json!({
@@ -3631,55 +3694,27 @@ async fn handle_forwarded_session_message(
             let session_id = msg["session_id"].as_str().unwrap_or("");
             let since = msg["since"].as_u64().unwrap_or(0);
             if !session_id.is_empty() {
-                // Abort any existing subscriber for this session
-                if let Some(task) = subscriber_tasks.lock().await.remove(session_id) {
-                    task.abort();
-                }
-
-                if let Some(buffer) = state.session_manager.attach_shared(session_id).await {
-                    let (entries, dropped) = {
-                        let buf = buffer.lock().await;
-                        buf.read_since(since)
-                    };
-                    let entries_json: Vec<Value> = entries
-                        .iter()
-                        .map(|e| entry_to_ws_message(session_id, e))
-                        .collect();
-                    let last_seq = entries.last().map_or(since, |e| e.seq);
-
-                    let mut resp = json!({
-                        "type": "session.attached",
-                        "session_id": session_id,
-                        "entries": entries_json,
-                        "dropped": dropped,
-                    });
-                    if let Some(ref rid) = request_id {
-                        resp["request_id"] = json!(rid);
-                    }
-                    send_response_async(ws_sink, resp).await;
-
-                    // Start subscriber
-                    let sink_clone = ws_sink.clone();
-                    let sid = session_id.to_string();
-                    let task = tokio::spawn(tunnel_subscriber_task(
-                        state.clone(),
-                        sid.clone(),
-                        buffer,
-                        sink_clone,
-                        last_seq,
-                    ));
-                    subscriber_tasks.lock().await.insert(sid, task);
+                let request_id = request_id.as_deref();
+                if msg["dedupes"].as_bool() == Some(true) {
+                    attach_keeping_subscriber(
+                        state,
+                        ws_sink,
+                        subscriber_tasks,
+                        session_id,
+                        since,
+                        request_id,
+                    )
+                    .await;
                 } else {
-                    let mut resp = json!({
-                        "type": "error",
-                        "code": "SESSION_NOT_FOUND",
-                        "session_id": session_id,
-                        "message": format!("Session {session_id} not found"),
-                    });
-                    if let Some(ref rid) = request_id {
-                        resp["request_id"] = json!(rid);
-                    }
-                    send_response_async(ws_sink, resp).await;
+                    attach_restarting_subscriber(
+                        state,
+                        ws_sink,
+                        subscriber_tasks,
+                        session_id,
+                        since,
+                        request_id,
+                    )
+                    .await;
                 }
             }
         }
@@ -3687,8 +3722,8 @@ async fn handle_forwarded_session_message(
             let session_id = msg["session_id"].as_str().unwrap_or("");
             if !session_id.is_empty() {
                 // Abort subscriber for this session
-                if let Some(task) = subscriber_tasks.lock().await.remove(session_id) {
-                    task.abort();
+                if let Some(subscriber) = subscriber_tasks.lock().await.remove(session_id) {
+                    subscriber.task.abort();
                 }
                 state.session_manager.detach(session_id).await;
             }
@@ -3926,6 +3961,152 @@ async fn handle_forwarded_session_message(
             warn!(msg_type, "Unknown forwarded session message type");
         }
     }
+}
+
+/// `session.attach` without `dedupes`, as agents before 0.6.12 answer every
+/// attach: the session's subscriber on this connection ends, the entries
+/// above `since` are replayed, and a new subscriber starts after the replay.
+/// What the old subscriber had taken and not yet sent never reaches the
+/// clients already watching; older clients rely on the restart.
+async fn attach_restarting_subscriber(
+    state: &AppState,
+    ws_sink: &WsSink,
+    subscribers: &Subscribers,
+    session_id: &str,
+    since: u64,
+    request_id: Option<&str>,
+) {
+    if let Some(subscriber) = subscribers.lock().await.remove(session_id) {
+        subscriber.task.abort();
+    }
+    let Some(buffer) = state.session_manager.attach_shared(session_id).await else {
+        send_response_async(ws_sink, session_not_found(session_id, request_id)).await;
+        return;
+    };
+    let (entries, dropped) = {
+        let buf = buffer.lock().await;
+        buf.read_since(since)
+    };
+    let replay_end = entries.last().map_or(since, |e| e.seq);
+    send_response_async(
+        ws_sink,
+        attached_reply(session_id, &entries, dropped, request_id),
+    )
+    .await;
+    let subscriber = spawn_subscriber(state, session_id, buffer, ws_sink, replay_end);
+    keep_subscriber(&mut *subscribers.lock().await, session_id, subscriber);
+}
+
+/// `session.attach` with `dedupes`, sent by a client that writes an entry
+/// only when its seq is above the highest it holds for the session, and that
+/// listens for the session's output before it attaches.
+///
+/// A subscriber already running for the session on this connection is kept,
+/// so the clients it feeds lose nothing, and the replay ends at its cursor:
+/// every batch it sends later starts above the replay's end, and every
+/// earlier one ends at or below it. The reply takes its slot on the request
+/// lane first, then the buffer's lock is held from the replay's read until
+/// the reply is queued, so no batch above the replay's end is queued before
+/// the reply, and the writer sends the request lane before the stream lane.
+/// Batches at or below the replay's end may still reach the client before
+/// or after the reply; it keeps each entry once by its seq. With no
+/// subscriber running, one starts after the replay, as without `dedupes`.
+///
+/// The subscribers' lock is held throughout, so no other attach on this
+/// connection ends or replaces the subscriber between the look and the
+/// replay.
+async fn attach_keeping_subscriber(
+    state: &AppState,
+    ws_sink: &WsSink,
+    subscribers: &Subscribers,
+    session_id: &str,
+    since: u64,
+    request_id: Option<&str>,
+) {
+    let Ok(slot) = ws_sink.request_tx.reserve().await else {
+        warn!(
+            session_id,
+            "Tunnel: session.attach not answered (request lane closed)"
+        );
+        return;
+    };
+    let mut subscribers = subscribers.lock().await;
+    let Some(buffer) = state.session_manager.attach_shared(session_id).await else {
+        if let Some(subscriber) = subscribers.remove(session_id) {
+            subscriber.task.abort();
+        }
+        slot.send(text_frame(&session_not_found(session_id, request_id)));
+        return;
+    };
+    let running = subscribers
+        .get(session_id)
+        .filter(|subscriber| !subscriber.task.is_finished())
+        .map(|subscriber| Arc::clone(&subscriber.cursor));
+    let buf = buffer.lock().await;
+    let (mut entries, dropped) = buf.read_since(since);
+    if let Some(cursor) = &running {
+        let end = cursor.load(Ordering::Relaxed);
+        entries.retain(|e| e.seq <= end);
+    }
+    let replay_end = entries.last().map_or(since, |e| e.seq);
+    slot.send(text_frame(&attached_reply(
+        session_id, &entries, dropped, request_id,
+    )));
+    drop(buf);
+    if running.is_some() {
+        tracing::debug!(
+            session_id,
+            replay_end,
+            "Tunnel: session.attach kept the running subscriber"
+        );
+    } else {
+        let subscriber = spawn_subscriber(state, session_id, buffer, ws_sink, replay_end);
+        keep_subscriber(&mut subscribers, session_id, subscriber);
+    }
+}
+
+/// `session.attached`: the replayed entries, and how many the buffer had
+/// already dropped after `since`.
+fn attached_reply(
+    session_id: &str,
+    entries: &[OutputEntry],
+    dropped: u64,
+    request_id: Option<&str>,
+) -> Value {
+    let entries: Vec<Value> = entries
+        .iter()
+        .map(|e| entry_to_ws_message(session_id, e))
+        .collect();
+    let mut resp = json!({
+        "type": "session.attached",
+        "session_id": session_id,
+        "entries": entries,
+        "dropped": dropped,
+    });
+    if let Some(rid) = request_id {
+        resp["request_id"] = json!(rid);
+    }
+    resp
+}
+
+fn session_not_found(session_id: &str, request_id: Option<&str>) -> Value {
+    let mut resp = json!({
+        "type": "error",
+        "code": "SESSION_NOT_FOUND",
+        "session_id": session_id,
+        "message": format!("Session {session_id} not found"),
+    });
+    if let Some(rid) = request_id {
+        resp["request_id"] = json!(rid);
+    }
+    resp
+}
+
+/// A JSON message as a text frame for one of the lanes.
+fn text_frame(msg: &Value) -> tokio_tungstenite::tungstenite::Message {
+    let text = serde_json::to_string(msg)
+        .unwrap_or_else(|_| r#"{"type":"error","message":"serialize failed"}"#.to_string());
+    tokio_tungstenite::tungstenite::Message::Text(text.into())
 }
 
 /// Convert an `OutputEntry` to a WS JSON message (same as `ws/mod.rs`).
@@ -4622,30 +4803,44 @@ async fn handle_tunnel_infra_check(
 /// Background task that reads from a session's `OutputBuffer` and forwards
 /// entries as WS messages through the tunnel. Similar to `ws/mod.rs` `subscriber_task`.
 ///
-/// Uses feed+flush batching: holds the WS sink lock once per batch, feeds all
-/// entries, and flushes periodically (every ~50 entries) to coalesce TCP writes.
-/// This avoids per-entry lock acquisition + syscall overhead on the slow RISC-V CPU.
+/// Each read is sent in batches (`batch_output_entries`) on the stream lane,
+/// so LTE links carry a few larger frames rather than many small ones.
+/// `cursor` starts where the subscriber starts and moves to the last entry
+/// of each read under the buffer's lock, before the read is sent, so a batch
+/// never holds entries on both sides of what an attach reads there
+/// (`attach_keeping_subscriber`).
 async fn tunnel_subscriber_task(
     state: AppState,
     session_id: String,
     buffer: Arc<tokio::sync::Mutex<OutputBuffer>>,
     ws_sink: WsSink,
-    since: u64,
+    cursor: Arc<AtomicU64>,
 ) {
-    let mut cursor = since;
+    let notify = buffer.lock().await.notifier();
     let mut logged_first_output = false;
     let mut backpressure_active = false;
     loop {
-        let (entries, notify) = {
+        // Made before the buffer is read, so an entry pushed after the read
+        // still wakes the wait below.
+        let pushed = notify.notified();
+        let entries = {
             let buf = buffer.lock().await;
-            if buf.has_entries_since(cursor) {
-                let (entries, _dropped) = buf.read_since(cursor);
-                (entries, None)
+            let from = cursor.load(Ordering::Relaxed);
+            if buf.has_entries_since(from) {
+                // Dropped entries are gone: the relay sends session.gap to a
+                // client it had to drop output for, so it can attach again.
+                let (entries, _dropped) = buf.read_since(from);
+                if let Some(last) = entries.last() {
+                    cursor.store(last.seq, Ordering::Relaxed);
+                }
+                entries
             } else {
-                (vec![], Some(buf.notifier()))
+                Vec::new()
             }
         };
-        if !entries.is_empty() {
+        if entries.is_empty() {
+            pushed.await;
+        } else {
             if !logged_first_output {
                 logged_first_output = true;
                 info!(
@@ -4683,14 +4878,6 @@ async fn tunnel_subscriber_task(
                     return;
                 }
             }
-            // Always advance cursor — dropped entries are gone (the relay
-            // will send session.gap notifications for client-side recovery).
-            if let Some(last) = entries.last() {
-                cursor = last.seq;
-            }
-        }
-        if let Some(n) = notify {
-            n.notified().await;
         }
     }
 }
@@ -5330,5 +5517,420 @@ mod file_read_tests {
         assert_eq!(status("NOT_A_REGULAR_FILE"), 400);
         assert_eq!(status("PERMISSION_DENIED"), 403);
         assert_eq!(status("MAX_TRANSFERS"), 429);
+    }
+}
+
+#[cfg(test)]
+mod attach_tests {
+    use std::collections::HashMap;
+    use std::future::Future;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use serde_json::{json, Value};
+    use tokio::sync::{watch, Mutex};
+
+    use super::{handle_forwarded_session_message, ws_lanes, Lanes, Subscribers, WsSink};
+    use crate::config::Config;
+    use crate::file_access::Gate;
+    use crate::sessions::buffer::{OutputBuffer, OutputStream};
+    use crate::state::AppState;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sctl-attach-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn state_in(dir: &Path) -> AppState {
+        let mut config: Config = toml::from_str("").unwrap();
+        config.server.data_dir = dir.join("data").display().to_string();
+        let gate = Arc::new(Gate::for_agent(&config, None, None));
+        AppState::for_tests(config, gate)
+    }
+
+    /// Wait for `done`; a wait past 10 s fails the test rather than hanging
+    /// it.
+    async fn wait_until<F, Fut>(what: &str, mut done: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !done().await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// The tunnel's writer over the three lanes, as `connect_and_run` runs
+    /// it, with the link in place of the socket: what it sent, in order,
+    /// and a switch that holds it back, as a slow link does.
+    struct Link {
+        sent: Arc<std::sync::Mutex<Vec<Value>>>,
+        flowing: watch::Sender<bool>,
+    }
+
+    impl Link {
+        fn new(mut lanes: Lanes) -> Self {
+            let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (flowing, mut flow) = watch::channel(true);
+            let out = Arc::clone(&sent);
+            tokio::spawn(async move {
+                while flow.wait_for(|on| *on).await.is_ok() {
+                    let Some(msg) = lanes.next().await else {
+                        return;
+                    };
+                    if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+                        out.lock()
+                            .unwrap()
+                            .push(serde_json::from_str(text.as_str()).unwrap());
+                    }
+                }
+            });
+            Self { sent, flowing }
+        }
+
+        fn sent(&self) -> Vec<Value> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    /// The session prints `line <n>` every 10 ms, one entry a line, so
+    /// line n is entry n.
+    fn print_lines(buffer: Arc<Mutex<OutputBuffer>>, lines: u64) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            for n in 1..=lines {
+                buffer
+                    .lock()
+                    .await
+                    .push(OutputStream::Stdout, format!("line {n}\n"));
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+    }
+
+    async fn attach(
+        state: &AppState,
+        ws_sink: &WsSink,
+        subscribers: &Subscribers,
+        request_id: &str,
+        dedupes: bool,
+    ) {
+        let mut msg = json!({
+            "type": "session.attach",
+            "session_id": "s1",
+            "since": 0,
+            "request_id": request_id,
+        });
+        if dedupes {
+            msg["dedupes"] = json!(true);
+        }
+        handle_forwarded_session_message(state, ws_sink, subscribers, &msg).await;
+    }
+
+    fn numbers(text: &str) -> Vec<u64> {
+        text.lines()
+            .map(|line| line.strip_prefix("line ").unwrap().parse().unwrap())
+            .collect()
+    }
+
+    fn batches(sent: &[Value]) -> impl Iterator<Item = &Value> {
+        sent.iter().filter(|m| m["type"] == "session.stdout")
+    }
+
+    /// What the stream carried, in order: what a client already watching
+    /// writes, whatever it sends with its attach.
+    fn streamed(sent: &[Value]) -> String {
+        batches(sent).map(|m| m["data"].as_str().unwrap()).collect()
+    }
+
+    fn reply<'a>(sent: &'a [Value], request_id: &str) -> &'a Value {
+        sent.iter()
+            .find(|m| m["type"] == "session.attached" && m["request_id"] == request_id)
+            .unwrap()
+    }
+
+    /// What a client that sends `dedupes` writes from what it receives: it
+    /// holds live output until its attach answers, writes the replay and
+    /// then the held output, then live output as it comes, each entry only
+    /// when its seq is above the highest it wrote.
+    fn written_keeping_seq(received: &[Value], request_id: &str) -> String {
+        fn write(entry: &Value, highest: &mut u64, out: &mut String) {
+            let seq = entry["seq"].as_u64().unwrap();
+            if seq > *highest {
+                out.push_str(entry["data"].as_str().unwrap());
+                *highest = seq;
+            }
+        }
+        let mut held = Vec::new();
+        let mut answered = false;
+        let mut highest = 0;
+        let mut out = String::new();
+        for msg in received {
+            if msg["type"] == "session.attached" && msg["request_id"] == request_id {
+                for entry in msg["entries"].as_array().unwrap() {
+                    write(entry, &mut highest, &mut out);
+                }
+                for entry in held.drain(..) {
+                    write(entry, &mut highest, &mut out);
+                }
+                answered = true;
+            } else if msg["type"] == "session.stdout" {
+                if answered {
+                    write(msg, &mut highest, &mut out);
+                } else {
+                    held.push(msg);
+                }
+            }
+        }
+        assert!(answered, "the attach was not answered");
+        out
+    }
+
+    #[tokio::test]
+    async fn a_deduping_attach_keeps_the_running_subscriber_and_every_line() {
+        const LINES: u64 = 150;
+        let dir = scratch("keep");
+        let state = state_in(&dir);
+        let buffer = state.session_manager.insert_for_tests("s1").await;
+        let (ws_sink, lanes) = ws_lanes(16, 256, 4);
+        let link = Link::new(lanes);
+        let subscribers: Subscribers = Arc::new(Mutex::new(HashMap::new()));
+
+        // The first client attaches before the session prints. No
+        // subscriber runs yet, so the attach starts one, as without
+        // `dedupes`.
+        attach(&state, &ws_sink, &subscribers, "a", true).await;
+        let running = subscribers.lock().await["s1"].task.id();
+        let printer = print_lines(Arc::clone(&buffer), LINES);
+
+        // The link slows: the stream lane fills, and the subscriber holds a
+        // read it cannot queue while the session prints on.
+        wait_until("lines on the link", || {
+            let n = batches(&link.sent()).count();
+            async move { n >= 10 }
+        })
+        .await;
+        link.flowing.send(false).unwrap();
+        wait_until("a full stream lane", || {
+            let full = ws_sink.stream_tx.capacity() == 0;
+            async move { full }
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // A second client attaches with `dedupes`. Through the relay it
+        // hears everything the writer sends from here on.
+        let from = link.sent().len();
+        attach(&state, &ws_sink, &subscribers, "b", true).await;
+        let (kept, cursor) = {
+            let subscribers = subscribers.lock().await;
+            let subscriber = &subscribers["s1"];
+            (
+                subscriber.task.id() == running && !subscriber.task.is_finished(),
+                subscriber.cursor.load(Ordering::Relaxed),
+            )
+        };
+        assert!(kept, "the attach replaced the running subscriber");
+        let in_buffer = buffer.lock().await.next_seq() - 1;
+        assert!(
+            cursor < in_buffer,
+            "the subscriber does not lag: {cursor} of {in_buffer}"
+        );
+
+        // The session prints on before the link catches up, so the
+        // subscriber's next read reaches past what it had printed at the
+        // attach.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        link.flowing.send(true).unwrap();
+        printer.await.unwrap();
+        wait_until("the last line on the link", || {
+            let last = batches(&link.sent()).last().map(|m| m["seq"].as_u64());
+            async move { last == Some(Some(LINES)) }
+        })
+        .await;
+        let sent = link.sent();
+        let every_line: Vec<u64> = (1..=LINES).collect();
+
+        // The clients already watching: every line once, in order.
+        assert_eq!(numbers(&streamed(&sent)), every_line);
+
+        // The replay ends where the subscriber stood, short of what the
+        // session had printed.
+        let replay_end = reply(&sent, "b")["entries"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["seq"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(replay_end, cursor);
+
+        // No batch holds lines on both sides of the replay's end.
+        for batch in batches(&sent) {
+            let held = numbers(batch["data"].as_str().unwrap());
+            assert!(
+                held.iter().all(|&n| n <= replay_end) || held.iter().all(|&n| n > replay_end),
+                "a batch spans the replay's end {replay_end}: {held:?}"
+            );
+        }
+
+        // The new client, keeping entries by seq: every line once, in
+        // order, judged by its content.
+        assert_eq!(
+            numbers(&written_keeping_seq(&sent[from..], "b")),
+            every_line
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_cursor_moves_when_a_read_is_taken_not_when_it_is_sent() {
+        const LINES: u64 = 100;
+        let dir = scratch("cursor");
+        let state = state_in(&dir);
+        let buffer = state.session_manager.insert_for_tests("s1").await;
+        let (ws_sink, lanes) = ws_lanes(16, 256, 1);
+        let link = Link::new(lanes);
+        link.flowing.send(false).unwrap();
+        let subscribers: Subscribers = Arc::new(Mutex::new(HashMap::new()));
+        attach(&state, &ws_sink, &subscribers, "a", true).await;
+
+        // One burst: the subscriber takes it in one read of four batches
+        // (32 entries each at most), queues the first and waits to queue
+        // the second.
+        {
+            let mut buf = buffer.lock().await;
+            for n in 1..=LINES {
+                buf.push(OutputStream::Stdout, format!("line {n}\n"));
+            }
+        }
+        wait_until("a full stream lane", || {
+            let full = ws_sink.stream_tx.capacity() == 0;
+            async move { full }
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let cursor = subscribers.lock().await["s1"]
+            .cursor
+            .load(Ordering::Relaxed);
+        assert_eq!(cursor, LINES);
+
+        // An attach now replays the whole read, the batches still to come
+        // included, and the client drops those by their seq.
+        attach(&state, &ws_sink, &subscribers, "b", true).await;
+        link.flowing.send(true).unwrap();
+        wait_until("the last line on the link", || {
+            let last = batches(&link.sent()).last().map(|m| m["seq"].as_u64());
+            async move { last == Some(Some(LINES)) }
+        })
+        .await;
+        let sent = link.sent();
+        let every_line: Vec<u64> = (1..=LINES).collect();
+        assert_eq!(numbers(&streamed(&sent)), every_line);
+        assert_eq!(batches(&sent).count(), 4);
+        assert_eq!(
+            reply(&sent, "b")["entries"].as_array().unwrap().len(),
+            LINES as usize
+        );
+        assert_eq!(numbers(&written_keeping_seq(&sent, "b")), every_line);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_attach_without_dedupes_restarts_the_subscriber_after_the_whole_replay() {
+        const LINES: u64 = 60;
+        let dir = scratch("restart");
+        let state = state_in(&dir);
+        let buffer = state.session_manager.insert_for_tests("s1").await;
+        let (ws_sink, lanes) = ws_lanes(16, 256, 4);
+        let link = Link::new(lanes);
+        let subscribers: Subscribers = Arc::new(Mutex::new(HashMap::new()));
+
+        attach(&state, &ws_sink, &subscribers, "a", false).await;
+        let (running, old) = {
+            let subscribers = subscribers.lock().await;
+            let subscriber = &subscribers["s1"];
+            (subscriber.task.id(), subscriber.task.abort_handle())
+        };
+        link.flowing.send(false).unwrap();
+        print_lines(Arc::clone(&buffer), LINES).await.unwrap();
+        wait_until("a full stream lane", || {
+            let full = ws_sink.stream_tx.capacity() == 0;
+            async move { full }
+        })
+        .await;
+
+        // An older client's attach, which sends no `dedupes`.
+        attach(&state, &ws_sink, &subscribers, "c", false).await;
+        let (restarted, cursor) = {
+            let subscribers = subscribers.lock().await;
+            let subscriber = &subscribers["s1"];
+            (
+                subscriber.task.id() != running,
+                subscriber.cursor.load(Ordering::Relaxed),
+            )
+        };
+        assert!(restarted, "the subscriber was kept");
+        wait_until("the old subscriber's end", || {
+            let ended = old.is_finished();
+            async move { ended }
+        })
+        .await;
+        // The new subscriber starts after the whole replay.
+        assert_eq!(cursor, LINES);
+
+        link.flowing.send(true).unwrap();
+        wait_until("the link drained", || {
+            let drained = ws_sink.stream_tx.capacity() == 4 && ws_sink.request_tx.capacity() == 256;
+            async move { drained }
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let sent = link.sent();
+        let replayed: Vec<u64> = reply(&sent, "c")["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(replayed, (1..=LINES).collect::<Vec<_>>());
+
+        // What the old subscriber held when it ended never reaches the
+        // clients already watching: the cut `dedupes` removes.
+        let streamed = numbers(&streamed(&sent));
+        assert!(
+            streamed.len() < LINES as usize,
+            "the stream carried every line"
+        );
+        assert_eq!(streamed, (1..=streamed.len() as u64).collect::<Vec<_>>());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_deduping_attach_to_no_session_is_answered_not_found() {
+        let dir = scratch("none");
+        let state = state_in(&dir);
+        let (ws_sink, lanes) = ws_lanes(16, 256, 4);
+        let link = Link::new(lanes);
+        let subscribers: Subscribers = Arc::new(Mutex::new(HashMap::new()));
+        attach(&state, &ws_sink, &subscribers, "d", true).await;
+        wait_until("the answer", || {
+            let n = link.sent().len();
+            async move { n == 1 }
+        })
+        .await;
+        let sent = link.sent();
+        assert_eq!(sent[0]["code"], "SESSION_NOT_FOUND");
+        assert_eq!(sent[0]["request_id"], "d");
+        assert!(subscribers.lock().await.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

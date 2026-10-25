@@ -251,6 +251,15 @@ export interface WsSessionAttachMsg {
 	request_id?: string;
 	session_id: string;
 	since?: number;
+	/**
+	 * Sent by a client that writes an entry only when its seq is above the
+	 * highest it holds for the session, and that listens for the session's
+	 * output before it attaches. Through a relay, an agent from 0.6.12 then
+	 * keeps the output stream the clients already watching share, and the
+	 * replay ends where that stream stands: live output at or below the
+	 * replay's end may arrive before or after the reply.
+	 */
+	dedupes?: boolean;
 }
 
 export interface WsSessionResizeMsg {

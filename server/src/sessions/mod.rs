@@ -591,6 +591,36 @@ impl SessionManager {
             .map(|entry| Arc::clone(&entry.session.buffer))
     }
 
+    /// A session with no process, as a journal recovery makes one: its
+    /// output is what a test pushes into the buffer this returns.
+    #[cfg(test)]
+    pub(crate) async fn insert_for_tests(
+        &self,
+        session_id: &str,
+    ) -> Arc<tokio::sync::Mutex<OutputBuffer>> {
+        let session = ManagedSession::archived(OutputBuffer::new(self.buffer_size), None);
+        let buffer = Arc::clone(&session.buffer);
+        self.sessions.write().await.insert(
+            session_id.to_string(),
+            SessionEntry {
+                session,
+                kind: SessionKind::Terminal,
+                persistent: true,
+                last_activity: Instant::now(),
+                attached_count: 0,
+                idle_timeout: 0,
+                name: None,
+                created_at: 0,
+                user_allows_ai: true,
+                ai_is_working: false,
+                ai_activity: None,
+                ai_status_message: None,
+                ai_last_activity: None,
+            },
+        );
+        buffer
+    }
+
     /// Rename a session. Returns `Err` if the session doesn't exist.
     pub async fn rename_session(&self, session_id: &str, name: &str) -> Result<(), String> {
         let mut sessions = self.sessions.write().await;

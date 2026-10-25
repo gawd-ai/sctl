@@ -7,7 +7,14 @@
 //!
 //! On disconnect, the client automatically reconnects with exponential backoff
 //! and re-attaches to all active sessions using `session.attach` with the last
-//! known sequence number, so no output is lost.
+//! sequence number the daemon sent, so no output is lost.
+//!
+//! Each attach sends `dedupes: true`: a session's buffer keeps an entry the
+//! daemon sent only when its seq is above the highest it holds, and live
+//! output that arrives while an attach waits for its reply is held until the
+//! replay is in. The buffer numbers its entries with a counter of its own,
+//! which its markers (a process exit, an output gap) take too; reads go by
+//! that counter, which follows the daemon's seq where it can.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,13 +31,35 @@ pub enum SessionStatus {
     Exited,
 }
 
-/// A single output entry from a session.
+/// A single output entry from a session, as the local buffer keeps it.
 #[derive(Debug, Clone)]
 pub struct OutputEntry {
+    /// The entry's place in the session's local buffer: a counter of the
+    /// buffer's own, which the daemon's entries and mcp-sctl's markers both
+    /// take, so a read from a `seq` misses neither. A daemon entry takes its
+    /// own seq when that is above the last place given, so the two are
+    /// equal until a marker comes between.
     pub seq: u64,
+    /// The daemon's seq for an entry it sent; `None` for a marker.
+    pub daemon_seq: Option<u64>,
     pub stream: String,
     pub data: String,
     pub timestamp_ms: u64,
+}
+
+/// An output entry as the daemon sent it, numbered by the daemon.
+#[derive(Debug, Clone)]
+struct DaemonEntry {
+    seq: u64,
+    stream: String,
+    data: String,
+    timestamp_ms: u64,
+}
+
+/// What came for a session while its attach waited for the reply.
+enum Held {
+    Entry(DaemonEntry),
+    Marker(String),
 }
 
 /// Max entries per session buffer to prevent unbounded memory growth.
@@ -42,6 +71,10 @@ struct SessionBuffer {
     status: SessionStatus,
     exit_code: Option<i32>,
     notify: Arc<Notify>,
+    /// The last place given to an entry (`OutputEntry::seq`).
+    last_place: u64,
+    /// The highest seq of the daemon's entries this buffer kept: where a
+    /// re-attach starts. Markers do not move it.
     last_seq: u64,
     is_pty: bool,
     /// Count of entries dropped due to ring buffer eviction (detected via sequence gaps).
@@ -50,6 +83,9 @@ struct SessionBuffer {
     attach_notify: Arc<Notify>,
     /// Set to true when a session.attached response has been received.
     attached: bool,
+    /// Live output held while an attach waits for its reply: kept after the
+    /// replay, in the order it came.
+    held: Option<Vec<Held>>,
 }
 
 impl SessionBuffer {
@@ -59,27 +95,105 @@ impl SessionBuffer {
             status: SessionStatus::Running,
             exit_code: None,
             notify: Arc::new(Notify::new()),
+            last_place: 0,
             last_seq: 0,
             is_pty: false,
             dropped_count: 0,
             attach_notify: Arc::new(Notify::new()),
             attached: false,
+            held: None,
         }
     }
 
-    fn push(&mut self, entry: OutputEntry) {
+    /// Keep an entry the daemon sent, unless its seq is not above the
+    /// highest kept: an attach's replay and the live stream may both carry
+    /// it.
+    fn push(&mut self, entry: DaemonEntry) {
+        if entry.seq <= self.last_seq {
+            return;
+        }
         // Detect sequence gaps (ring buffer eviction on the daemon side)
-        if entry.seq > self.last_seq + 1 && self.last_seq > 0 {
+        if self.last_seq > 0 && entry.seq > self.last_seq + 1 {
             self.dropped_count += entry.seq - self.last_seq - 1;
         }
-        if entry.seq > self.last_seq {
-            self.last_seq = entry.seq;
-        }
+        self.last_seq = entry.seq;
+        self.keep(
+            Some(entry.seq),
+            entry.stream,
+            entry.data,
+            entry.timestamp_ms,
+        );
+    }
+
+    /// A line mcp-sctl writes itself (a process exit, an output gap). It
+    /// takes a place and no seq of the daemon's, so the daemon's next entry
+    /// is still kept and a re-attach still starts after the daemon's last.
+    fn mark(&mut self, data: String) {
+        self.keep(None, "system".to_string(), data, 0);
+    }
+
+    fn keep(&mut self, daemon_seq: Option<u64>, stream: String, data: String, timestamp_ms: u64) {
+        self.last_place = (self.last_place + 1).max(daemon_seq.unwrap_or(0));
         if self.entries.len() >= MAX_BUFFER_ENTRIES {
             self.entries.pop_front();
         }
-        self.entries.push_back(entry);
+        self.entries.push_back(OutputEntry {
+            seq: self.last_place,
+            daemon_seq,
+            stream,
+            data,
+            timestamp_ms,
+        });
         self.notify.notify_waiters();
+    }
+
+    /// Live output: kept now, or held while an attach waits for its reply.
+    fn live(&mut self, entry: DaemonEntry) {
+        match &mut self.held {
+            Some(held) => held.push(Held::Entry(entry)),
+            None => self.push(entry),
+        }
+    }
+
+    /// A marker, held behind live output while an attach waits.
+    fn live_mark(&mut self, data: String) {
+        match &mut self.held {
+            Some(held) => held.push(Held::Marker(data)),
+            None => self.mark(data),
+        }
+    }
+
+    /// An attach is about to be sent from `since`: hold live output until
+    /// its reply. The buffer holds what the attach skips.
+    fn hold(&mut self, since: u64) {
+        self.last_seq = self.last_seq.max(since);
+        self.held.get_or_insert_with(Vec::new);
+    }
+
+    /// The attach answered, or will not: its replay, then what was held
+    /// meanwhile, each of the daemon's entries kept only when its seq is
+    /// above the highest kept.
+    fn settle(&mut self, replay: impl IntoIterator<Item = DaemonEntry>) {
+        for entry in replay {
+            self.push(entry);
+        }
+        for held in self.held.take().unwrap_or_default() {
+            match held {
+                Held::Entry(entry) => self.push(entry),
+                Held::Marker(data) => self.mark(data),
+            }
+        }
+    }
+
+    /// The entries an attach from `since` answers: those after the last of
+    /// the daemon's entries at or below `since`, markers included.
+    fn after_daemon_seq(&self, since: u64) -> Vec<OutputEntry> {
+        let start = self
+            .entries
+            .iter()
+            .rposition(|e| e.daemon_seq.is_some_and(|seq| seq <= since))
+            .map_or(0, |i| i + 1);
+        self.entries.iter().skip(start).cloned().collect()
     }
 }
 
@@ -440,7 +554,9 @@ impl DeviceWsConnection {
     ///
     /// Creates a local `SessionBuffer` if one doesn't exist yet, sends
     /// `session.attach` over the WebSocket, and waits for the daemon's
-    /// `session.attached` response with replayed entries.
+    /// `session.attached` response with replayed entries. `since` is the
+    /// daemon's seq; the entries returned carry the buffer's own (see
+    /// [`OutputEntry::seq`]), which [`Self::read_output`] takes.
     pub async fn attach_session(&self, session_id: &str, since: u64) -> Result<ReadResult, String> {
         // Ensure local buffer exists (may be new MCP process that doesn't know this session)
         let attach_notify = {
@@ -449,21 +565,23 @@ impl DeviceWsConnection {
                 .entry(session_id.to_string())
                 .or_insert_with(SessionBuffer::new);
             buf.attached = false;
+            buf.hold(since);
             Arc::clone(&buf.attach_notify)
         };
 
         // Register waiter before sending to avoid Notify race
         let notified = attach_notify.notified();
-        self.send(json!({
-            "type": "session.attach",
-            "session_id": session_id,
-            "since": since,
-        }))
-        .await?;
-
-        let result = tokio::time::timeout(tokio::time::Duration::from_secs(10), notified).await;
-
-        if result.is_err() {
+        let sent = self.send(attach_message(session_id, since)).await;
+        let answered = sent.is_ok()
+            && tokio::time::timeout(tokio::time::Duration::from_secs(10), notified)
+                .await
+                .is_ok();
+        if !answered {
+            // Nothing more is held for a reply that will not come.
+            if let Some(buf) = self.sessions.lock().await.get_mut(session_id) {
+                buf.settle(Vec::new());
+            }
+            sent?;
             return Err("Timeout waiting for session.attached response".to_string());
         }
 
@@ -473,15 +591,8 @@ impl DeviceWsConnection {
             .get(session_id)
             .ok_or_else(|| format!("Session {session_id} not found after attach"))?;
 
-        let entries: Vec<OutputEntry> = buf
-            .entries
-            .iter()
-            .filter(|e| e.seq > since)
-            .cloned()
-            .collect();
-
         Ok(ReadResult {
-            entries,
+            entries: buf.after_daemon_seq(since),
             status: buf.status,
             exit_code: buf.exit_code,
             dropped_count: buf.dropped_count,
@@ -522,7 +633,7 @@ impl DeviceWsConnection {
             let buf = sessions
                 .get(session_id)
                 .ok_or_else(|| format!("Session {session_id} not found locally"))?;
-            buf.last_seq
+            buf.last_place
         };
 
         // Send the wrapped command
@@ -673,8 +784,8 @@ fn build_ws_url(base_url: &str, api_key: &str) -> Result<String, String> {
     Ok(format!("{ws_base}/api/ws?token={api_key}"))
 }
 
-/// Parse an incoming WS message into an `OutputEntry` if it's a session output message.
-fn parse_output_entry(msg: &Value) -> Option<(String, OutputEntry)> {
+/// Parse an incoming WS message into a `DaemonEntry` if it's a session output message.
+fn parse_output_entry(msg: &Value) -> Option<(String, DaemonEntry)> {
     let msg_type = msg["type"].as_str()?;
     let session_id = msg["session_id"].as_str()?.to_string();
 
@@ -687,13 +798,40 @@ fn parse_output_entry(msg: &Value) -> Option<(String, OutputEntry)> {
 
     Some((
         session_id,
-        OutputEntry {
+        DaemonEntry {
             seq: msg["seq"].as_u64().unwrap_or(0),
             stream: stream.to_string(),
             data: msg["data"].as_str().unwrap_or("").to_string(),
             timestamp_ms: msg["timestamp_ms"].as_u64().unwrap_or(0),
         },
     ))
+}
+
+/// `session.attach` from `since`, the daemon's seq. `dedupes`: the buffer
+/// keeps an entry only when its seq is above the highest it holds, and
+/// holds live output until the reply, so the daemon may keep the output
+/// stream other clients share.
+fn attach_message(session_id: &str, since: u64) -> Value {
+    json!({
+        "type": "session.attach",
+        "session_id": session_id,
+        "since": since,
+        "dedupes": true,
+    })
+}
+
+/// The attaches a new connection sends, one per running session, from the
+/// daemon's last seq the session's buffer holds; each buffer then holds
+/// live output until its reply.
+fn reattach_messages(sessions: &mut HashMap<String, SessionBuffer>) -> Vec<Value> {
+    sessions
+        .iter_mut()
+        .filter(|(_, buf)| buf.status == SessionStatus::Running)
+        .map(|(session_id, buf)| {
+            buf.hold(buf.last_seq);
+            attach_message(session_id, buf.last_seq)
+        })
+        .collect()
 }
 
 type WsStream =
@@ -810,7 +948,7 @@ async fn dispatch_message(
             if let Some((session_id, entry)) = parse_output_entry(msg) {
                 let mut sessions = sessions.lock().await;
                 if let Some(buf) = sessions.get_mut(&session_id) {
-                    buf.push(entry);
+                    buf.live(entry);
                 }
             }
         }
@@ -822,13 +960,12 @@ async fn dispatch_message(
                 if let Some(buf) = sessions.get_mut(session_id) {
                     buf.status = SessionStatus::Exited;
                     buf.exit_code = exit_code;
-                    // Also push as a system entry
-                    buf.push(OutputEntry {
-                        seq: buf.last_seq + 1,
-                        stream: "system".to_string(),
-                        data: format!("Process exited with code {}", exit_code.unwrap_or(-1)),
-                        timestamp_ms: 0,
-                    });
+                    // Also a system line, after the output it ends
+                    buf.live_mark(format!(
+                        "Process exited with code {}",
+                        exit_code.unwrap_or(-1)
+                    ));
+                    buf.notify.notify_waiters();
                 }
             }
         }
@@ -860,11 +997,12 @@ async fn dispatch_message(
                     if let Some(pty) = msg["pty"].as_bool() {
                         buf.is_pty = pty;
                     }
-                    for entry_val in entries {
-                        if let Some((_, entry)) = parse_output_entry(entry_val) {
-                            buf.push(entry);
-                        }
-                    }
+                    // The replay, then the live output held meanwhile.
+                    buf.settle(
+                        entries
+                            .iter()
+                            .filter_map(|e| parse_output_entry(e).map(|(_, entry)| entry)),
+                    );
                     buf.attached = true;
                     buf.attach_notify.notify_waiters();
                 }
@@ -894,6 +1032,8 @@ async fn dispatch_message(
                 if let Some(buf) = sessions.get_mut(session_id) {
                     buf.status = SessionStatus::Exited;
                     buf.exit_code = None;
+                    // No replay follows: keep what an attach held.
+                    buf.settle(Vec::new());
                     buf.notify.notify_waiters();
                     buf.attach_notify.notify_waiters();
                 }
@@ -948,15 +1088,14 @@ async fn dispatch_message(
                 };
                 // Queue a re-attach. We can't call self.attach_session here since
                 // we don't have the sender. Instead, synthesize a system entry so
-                // the consumer knows output may have been lost.
+                // the consumer knows output may have been lost. The marker takes
+                // no seq of the daemon's, so the entry that follows the gap is
+                // still kept.
                 let mut sessions = sessions.lock().await;
                 if let Some(buf) = sessions.get_mut(session_id) {
-                    buf.push(OutputEntry {
-                        seq: buf.last_seq + 1,
-                        stream: "system".into(),
-                        data: format!("[output gap detected: {reason}, last_seq={last_seq}]"),
-                        timestamp_ms: 0,
-                    });
+                    buf.live_mark(format!(
+                        "[output gap detected: {reason}, last_seq={last_seq}]"
+                    ));
                 }
             }
         }
@@ -993,21 +1132,19 @@ async fn reconnect_loop(
                 let (mut ws_sink, ws_reader) = ws_stream.split();
 
                 // Re-attach all active sessions
-                let sessions_lock = sessions.lock().await;
-                for (session_id, buf) in sessions_lock.iter() {
-                    if buf.status == SessionStatus::Running {
-                        let attach_msg = json!({
-                            "type": "session.attach",
-                            "session_id": session_id,
-                            "since": buf.last_seq,
-                        });
-                        let text = serde_json::to_string(&attach_msg).unwrap_or_default();
-                        if ws_sink
-                            .send(tokio_tungstenite::tungstenite::Message::Text(text))
-                            .await
-                            .is_err()
-                        {
-                            eprintln!("mcp-sctl: failed to re-attach session {session_id}");
+                let mut sessions_lock = sessions.lock().await;
+                for attach_msg in reattach_messages(&mut sessions_lock) {
+                    let session_id = attach_msg["session_id"].as_str().unwrap_or("");
+                    let text = serde_json::to_string(&attach_msg).unwrap_or_default();
+                    if ws_sink
+                        .send(tokio_tungstenite::tungstenite::Message::Text(text))
+                        .await
+                        .is_err()
+                    {
+                        eprintln!("mcp-sctl: failed to re-attach session {session_id}");
+                        // No reply will come: hold nothing for it.
+                        if let Some(buf) = sessions_lock.get_mut(session_id) {
+                            buf.settle(Vec::new());
                         }
                     }
                 }
@@ -1027,21 +1164,29 @@ async fn reconnect_loop(
 mod tests {
     use super::*;
 
+    /// An entry the daemon sent: `line <seq>`.
+    fn line(seq: u64) -> DaemonEntry {
+        DaemonEntry {
+            seq,
+            stream: "stdout".into(),
+            data: format!("line {seq}\n"),
+            timestamp_ms: 0,
+        }
+    }
+
+    fn data(buf: &SessionBuffer) -> Vec<String> {
+        buf.entries.iter().map(|e| e.data.clone()).collect()
+    }
+
+    fn places(entries: &[OutputEntry]) -> Vec<u64> {
+        entries.iter().map(|e| e.seq).collect()
+    }
+
     #[test]
     fn session_buffer_detects_no_gap() {
         let mut buf = SessionBuffer::new();
-        buf.push(OutputEntry {
-            seq: 1,
-            stream: "stdout".into(),
-            data: "a".into(),
-            timestamp_ms: 0,
-        });
-        buf.push(OutputEntry {
-            seq: 2,
-            stream: "stdout".into(),
-            data: "b".into(),
-            timestamp_ms: 0,
-        });
+        buf.push(line(1));
+        buf.push(line(2));
         assert_eq!(buf.dropped_count, 0);
         assert_eq!(buf.last_seq, 2);
     }
@@ -1049,19 +1194,9 @@ mod tests {
     #[test]
     fn session_buffer_detects_gap() {
         let mut buf = SessionBuffer::new();
-        buf.push(OutputEntry {
-            seq: 1,
-            stream: "stdout".into(),
-            data: "a".into(),
-            timestamp_ms: 0,
-        });
+        buf.push(line(1));
         // Skip seq 2, 3, 4 — gap of 3
-        buf.push(OutputEntry {
-            seq: 5,
-            stream: "stdout".into(),
-            data: "b".into(),
-            timestamp_ms: 0,
-        });
+        buf.push(line(5));
         assert_eq!(buf.dropped_count, 3);
         assert_eq!(buf.last_seq, 5);
     }
@@ -1070,37 +1205,208 @@ mod tests {
     fn session_buffer_no_gap_on_first_entry() {
         let mut buf = SessionBuffer::new();
         // First entry at seq 100 — no gap (last_seq is 0)
-        buf.push(OutputEntry {
-            seq: 100,
-            stream: "stdout".into(),
-            data: "a".into(),
-            timestamp_ms: 0,
-        });
+        buf.push(line(100));
         assert_eq!(buf.dropped_count, 0);
     }
 
     #[test]
     fn session_buffer_cumulative_gaps() {
         let mut buf = SessionBuffer::new();
-        buf.push(OutputEntry {
-            seq: 1,
-            stream: "stdout".into(),
-            data: "a".into(),
-            timestamp_ms: 0,
-        });
-        buf.push(OutputEntry {
-            seq: 5,
-            stream: "stdout".into(),
-            data: "b".into(),
-            timestamp_ms: 0,
-        });
-        buf.push(OutputEntry {
-            seq: 10,
-            stream: "stdout".into(),
-            data: "c".into(),
-            timestamp_ms: 0,
-        });
+        buf.push(line(1));
+        buf.push(line(5));
+        buf.push(line(10));
         // Gap 1→5 = 3, gap 5→10 = 4, total = 7
         assert_eq!(buf.dropped_count, 7);
+    }
+
+    #[test]
+    fn a_gap_marker_and_the_real_next_entry_are_both_kept() {
+        let mut buf = SessionBuffer::new();
+        buf.push(line(1));
+        buf.push(line(2));
+        buf.mark("[output gap detected: backpressure, last_seq=2]".into());
+        buf.push(line(3));
+        assert_eq!(
+            data(&buf),
+            [
+                "line 1\n",
+                "line 2\n",
+                "[output gap detected: backpressure, last_seq=2]",
+                "line 3\n"
+            ]
+        );
+        // The marker takes a place of the buffer's own and no seq of the
+        // daemon's.
+        assert_eq!(places(buf.entries.make_contiguous()), [1, 2, 3, 4]);
+        assert_eq!(buf.entries[2].daemon_seq, None);
+        assert_eq!(buf.entries[3].daemon_seq, Some(3));
+        assert_eq!(buf.last_seq, 3);
+        assert_eq!(buf.dropped_count, 0);
+    }
+
+    #[test]
+    fn an_exit_marker_moves_no_seq_of_the_daemons() {
+        let mut buf = SessionBuffer::new();
+        buf.push(line(1));
+        buf.mark("Process exited with code 0".into());
+        assert_eq!(buf.last_seq, 1);
+        assert_eq!(buf.last_place, 2);
+    }
+
+    #[test]
+    fn a_repeated_entry_is_dropped() {
+        let mut buf = SessionBuffer::new();
+        buf.push(line(1));
+        buf.push(line(2));
+        buf.push(line(2));
+        buf.push(line(1));
+        buf.push(line(3));
+        assert_eq!(data(&buf), ["line 1\n", "line 2\n", "line 3\n"]);
+        assert_eq!(buf.dropped_count, 0);
+    }
+
+    #[test]
+    fn a_re_attach_starts_from_the_daemons_last_seq() {
+        let mut sessions = HashMap::new();
+        let mut buf = SessionBuffer::new();
+        buf.push(line(1));
+        buf.push(line(2));
+        buf.mark("[output gap detected: backpressure, last_seq=2]".into());
+        sessions.insert("s1".to_string(), buf);
+        let mut exited = SessionBuffer::new();
+        exited.push(line(1));
+        exited.status = SessionStatus::Exited;
+        sessions.insert("s2".to_string(), exited);
+
+        let messages = reattach_messages(&mut sessions);
+        assert_eq!(
+            messages,
+            [json!({
+                "type": "session.attach",
+                "session_id": "s1",
+                "since": 2,
+                "dedupes": true,
+            })]
+        );
+        // The re-attached session holds live output until its reply.
+        assert!(sessions["s1"].held.is_some());
+        assert!(sessions["s2"].held.is_none());
+    }
+
+    #[test]
+    fn output_held_during_an_attach_is_kept_once_after_the_replay() {
+        let mut buf = SessionBuffer::new();
+        buf.push(line(1));
+        buf.hold(1);
+        // Live output before the reply: one entry the replay also carries,
+        // then the exit, which follows the output it ends.
+        buf.live(line(4));
+        buf.live_mark("Process exited with code 0".into());
+        assert_eq!(data(&buf), ["line 1\n"]);
+        buf.settle([line(2), line(3), line(4)]);
+        buf.live(line(4));
+        assert_eq!(
+            data(&buf),
+            [
+                "line 1\n",
+                "line 2\n",
+                "line 3\n",
+                "line 4\n",
+                "Process exited with code 0"
+            ]
+        );
+        assert!(buf.held.is_none());
+        // Live output after the reply is kept as it comes.
+        buf.live(line(5));
+        assert_eq!(buf.entries.back().unwrap().data, "line 5\n");
+    }
+
+    #[test]
+    fn an_attach_from_a_seq_skips_what_the_buffer_does_not_ask_for() {
+        // A new buffer attached from the daemon's seq 10: an old batch at
+        // or below it, held before the reply, is not kept.
+        let mut buf = SessionBuffer::new();
+        buf.hold(10);
+        buf.live(line(9));
+        buf.settle([line(11), line(12)]);
+        assert_eq!(data(&buf), ["line 11\n", "line 12\n"]);
+        assert_eq!(buf.dropped_count, 0);
+    }
+
+    #[tokio::test]
+    async fn the_reader_keeps_a_replay_and_the_live_output_around_it_once() {
+        let notifiers = WsNotifiers {
+            start_notify: Arc::new(Notify::new()),
+            start_result: Arc::new(Mutex::new(None)),
+            list_notify: Arc::new(Notify::new()),
+            list_result: Arc::new(Mutex::new(None)),
+            ai_status_notify: Arc::new(Notify::new()),
+            ai_status_result: Arc::new(Mutex::new(None)),
+        };
+        let ai = Arc::new(Mutex::new(HashSet::new()));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let mut buf = SessionBuffer::new();
+        buf.hold(0);
+        sessions.lock().await.insert("s1".to_string(), buf);
+        let output = |seq: u64| {
+            json!({
+                "type": "session.stdout",
+                "session_id": "s1",
+                "data": format!("line {seq}\n"),
+                "seq": seq,
+                "timestamp_ms": 0,
+            })
+        };
+
+        // A batch the shared stream sent before the reply, which the
+        // replay also carries.
+        dispatch_message(&output(3), &sessions, &notifiers, &ai).await;
+        let entries: Vec<Value> = (1..=3).map(output).collect();
+        let attached = json!({
+            "type": "session.attached",
+            "session_id": "s1",
+            "entries": entries,
+            "dropped": 0,
+        });
+        dispatch_message(&attached, &sessions, &notifiers, &ai).await;
+        dispatch_message(&output(3), &sessions, &notifiers, &ai).await;
+        dispatch_message(&output(4), &sessions, &notifiers, &ai).await;
+
+        let sessions = sessions.lock().await;
+        let buf = &sessions["s1"];
+        assert_eq!(data(buf), ["line 1\n", "line 2\n", "line 3\n", "line 4\n"]);
+        assert!(buf.attached);
+        assert!(buf.held.is_none());
+    }
+
+    #[test]
+    fn an_attach_answers_from_the_last_daemon_entry_at_or_below_since() {
+        let mut buf = SessionBuffer::new();
+        buf.push(line(1));
+        buf.push(line(2));
+        buf.mark("[output gap detected: backpressure, last_seq=2]".into());
+        buf.push(line(3));
+        assert_eq!(places(&buf.after_daemon_seq(0)), [1, 2, 3, 4]);
+        assert_eq!(places(&buf.after_daemon_seq(2)), [3, 4]);
+        assert_eq!(places(&buf.after_daemon_seq(3)), Vec::<u64>::new());
+        // From a seq the buffer never held, all of it.
+        let mut fresh = SessionBuffer::new();
+        fresh.hold(10);
+        fresh.settle([line(11), line(12)]);
+        assert_eq!(places(&fresh.after_daemon_seq(10)), [11, 12]);
+    }
+
+    #[test]
+    fn places_follow_the_daemons_seq_where_they_can() {
+        let mut buf = SessionBuffer::new();
+        buf.push(line(5));
+        buf.push(line(6));
+        // A marker takes the next place; the daemon's next entry the one
+        // after it.
+        buf.mark("[output gap detected: backpressure, last_seq=6]".into());
+        buf.push(line(7));
+        // Entries the relay dropped: the daemon's next seq is ahead again.
+        buf.push(line(12));
+        assert_eq!(places(buf.entries.make_contiguous()), [5, 6, 7, 8, 12]);
     }
 }

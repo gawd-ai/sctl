@@ -1288,6 +1288,15 @@ the agent's own (`docs/config.md`).
 On disconnect, non-persistent sessions are killed; persistent sessions
 detach and keep buffering output for later re-attach.
 
+`session.attach` takes `session_id`, `since` and `dedupes`. It answers
+`session.attached` with `entries`, the session's entries above `since`
+(each a `session.stdout`, `session.stderr` or `session.system` message
+with its `seq`), and `dropped`, how many entries after `since` the buffer
+no longer holds; live output follows. On this socket each connection has
+a subscriber of its own per session, which an attach restarts after its
+replay, and `dedupes` changes nothing. Through a relay it does
+(`GET /d/{serial}/api/ws`).
+
 ---
 
 ## Managed upgrades
@@ -1616,6 +1625,25 @@ device's clients, and additionally delivers relay-only messages:
 client. Device telemetry broadcasts (`gps.fix`, `lte.signal`,
 `lte.watchdog`, `net.state`, `infra.state`) are relay-internal state feeds
 and are not part of the stable client contract.
+
+Every client watching a session is fed by one subscriber per session on
+the device's tunnel connection, which sends output in batches: one
+`session.stdout`, `session.stderr` or `session.system` message carries up
+to 32 entries or 8 KiB, under the `seq` of its last entry.
+
+- An attach without `dedupes` restarts that subscriber after its replay,
+  as agents before 0.6.12 do for every attach. What the old subscriber had
+  taken and not yet sent never reaches the clients already watching.
+- `dedupes: true` (0.6.12) is for a client that writes an entry only when
+  its seq is above the highest it holds for the session, and that listens
+  for the session's output before it sends the attach. A subscriber
+  already running is kept, and the replay ends where it stands: no batch
+  holds entries on both sides of the replay's end, batches above it come
+  after `session.attached`, and batches at or below it may come before or
+  after it. Such a client holds live output until the reply, then writes
+  the replay and the held output, each entry only when its seq is above
+  the highest it wrote. With no subscriber running, the attach starts one
+  after its replay, as without `dedupes`.
 
 ### `GET /d/{serial}/api/stp/chunk/{xfer}/{idx}`
 

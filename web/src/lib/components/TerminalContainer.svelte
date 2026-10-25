@@ -14,6 +14,7 @@
 		WsActivityNewMsg
 	} from '../types/terminal.types';
 	import { SctlWsClient } from '../utils/ws-client';
+	import { SessionSeq, attachKeepingSeq } from '../utils/session-seq';
 	import { uuid } from '../utils/index';
 	import Terminal from './Terminal.svelte';
 	import TerminalTabs from './TerminalTabs.svelte';
@@ -57,8 +58,10 @@
 	// Fast lookup: server sessionId → local key (for server message handlers)
 	const keyForSession = new Map<string, string>();
 
-	// Non-reactive seq tracking — avoids re-rendering on every output message
-	const seqMap = new Map<string, number>();
+	// Non-reactive seq tracking, so output does not re-render: each session's
+	// highest written seq, and its live output held while an attach is in
+	// flight. Every entry is written once, by its seq.
+	const outputSeq = new SessionSeq<WsSessionOutputMsg>();
 	const attachInFlight = new Set<string>();
 
 	// Buffer for output that arrives before xterm is ready inside the Terminal.
@@ -290,53 +293,40 @@
 			setActiveKey(existing.key);
 		}
 
-		// Now attach via WS
+		// Now attach via WS: listen first, and hold live output until the
+		// replay is written, so no line is lost or written twice.
 		try {
-			const since = seqMap.get(sessionId) ?? 0;
-			const result = await client.attachSession(sessionId, since);
+			const result = await attachKeepingSeq(client, outputSeq, sessionId, () =>
+				subscribeSession(sessionId)
+			);
 
 			// Guard: session may have been removed or marked dead during the await
 			const current = sessions.find((s) => s.sessionId === sessionId);
-			if (!current || current.dead) return;
+			if (!current || current.dead) {
+				outputSeq.release(sessionId);
+				return;
+			}
 
-			// Mark attached, subscribe to live output
+			// Mark attached
 			if (!current.attached) {
-				subscribeSession(sessionId);
 				sessions = sessions.map((s) =>
 					s.sessionId === sessionId ? { ...s, attached: true } : s
 				);
 				await tick();
 				syncTerminalSize(sessionId, true);
-			}
-
-			// Replay buffered entries
-			if (result.entries && result.entries.length > 0) {
-				const ref = getTermRef(sessionId);
-				if (ref) {
-					suppressInputForReplay(sessionId);
-					let maxSeq = since;
-					for (const entry of result.entries) {
-						ref.write(fixLineEndings(sessionId, entry.data));
-						if (entry.seq > maxSeq) maxSeq = entry.seq;
-					}
-					updateSessionSeq(sessionId, maxSeq);
-				} else {
-					// Terminal not mounted yet — buffer for later
-					let buf = outputBuffer.get(sessionId);
-					if (!buf) { buf = []; outputBuffer.set(sessionId, buf); }
-					let maxSeq = since;
-					for (const entry of result.entries) {
-						buf.push(entry.data);
-						if (entry.seq > maxSeq) maxSeq = entry.seq;
-					}
-					updateSessionSeq(sessionId, maxSeq);
-					suppressOnFlush.add(sessionId);
-					tick().then(() => flushBuffer(sessionId));
+				if (!sessions.some((s) => s.sessionId === sessionId && !s.dead)) {
+					outputSeq.release(sessionId);
+					return;
 				}
 			}
+
+			// The replay, then the output held during the attach: each entry
+			// only when its seq is above the highest written.
+			writeOutput(sessionId, outputSeq.settle(sessionId, result.entries), true);
 		} catch (err) {
 			console.error('Failed to attach session:', err);
 			// Attach failed — mark dead so the user sees the failure
+			outputSeq.release(sessionId);
 			unsubscribeSession(sessionId);
 			sessions = sessions.map((s) =>
 				s.sessionId === sessionId
@@ -458,7 +448,7 @@
 			delete terminalRefs[key];
 			keyForSession.delete(sessionId);
 		}
-		seqMap.delete(sessionId);
+		outputSeq.forget(sessionId);
 		outputBuffer.delete(sessionId);
 		nonPtySessions.delete(sessionId);
 		subscriptionCleanups.delete(sessionId);
@@ -495,25 +485,7 @@
 		const cleanups: (() => void)[] = [];
 
 		cleanups.push(client.onOutput(sessionId, (msg: WsSessionOutputMsg) => {
-			const ref = getTermRef(sessionId);
-			if (ref) {
-				// Flush any earlier buffered output, then write new data
-				const buf = outputBuffer.get(sessionId);
-				if (buf) {
-					for (const data of buf) ref.write(fixLineEndings(sessionId, data));
-					outputBuffer.delete(sessionId);
-				}
-				ref.write(fixLineEndings(sessionId, msg.data));
-			} else {
-				// Terminal component hasn't mounted yet — buffer the output
-				let buf = outputBuffer.get(sessionId);
-				if (!buf) {
-					buf = [];
-					outputBuffer.set(sessionId, buf);
-				}
-				buf.push(msg.data);
-			}
-			updateSessionSeq(sessionId, msg.seq);
+			writeOutput(sessionId, outputSeq.live(sessionId, msg), false);
 		}));
 
 		cleanups.push(client.onSessionEnd(sessionId, () => {
@@ -535,6 +507,36 @@
 		if (cleanups) {
 			for (const fn of cleanups) fn();
 			subscriptionCleanups.delete(sessionId);
+		}
+	}
+
+	/** Write output the seq check let through: to the session's terminal,
+	 *  after anything kept for it, or kept until the terminal is ready. A
+	 *  replay first stops the terminal's answers to what it replays from
+	 *  reaching the session. */
+	function writeOutput(sessionId: string, entries: readonly WsSessionOutputMsg[], replay: boolean): void {
+		if (entries.length === 0) return;
+		const ref = getTermRef(sessionId);
+		if (ref) {
+			const buf = outputBuffer.get(sessionId);
+			if (buf) {
+				for (const data of buf) ref.write(fixLineEndings(sessionId, data));
+				outputBuffer.delete(sessionId);
+			}
+			if (replay) suppressInputForReplay(sessionId);
+			for (const entry of entries) ref.write(fixLineEndings(sessionId, entry.data));
+		} else {
+			// Terminal component hasn't mounted yet: keep the output for it
+			let buf = outputBuffer.get(sessionId);
+			if (!buf) {
+				buf = [];
+				outputBuffer.set(sessionId, buf);
+			}
+			for (const entry of entries) buf.push(entry.data);
+			if (replay) {
+				suppressOnFlush.add(sessionId);
+				tick().then(() => flushBuffer(sessionId));
+			}
 		}
 	}
 
@@ -565,11 +567,6 @@
 		ref.fit();
 		const size = ref.getSize();
 		if (size) handleTerminalResize(sessionId, size.rows, size.cols);
-	}
-
-	function updateSessionSeq(sessionId: string, seq: number): void {
-		const prev = seqMap.get(sessionId) ?? 0;
-		seqMap.set(sessionId, Math.max(prev, seq));
 	}
 
 	/** Reconcile local sessions with remote server state after reconnect.
@@ -899,7 +896,7 @@
 
 	/** Get the current list of all session tabs as `SessionInfo[]`. */
 	export function getSessionList(): SessionInfo[] {
-		return sessions.map((s) => ({ ...s, lastSeq: seqMap.get(s.sessionId) ?? s.lastSeq }));
+		return sessions.map((s) => ({ ...s, lastSeq: outputSeq.highest(s.sessionId) ?? s.lastSeq }));
 	}
 
 	/** Get the local key of the currently active session tab, or null if no sessions. */
@@ -977,7 +974,7 @@
 				const isRelay = config.wsUrl.includes('/d/');
 				if (isRelay) {
 					for (const session of sessions) {
-						seqMap.delete(session.sessionId);
+						outputSeq.forget(session.sessionId);
 						outputBuffer.delete(session.sessionId);
 						subscriptionCleanups.delete(session.sessionId);
 						keyForSession.delete(session.sessionId);
@@ -1081,7 +1078,7 @@
 	// from being tracked as a dependency, avoiding infinite update loops.
 	$effect(() => {
 		const snapshot = sessions.map((s) => ({
-			...s, lastSeq: seqMap.get(s.sessionId) ?? s.lastSeq
+			...s, lastSeq: outputSeq.highest(s.sessionId) ?? s.lastSeq
 		}));
 		untrack(() => config.callbacks?.onSessionsChange?.(snapshot));
 	});

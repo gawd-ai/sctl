@@ -302,6 +302,7 @@ Returns: `{entries: [{seq, stream, data, timestamp_ms}], last_seq, status, exit_
 - `status`: `"running"` or `"exited"`
 - `dropped_entries`: number of entries lost due to buffer overflow
 - Pass `last_seq` as `since` on the next call to get only new output
+- `seq` numbers the entries of mcp-sctl's own buffer for the session, which its markers (an output gap, a process exit) take too, so a read misses neither. An entry from the daemon keeps the daemon's sequence number when that is above the last `seq` given, so the two are equal until a marker comes between. An entry the daemon sends twice is kept once.
 
 #### `session_signal`
 
@@ -339,6 +340,8 @@ Re-attach to an existing persistent session after a disconnect.
 | `session_id` | string | yes | Session ID |
 | `since` | integer | no | Sequence number (0 = replay from beginning) |
 | `device` | string | no | Device name |
+
+`since` is the daemon's sequence number. The entries returned, and `last_seq`, carry mcp-sctl's own `seq`, as `session_read` takes it.
 
 #### `session_exec_wait`
 

@@ -248,7 +248,7 @@ ws.connect();
 | `onOutput(sessionId, cb)` | `() => void` | Subscribe to session output (stdout/stderr/system) |
 | `onSessionEnd(sessionId, cb)` | `() => void` | Subscribe to session close/exit |
 | `startSession(opts?)` | `Promise<WsSessionStartedMsg>` | Start a shell session |
-| `attachSession(sessionId, since?)` | `Promise<WsSessionAttachedMsg>` | Attach to existing session |
+| `attachSession(sessionId, since?, opts?)` | `Promise<WsSessionAttachedMsg>` | Attach to existing session. `{ dedupes: true }` only for a caller that writes an entry only when its seq is above the highest it holds, and that listens before it attaches |
 | `killSession(sessionId)` | `Promise<WsSessionClosedMsg>` | Kill a session |
 | `sendStdin(sessionId, data)` | `void` | Send keystrokes (fire-and-forget) |
 | `execCommand(sessionId, command)` | `Promise<void>` | Execute command in session |

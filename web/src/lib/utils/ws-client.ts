@@ -409,12 +409,22 @@ export class SctlWsClient {
 		});
 	}
 
-	/** Attach to an existing session, replaying output since the given sequence number. */
-	async attachSession(sessionId: string, since?: number): Promise<WsSessionAttachedMsg> {
+	/**
+	 * Attach to an existing session, replaying output since the given sequence number.
+	 * `dedupes` is only for a caller that writes an entry only when its seq is above
+	 * the highest it holds, and that listens for the session's output before it
+	 * attaches (see `WsSessionAttachMsg`).
+	 */
+	async attachSession(
+		sessionId: string,
+		since?: number,
+		opts?: { dedupes?: boolean }
+	): Promise<WsSessionAttachedMsg> {
 		return this.sendWithAck<WsSessionAttachedMsg>({
 			type: 'session.attach',
 			session_id: sessionId,
-			since
+			since,
+			...(opts?.dedupes ? { dedupes: true } : {})
 		});
 	}
 
