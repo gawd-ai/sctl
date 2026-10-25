@@ -26,7 +26,12 @@
 //! before the command starts, so the count holds across the restarts a
 //! recovery causes, and the next start logs a run that did not end. The run
 //! writes that file, synced, on the blocking pool and outside the Infra
-//! lock ([`RecoveryFile`]).
+//! lock ([`RecoveryFile`]). A run whose record did not reach the disk does
+//! not run: that record is what bounds a recovery that power-cycles the
+//! unit's own supply across restarts. No command starts, the run is logged
+//! with `exit_code` -1 and says why, and it counts as an attempt for the
+//! count and the cooldown in memory, so `max_retries` still holds while the
+//! agent runs.
 //!
 //! Check now (`POST /api/infra/check/{target_id}`) is a reading: its result
 //! is applied as a monitor check's is, and it never starts a recovery.
@@ -1262,6 +1267,10 @@ struct RecoveryFileInner {
     taken: AtomicU64,
     /// The number of the snapshot on disk, held while a write runs.
     on_disk: StdMutex<u64>,
+    /// Tests hold the next write here, on the thread that writes, as a slow
+    /// disk would, until they let it through.
+    #[cfg(test)]
+    held: StdMutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 impl RecoveryFile {
@@ -1270,12 +1279,23 @@ impl RecoveryFile {
             path,
             taken: AtomicU64::new(0),
             on_disk: StdMutex::new(0),
+            #[cfg(test)]
+            held: StdMutex::new(None),
         }))
     }
 
     /// Where the file is.
     pub fn path(&self) -> &Path {
         &self.0.path
+    }
+
+    /// Hold the next write inside it until the sender sends, or drops, or
+    /// 10 s have passed, so a test that fails while it holds one still ends.
+    #[cfg(test)]
+    pub(crate) fn hold_next_write(&self) -> std::sync::mpsc::Sender<()> {
+        let (release, held) = std::sync::mpsc::channel();
+        *self.0.held.lock().unwrap_or_else(PoisonError::into_inner) = Some(held);
+        release
     }
 }
 
@@ -1321,6 +1341,15 @@ impl RecoverySnapshot {
         let mut on_disk = file.on_disk.lock().unwrap_or_else(PoisonError::into_inner);
         if *on_disk >= self.number {
             return true;
+        }
+        #[cfg(test)]
+        if let Some(held) = file
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            let _ = held.recv_timeout(Duration::from_secs(10));
         }
         let written = if self.saved.counts.is_empty() && self.saved.running.is_empty() {
             match std::fs::remove_file(&file.path) {

@@ -81,6 +81,9 @@ const STALL_ENV: &str = "SCTL_INFRA_TEST_STALL_SECS";
 /// The detail of a target whose check panicked.
 const CHECK_PANICKED: &str =
     "AGENT ERROR: the agent failed to check this target (its check panicked; see the agent's log)";
+/// What the log says of a run whose record did not reach the disk.
+const NOT_RECORDED: &str =
+    "ERROR: the run's record did not reach the disk; the recovery did not run";
 
 /// The monitor's clock.
 #[derive(Debug, Clone, Copy)]
@@ -1018,6 +1021,28 @@ impl RecoveryRun {
         }
     }
 
+    /// Without the lock, once the write of the run's record has ended: run
+    /// the command only when the record reached the disk. That record is
+    /// what bounds a recovery that power-cycles the unit's own supply across
+    /// the restarts it causes, so without it no command starts. The run is
+    /// logged all the same, and it counts as an attempt: its count and its
+    /// cooldown moved when it was recorded in memory, so `max_retries` still
+    /// holds while the agent runs.
+    async fn execute_if_recorded(&self, recorded: bool, prepared: Prepared) -> Ended {
+        if recorded {
+            return self.execute(prepared).await;
+        }
+        warn!(
+            "Recovery for {}: its record did not reach the disk; the recovery does not run",
+            self.target_id
+        );
+        Ended {
+            exit_code: -1,
+            stdout: NOT_RECORDED.to_string(),
+            stderr: String::new(),
+        }
+    }
+
     /// Without the lock: run the command under its 300 s limit, and mask and
     /// cut what it said. A panic here is the agent's, and still ends the
     /// run with a log entry.
@@ -1156,13 +1181,14 @@ fn start_recovery(
 /// Run a recovery in a task of its own (ADR-010 decision 9). Under the
 /// Infra lock it takes the credentials the command names and the record
 /// that saves the run as not ended. It releases the lock, writes that
-/// record, synced, on the blocking pool, and only then runs the command,
-/// which only its 300 s limit or the agent's stop ends: no push, rebuilt
-/// monitor or removed config. Its output, masked and cut, is logged under
-/// the lock, and the record that saves it as ended is written outside it.
-/// The run is in progress, and `flight`, the target's place, held, until
-/// that record is written: no check of the target starts before, and a
-/// managed upgrade's restart waits for it.
+/// record, synced, on the blocking pool, and only once the record is on
+/// disk runs the command, which only its 300 s limit or the agent's stop
+/// ends: no push, rebuilt monitor or removed config. A run whose record did
+/// not reach the disk starts no command, and is logged as such. Its output,
+/// masked and cut, is logged under the lock, and the record that saves it
+/// as ended is written outside it. The run is in progress, and `flight`,
+/// the target's place, held, until that record is written: no check of the
+/// target starts before, and a managed upgrade's restart waits for it.
 pub(crate) async fn run_recovery(infra: Arc<Mutex<InfraState>>, run: RecoveryRun, flight: Flight) {
     let (prepared, record) = {
         let state = infra.lock().await;
@@ -1171,13 +1197,8 @@ pub(crate) async fn run_recovery(infra: Arc<Mutex<InfraState>>, run: RecoveryRun
     // A synced write to flash can take hundreds of milliseconds: never on
     // the async worker, never under the lock the forwarder needs to send
     // the Down.
-    if !record.write().await {
-        warn!(
-            "Recovery for {}: its record did not reach the disk; it runs all the same",
-            run.target_id
-        );
-    }
-    let ended = run.execute(prepared).await;
+    let recorded = record.write().await;
+    let ended = run.execute_if_recorded(recorded, prepared).await;
     let record = run.log(&mut *infra.lock().await, ended);
     record.write().await;
     drop(run);
@@ -1257,8 +1278,8 @@ mod tests {
     /// A recovery run's parts in turn, on a state the test holds.
     async fn run_inline(state: &mut InfraState, run: RecoveryRun) {
         let prepared = run.prepare(state);
-        state.recoveries_snapshot().write().await;
-        let ended = run.execute(prepared).await;
+        let recorded = state.recoveries_snapshot().write().await;
+        let ended = run.execute_if_recorded(recorded, prepared).await;
         run.log(state, ended).write().await;
     }
 
@@ -2470,13 +2491,13 @@ mod tests {
     /// A synced write to a unit's flash can take hundreds of milliseconds,
     /// and a one-core unit has one async worker. A run's record is written
     /// on the blocking pool, outside the Infra lock: while its write is
-    /// held, here by a FIFO in place of the temporary file it writes, the
-    /// lock is free and the worker goes on, and the command waits for the
-    /// record.
+    /// held, here inside the write as a slow disk would hold it, the lock
+    /// is free and the worker goes on, and the command waits for the
+    /// record. A FIFO in place of the file cannot hold it: a FIFO takes no
+    /// sync, so the write fails, and a run whose record did not reach the
+    /// disk starts no command.
     #[tokio::test]
     async fn a_runs_record_is_written_outside_the_lock_and_off_the_async_worker() {
-        use std::os::unix::fs::OpenOptionsExt as _;
-
         let scratch = Scratch::new("slow-disk");
         let mut t = target_every("pdu", 60);
         t.recovery = Some(RecoveryConfig {
@@ -2500,29 +2521,11 @@ mod tests {
             })
             .expect("Down within five failures");
         let flight = state.in_flight.start("pdu").expect("free");
+        // The write waits inside itself until the test lets it through, or
+        // 10 s whatever happens, so a write that holds the worker fails the
+        // test instead of hanging it.
+        let release = state.recovery_file.hold_next_write();
         let infra = Arc::new(Mutex::new(state));
-
-        // The write waits in its open until the FIFO has a reader. A thread
-        // opens one when the test says, or after 5 s whatever happens, so a
-        // write that holds the worker fails the test instead of hanging it.
-        let fifo = scratch.0.join("infra-recovery.json.tmp");
-        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
-        let (open, opened) = std::sync::mpsc::channel::<()>();
-        let (close, closed) = std::sync::mpsc::channel::<()>();
-        let reader = std::thread::spawn({
-            let fifo = fifo.clone();
-            move || {
-                let _ = opened.recv_timeout(Duration::from_secs(5));
-                // Opened without waiting for a writer; while it is open,
-                // every write opens at once.
-                let held = std::fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NONBLOCK)
-                    .open(&fifo);
-                let _ = closed.recv_timeout(Duration::from_secs(30));
-                drop(held);
-            }
-        });
 
         let asked = std::time::Instant::now();
         let task = tokio::spawn(run_recovery(infra.clone(), run, flight));
@@ -2539,15 +2542,91 @@ mod tests {
         );
         assert!(!task.is_finished());
 
-        open.send(()).unwrap();
+        release.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(10), task)
             .await
             .expect("the run ends once its write does")
             .unwrap();
-        close.send(()).unwrap();
-        reader.join().unwrap();
         let log = infra.lock().await.results.recovery_log.clone();
         assert_eq!((log.len(), log[0].exit_code), (1, 0), "it ran, once");
+        assert_eq!(
+            scratch.saved(),
+            json!({"counts": {"pdu": 1}, "running": {}}),
+            "saved as ended"
+        );
+    }
+
+    /// A run whose record did not reach the disk does not run: that record
+    /// is what bounds a recovery that power-cycles the unit's own supply
+    /// across the restarts it causes. No command starts, the run is logged
+    /// with exit -1 saying so, and it counts as an attempt: no run starts
+    /// within the cooldown, and none past `max_retries`.
+    #[tokio::test]
+    async fn a_run_whose_record_did_not_reach_the_disk_does_not_run() {
+        let scratch = Scratch::new("unrecorded");
+        // A directory where the record goes: no write of it reaches the
+        // disk.
+        let record = scratch.0.join("infra-recovery.json");
+        std::fs::create_dir(&record).unwrap();
+        let mut t = target_every("pdu", 60);
+        t.down_after_consecutive = 1;
+        t.recovery = Some(RecoveryConfig {
+            enabled: true,
+            // Its output would be in the log, were it run.
+            command: "echo ran".into(),
+            cooldown_secs: 60,
+            max_retries: 2,
+            credential_ids: Vec::new(),
+        });
+        let infra = Arc::new(Mutex::new(holding(&scratch, vec![t.clone()])));
+        let digest = infra.lock().await.digest();
+        let t0 = Instant::now();
+
+        // Degraded, then Down with a run; one within the cooldown; one past
+        // it; then the count is spent.
+        let mut started_at = Vec::new();
+        for secs in [0, 10, 20, 70, 80, 140] {
+            let started = {
+                let mut state = infra.lock().await;
+                let now = t0 + Duration::from_secs(secs);
+                apply_result(&mut state, &t, answer(false, 0), 1, now, Reading::Monitor)
+                    .map(|run| (run, state.in_flight.start("pdu").expect("free")))
+            };
+            if let Some((run, flight)) = started {
+                started_at.push(secs);
+                run_recovery(infra.clone(), run, flight).await;
+            }
+        }
+        assert_eq!(
+            started_at,
+            [10, 70],
+            "attempts, within the cooldown and max_retries"
+        );
+
+        let state = infra.lock().await;
+        let log = &state.results.recovery_log;
+        assert_eq!(log.len(), 2);
+        for entry in log {
+            assert_eq!(
+                (
+                    entry.command.as_str(),
+                    entry.exit_code,
+                    entry.stdout.as_str()
+                ),
+                ("echo ran", -1, NOT_RECORDED),
+                "no command started"
+            );
+            assert!(entry.stderr.is_empty());
+        }
+        assert_eq!(
+            state.recovery_tracker["pdu"],
+            (t0 + Duration::from_secs(70), 2),
+            "each counted, its cooldown begun"
+        );
+        assert!(state.runs_not_ended.is_empty(), "logged: ended");
+        assert_eq!(state.runs().in_progress(), 0);
+        assert_eq!(digest.stamp().recoveries, 2, "each logged run moves it");
+        assert!(record.is_dir(), "nothing reached the disk");
     }
 
     #[tokio::test]

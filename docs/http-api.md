@@ -919,10 +919,16 @@ until it ends. Before the command
 starts, the run is saved in `<state_dir>/infra-recovery.json`, synced: the
 count holds across restarts (after a start, a target with a saved count
 waits a full cooldown), and the next start logs a run that did not end,
-its outcome unknown. The count clears when a good answer moves the target
-out of `down` or `unknown`; a removed config clears every count, and a
-target a push removes loses its own. A managed upgrade waits for a run in
-progress, at most 300 s, before it hands off (`docs/upgrade.md`).
+its outcome unknown. A run whose record did not reach the disk does not
+run, since that record is what bounds a recovery that power-cycles the
+unit's own supply across restarts: no command starts, the run is logged
+with `exit_code` -1 and `ERROR: the run's record did not reach the disk;
+the recovery did not run`, and it counts as an attempt for the count and
+the cooldown, so `max_retries` still holds while the agent runs. The
+count clears when a good answer moves the target out of `down` or
+`unknown`; a removed config clears every count, and a target a push
+removes loses its own. A managed upgrade waits for a run in progress, at
+most 300 s, before it hands off (`docs/upgrade.md`).
 
 Check kinds (`check.method`): `ping`, `http`, `https`, `tcp_port`, `snmp`,
 `custom_script`, and `http_api`. An `http_api` check logs into a device's
@@ -993,7 +999,9 @@ command (the out-of-memory killer, a crash, a kill from outside), and
 `stdout` and `stderr` are then its own output; a shell that outlives a
 command a signal ended exits 128 plus the signal's number instead. Or the
 agent says why in `stdout`: `ERROR: credential <id> is not on this unit`,
-`ERROR: spawn failed: ...` when the command could not start,
+`ERROR: the run's record did not reach the disk; the recovery did not
+run` when the run was not saved before its command, which then never
+started, `ERROR: spawn failed: ...` when the command could not start,
 `ERROR: timeout` at the 300 s limit, another `ERROR:` when the agent could
 not read the command's output or its end, `AGENT ERROR:` when the agent
 failed to finish the run, or `OUTCOME UNKNOWN: the agent stopped before
