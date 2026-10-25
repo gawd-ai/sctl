@@ -2792,7 +2792,8 @@ mod tests {
     }
 
     /// TRD-9 3.5: `own` by address and by MAC, a bridge named before the
-    /// port it shares its MAC with.
+    /// port it shares its MAC with; the unit's own addresses are never
+    /// asked by ARP.
     #[tokio::test]
     async fn the_unit_s_own_addresses_and_macs_carry_own() {
         let mut links = unit_links();
@@ -2808,6 +2809,11 @@ mod tests {
                 Answered {
                     ip: ip("192.0.2.81"),
                     mac: Some(MAC_A),
+                },
+                // Another device at the unit's own address.
+                Answered {
+                    ip: ip("192.0.2.1"),
+                    mac: Some(MAC_C),
                 },
             ],
         )]));
@@ -2828,6 +2834,22 @@ mod tests {
         assert_eq!(json["own"], "br-lan");
         let json = serde_json::to_value(device(&scanned, "192.0.2.81")).unwrap();
         assert!(json.get("own").is_none(), "{json}");
+        // The unit's own addresses are never asked: one carries a MAC only
+        // when another device answered the sweep there, an address
+        // conflict.
+        assert_eq!(
+            device(&scanned, "192.0.2.1").mac.as_deref(),
+            Some("02:00:00:00:00:0c")
+        );
+        assert_eq!(device(&scanned, "192.168.8.20").mac, None);
+        assert!(
+            fake.log_of("arp").iter().all(|l| {
+                let asked = l.split(' ').nth(2);
+                asked != Some("192.0.2.1") && asked != Some("192.168.8.20")
+            }),
+            "{:?}",
+            fake.log_of("arp")
+        );
     }
 
     /// A scan that cannot read the unit's network judges nothing, so it

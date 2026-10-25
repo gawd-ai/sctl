@@ -1105,7 +1105,9 @@ for gets none, whether the sweep heard both or the entry names another MAC
 than the sweep's. A STALE, DELAY or PROBE entry is never reported and
 never outweighs the sweep's answer: it may name the device that held the
 address before. A host the guard keeps from the wire gets the sweep's MAC
-or none, and the unit's own addresses get none.
+or none. The unit's own addresses are never asked, by the entry or by ARP:
+one carries a MAC only when another device answered the sweep there, as in
+an address conflict.
 
 Response `200`: `{ts, devices: [{ip, mac, hostname, open_ports,
 inferred_type, mdns_services, own?}], scan_duration_ms, not_swept: [{cidr,
@@ -1113,8 +1115,9 @@ reason}]}`.
 
 - `own`: present on a host that is the unit itself, naming the interface
   that holds its address, or else the one whose MAC answered for it (a
-  bridge before its ports). The unit's own addresses in a swept subnet are
-  listed without a probe.
+  bridge before its ports). The unit's own addresses in each subnet on the
+  LAN side are listed without the sweep finding them, also in a subnet
+  that is `too_large`.
 - `not_swept`: each subnet the scan did not sweep, in network form, and
   why: `not_on_lan` (searched by ARP alone, as above) or `too_large`.
 
