@@ -18,9 +18,10 @@
 //! An agent started on the bench layout `gz-tmp` (`SCTL_INSTALL_JSON`) makes
 //! the name where `SCTL_CLI_PATH` puts it, `/api/health` names it as `cli`,
 //! `net tcp` to the agent's own port answers through it, a restart writes
-//! nothing, and a regular file at the name is left as it is. It listens on
-//! the loopback under a key of this run's own, kept in a scratch directory
-//! only this account can read.
+//! nothing, and a regular file at the name is left as it is. With no
+//! `install.json`, or one it cannot use, it makes no name, and its log says
+//! which. It listens on the loopback under a key of this run's own, kept in
+//! a scratch directory only this account can read.
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -568,4 +569,46 @@ fn a_started_agent_makes_the_name_and_health_names_it() {
     let (report, said) = bench.install_info(Path::new(SCTL));
     assert!(report.get("cli").is_none(), "{report}");
     assert!(said.contains("no cli:"), "{said}");
+}
+
+/// With no `install.json` the agent makes no name and its log says there is
+/// none; with one it cannot use, its log says that instead, never that there
+/// is none.
+#[test]
+fn the_log_says_why_there_is_no_install_json_to_name_by() {
+    let bench = Bench::new("no-install");
+    let install_json = bench.scratch.path("install.json");
+    for (text, why, not) in [
+        (
+            None,
+            "No install.json: the agent makes no name for its tools",
+            "unusable",
+        ),
+        (
+            Some("{\"v\":2,\"layout\":\"gz-tmp\"}\n"),
+            "No name for the agent's tools: install.json is unusable",
+            "No install.json",
+        ),
+        (
+            Some("not json\n"),
+            "No name for the agent's tools: install.json is unusable",
+            "No install.json",
+        ),
+    ] {
+        match text {
+            Some(text) => std::fs::write(&install_json, text).unwrap(),
+            None => std::fs::remove_file(&install_json).unwrap(),
+        }
+        let agent = Agent::start(&bench);
+        let health = agent.health();
+        assert!(health.get("cli").is_none(), "{health}");
+        assert!(health["layout"].is_null(), "{health}");
+        let said = agent.said();
+        assert!(said.contains(why), "{text:?}: {said}");
+        assert!(!said.contains(not), "{text:?}: {said}");
+    }
+    assert!(
+        std::fs::symlink_metadata(bench.name()).is_err(),
+        "no name made"
+    );
 }

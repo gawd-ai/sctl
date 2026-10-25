@@ -700,7 +700,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     // The name the agent's tools run by on every layout, `/usr/bin/sctl`
     // (TRD-9 3.6): made now if it is not already right, so `/api/health`
     // can name it as `cli`.
-    let cli = sctl::upgrade::cli_name::at_start(install.as_ref());
+    let cli = sctl::upgrade::cli_name::at_start(install.as_ref(), install_error.as_deref());
 
     // The one gate before a file's content is read (ADR-011), for the file
     // routes and every transfer.

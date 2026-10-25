@@ -359,10 +359,17 @@ fn write_wrapper(temp: &Path, text: &[u8]) -> Result<(), String> {
 }
 
 /// At `serve` start: make the name for this install. The path `cli`
-/// reports, or `None`, with a log line that says why.
-pub fn at_start(install: Option<&InstallInfo>) -> Option<PathBuf> {
+/// reports, or `None`, with a log line that says why. `install_error` is
+/// why `install` is `None` when `install.json` exists but cannot be used.
+pub fn at_start(install: Option<&InstallInfo>, install_error: Option<&str>) -> Option<PathBuf> {
     let Some(install) = install else {
-        info!("No install.json: the agent makes no name for its tools, and health reports no cli");
+        if let Some(e) = install_error {
+            warn!("No name for the agent's tools: install.json is unusable ({e}); health reports no cli");
+        } else {
+            info!(
+                "No install.json: the agent makes no name for its tools, and health reports no cli"
+            );
+        }
         return None;
     };
     let name = path();

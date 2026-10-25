@@ -270,7 +270,8 @@ release) to the relay with the routes above.
 body. From 0.6.12 it also names `"cli"`: the path that runs the agent's tools
 on this unit, `/usr/bin/sctl`, or `/usr/local/bin/sctl` on the relay
 ([the tools' name](#targets-and-layouts)). `cli` is absent when the agent
-could not make the name, or has no `install.json`, and its log says why.
+could not make the name, or has no `install.json` it can use, and its log
+says why.
 
 ## Asking a device to upgrade
 
