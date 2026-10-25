@@ -17,7 +17,9 @@
 //! An agent started on the bench layout `gz-tmp` (`SCTL_INSTALL_JSON`) makes
 //! the name where `SCTL_CLI_PATH` puts it, `/api/health` names it as `cli`,
 //! `net tcp` to the agent's own port answers through it, a restart writes
-//! nothing, and a regular file at the name is left as it is.
+//! nothing, and a regular file at the name is left as it is. It listens on
+//! the loopback under a key of this run's own, kept in a scratch directory
+//! only this account can read.
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -64,14 +66,22 @@ const ARGS: [&str; 15] = [
     "--config=/etc/sctl/sctl.toml",
 ];
 
-/// A scratch directory, removed on drop.
+/// A scratch directory, removed on drop. It is private (0700) and made
+/// here: a directory another account made at its name first is refused,
+/// since the scripts and the agent's key written into it are this run's.
 struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(name: &str) -> Self {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         let dir = std::env::temp_dir().join(format!("sctl-cli-name-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{}: private", dir.display());
         Self(dir)
     }
 
@@ -309,10 +319,25 @@ fn rundev_knows_the_agents_name_and_not_its_binary() {
 // ─── a started agent ────────────────────────────────────────────────────
 
 /// A bench unit: a config, an `install.json` staging the `gz-tmp` layout,
-/// and a directory for the name.
+/// and a directory for the name. The agent's routes that run commands
+/// answer only its key, which is this run's own and sits in the private
+/// scratch directory: the test itself uses only the routes that need none.
 struct Bench {
     scratch: Scratch,
     port: u16,
+}
+
+/// A key no other run shares: 16 bytes of `/dev/urandom`, in hex.
+fn run_key() -> String {
+    use std::fmt::Write as _;
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut random| random.read_exact(&mut bytes))
+        .expect("/dev/urandom");
+    bytes.iter().fold(String::with_capacity(32), |mut key, b| {
+        let _ = write!(key, "{b:02x}");
+        key
+    })
 }
 
 impl Bench {
@@ -331,9 +356,10 @@ impl Bench {
             scratch.path("sctl.toml"),
             format!(
                 "[server]\nlisten = \"127.0.0.1:{port}\"\ndata_dir = \"{}\"\nstate_dir = \"{}\"\n\n\
-                 [auth]\napi_key = \"cli-name-bench-key\"\n",
+                 [auth]\napi_key = \"{}\"\n",
                 scratch.path("data").display(),
-                scratch.path("state").display()
+                scratch.path("state").display(),
+                run_key()
             ),
         )
         .unwrap();
