@@ -1063,8 +1063,9 @@ empty list, the scan sweeps the networks the unit holds an address on, on
 its LAN-side interfaces: the `addr` subnets of up `lan` interfaces in
 [`GET /api/infra/discover/subnets`](#get-apiinfradiscoversubnets). Its LTE
 and tunnel networks are never swept, and a `route` or `arp` subnet is swept
-only when a request names it. An entry that is not an IPv4 CIDR is left
-out.
+only when a request names it. An entry that is not an IPv4 CIDR, an IPv6
+one included, is left out: it is not swept, and `not_swept` does not name
+it.
 
 A scan sends only on the unit's LAN side, as the net tools' guard judges it
 (ADR-012; the guide's "Network tools"):
