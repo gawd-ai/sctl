@@ -15,8 +15,12 @@
 //! - the LTE side, behind `lte9`, and the mesh's far end, behind `wg9`.
 //!
 //! A capture in each namespace keeps every frame it sees, so a case can say
-//! what reached the wire. Every command is an argument vector, and every
-//! one acts only in the namespaces this test creates and removes.
+//! what reached the wire. Every command the test runs is an argument
+//! vector, and every one acts only in the namespaces this test creates and
+//! removes. One string reaches a shell, by design: case 8 sends `sctl net
+//! snmp set` through the agent's exec, which runs `sh -c`, so that the
+//! activity log keeps the command. That string is a constant: the binary's
+//! path and the community reach it through the request's environment.
 //!
 //! The cases are 1 to 8 of TRD-9 3.4; case 9, a scan, comes with 3.5.
 //!
@@ -66,6 +70,14 @@ const API_KEY: &str = "netns-test-key";
 /// wire to the target and in the tool's environment.
 const COMMUNITY: &str = "c0mmunity-n3ver-in-argv";
 const OID: &str = "1.3.6.1.4.1.99.1.0";
+/// The Peplink login case 8 stores: off the LAN it is never sent.
+const LOGIN_PASSWORD: &str = "l0gin-n3ver-s3nt";
+/// Case 8's commands through the agent's exec, constants: `$SCTL_BIN` and
+/// `$SCTL_CRED_PASS_1` come from the request's environment.
+const EXEC_SET_TARGET: &str =
+    "SCTL_SNMP_COMMUNITY=\"$SCTL_CRED_PASS_1\" \"$SCTL_BIN\" net snmp set 192.0.2.10 1.3.6.1.4.1.99.1.0 i 1";
+const EXEC_SET_BEHIND_GATEWAY: &str =
+    "SCTL_SNMP_COMMUNITY=\"$SCTL_CRED_PASS_1\" \"$SCTL_BIN\" net snmp set 203.0.113.50 1.3.6.1.4.1.99.1.0 i 1";
 
 // ─── namespaces ─────────────────────────────────────────────────────────
 
@@ -683,11 +695,6 @@ fn the_net_tools_send_only_on_the_lan_to_the_device_expected() {
     }
     // SAFETY: geteuid has no preconditions.
     assert_eq!(unsafe { libc::geteuid() }, 0, "SCTL_NETNS_TEST needs root");
-    assert!(
-        SCTL.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b)),
-        "case 8 puts the binary's path in a shell command; this one needs quoting: {SCTL}"
-    );
 
     let lab = Lab::create();
     let config = lab.config();
@@ -710,6 +717,7 @@ fn the_net_tools_send_only_on_the_lan_to_the_device_expected() {
     let u = lab.unit.as_str();
 
     case_1_on_the_lan_is_sent(u, &env, &received, &snmp, &lte);
+    case_1_the_unit_s_own_addresses_are_sent(&lab, &env, &unit);
     case_2_behind_the_gateway_is_refused(u, &env, &unit, &lte);
     case_3_the_mesh_and_a_gatewayless_lte_route_are_refused(u, &env, &unit, &lte, &mesh);
     case_4_a_host_route_and_dev(u, &env, &received, &snmp, &unit, &lte);
@@ -719,17 +727,19 @@ fn the_net_tools_send_only_on_the_lan_to_the_device_expected() {
     case_8_the_community(&lab, &config, &env, &snmp);
 
     // On every wire, the community travels only to and from the target:
-    // never by the LTE veth, never to the twin or the mesh. The unit's
-    // loopback carries it to its own agent, which is not a wire.
+    // never by the LTE veth, never to the twin or the mesh. The Peplink
+    // login, off the LAN, travels nowhere. The unit's loopback carries both
+    // to its own agent, which is not a wire.
     for capture in [&unit, &lte, &mesh, &twin] {
         let leaked: Vec<Frame> = capture
             .all()
             .into_iter()
             .filter(|f| {
                 f.dev != "lo"
-                    && f.carries(COMMUNITY.as_bytes())
-                    && f.ipv4_dst() != Some(TARGET)
-                    && f.ipv4_src() != Some(TARGET)
+                    && ((f.carries(COMMUNITY.as_bytes())
+                        && f.ipv4_dst() != Some(TARGET)
+                        && f.ipv4_src() != Some(TARGET))
+                        || f.carries(LOGIN_PASSWORD.as_bytes()))
             })
             .collect();
         assert!(
@@ -780,6 +790,87 @@ fn case_1_on_the_lan_is_sent(
     );
     assert!(lte.since(mark).is_empty(), "nothing by the LTE veth");
     eprintln!("case 1: tcp, http and snmp get reach the target by lan0");
+}
+
+/// A TCP listener on `port` in namespace `ns`, until `stop`: the local
+/// address each connection reached.
+fn listen(ns: &str, port: u16, stop: &Arc<AtomicBool>) -> Arc<Mutex<Vec<SocketAddr>>> {
+    let reached = Arc::new(Mutex::new(Vec::new()));
+    let (ready, started) = std::sync::mpsc::channel();
+    {
+        let (ns, reached, stop) = (ns.to_string(), reached.clone(), stop.clone());
+        std::thread::spawn(move || {
+            enter(&ns);
+            let listener = TcpListener::bind(("0.0.0.0", port)).expect("it listens");
+            listener.set_nonblocking(true).unwrap();
+            ready.send(()).unwrap();
+            while !stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => reached.lock().unwrap().push(stream.local_addr().unwrap()),
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        });
+    }
+    started
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the listener started");
+    reached
+}
+
+/// ADR-012 decision 1: a destination the unit holds itself passes, and
+/// nothing leaves the unit. Its LAN address, and an address a dummy
+/// interface holds (no ARP, so off the LAN side): `tcp` and `snmp get`
+/// reach a listener and an agent in the unit, and no packet for either
+/// address goes out on a wire.
+fn case_1_the_unit_s_own_addresses_are_sent(lab: &Lab, env: &[(&str, &str)], unit: &Capture) {
+    let u = lab.unit.as_str();
+    let own_lan = Ipv4Addr::new(192, 0, 2, 1);
+    let own_dummy = Ipv4Addr::new(10, 77, 0, 1);
+    ip(&["-n", u, "link", "add", "dum9", "type", "dummy"]);
+    ip(&["-n", u, "addr", "add", "10.77.0.1/32", "dev", "dum9"]);
+    ip(&["-n", u, "link", "set", "dum9", "up"]);
+    let done = Arc::new(AtomicBool::new(false));
+    let reached = listen(u, TCP_PORT, &done);
+    let agent = {
+        let ns = lab.unit.clone();
+        Agent::start(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 161)),
+            Duration::ZERO,
+            move || enter(&ns),
+        )
+    };
+    let mark = unit.mark();
+    for own in [own_lan, own_dummy] {
+        let host = own.to_string();
+        let tcp = net(u, &["tcp", &host, "7000"], env);
+        assert_eq!(tcp.code, 0, "{tcp:?}");
+        eventually("the unit's listener accepted the connection", || {
+            reached
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|local| local.ip() == own)
+        });
+        let get = net(u, &["snmp", "get", &host, "1.3.6.1.2.1.1.1.0"], env);
+        assert_eq!(get.code, 0, "{get:?}");
+    }
+    let requests = agent.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    let wire: Vec<Frame> = unit
+        .since(mark)
+        .into_iter()
+        .filter(|f| {
+            f.outgoing
+                && f.dev != "lo"
+                && (f.ipv4_dst() == Some(own_lan) || f.ipv4_dst() == Some(own_dummy))
+        })
+        .collect();
+    assert!(wire.is_empty(), "nothing left the unit: {wire:?}");
+    drop(agent);
+    done.store(true, Ordering::SeqCst);
+    ip(&["-n", u, "link", "del", "dum9"]);
+    eprintln!("case 1: tcp and snmp get reach the unit's own addresses, and nothing leaves it");
 }
 
 fn case_2_behind_the_gateway_is_refused(
@@ -1443,17 +1534,23 @@ fn case_8_the_community(lab: &Lab, config: &Path, env: &[(&str, &str)], snmp: &A
         );
         std::thread::sleep(Duration::from_millis(200));
     }
-    let exec = |host: &str| {
-        let command = format!(
-            "SCTL_SNMP_COMMUNITY=\"$SCTL_CRED_PASS_1\" '{SCTL}' net snmp set {host} {OID} i 1"
+    for (command, host) in [
+        (EXEC_SET_TARGET, TARGET),
+        (EXEC_SET_BEHIND_GATEWAY, BEHIND_GATEWAY),
+    ] {
+        assert!(
+            command.ends_with(&format!(" {host} {OID} i 1")),
+            "{command}"
         );
+    }
+    let exec = |command: &str| {
         let (status, body) = api(
             u,
             "POST",
             "/api/exec",
             Some(&json!({
                 "command": command,
-                "env": {"SCTL_CRED_PASS_1": COMMUNITY},
+                "env": {"SCTL_BIN": SCTL, "SCTL_CRED_PASS_1": COMMUNITY},
                 "timeout_ms": 20_000,
             })),
         );
@@ -1463,10 +1560,10 @@ fn case_8_the_community(lab: &Lab, config: &Path, env: &[(&str, &str)], snmp: &A
         answer
     };
     let before = snmp.requests().len();
-    let delivered = exec("192.0.2.10");
+    let delivered = exec(EXEC_SET_TARGET);
     assert_eq!(delivered["exit_code"], 0, "{delivered}");
     assert_eq!(snmp.requests()[before].community, COMMUNITY.as_bytes());
-    let refused = exec("203.0.113.50");
+    let refused = exec(EXEC_SET_BEHIND_GATEWAY);
     assert_eq!(refused["exit_code"], 3, "{refused}");
     let tool: Value = serde_json::from_str(refused["stdout"].as_str().unwrap().trim()).unwrap();
     assert_eq!(
@@ -1481,6 +1578,13 @@ fn case_8_the_community(lab: &Lab, config: &Path, env: &[(&str, &str)], snmp: &A
     let (status, body) = api(
         u,
         "POST",
+        "/api/infra/credentials",
+        Some(&json!({"id": "far-login", "username": "admin", "password": LOGIN_PASSWORD})),
+    );
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = api(
+        u,
+        "POST",
         "/api/infra/config",
         Some(&json!({
             "version": 7,
@@ -1488,23 +1592,33 @@ fn case_8_the_community(lab: &Lab, config: &Path, env: &[(&str, &str)], snmp: &A
             "targets": [
                 {"id": "bar", "name": "bar", "check": {"method": "snmp", "host": "192.0.2.10", "community": COMMUNITY, "timeout_ms": 2000}},
                 {"id": "far", "name": "far", "check": {"method": "snmp", "host": "203.0.113.50", "community": COMMUNITY, "timeout_ms": 2000}},
+                {"id": "far-api", "name": "far-api", "check": {"method": "http_api", "base_url": "http://203.0.113.50", "profile": "peplink", "credential_id": "far-login", "timeout_ms": 2000}},
             ],
         })),
     );
     assert_eq!(status, 200, "{body}");
-    for (id, sent) in [("bar", true), ("far", false)] {
+    for (id, refused) in [
+        ("bar", None),
+        ("far", Some("SNMP NOT SENT (not_on_lan)")),
+        ("far-api", Some("API NOT SENT (not_on_lan)")),
+    ] {
         let (status, body) = api(u, "POST", &format!("/api/infra/check/{id}"), None);
         assert_eq!(status, 200, "{body}");
         clean("a check's detail", &body);
+        assert!(!body.contains(LOGIN_PASSWORD), "{body}");
         let result: Value = serde_json::from_str(&body).unwrap();
         let detail = result["detail"].as_str().unwrap_or_default();
-        if sent {
-            assert_eq!(result["ok"], true, "{body}");
-        } else {
-            assert!(
-                detail.starts_with("SNMP NOT SENT (not_on_lan)"),
-                "off the LAN it reads down with the guard's reason: {body}"
-            );
+        match refused {
+            None => assert_eq!(result["ok"], true, "{body}"),
+            Some(words) => {
+                assert!(
+                    detail.starts_with(words),
+                    "off the LAN it reads down with the guard's reason: {body}"
+                );
+                // The agent's own [lte] interface names the bearer: by its
+                // flags alone, lte9 would read lan.
+                assert!(detail.contains("by lte9 (lte)"), "{body}");
+            }
         }
     }
     let (status, results) = api(u, "GET", "/api/infra/results", None);
@@ -1517,10 +1631,12 @@ fn case_8_the_community(lab: &Lab, config: &Path, env: &[(&str, &str)], snmp: &A
         "the log keeps the command as written: {activity}"
     );
     clean("the activity log", &activity);
+    assert!(!activity.contains(LOGIN_PASSWORD), "{activity}");
     drop(agent);
-    clean(
-        "the agent's log",
-        &std::fs::read_to_string(lab.dir.join("agent.log")).unwrap_or_default(),
-    );
+    for log in ["agent.log", "agent.err"] {
+        let text = std::fs::read_to_string(lab.dir.join(log)).unwrap_or_default();
+        clean("the agent's log", &text);
+        assert!(!text.contains(LOGIN_PASSWORD), "the login in {log}");
+    }
     eprintln!("case 8: the community reaches the agent and shows nowhere else");
 }
