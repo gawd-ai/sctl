@@ -1,6 +1,7 @@
 //! Transfer lifecycle manager — owns transfers, chunk I/O, disk space checks.
 //!
-//! Zero full-file buffering: only one chunk (256 KiB default) in memory at a time.
+//! Zero full-file buffering: only one chunk (256 KiB default, a download's at
+//! most 4 MiB) in memory at a time.
 //! Uploads write chunks directly to a temp file via seek+write. A download
 //! passes the file gate at init (ADR-011), hashes exactly the size its stat
 //! gave, and serves each chunk by seek+read from the file it hashed.
@@ -25,6 +26,7 @@ use super::types::{
 };
 use crate::activity::{ActivityLog, ActivitySource, ActivityType};
 use crate::file_access::{self, FileId, Gate, Opened, Purpose, Refusal, Reopen};
+use crate::routes::files::TUNNEL_READ_CAP;
 
 /// Owns the set of active transfers and their lifecycle.
 pub struct TransferManager {
@@ -45,6 +47,12 @@ pub struct TransferManager {
 /// The smallest chunk a transfer uses, an upload's or a download's: a
 /// smaller one asked for is raised to it, so 0 never divides a size.
 const MIN_CHUNK_SIZE: u32 = 1024;
+
+/// The largest chunk a download uses: 4 MiB, the most a file read returns
+/// through the relay. A larger one asked for, or a larger server default,
+/// is answered as this one, never refused: a client reads the chunk size
+/// the init answers.
+const MAX_DOWNLOAD_CHUNK_SIZE: u32 = TUNNEL_READ_CAP as u32;
 
 /// A download's place under `max_concurrent` from its limit check until it
 /// is registered. The hash owns it, so a place is freed only when its hash
@@ -170,10 +178,11 @@ impl TransferManager {
             ));
         }
 
-        // The size asked for, raised to the floor an upload has.
+        // The size asked for, raised to the floor an upload has and lowered
+        // to the most a read returns through the relay.
         let chunk_size = chunk_size
             .unwrap_or(self.config.chunk_size)
-            .max(MIN_CHUNK_SIZE);
+            .clamp(MIN_CHUNK_SIZE, MAX_DOWNLOAD_CHUNK_SIZE);
         let total_chunks = compute_chunks(file_size, chunk_size);
 
         // A place under the limit before the hash, so at most that many
@@ -1481,6 +1490,61 @@ mod tests {
             assert_eq!(got, data, "{asked}");
         }
         assert_eq!(tm.hashing.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A chunk above 4 MiB, asked for or the server's default, is answered
+    /// as 4 MiB, never refused: the most a read returns through the relay.
+    /// The client reads the chunk size the init answers.
+    #[tokio::test]
+    async fn a_chunk_size_above_the_ceiling_is_answered_as_the_ceiling() {
+        assert_eq!(MAX_DOWNLOAD_CHUNK_SIZE, 4 * 1024 * 1024);
+        let dir = scratch("ceiling");
+        let file = dir.join("data.bin");
+        let data: Vec<u8> = (0..TUNNEL_READ_CAP + 3000)
+            .map(|i| (i % 241) as u8)
+            .collect();
+        std::fs::write(&file, &data).unwrap();
+
+        let from_default = |chunk_size: u32| {
+            let (tx, _) = broadcast::channel(64);
+            let log = Arc::new(ActivityLog::new(64, tx.clone()));
+            TransferManager::new(
+                TransferConfig::new(4, chunk_size, 1 << 30, 60),
+                tx,
+                log,
+                Arc::new(Gate::new(Vec::new(), None)),
+            )
+        };
+        let asked = [
+            (manager(4), Some(MAX_DOWNLOAD_CHUNK_SIZE + 1)),
+            (manager(4), Some(2 * MAX_DOWNLOAD_CHUNK_SIZE)),
+            (manager(4), Some(u32::MAX)),
+            (from_default(8 * 1024 * 1024), None),
+        ];
+        for (tm, chunk_size) in asked {
+            let init = tm
+                .init_download(&path_str(&file), chunk_size)
+                .await
+                .unwrap();
+            assert_eq!(init.chunk_size, MAX_DOWNLOAD_CHUNK_SIZE, "{chunk_size:?}");
+            assert_eq!(init.total_chunks, 2, "{chunk_size:?}");
+            let (_, first) = tm.serve_chunk(&init.transfer_id, 0).await.unwrap();
+            assert_eq!(first.len(), TUNNEL_READ_CAP, "{chunk_size:?}");
+            let (_, last) = tm.serve_chunk(&init.transfer_id, 1).await.unwrap();
+            assert_eq!(last.len(), 3000, "{chunk_size:?}");
+            assert!(
+                first.iter().chain(&last).eq(data.iter()),
+                "{chunk_size:?}: the file, whole"
+            );
+        }
+        // The ceiling itself stands.
+        let tm = manager(4);
+        let init = tm
+            .init_download(&path_str(&file), Some(MAX_DOWNLOAD_CHUNK_SIZE))
+            .await
+            .unwrap();
+        assert_eq!(init.chunk_size, MAX_DOWNLOAD_CHUNK_SIZE);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

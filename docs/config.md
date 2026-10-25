@@ -98,7 +98,7 @@ HTTP server and resource limits (`ServerConfig`).
 | `default_terminal_rows` | `24` | Default PTY rows when a session does not specify. |
 | `default_terminal_cols` | `80` | Default PTY columns when a session does not specify. |
 | `max_concurrent_transfers` | `4` | Maximum concurrent STP (gawdxfer) transfers. |
-| `transfer_chunk_size` | `262144` (256 KiB) | STP chunk size in bytes. |
+| `transfer_chunk_size` | `262144` (256 KiB) | STP chunk size in bytes. A download uses at most 4 MiB whatever this says. |
 | `transfer_max_file_size` | `1073741824` (1 GiB) | Maximum file size for STP transfers, bytes. |
 | `transfer_stale_timeout_secs` | `3600` | Seconds after which an inactive transfer is swept. |
 
