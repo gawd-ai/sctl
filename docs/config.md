@@ -45,7 +45,8 @@ environment of every command a caller or a pushed config gives it to run
 (exec, sessions and their jobs, Infra checks and recoveries). `sctl net`
 reads the agent's `[lte] interface` from that file (ADR-012), unless
 `--config <path>` names another; it never reads `./sctl.toml`. An agent that
-loaded no file takes the variable out of those environments.
+loaded no file takes the variable out of those environments. A request's
+`env` (exec, a batch, a session start) cannot replace the agent's value.
 
 Every section is optional. `[server]`, `[auth]`, `[shell]`, `[device]`,
 `[logging]`, and `[supervisor]` fall back to defaults field-by-field;

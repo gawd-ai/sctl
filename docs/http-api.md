@@ -279,7 +279,7 @@ Request body:
 | `timeout_ms` | integer | no | Per-request timeout; default `server.exec_timeout_ms` |
 | `request_id` | string | no | Opaque correlation ID echoed in the response |
 | `working_dir` | string | no | Working directory override (`~` expanded) |
-| `env` | object&lt;string,string&gt; | no | Extra env vars merged into the inherited environment |
+| `env` | object&lt;string,string&gt; | no | Extra env vars merged into the inherited environment; `SCTL_AGENT_CONFIG` is the agent's own (`docs/config.md`) |
 | `shell` | string | no | Shell binary override (e.g. `/bin/bash`) |
 
 Response `200`:
@@ -306,7 +306,7 @@ Request body:
 |-------|------|----------|-------------|
 | `commands` | array | yes | `[{command, timeout_ms?, working_dir?, env?, shell?}]` |
 | `working_dir` | string | no | Default for all commands |
-| `env` | object | no | Default env (per-command env merged over it, command wins) |
+| `env` | object | no | Default env (per-command env merged over it, command wins); `SCTL_AGENT_CONFIG` is the agent's own (`docs/config.md`) |
 | `shell` | string | no | Default shell |
 | `request_id` | string | no | Echoed in the response |
 
@@ -1187,6 +1187,8 @@ response(s). Client → server types: `ping`, `session.start`,
 (with `seq`), `session.exited`, `session.closed`, `session.attached`,
 `session.listed`, `shell.listed`, and `error` (`{code, message,
 session_id?}`). The full message table lives in `server/src/ws/mod.rs`.
+A `session.start`'s `env` is merged as exec's is: `SCTL_AGENT_CONFIG` is
+the agent's own (`docs/config.md`).
 
 On disconnect, non-persistent sessions are killed; persistent sessions
 detach and keep buffering output for later re-attach.

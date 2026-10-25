@@ -540,7 +540,7 @@ ip addr del 192.0.2.250/32 dev eth1
 - **SNMP.** The community comes from `SCTL_SNMP_COMMUNITY` only, so the shell puts it in the tool's environment and in no argv: `SCTL_SNMP_COMMUNITY="${SCTL_CRED_PASS_1}" sctl net snmp ...`. `-c` and `--community` are a usage error that shows that form, never the value. A variable set but empty (a reference to a credential the command does not carry) is a usage error too, never `public`. Unset, get and walk send `public`; set needs a community.
 - **Recoveries** name stored credentials by slot: entry n of `credential_ids` is in the command's environment as `SCTL_CRED_USER_n` and `SCTL_CRED_PASS_n`.
 - **HTTP.** `-u`, `-H Authorization`, `-d` and `-F` still take their values on the command line.
-- No answer, refusal or usage error carries a secret, and no usage error repeats an option's value.
+- No answer, refusal or usage error carries the SNMP community, and none repeats the values of `-u`, `-H`, `-d` or `-F`; no usage error repeats any option's value. `sctl net http` repeats its URL in its answer, in a failure and in a refusal, so put no secret in a URL. An answer carries what the device sent back, its headers and cookies included.
 
 ### HTTP redirects
 
@@ -555,7 +555,7 @@ ip addr del 192.0.2.250/32 dev eth1
 | 2 | Usage error, on stderr. |
 | 3 | Refused: the request never left. At most a name lookup and the ARP request did. |
 
-A refusal prints `ok: false`, `refused` (the code), a one-line `reason`, `host` (the address judged), `route` (the route the kernel would have used: its interface, that interface's `role` and what decided it, its gateway and type), `lan` (the LAN side by interface, a bridge's ports left to their bridge) and, after an ARP request, `macs` (the MACs that answered) and `neighbour` (the kernel's entry). `route` is absent when the kernel has no route to the destination, for an IPv6 destination, and when the lookup itself failed. `route` and `lan` are both absent when the guard could not read the unit's network, and for `config_unreadable`: the roles come from the config, and the guard never falls back to defaults. A unit that lost its address on the site's network and runs on LTE answers an SNMP set to the site's power bar:
+A refusal prints `ok: false`, `refused` (the code), a one-line `reason`, `host` (the address judged), `name` (the host as given, when it was a name), `dev` (`--dev` as given), `route` (the route the kernel would have used: its interface, that interface's `role` and what decided it, its gateway and type), `lan` (the LAN side by interface, a bridge's ports left to their bridge) and, after an ARP request, `macs` (the MACs that answered) and `neighbour` (the kernel's entry). `sctl net tcp` adds `port`, and `sctl net http` adds `url`, the URL as given. `route` is absent when the kernel has no route to the destination, for an IPv6 destination, and when the lookup itself failed. `route` and `lan` are both absent when the guard could not read the unit's network, and for `config_unreadable`: the roles come from the config, and the guard never falls back to defaults. A unit that lost its address on the site's network and runs on LTE answers an SNMP set to the site's power bar:
 
 ```json
 {"ok":false,"refused":"not_on_lan","reason":"198.51.100.50 is not on a network this unit holds on its LAN side: the kernel would send it by wwan0 (lte) through a gateway. LAN side: br-lan 192.0.2.1/24; eth1 holds no address.","host":"198.51.100.50","route":{"dev":"wwan0","role":"lte","role_by":"config","gateway":"10.180.41.232","type":"unicast"},"lan":[{"dev":"br-lan","ipv4":["192.0.2.1/24"]},{"dev":"eth1","ipv4":[]}]}
@@ -575,7 +575,7 @@ A refusal prints `ok: false`, `refused` (the code), a one-line `reason`, `host` 
 
 ### The Infra checks
 
-The SNMP check (its community, every interval) and the Peplink check (its login) send a stored secret, so they pass the same guard as the tools, with the agent's `[lte] interface`. Off the LAN such a target reads down with the guard's reason, as `SNMP NOT SENT (not_on_lan): ...` or `API NOT SENT (not_on_lan): ...`. The ping, HTTP and TCP checks and `POST /api/fetch` send no secret and keep their behaviour.
+The SNMP check (its community, every interval) and the Peplink check (its login) send a stored secret, so they pass the same guard as the tools, with the agent's `[lte] interface`. Off the LAN such a target reads down with the guard's reason, as `SNMP NOT SENT (not_on_lan): ...` or `API NOT SENT (not_on_lan): ...`. The ping, HTTP and TCP checks send no secret and keep their behaviour. `POST /api/fetch` is not guarded either (ADR-012 decision 9), whatever headers or body it carries.
 
 ## Comms Providers, GPS & LTE
 
