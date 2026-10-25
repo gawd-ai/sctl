@@ -1075,20 +1075,20 @@ A scan sends only on the unit's LAN side, as the net tools' guard judges it
    would send to, at a unicast address. Their MACs are not taken from it.
 2. **Sweep.** A subnet that lies wholly under a main-table route with no
    gateway through a LAN-side interface holding an address is swept on that
-   interface only: `nmap -sn`, else `arp-scan` from the interface's address,
-   else, for a subnet of at most 254 hosts, one ping to each host the guard
-   passes on that interface, 32 at a time. The network and broadcast
-   addresses and the unit's own are left out, and so is any address the
-   kernel routes as broadcast or multicast, such as a network's broadcast
-   address named as a /32. Each runs when the one before found nothing. Any other subnet (an LTE or
-   tunnel network, one behind a gateway, one the unit has lost its address
-   on) is not swept: `arp-scan` from 0.0.0.0, which stays on the link,
-   searches it on each LAN-side interface, bridges first, until one finds
-   hosts. arp-scan runs only on a subnet of at most 8190 hosts (a /19),
-   which it can search within its 60 s limit: a run the limit cuts keeps
-   none of its answers. A LAN subnet of more than 254 hosts that neither
-   nmap nor arp-scan swept is not swept either. The tools a unit lacks are
-   skipped.
+   interface only: `nmap -sn`, else `arp-scan` from the interface's
+   address, else, for a subnet of at most 254 hosts, one ping to each host
+   the guard passes on that interface, 32 at a time. The network and
+   broadcast addresses and the unit's own are left out, and so is any
+   address the kernel routes as broadcast or multicast, such as a network's
+   broadcast address named as a /32. Each runs when the one before found
+   nothing. Any other subnet (an LTE or tunnel network, one behind a
+   gateway, one the unit has lost its address on) is not swept: `arp-scan`
+   from 0.0.0.0, which stays on the link, searches it on each LAN-side
+   interface, bridges first, until one finds hosts. arp-scan runs only on a
+   subnet of at most 8190 hosts (a /19), which it can search within its
+   60 s limit: a run the limit cuts keeps none of its answers. A LAN subnet
+   of more than 254 hosts that neither nmap nor arp-scan swept is not swept
+   either. The tools a unit lacks are skipped.
 3. **Ports.** The guard judges each host. A host it approves gets a TCP
    connect to each of 22, 80, 443, 554, 8080, 8443, 161, 53, 3389 and 1337,
    2 s each, from a socket bound to the interface and source address it
