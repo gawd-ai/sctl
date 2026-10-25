@@ -692,8 +692,13 @@ async fn sniff_iface(iface: String, secs: u64) -> Vec<(String, Cidr)> {
         return Vec::new();
     }
     let args = sniff_args(&iface);
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let Some(lines) = listen("tcpdump", &args, Duration::from_secs(secs), SNIFF_PACKETS).await
+    let Some(lines) = listen(
+        "tcpdump",
+        &strs(&args),
+        Duration::from_secs(secs),
+        SNIFF_PACKETS,
+    )
+    .await
     else {
         return Vec::new();
     };
@@ -891,9 +896,8 @@ impl Probes for AgentProbes {
 
     fn nmap<'a>(&'a self, dev: &'a str, subnet: Cidr) -> BoxFuture<'a, Option<Vec<Answered>>> {
         Box::pin(async move {
-            let subnet = subnet.to_string();
-            let args = ["-sn", "-n", "-e", dev, subnet.as_str()];
-            let (code, stdout, _) = checks::exec_args_pub("nmap", &args, SWEEP_TIMEOUT_MS)
+            let args = nmap_args(dev, subnet);
+            let (code, stdout, _) = checks::exec_args_pub("nmap", &strs(&args), SWEEP_TIMEOUT_MS)
                 .await
                 .ok()?;
             (code == 0).then(|| parse_nmap(&stdout))
@@ -907,25 +911,19 @@ impl Probes for AgentProbes {
         addressless: bool,
     ) -> BoxFuture<'a, Option<Vec<Answered>>> {
         Box::pin(async move {
-            let interface = format!("--interface={dev}");
-            let subnet = subnet.to_string();
-            let mut args = vec![interface.as_str(), "--retry=2", "--timeout=300"];
-            if addressless {
-                args.extend(["--arpspa=0.0.0.0", "--destaddr=ff:ff:ff:ff:ff:ff"]);
-            }
-            args.push(subnet.as_str());
-            let (code, stdout, _) = checks::exec_args_pub("arp-scan", &args, SWEEP_TIMEOUT_MS)
-                .await
-                .ok()?;
+            let args = arp_scan_args(dev, subnet, addressless);
+            let (code, stdout, _) =
+                checks::exec_args_pub("arp-scan", &strs(&args), SWEEP_TIMEOUT_MS)
+                    .await
+                    .ok()?;
             (code == 0).then(|| parse_arp_scan(&stdout))
         })
     }
 
     fn ping<'a>(&'a self, dev: &'a str, ip: Ipv4Addr) -> BoxFuture<'a, bool> {
         Box::pin(async move {
-            let ip = ip.to_string();
-            let args = ["-c", "1", "-W", "1", "-I", dev, ip.as_str()];
-            checks::exec_args_pub("ping", &args, PING_TIMEOUT_MS)
+            let args = ping_args(dev, ip);
+            checks::exec_args_pub("ping", &strs(&args), PING_TIMEOUT_MS)
                 .await
                 .is_ok_and(|(code, _, _)| code == 0)
         })
@@ -964,6 +962,49 @@ impl Probes for AgentProbes {
     fn hostname(&self, ip: Ipv4Addr) -> BoxFuture<'_, Option<String>> {
         Box::pin(async move { resolve_hostname(&ip.to_string()).await.ok() })
     }
+}
+
+/// nmap's arguments: a ping sweep of `subnet`, no name lookups, sent by
+/// `dev` alone (`-e`), the interface the sweep chose (ADR-012 decision
+/// 10).
+fn nmap_args(dev: &str, subnet: Cidr) -> Vec<String> {
+    let subnet = subnet.to_string();
+    ["-sn", "-n", "-e", dev, subnet.as_str()]
+        .map(String::from)
+        .to_vec()
+}
+
+/// arp-scan's arguments: `subnet` searched on `dev`, the interface the
+/// sweep chose, from its address or, `addressless`, from 0.0.0.0 to the
+/// broadcast MAC, each silent host asked twice.
+fn arp_scan_args(dev: &str, subnet: Cidr, addressless: bool) -> Vec<String> {
+    let mut args = vec![
+        format!("--interface={dev}"),
+        "--retry=2".into(),
+        "--timeout=300".into(),
+    ];
+    if addressless {
+        args.extend([
+            "--arpspa=0.0.0.0".into(),
+            "--destaddr=ff:ff:ff:ff:ff:ff".into(),
+        ]);
+    }
+    args.push(subnet.to_string());
+    args
+}
+
+/// ping's arguments: one echo to `ip`, waiting a second, from a socket
+/// bound to `dev` (`-I`), the interface the sweep chose.
+fn ping_args(dev: &str, ip: Ipv4Addr) -> Vec<String> {
+    let ip = ip.to_string();
+    ["-c", "1", "-W", "1", "-I", dev, ip.as_str()]
+        .map(String::from)
+        .to_vec()
+}
+
+/// Each argument as the exec helper takes it.
+fn strs(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
 }
 
 /// nmap's report of a ping sweep: each `Nmap scan report for <ip>`, with
@@ -2779,6 +2820,70 @@ mod tests {
             "{error}"
         );
         assert!(fake.log().is_empty());
+    }
+
+    /// ADR-012 decision 10: nmap, arp-scan and the ping fallback send only
+    /// on the interface the sweep chose: each tool's arguments name it, and
+    /// arp-scan's search off the LAN side goes from 0.0.0.0.
+    #[test]
+    fn each_sweep_tool_sends_by_the_interface_the_sweep_chose() {
+        let subnet = cidr("192.0.2.0/24");
+        assert_eq!(
+            nmap_args("br-lan", subnet),
+            ["-sn", "-n", "-e", "br-lan", "192.0.2.0/24"]
+        );
+        assert_eq!(
+            arp_scan_args("eth1", subnet, false),
+            [
+                "--interface=eth1",
+                "--retry=2",
+                "--timeout=300",
+                "192.0.2.0/24"
+            ]
+        );
+        assert_eq!(
+            arp_scan_args("eth1", subnet, true),
+            [
+                "--interface=eth1",
+                "--retry=2",
+                "--timeout=300",
+                "--arpspa=0.0.0.0",
+                "--destaddr=ff:ff:ff:ff:ff:ff",
+                "192.0.2.0/24"
+            ]
+        );
+        assert_eq!(
+            ping_args("br-lan", ip("192.0.2.7")),
+            ["-c", "1", "-W", "1", "-I", "br-lan", "192.0.2.7"]
+        );
+    }
+
+    /// ADR-012 decision 10: the port probe connects from the socket the
+    /// guard bound. On the loopback the port opens; with an interface the
+    /// unit lacks the bind fails, nothing is sent and the port reads
+    /// closed, where an unbound connect would open it.
+    #[tokio::test]
+    async fn the_port_probe_connects_from_the_socket_the_guard_bound() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let probes = AgentProbes {
+            lte: Lte::default(),
+        };
+        let approved = guard::Guard::default()
+            .approve(Ipv4Addr::LOCALHOST)
+            .await
+            .unwrap();
+        assert_eq!(approved.dev, "lo");
+        assert_eq!(probes.open_ports(&approved, &[port]).await, [port]);
+        let gone = Approved {
+            dev: "sctl-none0".into(),
+            ..approved
+        };
+        assert_eq!(
+            probes.open_ports(&gone, &[port]).await,
+            Vec::<u16>::new(),
+            "bound to an interface the unit lacks, nothing is sent"
+        );
     }
 
     #[test]

@@ -32,8 +32,8 @@
 //! sudo -n env SCTL_NETNS_TEST=1 target/debug/deps/net_tools_netns-<hash> --ignored --nocapture
 //! ```
 //!
-//! Case 5 marks the unit's own traffic as mwan3 does, with `nft`, else
-//! `iptables`; one of them must be on the PATH.
+//! Cases 5 and 9 mark the unit's own traffic as mwan3 does, with `nft`,
+//! else `iptables`; one of them must be on the PATH.
 
 mod snmp_agent;
 
@@ -1163,15 +1163,11 @@ fn mark_own_traffic(u: &str, on: bool) {
     }
 }
 
-fn case_5_marks_do_not_move_a_bound_request(
-    u: &str,
-    env: &[(&str, &str)],
-    received: &Arc<Mutex<Received>>,
-    snmp: &Agent,
-    lte: &Capture,
-) {
-    // As mwan3 does: the unit's own traffic is marked, and the mark leads
-    // to a table whose default route is the LTE veth.
+/// Steer the unit's own traffic to the LTE veth as mwan3 does: every packet
+/// it sends is marked, and the mark leads to a table whose default route is
+/// the LTE veth. An unbound packet then leaves by the LTE veth, which this
+/// proves before it returns.
+fn steer_to_lte(u: &str, lte: &Capture) {
     ip(&[
         "-n",
         u,
@@ -1190,7 +1186,6 @@ fn case_5_marks_do_not_move_a_bound_request(
     ]);
     mark_own_traffic(u, true);
 
-    // The steering works: an unbound packet leaves by the LTE veth.
     let control_mark = lte.mark();
     {
         let ns = u.to_string();
@@ -1207,6 +1202,27 @@ fn case_5_marks_do_not_move_a_bound_request(
         control.iter().any(|f| f.carries(b"steered")),
         "the marks steer unbound traffic to the LTE veth: {control:?}"
     );
+}
+
+/// Undo [`steer_to_lte`].
+fn stop_steering(u: &str) {
+    mark_own_traffic(u, false);
+    ip(&[
+        "-n", u, "rule", "del", "fwmark", "0x100", "lookup", "100", "pref", "100",
+    ]);
+    ip(&["-n", u, "route", "del", "default", "table", "100"]);
+}
+
+fn case_5_marks_do_not_move_a_bound_request(
+    u: &str,
+    env: &[(&str, &str)],
+    received: &Arc<Mutex<Received>>,
+    snmp: &Agent,
+    lte: &Capture,
+) {
+    // As mwan3 does: the unit's own traffic is marked, and the mark leads
+    // to a table whose default route is the LTE veth.
+    steer_to_lte(u, lte);
 
     let mark = lte.mark();
     let (connections, pages) = {
@@ -1217,11 +1233,7 @@ fn case_5_marks_do_not_move_a_bound_request(
     let tcp = net(u, &["tcp", "192.0.2.10", "7000"], env);
     let http = net(u, &["http", "http://192.0.2.10:8080/ok"], env);
     let get = net(u, &["snmp", "get", "192.0.2.10", "1.3.6.1.2.1.1.1.0"], env);
-    mark_own_traffic(u, false);
-    ip(&[
-        "-n", u, "rule", "del", "fwmark", "0x100", "lookup", "100", "pref", "100",
-    ]);
-    ip(&["-n", u, "route", "del", "default", "table", "100"]);
+    stop_steering(u);
     assert_eq!(
         (tcp.code, http.code, get.code),
         (0, 0, 0),
@@ -1677,7 +1689,9 @@ fn phase_4(frame: &Frame) -> bool {
 /// the agent sweeps the unit's LAN network only, reports the MACs it saw
 /// and marks the unit's own address; named subnets off the LAN side are
 /// not swept. Nothing goes by the LTE veth or the mesh, Phase 4's lookups
-/// aside.
+/// aside. The default scan runs with the unit's traffic steered to the LTE
+/// veth, as case 5 steers it: a sweep or a port probe not bound where the
+/// guard approved would leave there.
 fn case_9_a_scan(lab: &Lab, config: &Path, unit: &Capture, lte: &Capture, mesh: &Capture) {
     let u = lab.unit.as_str();
     let agent = RunningAgent::answering(u, config, &lab.dir);
@@ -1731,6 +1745,9 @@ fn case_9_a_scan(lab: &Lab, config: &Path, unit: &Capture, lte: &Capture, mesh: 
         );
     };
 
+    // mwan3's marks, as in case 5: the ping fallback and the port probe
+    // must hold to lan0, where the guard bound them.
+    steer_to_lte(u, lte);
     // The target's first address is new to the unit, so the sweep finds it
     // first; its second is known by a STALE entry naming the twin, as after
     // an address shuffle.
@@ -1750,6 +1767,7 @@ fn case_9_a_scan(lab: &Lab, config: &Path, unit: &Capture, lte: &Capture, mesh: 
     ]);
     let mark = (unit.mark(), lte.mark(), mesh.mark());
     let (status, body) = api(u, "POST", "/api/infra/discover", Some(&json!({})));
+    stop_steering(u);
     assert_eq!(status, 200, "{body}");
     let scan: Value = serde_json::from_str(&body).unwrap();
     nothing_off_the_lan("a default scan", mark);
