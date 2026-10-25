@@ -1928,7 +1928,9 @@ mod tests {
         ] {
             assert_eq!(Cidr::parse(bad), None, "{bad:?}");
         }
-        assert!(lan.contains(ip("192.0.2.255")) && !lan.contains(ip("192.0.3.0")));
+        assert!(lan.contains(ip("192.0.2.255")));
+        let private = cidr("10.0.0.0/24");
+        assert!(private.contains(ip("10.0.0.255")) && !private.contains(ip("10.0.1.0")));
         let upper = cidr("192.0.2.128/25");
         assert!(lan.covers(upper) && !upper.covers(lan));
         assert!(lan.overlaps(upper) && upper.overlaps(lan));
@@ -1975,7 +1977,7 @@ mod tests {
         let without_own = hosts("192.0.2.0/24", &[ip("192.0.2.1")]).unwrap();
         assert_eq!(without_own.len(), 253);
         assert!(!without_own.contains(&ip("192.0.2.1")));
-        assert_eq!(hosts("192.0.2.0/23", &[]), None, "a /23 is too large");
+        assert_eq!(hosts("10.0.0.0/23", &[]), None, "a /23 is too large");
         assert_eq!(hosts("10.0.0.0/8", &[]), None);
     }
 
@@ -2198,7 +2200,7 @@ mod tests {
             "a wired WAN port is on the LAN side"
         );
         assert_eq!(
-            on(&net, "192.0.2.0/23"),
+            on(&net, "192.168.8.0/23"),
             None,
             "half of it lies behind the gateway"
         );
@@ -2375,9 +2377,9 @@ mod tests {
     #[tokio::test]
     async fn a_lan_subnet_larger_than_the_fallback_is_too_large_without_nmap_or_arp_scan() {
         let mut addrs = unit_addrs();
-        addrs[1] = addr(4, [192, 0, 2, 1], 23);
+        addrs[1] = addr(4, [10, 0, 0, 1], 23);
         let mut routes = unit_routes();
-        routes[1] = route(Some(([192, 0, 2, 0], 23)), None, 4, 0);
+        routes[1] = route(Some(([10, 0, 0, 0], 23)), None, 4, 0);
         let net = network(&unit_links(), &addrs, &routes);
 
         let fake = Fake::on(net.clone());
@@ -2385,7 +2387,7 @@ mod tests {
         assert_eq!(
             scanned.not_swept,
             [NotSwept {
-                cidr: "192.0.2.0/23".into(),
+                cidr: "10.0.0.0/23".into(),
                 reason: NotSweptReason::TooLarge,
             }]
         );
@@ -2394,37 +2396,37 @@ mod tests {
             .iter()
             .all(|p| p.starts_with("ping eth1 ")));
         assert_eq!(
-            device(&scanned, "192.0.2.1").own.as_deref(),
+            device(&scanned, "10.0.0.1").own.as_deref(),
             Some("br-lan"),
             "the unit's own address there is found without a probe"
         );
         let json = serde_json::to_value(&scanned.not_swept).unwrap();
         assert_eq!(
             json,
-            json!([{"cidr": "192.0.2.0/23", "reason": "too_large"}])
+            json!([{"cidr": "10.0.0.0/23", "reason": "too_large"}])
         );
 
         let mut fake = Fake::on(net.clone());
         fake.nmap = Some(HashMap::from([(
-            cidr("192.0.2.0/23"),
+            cidr("10.0.0.0/23"),
             vec![Answered {
-                ip: ip("192.0.3.7"),
+                ip: ip("10.0.1.7"),
                 mac: Some(MAC_A),
             }],
         )]));
-        let scanned = scan(&fake, &requested(&["192.0.2.0/23"]), &no_progress())
+        let scanned = scan(&fake, &requested(&["10.0.0.0/23"]), &no_progress())
             .await
             .unwrap();
         assert!(scanned.not_swept.is_empty());
-        assert_eq!(fake.log_of("nmap"), ["nmap br-lan 192.0.2.0/23"]);
+        assert_eq!(fake.log_of("nmap"), ["nmap br-lan 10.0.0.0/23"]);
         assert_eq!(
-            device(&scanned, "192.0.3.7").mac.as_deref(),
+            device(&scanned, "10.0.1.7").mac.as_deref(),
             Some("02:00:00:00:00:0a")
         );
 
         let mut fake = Fake::on(net);
         fake.arp_scan = Some(HashMap::new());
-        let scanned = scan(&fake, &requested(&["192.0.2.0/23"]), &no_progress())
+        let scanned = scan(&fake, &requested(&["10.0.0.0/23"]), &no_progress())
             .await
             .unwrap();
         assert!(
@@ -2434,8 +2436,8 @@ mod tests {
         assert_eq!(
             fake.log(),
             [
-                "arp-scan br-lan 192.0.2.0/23",
-                "ports br-lan 192.0.2.1 from 192.0.2.1"
+                "arp-scan br-lan 10.0.0.0/23",
+                "ports br-lan 10.0.0.1 from 10.0.0.1"
             ]
         );
     }
