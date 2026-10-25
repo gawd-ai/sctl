@@ -1063,7 +1063,7 @@ pub(crate) async fn scan(
     let net_ref = &net;
     let verdicts: Vec<(Ipv4Addr, Option<Approved>, Vec<u16>)> = stream::iter(ips)
         .map(|ip| async move {
-            let approved = approve(probes, net_ref, ip).await;
+            let approved = approve(probes, net_ref, ip, "probed").await;
             let open = match &approved {
                 Some(approved) => probes.open_ports(approved, &PORTS).await,
                 None => Vec::new(),
@@ -1142,8 +1142,9 @@ impl Sweep {
 
 /// Sweep `subnet` (ADR-012 decisions 10 and 13). On the LAN side, on the
 /// interface its route leaves by: nmap, else arp-scan, else the ping
-/// fallback, each tried when the one before found nothing. Off it: arp-scan
-/// alone, from 0.0.0.0, on each LAN-side interface until one finds hosts.
+/// fallback, each tried when the one before found nothing; the fallback
+/// pings only what the guard passes there. Off it: arp-scan alone, from
+/// 0.0.0.0, on each LAN-side interface until one finds hosts.
 async fn sweep(probes: &dyn Probes, net: &Network, subnet: Cidr, own: &[Ipv4Addr]) -> Sweep {
     let Some(iface) = sweep_iface(net, subnet) else {
         let mut answered = Vec::new();
@@ -1195,7 +1196,7 @@ async fn sweep(probes: &dyn Probes, net: &Network, subnet: Cidr, own: &[Ipv4Addr
             not: (!ran).then_some(NotSweptReason::TooLarge),
         };
     };
-    let answered = ping_all(probes, dev, &targets).await;
+    let answered = ping_all(probes, net, dev, &targets).await;
     debug!(
         "Discovery: {subnet} by ping on {dev}: {} hosts",
         answered.len()
@@ -1214,11 +1215,32 @@ fn fallback_targets(subnet: Cidr, own: &[Ipv4Addr]) -> Option<Vec<Ipv4Addr>> {
     Some(subnet.hosts().filter(|ip| !own.contains(ip)).collect())
 }
 
-/// The ping fallback: one ping to each target from `dev`, at most
-/// [`AT_ONCE`] in flight.
-async fn ping_all(probes: &dyn Probes, dev: &str, targets: &[Ipv4Addr]) -> Vec<Answered> {
+/// The ping fallback: one ping from `dev` to each target the guard passes
+/// there, at most [`AT_ONCE`] in flight. Whatever the request names, every
+/// send follows decision 1 (ADR-012 decision 10): a target is pinged only
+/// when the kernel's route to it is unicast, has no gateway and leaves by
+/// `dev`. A broadcast or multicast address a named subnet holds, such as a
+/// network's directed broadcast named as a /32, is never pinged.
+async fn ping_all(
+    probes: &dyn Probes,
+    net: &Network,
+    dev: &str,
+    targets: &[Ipv4Addr],
+) -> Vec<Answered> {
     stream::iter(targets.iter().copied())
         .map(|ip| async move {
+            let approved = approve(probes, net, ip, "pinged").await?;
+            if approved.own {
+                debug!("Discovery: {ip} not pinged: it is this unit's own");
+                return None;
+            }
+            if approved.dev != dev {
+                debug!(
+                    "Discovery: {ip} not pinged: the kernel would send it by {}, not {dev}",
+                    approved.dev
+                );
+                return None;
+            }
             probes
                 .ping(dev, ip)
                 .await
@@ -1231,12 +1253,13 @@ async fn ping_all(probes: &dyn Probes, dev: &str, targets: &[Ipv4Addr]) -> Vec<A
 }
 
 /// The guard's verdict on `ip` (ADR-012 decision 1), from the kernel's route
-/// now: where a probe of it may go, or None when nothing may.
-async fn approve(probes: &dyn Probes, net: &Network, ip: Ipv4Addr) -> Option<Approved> {
+/// now: where a send to it may go, or None when nothing may. `what` names
+/// the send in the log: "probed", "pinged".
+async fn approve(probes: &dyn Probes, net: &Network, ip: Ipv4Addr, what: &str) -> Option<Approved> {
     let answer = match probes.route(ip).await {
         Ok(answer) => answer,
         Err(e) => {
-            debug!("Discovery: {ip} not probed: cannot ask the kernel for the route: {e}");
+            debug!("Discovery: {ip} not {what}: cannot ask the kernel for the route: {e}");
             return None;
         }
     };
@@ -1244,7 +1267,7 @@ async fn approve(probes: &dyn Probes, net: &Network, ip: Ipv4Addr) -> Option<App
         Ok(approved) => Some(approved),
         Err(refusal) => {
             debug!(
-                "Discovery: {ip} not probed ({}): {}",
+                "Discovery: {ip} not {what} ({}): {}",
                 refusal.refused, refusal.reason
             );
             None
@@ -1549,7 +1572,10 @@ mod tests {
     }
 
     /// The kernel's answer for `ip` on a test network: local for an address
-    /// the unit holds, else its best main-table route.
+    /// the unit holds; broadcast for the broadcast address of a network an
+    /// interface holds, from the local table as the kernel fills it; else
+    /// its best main-table route, as a broadcast route for 255.255.255.255
+    /// and a multicast one for a multicast address.
     fn kernel(net: &Network, ip: Ipv4Addr) -> guard::Answer {
         if net.holder_of(ip).is_some() {
             return guard::Answer::Route(KernelRoute {
@@ -1560,11 +1586,32 @@ mod tests {
                 kind: RouteKind::Local,
             });
         }
+        let directed = net.ifaces.iter().find(|i| {
+            i.ipv4
+                .iter()
+                .any(|&(a, p)| p < 31 && Ipv4Addr::from(u32::from(a) | !mask(p)) == ip)
+        });
+        if let Some(iface) = directed {
+            return guard::Answer::Route(KernelRoute {
+                dev: iface.name.clone(),
+                oif: iface.index,
+                via: None,
+                src: iface.ipv4.first().map(|(a, _)| *a),
+                kind: RouteKind::Broadcast,
+            });
+        }
         let best = net
             .routes()
             .iter()
             .filter(|r| route_net(r).is_some_and(|n| n.contains(ip)))
             .min_by_key(|r| (Reverse(r.dst_len), r.priority));
+        let kind = if ip.is_broadcast() {
+            RouteKind::Broadcast
+        } else if ip.is_multicast() {
+            RouteKind::Multicast
+        } else {
+            RouteKind::Unicast
+        };
         match best.and_then(|r| r.oif.and_then(|oif| net.iface_at(oif)).map(|i| (r, i))) {
             Some((r, iface)) if r.kind == netlink::RTN_UNICAST => {
                 guard::Answer::Route(KernelRoute {
@@ -1572,7 +1619,7 @@ mod tests {
                     oif: iface.index,
                     via: r.gateway,
                     src: iface.ipv4.first().map(|(a, _)| *a),
-                    kind: RouteKind::Unicast,
+                    kind,
                 })
             }
             _ => guard::Answer::NoRoute,
@@ -2244,12 +2291,59 @@ mod tests {
     #[tokio::test]
     async fn the_fallback_never_has_more_than_32_pings_in_flight() {
         let fake = Fake::on(unit());
-        let targets = fallback_targets(cidr("192.0.2.0/24"), &[]).unwrap();
-        let answered = ping_all(&fake, "br-lan", &targets).await;
+        let targets = fallback_targets(cidr("192.0.2.0/24"), &[ip("192.0.2.1")]).unwrap();
+        let answered = ping_all(&fake, &fake.net, "br-lan", &targets).await;
         assert!(answered.is_empty());
-        assert_eq!(fake.log_of("ping").len(), 254);
+        assert_eq!(fake.log_of("ping").len(), 253);
         assert_eq!(fake.most_in_flight.load(Ordering::SeqCst), AT_ONCE);
         assert_eq!(AT_ONCE, 32);
+    }
+
+    /// ADR-012 decisions 1 and 10: the ping fallback pings only a target
+    /// the guard passes on the interface it sweeps. br-lan's directed
+    /// broadcast, named as a /32 or inside a /31, and a multicast range
+    /// under a no-gateway default route through br-lan lie on the LAN side
+    /// as the routes read, and none of their broadcast or multicast
+    /// addresses is pinged; the /31's other address is.
+    #[tokio::test]
+    async fn the_ping_fallback_pings_no_broadcast_or_multicast_address() {
+        let mut routes = unit_routes();
+        routes.push(route(None, None, 4, 10));
+        let fake = Fake::on(network(&unit_links(), &unit_addrs(), &routes));
+        let named = ["192.0.2.255/32", "192.0.2.254/31", "233.252.0.0/30"];
+        for subnet in named {
+            assert_eq!(
+                sweep_iface(&fake.net, cidr(subnet)).map(|i| i.name.as_str()),
+                Some("br-lan"),
+                "{subnet}"
+            );
+        }
+        let scanned = scan(&fake, &requested(&named), &no_progress())
+            .await
+            .unwrap();
+        assert!(scanned.not_swept.is_empty(), "{:?}", scanned.not_swept);
+        assert_eq!(fake.log_of("ping"), ["ping br-lan 192.0.2.254"]);
+        assert!(
+            fake.log()
+                .iter()
+                .all(|l| !l.contains("192.0.2.255") && !l.contains("233.252.0.")),
+            "{:?}",
+            fake.log()
+        );
+        // The guard's own reasons: the kernel's broadcast route, and a
+        // multicast address whatever the route says.
+        for (at, kind) in [
+            ("192.0.2.255", RouteKind::Broadcast),
+            ("233.252.0.1", RouteKind::Multicast),
+        ] {
+            let answer = kernel(&fake.net, ip(at));
+            assert!(
+                matches!(&answer, guard::Answer::Route(r) if r.kind == kind),
+                "{answer:?}"
+            );
+            let refusal = guard::judge(&fake.net, ip(at), &answer, None, false).unwrap_err();
+            assert_eq!(refusal.refused, guard::Code::NotUnicast, "{at}");
+        }
     }
 
     /// ADR-012 decision 11, step by step: the sweep's answers and a

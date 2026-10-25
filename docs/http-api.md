@@ -1075,9 +1075,11 @@ A scan sends only on the unit's LAN side, as the net tools' guard judges it
 2. **Sweep.** A subnet that lies wholly under a main-table route with no
    gateway through a LAN-side interface holding an address is swept on that
    interface only: `nmap -sn`, else `arp-scan` from the interface's address,
-   else, for a subnet of at most 254 hosts, one ping to each host, 32 at a
-   time, the network and broadcast addresses and the unit's own left out.
-   Each runs when the one before found nothing. Any other subnet (an LTE or
+   else, for a subnet of at most 254 hosts, one ping to each host the guard
+   passes on that interface, 32 at a time. The network and broadcast
+   addresses and the unit's own are left out, and so is any address the
+   kernel routes as broadcast or multicast, such as a network's broadcast
+   address named as a /32. Each runs when the one before found nothing. Any other subnet (an LTE or
    tunnel network, one behind a gateway, one the unit has lost its address
    on) is not swept: `arp-scan` from 0.0.0.0, which stays on the link,
    searches it on each LAN-side interface, bridges first, until one finds
