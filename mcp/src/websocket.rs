@@ -876,6 +876,28 @@ fn reattach_messages(sessions: &mut HashMap<String, SessionBuffer>) -> Vec<Value
         .collect()
 }
 
+/// Send a new connection's re-attaches, one per running session. A
+/// re-attach that cannot be sent holds nothing: no reply will come for it.
+async fn reattach<S>(sink: &mut S, sessions: &mut HashMap<String, SessionBuffer>)
+where
+    S: futures_util::Sink<tokio_tungstenite::tungstenite::Message> + Unpin,
+{
+    for attach_msg in reattach_messages(sessions) {
+        let session_id = attach_msg["session_id"].as_str().unwrap_or("");
+        let text = serde_json::to_string(&attach_msg).unwrap_or_default();
+        if sink
+            .send(tokio_tungstenite::tungstenite::Message::Text(text))
+            .await
+            .is_err()
+        {
+            eprintln!("mcp-sctl: failed to re-attach session {session_id}");
+            if let Some(buf) = sessions.get_mut(session_id) {
+                buf.settle(Vec::new());
+            }
+        }
+    }
+}
+
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -1186,23 +1208,7 @@ async fn reconnect_loop(
                 let (mut ws_sink, ws_reader) = ws_stream.split();
 
                 // Re-attach all active sessions
-                let mut sessions_lock = sessions.lock().await;
-                for attach_msg in reattach_messages(&mut sessions_lock) {
-                    let session_id = attach_msg["session_id"].as_str().unwrap_or("");
-                    let text = serde_json::to_string(&attach_msg).unwrap_or_default();
-                    if ws_sink
-                        .send(tokio_tungstenite::tungstenite::Message::Text(text))
-                        .await
-                        .is_err()
-                    {
-                        eprintln!("mcp-sctl: failed to re-attach session {session_id}");
-                        // No reply will come: hold nothing for it.
-                        if let Some(buf) = sessions_lock.get_mut(session_id) {
-                            buf.settle(Vec::new());
-                        }
-                    }
-                }
-                drop(sessions_lock);
+                reattach(&mut ws_sink, &mut *sessions.lock().await).await;
 
                 return Some((ws_sink, ws_reader));
             }
@@ -1662,5 +1668,218 @@ mod tests {
             assert_eq!(data(&sessions[session_id]), ["line 1\n"]);
             assert!(sessions[session_id].held.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn the_reader_keeps_a_gap_marker_and_the_real_next_entry() {
+        let (ws, _sent) = connection();
+        ws.sessions
+            .lock()
+            .await
+            .insert("s1".to_string(), SessionBuffer::new());
+        deliver(&ws, &output(1)).await;
+        deliver(&ws, &output(2)).await;
+        let gap = json!({ "type": "session.gap", "session_id": "s1", "reason": "backpressure" });
+        deliver(&ws, &gap).await;
+        {
+            // The marker takes the next place and no seq of the daemon's.
+            let sessions = ws.sessions.lock().await;
+            assert_eq!(sessions["s1"].last_seq, 2);
+            assert_eq!(sessions["s1"].last_place, 3);
+        }
+
+        // A re-attach starts from the daemon's last seq. Its replay brings
+        // the line after the gap, which also comes live before and after
+        // the reply.
+        let attaches = reattach_messages(&mut *ws.sessions.lock().await);
+        assert_eq!(attaches[0]["since"], 2);
+        deliver(&ws, &output(3)).await;
+        deliver(&ws, &attached(3..=3)).await;
+        deliver(&ws, &output(3)).await;
+
+        let read = ws.read_output("s1", 0, 0).await.unwrap();
+        assert_eq!(
+            texts(&read.entries),
+            [
+                "line 1\n",
+                "line 2\n",
+                "[output gap detected: backpressure, last_seq=2]",
+                "line 3\n"
+            ]
+        );
+        assert_eq!(places(&read.entries), [1, 2, 3, 4]);
+        assert_eq!(ws.sessions.lock().await["s1"].last_seq, 3);
+        assert_eq!(read.dropped_count, 0);
+    }
+
+    #[tokio::test]
+    async fn the_reader_keeps_the_last_output_an_exit_overtakes() {
+        // Through a relay a session's exit can come before its last output.
+        let (ws, _sent) = connection();
+        ws.sessions
+            .lock()
+            .await
+            .insert("s1".to_string(), SessionBuffer::new());
+        deliver(&ws, &output(1)).await;
+        let exited = json!({ "type": "session.exited", "session_id": "s1", "exit_code": 0 });
+        deliver(&ws, &exited).await;
+        {
+            let sessions = ws.sessions.lock().await;
+            assert_eq!(sessions["s1"].last_seq, 1);
+            assert_eq!(sessions["s1"].last_place, 2);
+            assert_eq!(sessions["s1"].status, SessionStatus::Exited);
+        }
+        deliver(&ws, &output(2)).await;
+        let read = ws.read_output("s1", 0, 0).await.unwrap();
+        assert_eq!(
+            texts(&read.entries),
+            ["line 1\n", "Process exited with code 0", "line 2\n"]
+        );
+        assert_eq!(places(&read.entries), [1, 2, 3]);
+        assert_eq!(read.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn an_attach_holds_live_output_from_before_it_is_sent() {
+        let (ws, mut sent) = connection();
+        // The connection's queue is full, so the attach waits to go out.
+        while ws.sender.try_send(json!({ "type": "ping" })).is_ok() {}
+        let (answer, ()) = tokio::join!(ws.attach_session("s1", 0), async {
+            // Output that comes before the attach goes out waits for the
+            // replay.
+            assert_eq!(sent.recv().await.unwrap()["type"], "ping");
+            deliver(&ws, &output(3)).await;
+            let attach = loop {
+                let frame = sent.recv().await.unwrap();
+                if frame["type"] == "session.attach" {
+                    break frame;
+                }
+            };
+            assert_eq!(
+                attach,
+                json!({
+                    "type": "session.attach",
+                    "session_id": "s1",
+                    "since": 0,
+                    "dedupes": true,
+                })
+            );
+            deliver(&ws, &replay(&attach, 3)).await;
+        });
+        let answer = answer.unwrap();
+        assert_eq!(texts(&answer.entries), ["line 1\n", "line 2\n", "line 3\n"]);
+        assert_eq!(answer.last_seq, 3);
+
+        // Live output after the reply: a repeat is dropped, a new line kept.
+        deliver(&ws, &output(3)).await;
+        deliver(&ws, &output(4)).await;
+        let read = ws.read_output("s1", answer.last_seq, 0).await.unwrap();
+        assert_eq!(texts(&read.entries), ["line 4\n"]);
+    }
+
+    #[tokio::test]
+    async fn an_attach_that_cannot_be_sent_holds_nothing() {
+        let (ws, sent) = connection();
+        drop(sent);
+        let mut buf = SessionBuffer::new();
+        buf.push(line(1));
+        ws.sessions.lock().await.insert("s1".to_string(), buf);
+
+        assert!(ws.attach_session("s1", 1).await.is_err());
+        assert!(ws.sessions.lock().await["s1"].held.is_none());
+        deliver(&ws, &output(2)).await;
+        let read = ws.read_output("s1", 1, 0).await.unwrap();
+        assert_eq!(texts(&read.entries), ["line 2\n"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_attach_with_no_reply_holds_nothing_after_its_wait() {
+        let (ws, mut sent) = connection();
+        let (answer, attach) = tokio::join!(ws.attach_session("s1", 0), sent.recv());
+        assert_eq!(attach.unwrap()["type"], "session.attach");
+        assert_eq!(
+            answer.err().as_deref(),
+            Some("Timeout waiting for session.attached response")
+        );
+        assert!(ws.sessions.lock().await["s1"].held.is_none());
+        deliver(&ws, &output(1)).await;
+        let read = ws.read_output("s1", 0, 0).await.unwrap();
+        assert_eq!(texts(&read.entries), ["line 1\n"]);
+    }
+
+    #[tokio::test]
+    async fn an_error_for_a_session_ends_its_hold() {
+        let (ws, _sent) = connection();
+        let mut buf = SessionBuffer::new();
+        buf.push(line(1));
+        buf.hold();
+        buf.live(line(2));
+        ws.sessions.lock().await.insert("s1".to_string(), buf);
+
+        let error = json!({
+            "type": "error",
+            "code": "SESSION_NOT_FOUND",
+            "session_id": "s1",
+            "message": "Session s1 not found",
+        });
+        deliver(&ws, &error).await;
+        let sessions = ws.sessions.lock().await;
+        assert_eq!(data(&sessions["s1"]), ["line 1\n", "line 2\n"]);
+        assert!(sessions["s1"].held.is_none());
+        assert_eq!(sessions["s1"].status, SessionStatus::Exited);
+    }
+
+    /// A socket that takes nothing: every send fails.
+    struct ClosedSocket;
+
+    impl futures_util::Sink<tokio_tungstenite::tungstenite::Message> for ClosedSocket {
+        type Error = ();
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ()>> {
+            std::task::Poll::Ready(Err(()))
+        }
+
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            _: tokio_tungstenite::tungstenite::Message,
+        ) -> Result<(), ()> {
+            Err(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), ()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_re_attach_that_cannot_be_sent_holds_nothing() {
+        let mut sessions = HashMap::new();
+        let mut buf = SessionBuffer::new();
+        buf.push(line(1));
+        sessions.insert("s1".to_string(), buf);
+
+        // Sent: the session holds live output until the reply.
+        reattach(&mut futures_util::sink::drain(), &mut sessions).await;
+        assert!(sessions["s1"].held.is_some());
+
+        // The next connection cannot send it: no reply will come.
+        reattach(&mut ClosedSocket, &mut sessions).await;
+        let buf = sessions.get_mut("s1").unwrap();
+        assert!(buf.held.is_none());
+        buf.live(line(2));
+        assert_eq!(data(buf), ["line 1\n", "line 2\n"]);
     }
 }
