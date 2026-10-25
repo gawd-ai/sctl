@@ -15,7 +15,9 @@
 //!   holding an address, and only on that interface. Any other subnet is
 //!   `not_swept` as `not_on_lan`, and arp-scan, which stays on the link,
 //!   searches it on the LAN-side interfaces. arp-scan runs only on a subnet
-//!   it can search within its limit, a /19 at most.
+//!   it can search within its limit, a /19 at most. An entry of a request
+//!   that is not an IPv4 network is `not_swept` as `not_ipv4` (an IPv6 one)
+//!   or `invalid`.
 //! - **The port probe** judges each host by the guard and connects from a
 //!   socket bound where the guard approved. The guard refuses the unit's
 //!   own addresses (`own_address`), so they get none.
@@ -119,12 +121,18 @@ pub enum NotSweptReason {
     /// It holds more hosts than the ping fallback pings, and neither nmap
     /// nor arp-scan swept it: arp-scan searches at most a /19.
     TooLarge,
+    /// An IPv6 address or network: a scan sweeps IPv4 networks only.
+    NotIpv4,
+    /// Not a network in `a.b.c.d/p` form: no prefix, a prefix over 32, a
+    /// word.
+    Invalid,
 }
 
 /// A subnet the scan did not sweep, and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotSwept {
-    /// In network form.
+    /// In network form; as the request gave it when it is not an IPv4
+    /// network.
     pub cidr: String,
     pub reason: NotSweptReason,
 }
@@ -146,8 +154,9 @@ pub struct DiscoveryResults {
 /// empty one, it sweeps the networks the unit holds an address on, on
 /// LAN-side interfaces (ADR-012 decision 10); a subnet the request names is
 /// swept only where the guard lets it be, and `not_swept` says which were
-/// not. Answers `503 NET_UNAVAILABLE` when the unit's network cannot be
-/// read: nothing is judged, so nothing is sent.
+/// not, an entry that is not an IPv4 network included. Answers
+/// `503 NET_UNAVAILABLE` when the unit's network cannot be read: nothing is
+/// judged, so nothing is sent.
 pub async fn discover(
     State(state): State<AppState>,
     Json(payload): Json<Value>,
@@ -418,18 +427,44 @@ fn default_subnets(net: &Network) -> Vec<Cidr> {
     out
 }
 
-/// The subnets a request names, in network form, each once. An entry that
-/// is not an IPv4 CIDR is left out.
-fn named_subnets(requested: &[String]) -> Vec<Cidr> {
-    let mut out = Vec::new();
+/// The subnets a request names, in network form, each once, and each entry
+/// that is not an IPv4 network, once as given, with why (ADR-012 decision
+/// 10: `not_swept` names every subnet the scan did not sweep).
+fn named_subnets(requested: &[String]) -> (Vec<Cidr>, Vec<NotSwept>) {
+    let mut subnets = Vec::new();
+    let mut unread: Vec<NotSwept> = Vec::new();
     for text in requested {
         match Cidr::parse(text) {
-            Some(cidr) if !out.contains(&cidr) => out.push(cidr),
+            Some(cidr) if !subnets.contains(&cidr) => subnets.push(cidr),
             Some(_) => {}
-            None => debug!("Discovery: {text:?} is not an IPv4 CIDR, left out"),
+            None if unread.iter().any(|n| n.cidr == *text) => {}
+            None => {
+                let reason = if ipv6_entry(text) {
+                    NotSweptReason::NotIpv4
+                } else {
+                    NotSweptReason::Invalid
+                };
+                debug!("Discovery: {text:?} is not an IPv4 network ({reason:?}), not swept");
+                unread.push(NotSwept {
+                    cidr: text.clone(),
+                    reason,
+                });
+            }
         }
     }
-    out
+    (subnets, unread)
+}
+
+/// Whether a request's entry is an IPv6 address, or an IPv6 network with a
+/// prefix of at most 128.
+fn ipv6_entry(text: &str) -> bool {
+    let text = text.trim();
+    let (ip, prefix) = match text.split_once('/') {
+        Some((ip, prefix)) => (ip, Some(prefix)),
+        None => (text, None),
+    };
+    ip.parse::<std::net::Ipv6Addr>().is_ok()
+        && prefix.is_none_or(|p| p.parse::<u8>().is_ok_and(|p| p <= 128))
 }
 
 /// Where nmap and the ping fallback may sweep `subnet` (ADR-012 decision
@@ -1128,8 +1163,9 @@ pub(crate) async fn scan(
         .network()
         .await
         .map_err(|e| format!("cannot read this unit's network: {e}"))?;
-    let subnets = if requested.is_empty() {
-        default_subnets(&net)
+    // Entries that are not IPv4 networks are named first, as given.
+    let (subnets, mut not_swept) = if requested.is_empty() {
+        (default_subnets(&net), Vec::new())
     } else {
         named_subnets(requested)
     };
@@ -1152,7 +1188,6 @@ pub(crate) async fn scan(
 
     // Phase 2: the sweep.
     progress.phase("ping", 2, &hosts);
-    let mut not_swept = Vec::new();
     for &subnet in &subnets {
         let swept = sweep(probes, &net, subnet, &own).await;
         for answer in swept.answered {
@@ -1937,16 +1972,107 @@ mod tests {
         assert!(lan.covers(upper) && !upper.covers(lan));
         assert!(lan.overlaps(upper) && upper.overlaps(lan));
         assert!(!upper.overlaps(cidr("192.0.2.0/25")));
+        let (subnets, unread) = named_subnets(&requested(&[
+            "192.0.2.7/24",
+            "192.0.2.0/24",
+            "x/24",
+            "198.51.100.0/24",
+        ]));
         assert_eq!(
-            named_subnets(&requested(&[
-                "192.0.2.7/24",
-                "192.0.2.0/24",
-                "x/24",
-                "198.51.100.0/24"
-            ])),
+            subnets,
             [lan, cidr("198.51.100.0/24")],
-            "each once, in network form, a word left out"
+            "each once, in network form"
         );
+        assert_eq!(
+            unread,
+            [NotSwept {
+                cidr: "x/24".into(),
+                reason: NotSweptReason::Invalid,
+            }],
+            "a word named as not swept, as given"
+        );
+    }
+
+    /// ADR-012 decision 10: `not_swept` names each subnet the scan did not
+    /// sweep, and why. An entry that is not an IPv4 network is named as
+    /// given, once: `not_ipv4` for an IPv6 address or network, `invalid`
+    /// for anything else that is not `a.b.c.d/p`. It is never swept nor
+    /// searched.
+    #[tokio::test]
+    async fn an_entry_that_is_not_an_ipv4_network_is_named_in_not_swept() {
+        let fake = Fake::on(unit());
+        let scanned = scan(
+            &fake,
+            &requested(&[
+                "2001:db8::/64",
+                "192.0.2.0/33",
+                "2001:db8::1",
+                "192.0.2.5",
+                "2001:db8::/129",
+                "bogus",
+                "2001:db8::/64",
+                "",
+            ]),
+            &no_progress(),
+        )
+        .await
+        .unwrap();
+        let named: Vec<(&str, NotSweptReason)> = scanned
+            .not_swept
+            .iter()
+            .map(|n| (n.cidr.as_str(), n.reason))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("2001:db8::/64", NotSweptReason::NotIpv4),
+                ("192.0.2.0/33", NotSweptReason::Invalid),
+                ("2001:db8::1", NotSweptReason::NotIpv4),
+                ("192.0.2.5", NotSweptReason::Invalid),
+                ("2001:db8::/129", NotSweptReason::Invalid),
+                ("bogus", NotSweptReason::Invalid),
+                ("", NotSweptReason::Invalid),
+            ]
+        );
+        assert!(
+            fake.log()
+                .iter()
+                .all(|l| !["nmap", "arp-scan", "ping", "ports", "arp "]
+                    .iter()
+                    .any(|tool| l.starts_with(tool))),
+            "nothing swept or searched: {:?}",
+            fake.log()
+        );
+        let json = serde_json::to_value(&scanned.not_swept[..2]).unwrap();
+        assert_eq!(
+            json,
+            json!([
+                {"cidr": "2001:db8::/64", "reason": "not_ipv4"},
+                {"cidr": "192.0.2.0/33", "reason": "invalid"}
+            ])
+        );
+
+        // Beside an IPv4 network the request names, which is swept.
+        let fake = Fake::on(unit());
+        let scanned = scan(
+            &fake,
+            &requested(&["2001:db8::/64", "192.0.2.0/24"]),
+            &no_progress(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scanned.not_swept,
+            [NotSwept {
+                cidr: "2001:db8::/64".into(),
+                reason: NotSweptReason::NotIpv4,
+            }]
+        );
+        assert!(fake
+            .log_of("ping")
+            .iter()
+            .all(|p| p.starts_with("ping br-lan 192.0.2.")));
+        assert!(!fake.log_of("ping").is_empty(), "the IPv4 network is swept");
     }
 
     /// TRD-9 3.5: the hosts a prefix yields, and a /23 too large for the

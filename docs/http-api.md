@@ -1098,9 +1098,10 @@ empty list, the scan sweeps the networks the unit holds an address on, on
 its LAN-side interfaces: the `addr` subnets of up `lan` interfaces in
 [`GET /api/infra/discover/subnets`](#get-apiinfradiscoversubnets). Its LTE
 and tunnel networks are never swept, and a `route` or `arp` subnet is swept
-only when a request names it. An entry that is not an IPv4 CIDR, an IPv6
-one included, is left out: it is not swept, and `not_swept` does not name
-it.
+only when a request names it. An entry that is not an IPv4 network is not
+swept, and `not_swept` names it as given: `not_ipv4` for an IPv6 address or
+network, `invalid` for anything else not in `a.b.c.d/p` form (no prefix, a
+prefix over 32, a word).
 
 A scan sends only on the unit's LAN side, as the net tools' guard judges it
 (ADR-012; the guide's "Network tools"):
@@ -1156,7 +1157,9 @@ reason}]}`.
   LAN side are listed without the sweep finding them, also in a subnet
   that is `too_large`.
 - `not_swept`: each subnet the scan did not sweep, in network form, and
-  why: `not_on_lan` (searched by ARP alone, as above) or `too_large`.
+  why: `not_on_lan` (searched by ARP alone, as above) or `too_large`; and
+  each entry of the request that is not an IPv4 network, once and as
+  given, with `not_ipv4` or `invalid`.
 
 Errors: `503` `NET_UNAVAILABLE` when the unit's network cannot be read:
 the scan judges nothing, so it sends nothing.
