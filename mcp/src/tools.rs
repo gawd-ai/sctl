@@ -515,7 +515,7 @@ fn builtin_tool_definitions() -> Vec<Value> {
                     },
                     "since": {
                         "type": "integer",
-                        "description": "Sequence number. Returns entries with seq > since. Use 0 to replay from the beginning."
+                        "description": "Sequence number, as session_read takes it: last_seq from a previous session_read or session_attach. Returns entries with seq > since. Use 0 to replay from the beginning."
                     },
                     "device": {
                         "type": "string",
@@ -1231,7 +1231,7 @@ async fn handle_session_read(args: &Value, registry: &DeviceRegistry) -> ToolRes
                 })
                 .collect();
 
-            let last_seq = result.entries.last().map_or(since, |e| e.seq);
+            let last_seq = result.last_seq;
 
             let status = match result.status {
                 crate::websocket::SessionStatus::Running => "running",
@@ -1452,7 +1452,7 @@ async fn handle_session_attach(args: &Value, registry: &DeviceRegistry) -> ToolR
                 })
                 .collect();
 
-            let last_seq = result.entries.last().map_or(since, |e| e.seq);
+            let last_seq = result.last_seq;
 
             let status = match result.status {
                 crate::websocket::SessionStatus::Running => "running",

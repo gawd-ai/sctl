@@ -341,7 +341,7 @@ Re-attach to an existing persistent session after a disconnect.
 | `since` | integer | no | Sequence number (0 = replay from beginning) |
 | `device` | string | no | Device name |
 
-`since` is the daemon's sequence number. The entries returned, and `last_seq`, carry mcp-sctl's own `seq`, as `session_read` takes it.
+`since`, the `seq` of the entries returned and `last_seq` are mcp-sctl's own `seq`, as in `session_read`: pass `last_seq` from either. With no entry returned, `last_seq` is the last `seq` the buffer gave. mcp-sctl asks the daemon only for its entries above the highest it holds. A session mcp-sctl holds no output for yet, as after a restart, takes `since` as the daemon's sequence number, which its `seq` follows until a marker comes between.
 
 #### `session_exec_wait`
 
