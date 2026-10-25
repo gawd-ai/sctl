@@ -215,6 +215,11 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
         "gps": gps,
         "lte": lte,
     });
+    // The path that runs the agent's tools (TRD-9 3.6), absent when the
+    // agent could not make its name at start.
+    if let Some(cli) = &state.cli {
+        resp["cli"] = json!(cli.display().to_string());
+    }
     if let Some(ch) = connection_history {
         resp["connection_history"] = json!(ch);
     }
@@ -245,4 +250,35 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
     }
     debug!(total_ms, lte_lock_wait_ms, "api.health: end");
     Json(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::config::Config;
+    use crate::file_access::Gate;
+
+    /// `cli` is the path the agent made for its tools at start, and absent
+    /// when it made none.
+    #[tokio::test]
+    async fn health_names_the_path_that_runs_the_tools() {
+        let dir = std::env::temp_dir().join(format!("sctl-health-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config: Config = toml::from_str("").unwrap();
+        config.server.data_dir = dir.join("data").display().to_string();
+        let gate = Arc::new(Gate::for_agent(&config, None, None));
+        let mut state = AppState::for_tests(config, gate);
+
+        let Json(body) = health(State(state.clone())).await;
+        assert_eq!(body["status"], "ok");
+        assert!(body.get("cli").is_none(), "{body}");
+
+        state.cli = Some(PathBuf::from("/usr/bin/sctl"));
+        let Json(body) = health(State(state)).await;
+        assert_eq!(body["cli"], "/usr/bin/sctl");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

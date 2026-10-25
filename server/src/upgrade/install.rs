@@ -20,18 +20,26 @@ use serde_json::{json, Value};
 pub const DEFAULT_PATH: &str = "/etc/sctl/install.json";
 /// The file `[upgrade] hold` is the config form of.
 pub const HOLD_PATH: &str = "/etc/sctl/upgrade-hold";
+/// The boot fetcher's config when `install.json` names none.
+pub const RAMBOOT_CONF_PATH: &str = "/etc/sctl/ramboot.conf";
 
-/// How the agent is installed.
+/// How the agent is installed. Every layout runs the agent's tools as
+/// `/usr/bin/sctl`, or `/usr/local/bin/sctl` on the relay
+/// ([`super::cli_name`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Layout {
-    /// The raw binary at `/usr/bin/sctl`, procd.
+    /// The raw binary at `/usr/bin/sctl`, procd (the BPIs).
     UsrBin,
     /// Gzipped payloads under `/usr/local/lib/sctl/`, expanded to `/tmp/sctl/`
-    /// by the init at start (XE300, RUT241).
+    /// by the init at every start (the XE300, and a RUT241 as installed).
+    /// The agent links `/usr/bin/sctl` to the binary it runs.
     GzTmp,
     /// Nothing but `/etc/sctl/ramboot.conf`; the boot fetcher downloads the
-    /// payloads into `/tmp/sctl/cache/` (WE826).
+    /// payloads into `/tmp/sctl/cache/` at boot (the WE826, and a RUT241
+    /// after `ramboot-migrate.sh`). The agent links `/usr/bin/sctl` to the
+    /// binary it runs, or on a unit that runs it under a loader (the WE826,
+    /// `helper_prefix`) writes a wrapper there.
     Ramboot,
     /// The raw binary at `/usr/local/bin/sctl` under a systemd unit (the relay).
     Systemd,
@@ -81,6 +89,17 @@ struct Raw {
     cache_dir: Option<String>,
     #[serde(default)]
     helper_prefix: Option<Vec<String>>,
+}
+
+/// How the agent runs: its binary, and the loader words before it when the
+/// kernel does not run the binary itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Running {
+    /// The agent's binary.
+    pub binary: PathBuf,
+    /// The loader and its options (`helper_prefix`); empty on every unit but
+    /// one that runs its agent under a loader.
+    pub loader: Vec<String>,
 }
 
 /// The resolved install: every field filled.
@@ -282,6 +301,43 @@ impl InstallInfo {
         }
     }
 
+    /// The boot fetcher's config: the file's, else `/etc/sctl/ramboot.conf`.
+    pub fn ramboot_conf_path(&self) -> PathBuf {
+        self.ramboot_conf
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(RAMBOOT_CONF_PATH))
+    }
+
+    /// The binary the boot fetcher runs: `ramboot.conf`'s `BIN`.
+    pub fn ramboot_bin(&self) -> Result<PathBuf, String> {
+        let conf_path = self.ramboot_conf_path();
+        let conf = std::fs::read_to_string(&conf_path)
+            .map_err(|e| format!("{}: {e}", conf_path.display()))?;
+        conf_value(&conf, "BIN").map(PathBuf::from).ok_or_else(|| {
+            format!(
+                "{}: no BIN, the binary the boot fetcher runs",
+                conf_path.display()
+            )
+        })
+    }
+
+    /// How this agent runs, for the upgrade's helper and the tools' name.
+    /// Under a loader (`helper_prefix`, the WE826's musl `libc.so
+    /// --library-path`) `current_exe()` is the loader, so the binary is the
+    /// one `ramboot.conf` names as `BIN`; everywhere else it is
+    /// `current_exe()`.
+    pub fn running(&self) -> Result<Running, String> {
+        let binary = if self.helper_prefix.is_empty() {
+            std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?
+        } else {
+            self.ramboot_bin()?
+        };
+        Ok(Running {
+            binary,
+            loader: self.helper_prefix.clone(),
+        })
+    }
+
     /// The health URL: the file's, or `server.listen`'s port on loopback.
     pub fn health_url(&self, listen: &str) -> String {
         if let Some(url) = &self.health_url {
@@ -312,6 +368,15 @@ impl InstallInfo {
             "helper_prefix": self.helper_prefix,
         })
     }
+}
+
+/// One value of a `ramboot.conf` (`KEY='value'` or `KEY=value`).
+pub fn conf_value(conf: &str, key: &str) -> Option<String> {
+    conf.lines().find_map(|line| {
+        let rest = line.strip_prefix(key)?.strip_prefix('=')?;
+        let value = rest.trim().trim_matches('\'').trim_matches('"');
+        (!value.is_empty()).then(|| value.to_string())
+    })
 }
 
 /// The hold file's reason, if the file exists (its first line, or "held").
@@ -436,6 +501,66 @@ mod tests {
         assert_eq!(report["layout"], "usr-bin");
         assert_eq!(report["files"]["server"], "/usr/bin/sctl");
         assert_eq!(report["health_url"], "http://127.0.0.1:1337/api/health");
+    }
+
+    #[test]
+    fn conf_values_are_read_quoted_or_bare() {
+        let conf =
+            "RUN_DIR='/tmp/sctl'\nBIN=\"/tmp/sctl/sctl-server\"\nMIN_TMP_KB=24576\nEMPTY=''\n";
+        assert_eq!(
+            conf_value(conf, "BIN").as_deref(),
+            Some("/tmp/sctl/sctl-server")
+        );
+        assert_eq!(conf_value(conf, "RUN_DIR").as_deref(), Some("/tmp/sctl"));
+        assert_eq!(conf_value(conf, "MIN_TMP_KB").as_deref(), Some("24576"));
+        assert_eq!(conf_value(conf, "EMPTY"), None);
+        assert_eq!(conf_value(conf, "BINARY"), None);
+    }
+
+    /// The upgrade's helper and the tools' name find the agent the same way:
+    /// `current_exe()`, or under a loader `ramboot.conf`'s `BIN` with the
+    /// loader's words.
+    #[test]
+    fn the_running_binary_is_current_exe_or_under_a_loader_ramboots_bin() {
+        let dir = std::env::temp_dir().join(format!("sctl-install-running-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let plain = InstallInfo::defaults(Layout::GzTmp, "mips_24kc");
+        let running = plain.running().unwrap();
+        assert_eq!(running.binary, std::env::current_exe().unwrap());
+        assert!(running.loader.is_empty());
+
+        let conf = dir.join("ramboot.conf");
+        let mut loader_run = InstallInfo::defaults(Layout::Ramboot, "mips_24kc");
+        loader_run.ramboot_conf = Some(conf.clone());
+        loader_run.helper_prefix = vec![
+            "/tmp/sctl/lib/libc.so".into(),
+            "--library-path".into(),
+            "/tmp/sctl/lib".into(),
+        ];
+        let err = loader_run.running().unwrap_err();
+        assert!(err.contains("ramboot.conf"), "no file: {err}");
+        std::fs::write(
+            &conf,
+            "RUN_DIR='/tmp/sctl'\nSERVER_URL='http://192.0.2.10/s'\n",
+        )
+        .unwrap();
+        let err = loader_run.running().unwrap_err();
+        assert!(err.contains("no BIN"), "{err}");
+        std::fs::write(&conf, "RUN_DIR='/tmp/sctl'\nBIN='/tmp/sctl/sctl-server'\n").unwrap();
+        assert_eq!(
+            loader_run.running().unwrap(),
+            Running {
+                binary: PathBuf::from("/tmp/sctl/sctl-server"),
+                loader: loader_run.helper_prefix.clone(),
+            }
+        );
+        assert_eq!(
+            InstallInfo::defaults(Layout::GzTmp, "mips_24kc").ramboot_conf_path(),
+            PathBuf::from(RAMBOOT_CONF_PATH)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

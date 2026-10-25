@@ -421,15 +421,6 @@ fn copy_file(from: &Path, to: &Path) -> Result<(), String> {
         .map_err(|e| format!("copy {} to {}: {e}", from.display(), to.display()))
 }
 
-/// One value of a `ramboot.conf` (`KEY='value'` or `KEY=value`).
-pub fn conf_value(conf: &str, key: &str) -> Option<String> {
-    conf.lines().find_map(|line| {
-        let rest = line.strip_prefix(key)?.strip_prefix('=')?;
-        let value = rest.trim().trim_matches('\'').trim_matches('"');
-        (!value.is_empty()).then(|| value.to_string())
-    })
-}
-
 /// What a file already at the destination is worth (ADR-002): the one the
 /// manifest names (keep it, no download), a stale file at least as large as
 /// the one expected (never trusted by size: dropped first), or a partial
@@ -660,10 +651,7 @@ async fn stage(ctx: &Context, req: &Request, handle: &Handle) -> Result<(), Refu
         )
     })?;
     if install.layout == Layout::Ramboot {
-        let conf_path = install
-            .ramboot_conf
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("/etc/sctl/ramboot.conf"));
+        let conf_path = install.ramboot_conf_path();
         let current = std::fs::read_to_string(&conf_path)
             .map_err(|e| Refusal::new(Reason::Internal, format!("{}: {e}", conf_path.display())))?;
         let mirror = req.mirror_base.as_deref().unwrap_or_default();
@@ -748,31 +736,14 @@ async fn stage(ctx: &Context, req: &Request, handle: &Handle) -> Result<(), Refu
     )
     .map_err(|e| Refusal::new(Reason::Internal, format!("{}: {e}", plan_path.display())))?;
 
-    // The helper: a copy of this binary, detached. Under a loader (the
-    // WE826's musl `libc.so --library-path`) `current_exe()` is the loader,
-    // so the running binary is the one `ramboot.conf` names as `BIN`.
+    // The helper: a copy of the running binary, detached, started through
+    // the unit's loader words when it runs its agent under a loader (the
+    // WE826's musl `libc.so --library-path`, `InstallInfo::running`).
     let helper = stage.join("helper");
-    let me = if install.helper_prefix.is_empty() {
-        std::env::current_exe()
-            .map_err(|e| Refusal::new(Reason::Internal, format!("current_exe: {e}")))?
-    } else {
-        let conf_path = install
-            .ramboot_conf
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("/etc/sctl/ramboot.conf"));
-        let conf = std::fs::read_to_string(&conf_path)
-            .map_err(|e| Refusal::new(Reason::Internal, format!("{}: {e}", conf_path.display())))?;
-        PathBuf::from(conf_value(&conf, "BIN").ok_or_else(|| {
-            Refusal::new(
-                Reason::Internal,
-                format!(
-                    "{}: no BIN for the helper under a loader",
-                    conf_path.display()
-                ),
-            )
-        })?)
-    };
-    copy_file(&me, &helper).map_err(|e| Refusal::new(Reason::Internal, e))?;
+    let running = install
+        .running()
+        .map_err(|e| Refusal::new(Reason::Internal, e))?;
+    copy_file(&running.binary, &helper).map_err(|e| Refusal::new(Reason::Internal, e))?;
     set_mode(&helper, 0o755).map_err(|e| Refusal::new(Reason::Internal, e))?;
     // The old helper's log starts afresh for this attempt.
     let _ = std::fs::remove_file(&plan.log_path);
@@ -791,7 +762,7 @@ async fn stage(ctx: &Context, req: &Request, handle: &Handle) -> Result<(), Refu
             install.layout,
             &manifest.version,
             &plan.log_path,
-            &install.helper_prefix,
+            &running.loader,
         )
     })
     .await?;
@@ -1126,20 +1097,6 @@ mod tests {
             Cache::Partial
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn conf_values_are_read_quoted_or_bare() {
-        let conf =
-            "RUN_DIR='/tmp/sctl'\nBIN=\"/tmp/sctl/sctl-server\"\nMIN_TMP_KB=24576\nEMPTY=''\n";
-        assert_eq!(
-            conf_value(conf, "BIN").as_deref(),
-            Some("/tmp/sctl/sctl-server")
-        );
-        assert_eq!(conf_value(conf, "RUN_DIR").as_deref(), Some("/tmp/sctl"));
-        assert_eq!(conf_value(conf, "MIN_TMP_KB").as_deref(), Some("24576"));
-        assert_eq!(conf_value(conf, "EMPTY"), None);
-        assert_eq!(conf_value(conf, "BINARY"), None);
     }
 
     /// Hand off as `stage` does, with a `spawn` that starts nothing: it

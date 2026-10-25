@@ -131,11 +131,19 @@ async fn main() {
         Command::InstallInfo { config } => {
             let config = Config::load(config.as_deref());
             match load_install_info() {
-                (Some(info), _) => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&info.report(&config.server.listen))
-                        .unwrap_or_default()
-                ),
+                (Some(info), _) => {
+                    let mut report = info.report(&config.server.listen);
+                    // The name the agent made for its tools at start, as it
+                    // stands: read here, never written.
+                    match sctl::upgrade::cli_name::reported(&info) {
+                        Ok(cli) => report["cli"] = serde_json::json!(cli.display().to_string()),
+                        Err(why) => eprintln!("no cli: {why}"),
+                    }
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).unwrap_or_default()
+                    );
+                }
                 (None, Some(error)) => {
                     eprintln!("{error}");
                     std::process::exit(1);
@@ -689,6 +697,11 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         None => {}
     }
 
+    // The name the agent's tools run by on every layout, `/usr/bin/sctl`
+    // (TRD-9 3.6): made now if it is not already right, so `/api/health`
+    // can name it as `cli`.
+    let cli = sctl::upgrade::cli_name::at_start(install.as_ref());
+
     // The one gate before a file's content is read (ADR-011), for the file
     // routes and every transfer.
     let file_gate = Arc::new(file_access::Gate::for_agent(
@@ -812,6 +825,7 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         upgrade,
         install: install.map(Arc::new),
         install_error,
+        cli,
         config_path: config_path.map(ToString::to_string),
         file_gate,
     };

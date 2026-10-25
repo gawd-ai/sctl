@@ -120,6 +120,13 @@ install_json_usr_bin() {
     printf '{"v":1,"layout":"usr-bin","target":"%s"}' "${ARCH_UPGRADE_TARGET[$arch]:-unknown}"
 }
 
+# A shell condition run on a unit: whether /usr/bin/sctl is the name an
+# agent from 0.6.12 makes for its tools (docs/upgrade.md), a symbolic link
+# (gz-tmp, ramboot) or its wrapper, known by its second line (a unit that
+# runs its agent under a loader). Every path here that writes /usr/bin/sctl
+# refuses such a unit rather than write through the name.
+AGENT_CLI_TEST='{ [ -L /usr/bin/sctl ] || head -n 2 /usr/bin/sctl 2>/dev/null | grep -qxF "# sctl: the agent writes this file at start"; }'
+
 declare -A ARCH_TARGET=(
     [riscv64]=riscv64gc-unknown-linux-musl
     [mipsel]=mipsel-unknown-linux-musl
@@ -1464,6 +1471,21 @@ do_device_ls() {
 
 # ─── device deploy ───────────────────────────────────────────────────
 
+# Refuse a unit whose /usr/bin/sctl is the name its agent made for its tools
+# (AGENT_CLI_TEST): a copy there would write through the name into the
+# binary the agent runs from /tmp, or replace its wrapper. Such a unit
+# upgrades itself (docs/upgrade.md).
+# Usage: refuse_agent_cli_over_ssh <name> <host> <ssh_opts> <what>
+refuse_agent_cli_over_ssh() {
+    local name="$1" host="$2" ssh_opts="$3" what="$4" answer
+    answer=$(ssh $ssh_opts "root@$host" "if $AGENT_CLI_TEST; then echo agent-cli; fi" 2>/dev/null) || true
+    if [[ "$answer" == "agent-cli" ]]; then
+        err "/usr/bin/sctl on '$name' is a link or the agent's wrapper, the name an agent from 0.6.12 makes for its tools."
+        err "$what would write through it. The unit upgrades itself: ask it through a managed rollout (docs/upgrade.md)."
+        exit 1
+    fi
+}
+
 do_device_deploy() {
     local name="${1:-}"
     if [[ -z "$name" ]]; then
@@ -1498,6 +1520,9 @@ do_device_deploy() {
     local comms_provider
     comms_provider=$(device_comms_provider "$name")
 
+    local ssh_opts="-o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new"
+    refuse_agent_cli_over_ssh "$name" "$host" "$ssh_opts" "device deploy"
+
     # Cross-compile
     if [[ "$target" == "native" ]]; then
         log "Building sctl for $arch (native)..."
@@ -1509,8 +1534,6 @@ do_device_deploy() {
     ok "Build complete: $bin_path"
 
     build_comms_provider "$comms_provider" "$arch"
-
-    local ssh_opts="-o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new"
 
     # Upload binary
     log "Uploading sctl binary to $host..."
@@ -1584,6 +1607,9 @@ do_device_upgrade() {
     local comms_provider
     comms_provider=$(device_comms_provider "$name")
 
+    local ssh_opts="-o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new"
+    refuse_agent_cli_over_ssh "$name" "$host" "$ssh_opts" "device upgrade"
+
     # Cross-compile
     if [[ "$target" == "native" ]]; then
         log "Building sctl for $arch (native)..."
@@ -1595,8 +1621,6 @@ do_device_upgrade() {
     ok "Build complete: $bin_path"
 
     build_comms_provider "$comms_provider" "$arch"
-
-    local ssh_opts="-o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new"
 
     # Stop, upload, start
     log "Stopping sctl on $host..."
@@ -1685,6 +1709,11 @@ is_healthy() {
     wget -qO /dev/null -T 5 "$HEALTH_URL" 2>/dev/null
 }
 
+# Whether /usr/bin/sctl is the name an agent from 0.6.12 makes for its
+# tools, a link or its wrapper: the agent runs from elsewhere, and a copy
+# over the name would write through it.
+is_agents_name() { '"$AGENT_CLI_TEST"'; }
+
 # ── Main logic ──
 
 # 1. If sctl not running, start it
@@ -1725,7 +1754,11 @@ else
     log "health check failed ($fails/$MAX_FAILS)"
 
     if [ "$fails" -ge "$MAX_FAILS" ]; then
-        if [ -f "$ROLLBACK_BIN" ]; then
+        if [ -f "$ROLLBACK_BIN" ] && is_agents_name; then
+            log "not rolling back: $SCTL_BIN is the name the agent made for its tools; restarting sctl after $fails failures"
+            /etc/init.d/sctl restart
+            set_fails 0
+        elif [ -f "$ROLLBACK_BIN" ]; then
             # Rollback to previous binary
             log "ROLLBACK: swapping to previous binary after $fails failures"
             cp "$ROLLBACK_BIN" "$SCTL_BIN"
@@ -1815,7 +1848,8 @@ do_device_deploy_watchdog() {
     ok "Watchdog deployed to '$name'"
     echo "  Script: /etc/sctl/watchdog.sh"
     echo "  Schedule: every 2 minutes via cron"
-    echo "  Rollback: swaps to /usr/bin/sctl.rollback after 3 failed health checks"
+    echo "  Rollback: swaps to /usr/bin/sctl.rollback after 3 failed health checks,"
+    echo "            never when /usr/bin/sctl is the name the agent made for its tools"
 }
 
 # ─── device upgrade-remote ───────────────────────────────────────────
@@ -2300,6 +2334,11 @@ do_device_upgrade_remote() {
         err "It upgrades itself: ask it through a managed rollout (docs/upgrade.md), not upgrade-remote."
         exit 1
     fi
+    if [[ "$layout" == "agent-cli" ]]; then
+        err "/usr/bin/sctl on '$name' is a link or the agent's wrapper, the name an agent from 0.6.12 makes for its tools."
+        err "upgrade-remote would write through it. The unit upgrades itself: ask it through a managed rollout (docs/upgrade.md)."
+        exit 1
+    fi
 
     if [[ -z "$arch" ]]; then
         err "Device '$name' has no arch configured"
@@ -2395,13 +2434,28 @@ do_device_upgrade_remote() {
     done
 
     # Step 7: Swap binary and kill child process (wait for window)
-    # All 3 commands are tiny — must complete in one window.
+    # The commands are tiny: they must complete in one window.
     log "Swapping binary and restarting sctl..."
     local swap_ok=false
     for attempt in $(seq 1 5); do
         if ! wait_for_device "$url" 360 quiet "$api_key"; then
             err "Device not reachable for swap"
             exit 1
+        fi
+        # Nothing is written to a unit whose /usr/bin/sctl an agent from
+        # 0.6.12 has made its tools' name since the probe: neither
+        # install.json nor the binary (the swap asks again).
+        local cli_now
+        cli_now=$(remote_exec_stdout_trimmed "$url" "$api_key" \
+            "if $AGENT_CLI_TEST; then echo agent_cli; else echo plain; fi" 5000 2 8) || true
+        if [[ "$cli_now" == agent_cli ]]; then
+            err "/usr/bin/sctl on '$name' is now a link or the agent's wrapper: nothing was written."
+            err "The unit upgrades itself: ask it through a managed rollout (docs/upgrade.md)."
+            exit 1
+        fi
+        if [[ "$cli_now" != plain ]]; then
+            warn "Swap attempt $attempt: no answer, retrying on next window..."
+            continue
         fi
         # The install layout (docs/upgrade.md), so this is the last hand upgrade.
         local install_json_file
@@ -2415,8 +2469,13 @@ do_device_upgrade_remote() {
         rm -f "$install_json_file"
         local swap_out
         swap_out=$(remote_exec_stdout_trimmed "$url" "$api_key" \
-            "sh -c 'set -e; if [ ! -x /usr/bin/sctl.rollback ]; then cp /usr/bin/sctl /usr/bin/sctl.rollback; fi; cp /tmp/sctl-upgrade /usr/bin/sctl; chmod +x /usr/bin/sctl; sync; echo swap_ok; (sleep 1; kill \$(pgrep -f \"[s]ctl serve\") 2>/dev/null || true) >/dev/null 2>&1 &'" \
+            "sh -c 'set -e; if $AGENT_CLI_TEST; then echo agent_cli; exit 0; fi; if [ ! -x /usr/bin/sctl.rollback ]; then cp /usr/bin/sctl /usr/bin/sctl.rollback; fi; cp /tmp/sctl-upgrade /usr/bin/sctl; chmod +x /usr/bin/sctl; sync; echo swap_ok; (sleep 1; kill \$(pgrep -f \"[s]ctl serve\") 2>/dev/null || true) >/dev/null 2>&1 &'" \
             8000 2 10) || true
+        if [[ "$swap_out" == *agent_cli* ]]; then
+            err "/usr/bin/sctl on '$name' is now a link or the agent's wrapper: no binary was copied."
+            err "The unit upgrades itself: ask it through a managed rollout (docs/upgrade.md)."
+            exit 1
+        fi
         if [[ "$swap_out" == *swap_ok* ]]; then
             swap_ok=true
             ok "Swap command acknowledged"
@@ -2973,8 +3032,10 @@ XE300_LOG="/tmp/sctl-xe300-upgrade.log"
 # How sctl is installed, in one word: xe300, rut241 (gz-tmp payloads), we826
 # (ramboot run through the musl loader, no install.json that names it: the
 # one-time move), we826-managed (install.json names the loader: a rollout
-# citizen), or other.
-XE300_LAYOUT_PROBE="if [ -x /etc/init.d/sctl ] && [ -f /usr/local/lib/sctl/sctl-server-mips_24kc.gz ]; then echo xe300; elif [ -x /etc/init.d/sctl ] && [ -f /usr/local/lib/sctl/sctl-server-mipsel_24kc.gz ]; then echo rut241; elif [ -x /etc/init.d/sctl ] && grep -q '^MUSL_LIBC_URL=' /etc/sctl/ramboot.conf 2>/dev/null && [ -f /tmp/sctl/lib/libc.so ]; then if grep -q helper_prefix /etc/sctl/install.json 2>/dev/null; then echo we826-managed; else echo we826; fi; else echo other; fi"
+# citizen), agent-cli (/usr/bin/sctl is the name an agent from 0.6.12 made
+# for its tools, which the generic path would write through: a rollout
+# citizen, as a ramboot RUT241 is from then on), or other.
+XE300_LAYOUT_PROBE="if [ -x /etc/init.d/sctl ] && [ -f /usr/local/lib/sctl/sctl-server-mips_24kc.gz ]; then echo xe300; elif [ -x /etc/init.d/sctl ] && [ -f /usr/local/lib/sctl/sctl-server-mipsel_24kc.gz ]; then echo rut241; elif [ -x /etc/init.d/sctl ] && grep -q '^MUSL_LIBC_URL=' /etc/sctl/ramboot.conf 2>/dev/null && [ -f /tmp/sctl/lib/libc.so ]; then if grep -q helper_prefix /etc/sctl/install.json 2>/dev/null; then echo we826-managed; else echo we826; fi; elif $AGENT_CLI_TEST; then echo agent-cli; else echo other; fi"
 
 # Write a local text file to the device through the file API, retrying across
 # short windows.

@@ -87,6 +87,46 @@ started through (`["/tmp/sctl/lib/libc.so", "--library-path", "/tmp/sctl/lib"]`)
 Under a loader `current_exe()` is the loader, so with a prefix the helper is a
 copy of the binary `ramboot.conf` names as `BIN`. Empty everywhere else.
 
+**The tools' name** (0.6.12, TRD-9). Every unit runs the agent's tools
+(`sctl net`, `sctl install-info`, `sctl upgrade`) as `/usr/bin/sctl`, whatever
+its layout, so a command stored for any unit carries no layout's path. It is a
+name, not an install path: `gz-tmp` and `ramboot` units still run the agent
+from `/tmp`. At `serve` start the agent makes it:
+
+| Layout | `/usr/bin/sctl` |
+|---|---|
+| `usr-bin` | the installed binary itself; nothing is made |
+| `gz-tmp` | a symbolic link to the running binary (`/tmp/sctl/sctl-server`) |
+| `ramboot` without `helper_prefix` | a symbolic link to the running binary, the one `ramboot.conf` names as `BIN` |
+| `ramboot` with `helper_prefix` (the WE826) | a wrapper that runs `BIN` through the loader's words |
+| `systemd` | nothing: the relay runs its tools as `/usr/local/bin/sctl` |
+
+The wrapper is three lines, each word in single quotes, about 150 bytes:
+
+```sh
+#!/bin/sh
+# sctl: the agent writes this file at start
+exec '/tmp/sctl/lib/libc.so' '--library-path' '/tmp/sctl/lib' '/tmp/sctl/sctl-server' "$@"
+```
+
+The second line is how the agent, and `rundev.sh`, know the agent's own
+wrapper. The agent writes the name only when it is absent, a symbolic link, or
+its own wrapper with other content, through a temporary entry renamed over it
+(`.sctl.new` beside it). It never replaces a regular file that is not its
+wrapper, and it leaves a name already right alone, so a restart writes nothing
+to flash. With no `install.json` it makes nothing. A `ramboot` unit that runs
+its agent under a loader its `install.json` does not name (a WE826 before its
+move, [below](#a-we826-installed-before-069)) gets no link: the link would
+name the loader. `SCTL_CLI_PATH` moves the name for tests and benches, as
+`SCTL_INSTALL_JSON` moves `install.json`. A rollback to 0.6.11 keeps the name,
+which still runs the agent's tools: 0.6.11 runs from the same path, through
+the same loader words.
+
+`rundev.sh device deploy`, `device upgrade`, its watchdog's rollback and the
+generic path of `device upgrade-remote` write `/usr/bin/sctl`, so they refuse a
+unit whose `/usr/bin/sctl` is a symbolic link or the agent's wrapper rather than
+write through it: such a unit upgrades itself.
+
 **Bundle retention.** A ramboot unit's rollback restores its previous
 `ramboot.conf`, and its next boot fetches that version from that mirror; so a
 relay keeps a version and its mirror until no ramboot unit may still roll back
@@ -224,7 +264,10 @@ release) to the relay with the routes above.
 
 `GET /api/health` on the device gains `"target"` and `"layout"` beside
 `"version"`, and `"upgrade"` with the current [`upgrade.state`](#the-upgradestate-push)
-body.
+body. From 0.6.12 it also names `"cli"`: the path that runs the agent's tools
+on this unit, `/usr/bin/sctl`, or `/usr/local/bin/sctl` on the relay
+([the tools' name](#targets-and-layouts)). `cli` is absent when the agent
+could not make the name, or has no `install.json`, and its log says why.
 
 ## Asking a device to upgrade
 
@@ -439,7 +482,9 @@ later release reaches it as a rollout.
   finishes a `needs_hands` device.
 - `sctl upgrade-apply --stage <dir>` is the helper. Never run by hand.
 - `sctl target` prints the compile target, and `sctl install-info` prints what
-  `install.json` resolves to with defaults applied.
+  `install.json` resolves to with defaults applied, and `cli` when the name
+  the agent makes at start is already what it makes for the binary that
+  answers. It writes nothing, and says on stderr why `cli` is absent.
 - `rundev.sh device upgrade-remote` remains for a unit that runs an agent
   older than 0.6.7 or has no `install.json` (the RUT241's move to `ramboot`,
   the WE826's move above). After the last hand upgrade every release is a

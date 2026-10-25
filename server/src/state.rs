@@ -85,6 +85,10 @@ pub struct AppState {
     pub install: Option<Arc<crate::upgrade::install::InstallInfo>>,
     /// Why `install` is `None` when the file exists but is unusable.
     pub install_error: Option<String>,
+    /// The path that runs the agent's tools on this unit, `/api/health`'s
+    /// `cli`: the name made at start (`/usr/bin/sctl`), or the installed
+    /// binary. `None` when the agent could not make the name.
+    pub cli: Option<PathBuf>,
     /// The config file the server was started with, for the rollback set.
     pub config_path: Option<String>,
     /// The one gate before a file's content is read (ADR-011): the file
@@ -142,6 +146,7 @@ impl AppState {
             upgrade,
             install: None,
             install_error: None,
+            cli: None,
             config_path: None,
             file_gate,
         }

@@ -96,7 +96,11 @@ Response `200`:
 {
   "status": "ok",
   "uptime_secs": 12345,
-  "version": "0.6.0",
+  "version": "0.6.12",
+  "target": "mips_24kc",
+  "layout": "gz-tmp",
+  "cli": "/usr/bin/sctl",
+  "upgrade": { "phase": "idle", "...": "..." },
   "sessions": 2,
   "tunnel": { "connected": true, "reconnects": 3, "...": "..." },
   "gps": { "status": "fix", "has_fix": true, "fix_age_secs": 2, "satellites": 9 },
@@ -104,6 +108,16 @@ Response `200`:
 }
 ```
 
+- `target`, `layout` and `upgrade`: the compile target, the install layout
+  (`null` without `install.json`) and the current `upgrade.state` body
+  (`docs/upgrade.md`).
+- `cli` (0.6.12): the path that runs the agent's tools on this unit,
+  `/usr/bin/sctl` on every layout but the relay's (`/usr/local/bin/sctl`).
+  On `gz-tmp` and `ramboot` the agent makes it at start, a symbolic link to
+  its binary or, under a loader, a short wrapper (`docs/upgrade.md`, the
+  tools' name). Absent when the agent has no `install.json` or could not
+  make the name, as when a regular file that is not its wrapper is there;
+  its log says why. `SCTL_CLI_PATH` moves the name for tests and benches.
 - `tunnel` — in tunnel-client mode, extended with `uptime_secs`,
   `messages_sent/received`, `last_pong_age_ms`, `dropped_outbound`,
   `stream_backpressure_events`, `stream_replay_events`, `rtt_median_ms`,

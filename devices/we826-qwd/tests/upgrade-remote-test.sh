@@ -13,7 +13,9 @@
 # shadow the fake, with the unit's paths moved into its tree),
 # ramboot-refresh.sh on the unit and the unit's init files and ramboot.sh
 # (refresh-fixtures.sh). Also XE300_LAYOUT_PROBE, the dispatcher's question,
-# under busybox against fake trees of every layout.
+# under busybox against fake trees of every layout, and the dispatcher's
+# answer to a unit whose /usr/bin/sctl is the name an agent from 0.6.12 made
+# for its tools: no path that writes through it.
 # What is fake: the mirror and the device API (curl), the relay exec and file
 # routes, and start-stop-daemon, which starts the script in the unit's
 # environment.
@@ -28,7 +30,7 @@ DEVICE_URL=https://relay.invalid/d/WE826-TEST
 API_KEY=unit-key
 
 # rundev.sh's own pieces, as they are.
-eval "$(sed -n '/^WE826_STAGE=/p; /^WE826_LOG=/p; /^XE300_LAYOUT_PROBE=/p' "$REPO_DIR/rundev.sh")"
+eval "$(sed -n '/^AGENT_CLI_TEST=/p; /^WE826_STAGE=/p; /^WE826_LOG=/p; /^XE300_LAYOUT_PROBE=/p' "$REPO_DIR/rundev.sh")"
 eval "$(sed -n '/^we826_trusted_keys() {/,/^}/p; /^we826_url_host() {/,/^}/p; /^do_device_upgrade_remote_we826() {/,/^}/p' "$REPO_DIR/rundev.sh")"
 declare -F do_device_upgrade_remote_we826 >/dev/null || { echo "rundev.sh has no do_device_upgrade_remote_we826"; exit 1; }
 log()  { echo "==> $*"; }
@@ -277,8 +279,75 @@ probe_case no-init 'rm -f "$tree/etc/init.d/sctl"' other
 probe_case we826-0.6.2 'printf "MUSL_LIBC_URL=x\n" > "$tree/etc/sctl/ramboot.conf"; : > "$tree/tmp/sctl/lib/libc.so"' we826
 probe_case we826-0.6.7 'printf "MUSL_LIBC_URL=x\n" > "$tree/etc/sctl/ramboot.conf"; : > "$tree/tmp/sctl/lib/libc.so"; echo "{\"layout\":\"ramboot\"}" > "$tree/etc/sctl/install.json"' we826
 probe_case we826-current 'printf "MUSL_LIBC_URL=x\n" > "$tree/etc/sctl/ramboot.conf"; : > "$tree/tmp/sctl/lib/libc.so"; echo "{\"helper_prefix\":[]}" > "$tree/etc/sctl/install.json"' we826-managed
+# What an agent from 0.6.12 makes at /usr/bin/sctl (docs/upgrade.md): a link
+# to the binary it runs from /tmp, or on a unit that runs it under a loader
+# its wrapper, known by its second line (the agent's own text, which
+# server/tests/cli_name.rs runs this condition on). None of these takes the
+# generic path, the one that writes /usr/bin/sctl.
+CLI_LINK='mkdir -p "$tree/usr/bin" && ln -s "$tree/tmp/sctl/sctl-server" "$tree/usr/bin/sctl"'
+CLI_WRAPPER='mkdir -p "$tree/usr/bin" && printf "#!/bin/sh\n# sctl: the agent writes this file at start\nexec '"'"'/tmp/sctl/lib/libc.so'"'"' '"'"'--library-path'"'"' '"'"'/tmp/sctl/lib'"'"' '"'"'/tmp/sctl/sctl-server'"'"' \"\$@\"\n" > "$tree/usr/bin/sctl"'
+probe_case xe300-with-the-link ': > "$tree/usr/local/lib/sctl/sctl-server-mips_24kc.gz"; '"$CLI_LINK" xe300
+probe_case rut241-ramboot-with-the-link 'printf "SERVER_URL=x\n" > "$tree/etc/sctl/ramboot.conf"; '"$CLI_LINK" agent-cli
+probe_case we826-with-the-wrapper 'printf "MUSL_LIBC_URL=x\n" > "$tree/etc/sctl/ramboot.conf"; : > "$tree/tmp/sctl/lib/libc.so"; echo "{\"helper_prefix\":[]}" > "$tree/etc/sctl/install.json"; '"$CLI_WRAPPER" we826-managed
+probe_case the-wrapper-alone "$CLI_WRAPPER" agent-cli
+probe_case a-script-of-ones-own 'mkdir -p "$tree/usr/bin" && printf "#!/bin/sh\nexec /opt/sctl \"\$@\"\n" > "$tree/usr/bin/sctl"' other
 check "the probe names no path the trees did not replace" \
     '! printf "%s" "$XE300_LAYOUT_PROBE" | grep -o "/[a-z][a-z/._-]*" | grep -v "^/etc/\|^/usr/\|^/tmp/sctl/\|^/dev/null" | grep -q .'
+
+# --- the dispatcher, for a unit whose /usr/bin/sctl is the agent's name ---------
+printf '\nupgrade-remote, a unit whose /usr/bin/sctl is the name its agent made\n'
+eval "$(sed -n '/^do_device_upgrade_remote() {/,/^}/p' "$REPO_DIR/rundev.sh")"
+declare -F do_device_upgrade_remote >/dev/null || { echo "rundev.sh has no do_device_upgrade_remote"; exit 1; }
+# rundev's upgrade-remote asks the device its probe and nothing else before
+# it refuses: every other call it could make is a stand-in that records it.
+# Each run has a tree of its own. The names are not rundev's (bash finds a
+# variable in its caller's scope first: rundev's own `name` would win).
+dispatch() {
+    dispatch_tree=$1
+    dispatch_setup=$2
+    rm -rf "$TOP/probe-$dispatch_tree"
+    rm -f "$TOP/unexpected" "$TOP/paths"
+    (
+        require_jq() { :; }
+        ensure_config() { :; }
+        cfg_device_exists() { :; }
+        cfg_device_get() {
+            case $2 in
+                url) echo "$DEVICE_URL" ;;
+                api_key) echo "$API_KEY" ;;
+                arch) echo mipsel ;;
+            esac
+        }
+        remote_exec_stdout_trimmed() {
+            [ "$3" = "$XE300_LAYOUT_PROBE" ] || { echo "exec $3" >> "$TOP/unexpected"; return 1; }
+            probe_tree "$dispatch_tree" "$dispatch_setup"
+        }
+        do_device_upgrade_remote_xe300() { echo "the xe300 path" >> "$TOP/paths"; }
+        do_device_upgrade_remote_rut241() { echo "the rut241 path" >> "$TOP/paths"; }
+        do_device_upgrade_remote_we826() { echo "the we826 path" >> "$TOP/paths"; }
+        cargo() { echo "cargo $*" >> "$TOP/unexpected"; return 1; }
+        cross() { echo "cross $*" >> "$TOP/unexpected"; return 1; }
+        build_comms_provider() { echo "build_comms_provider $*" >> "$TOP/unexpected"; return 1; }
+        do_device_upgrade_remote bus
+    ) > "$TOP/dispatch.out" 2>&1
+    DRC=$?
+}
+dispatch d-rut241-ramboot 'printf "SERVER_URL=x\n" > "$tree/etc/sctl/ramboot.conf"; '"$CLI_LINK"
+check "a ramboot RUT241 with the link: refused before anything is built or written" \
+    '[ "$DRC" = 1 ] && grep -q "would write through it" "$TOP/dispatch.out" && [ ! -e "$TOP/unexpected" ] && [ ! -e "$TOP/paths" ]' \
+    "$(tr '\n' '|' < "$TOP/dispatch.out") $(cat "$TOP/unexpected" 2>/dev/null)"
+dispatch d-wrapper-alone "$CLI_WRAPPER"
+check "the agent's wrapper alone: refused the same way" \
+    '[ "$DRC" = 1 ] && grep -q "would write through it" "$TOP/dispatch.out" && [ ! -e "$TOP/unexpected" ] && [ ! -e "$TOP/paths" ]' \
+    "$(tr '\n' '|' < "$TOP/dispatch.out") $(cat "$TOP/unexpected" 2>/dev/null)"
+dispatch d-we826 'printf "MUSL_LIBC_URL=x\n" > "$tree/etc/sctl/ramboot.conf"; : > "$tree/tmp/sctl/lib/libc.so"; echo "{\"helper_prefix\":[]}" > "$tree/etc/sctl/install.json"; '"$CLI_WRAPPER"
+check "a WE826 with the wrapper: refused as a rollout citizen" \
+    '[ "$DRC" = 1 ] && grep -q "It upgrades itself" "$TOP/dispatch.out" && [ ! -e "$TOP/unexpected" ] && [ ! -e "$TOP/paths" ]' \
+    "$(tr '\n' '|' < "$TOP/dispatch.out") $(cat "$TOP/unexpected" 2>/dev/null)"
+dispatch d-xe300 ': > "$tree/usr/local/lib/sctl/sctl-server-mips_24kc.gz"; '"$CLI_LINK"
+check "an XE300 with the link: its own path, which writes its payloads, not /usr/bin/sctl" \
+    '[ "$(cat "$TOP/paths" 2>/dev/null)" = "the xe300 path" ] && [ ! -e "$TOP/unexpected" ]' \
+    "$(tr '\n' '|' < "$TOP/dispatch.out") $(cat "$TOP/paths" "$TOP/unexpected" 2>/dev/null)"
 
 printf '\n  %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

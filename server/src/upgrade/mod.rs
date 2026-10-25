@@ -5,6 +5,8 @@
 //! The pieces, in the order an upgrade uses them:
 //! - [`install`]: what this box is (`/etc/sctl/install.json`: layout, file
 //!   locations, restart command, rollback directory).
+//! - [`cli_name`]: the name the agent's tools run by on every layout,
+//!   `/usr/bin/sctl`, made at start.
 //! - [`manifest`]: the signed `release.json` and its verification.
 //! - [`fetch`]: HTTP(S) downloads to a file, resumable, over the tunnel's
 //!   own TLS trust.
@@ -16,6 +18,7 @@
 //! - [`routes`]: `POST/GET/DELETE /api/upgrade`.
 
 pub mod apply;
+pub mod cli_name;
 pub mod fetch;
 pub mod install;
 pub mod keys;

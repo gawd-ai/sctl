@@ -192,7 +192,9 @@ is absent from that map (the GL-XE300 reports big-endian `mips`) fails at
 `arch_to_bin`. Adding a map entry would be worse than the failure: those
 paths build a generic `cross` binary rather than the OpenWrt-SDK
 `-Z build-std` one the device was qualified on, and install to
-`/usr/bin/sctl` regardless of where that device keeps its payloads. Use
+`/usr/bin/sctl` regardless of where that device keeps its payloads (they
+refuse a unit whose `/usr/bin/sctl` is the name an agent from 0.6.12 made
+for its tools, a link or its wrapper, `docs/upgrade.md`). Use
 the device's own `install.sh` over SSH instead, or push the `.gz` payloads
 via the file API / STP and restart its init script.
 
