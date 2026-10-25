@@ -34,7 +34,11 @@
 //! agent runs.
 //!
 //! Check now (`POST /api/infra/check/{target_id}`) is a reading: its result
-//! is applied as a monitor check's is, and it never starts a recovery.
+//! is applied as a monitor check's is, and it never starts a recovery. The
+//! monitor checks no target while its recovery runs; Check now still reads
+//! it, and leaves the target's count and cooldown to the run, whose end
+//! applies its outcome: a target that came back during the run starts
+//! afresh.
 //!
 //! Results are served via `GET /api/infra/results` for external health polling,
 //! and pushed over the tunnel as `infra.state` (see `tunnel::infra_state`)
@@ -584,8 +588,8 @@ impl Drop for RunGuard {
 /// whose check is in flight, and its round rule reads when each running
 /// check took its permit. It lives in the Infra state, so every monitor the
 /// unit runs, a rebuilt one included, and Check now see the same set. A
-/// target whose failed check started a recovery stays in flight until the
-/// run ends.
+/// recovery run is not a check: the monitor skips a target while its run is
+/// in progress ([`Runs`]), and Check now still reads it.
 #[derive(Debug, Clone, Default)]
 pub struct InFlight(Arc<StdMutex<Flights>>);
 
@@ -614,8 +618,7 @@ struct FlightEntry {
 pub type Answer = watch::Receiver<Option<checks::CheckResult>>;
 
 /// A target's place in flight, held by its check until its result is
-/// applied, then by the recovery run that result started, if any.
-/// Dropping it, when the check or the run ends or is aborted, frees the
+/// applied. Dropping it, when the check ends or is aborted, frees the
 /// target.
 #[derive(Debug)]
 pub struct Flight {
@@ -1860,8 +1863,8 @@ mod tests {
             latency_ms: Some(42),
             ..checks::CheckResult::default()
         });
-        // One that comes after the result, while the place is held (as a
-        // recovery run holds it), has it at once.
+        // One that comes after the result, while the place is still held,
+        // has it at once.
         let late = in_flight.take_or_wait("t1").expect_err("still held");
         assert_eq!(late.borrow().as_ref().and_then(|r| r.latency_ms), Some(42));
         drop(flight);

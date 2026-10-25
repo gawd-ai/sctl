@@ -131,7 +131,9 @@ pub async fn get_results(
 /// (ADR-010 decision 10). It runs under the monitor's 90 s deadline and its
 /// result is applied as a monitor check's is, a status change pushed; it
 /// counts no round and never starts a recovery. While a check of the target
-/// is in flight it waits for that check and answers its result.
+/// is in flight it waits for that check and answers its result. While the
+/// target's recovery runs it reads the target, and leaves its recovery
+/// count and cooldown to the run.
 pub async fn check_target(
     State(state): State<AppState>,
     Path(target_id): Path<String>,
@@ -973,8 +975,8 @@ mod tests {
         let runs = state.infra_digest.runs();
         assert!(runs.contains("pdu"), "the run is in progress");
 
-        // The run holds the target's place, not the permit of a running
-        // check: the rounds go on past the deadline plus a tick.
+        // The run holds no permit of a running check: the rounds go on
+        // past the deadline plus a tick.
         tokio::time::sleep(Duration::from_millis(700)).await;
         let rounds = state.infra_digest.group().rounds;
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -982,23 +984,31 @@ mod tests {
         assert!(later >= rounds + 3, "rounds {rounds}, then {later}");
         assert!(runs.contains("pdu"), "both read during the run");
 
-        // During the run: no check of pdu starts, cam's go on, and Check
-        // now of pdu answers the Down check's result at once.
+        // During the run: the monitor starts no check of pdu, cam's go on,
+        // and Check now reads pdu, its failure applied, and starts no run.
         let (pdu_checks, cam_checks) = (calls_of("pdu"), calls_of("cam"));
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(calls_of("pdu"), pdu_checks, "its place is the run's");
+        assert_eq!(
+            calls_of("pdu"),
+            pdu_checks,
+            "the monitor leaves it to its run"
+        );
         assert!(
             calls_of("cam") >= cam_checks + 3,
             "another target's checks go on"
         );
-        let asked = std::time::Instant::now();
+        let failures = infra.lock().await.results.targets["pdu"].consecutive_fail;
         let now = check_now(&state, "pdu").await;
-        assert!(asked.elapsed() < Duration::from_millis(500));
         assert_eq!(
             (&now["ok"], &now["detail"]),
             (&json!(false), &json!("NO ANSWER"))
         );
-        assert_eq!(calls_of("pdu"), pdu_checks, "no second check of pdu");
+        assert_eq!(calls_of("pdu"), pdu_checks + 1, "Check now read it");
+        assert_eq!(
+            infra.lock().await.results.targets["pdu"].consecutive_fail,
+            failures + 1,
+            "its reading applied"
+        );
         assert_eq!(runs.in_progress(), 1, "no second run");
 
         // A push during the run lets it finish.
@@ -1020,7 +1030,11 @@ mod tests {
         assert_eq!(at_start["running"]["pdu"]["command"], command.as_str());
         assert_eq!(at_start["counts"]["pdu"], 1);
         let now: Value = serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
-        assert_eq!(now, json!({"counts": {"pdu": 1}, "running": {}}), "ended");
+        assert_eq!(
+            now,
+            json!({"counts": {"pdu": 1}, "running": {}}),
+            "ended, Down: its count stands"
+        );
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(infra.lock().await.results.recovery_log.len(), 1, "once");
 
@@ -1099,7 +1113,7 @@ mod tests {
         assert!(runs.contains("pdu"), "the run goes on");
 
         // Rebuilt after 5 s, while the run goes on: cam is checked again,
-        // pdu, whose place the run holds, is not.
+        // pdu, whose run is in progress, is not.
         wait_until(Duration::from_secs(10), || {
             cam_checks
                 .lock()
@@ -1123,6 +1137,68 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(infra.lock().await.results.recovery_log.len(), 1, "once");
         stop_monitor(&infra).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Check now during a recovery run stays a reading: when the outlet
+    /// answers again, two readings bring it Up, the change pushed, while
+    /// its count and cooldown stand. The monitor leaves it to its run, and
+    /// checks it again once the run has ended, whose outcome clears the
+    /// count: the outlet came back during the run.
+    #[tokio::test]
+    async fn check_now_during_a_run_reads_and_the_runs_end_clears_the_count() {
+        let dir = scratch("during-run");
+        let (state, infra) = state(&dir);
+        let answers = Arc::new(AtomicBool::new(false));
+        let (checker, calls) = counting({
+            let answers = answers.clone();
+            move |id| answer(id != "pdu" || answers.load(SeqCst), 3)
+        });
+        let calls_of = |id: &str| calls.lock().unwrap().get(id).copied().unwrap_or(0);
+        use_checks(&infra, fast(), checker).await;
+        let (task, mut rx) = forwarder(&infra);
+        next_message(&mut rx).await;
+        push(&state, outlet_and_camera("sleep 3", Vec::new()))
+            .await
+            .unwrap();
+        message_with(&mut rx, "pdu", "down").await;
+        let runs = state.infra_digest.runs();
+        wait_until(Duration::from_secs(5), || runs.contains("pdu")).await;
+        let begun = infra.lock().await.recovery_tracker["pdu"];
+
+        // The outlet answers: Check now reads it twice, and it is Up.
+        let monitor_checks = calls_of("pdu");
+        answers.store(true, SeqCst);
+        for _ in 0..2 {
+            assert_eq!(check_now(&state, "pdu").await["ok"], true);
+        }
+        assert_eq!(calls_of("pdu"), monitor_checks + 2, "only Check now's");
+        message_with(&mut rx, "pdu", "up").await;
+        {
+            let guard = infra.lock().await;
+            assert_eq!(guard.results.targets["pdu"].status, TargetStatus::Up);
+            assert_eq!(guard.recovery_tracker["pdu"], begun, "they stand");
+        }
+        assert!(runs.contains("pdu"), "the run goes on");
+        assert_eq!(runs.in_progress(), 1);
+
+        // The run ends: the outlet came back, so its count is clear, and
+        // the monitor checks it again.
+        wait_until(Duration::from_secs(10), || !runs.contains("pdu")).await;
+        assert!(!infra.lock().await.recovery_tracker.contains_key("pdu"));
+        assert!(
+            !dir.join("state/infra-recovery.json").exists(),
+            "nothing left to save"
+        );
+        wait_until(Duration::from_secs(5), || {
+            calls_of("pdu") > monitor_checks + 2
+        })
+        .await;
+        let log = infra.lock().await.results.recovery_log.clone();
+        assert_eq!((log.len(), log[0].exit_code), (1, 0));
+
+        stop_monitor(&infra).await;
+        task.abort();
         std::fs::remove_dir_all(&dir).ok();
     }
 

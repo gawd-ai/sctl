@@ -32,13 +32,19 @@
 //! `max_retries`. Under the Infra lock the result is folded and the Down
 //! signalled first, so the run never holds it back: its push leaves within
 //! about a second, and the command may start before it does. The run goes
-//! on in a task of its own, outside the monitor's task set, holding the
-//! target's place in flight until it ends. Nothing but its own 300 s limit
-//! or the agent's stop ends it: no push, rebuilt monitor or removed config.
+//! on in a task of its own, outside the monitor's task set, and the tick
+//! checks no target while its run is in progress. Nothing but its own
+//! 300 s limit or the agent's stop ends it: no push, rebuilt monitor or
+//! removed config.
 //!
 //! Check now ([`check_now`], ADR-010 decision 10) is a reading: it runs under
 //! the same deadline, its result is applied as a monitor check's is, and it
-//! counts no round and starts no recovery.
+//! counts no round and starts no recovery. During a recovery run of its
+//! target it still reads the target and moves its record, its status
+//! included, while the target's recovery count and cooldown stand until the
+//! run ends. The run's outcome then applies them: a target that reads Up or
+//! Degraded came back during the run and starts afresh; one that reads Down
+//! or `unknown` keeps the count and the cooldown the run began.
 //!
 //! `SCTL_INFRA_TEST_STALL_SECS`, for tests and benches, stops the loop that
 //! many seconds after it starts, so a stopped monitor can be seen while the
@@ -323,6 +329,7 @@ impl Monitor {
     /// counted.
     async fn tick(&mut self, at: Instant) -> bool {
         let guard = self.infra.lock().await;
+        let runs = guard.runs();
         for target in &self.config.targets {
             let every = Duration::from_secs(
                 target
@@ -336,9 +343,17 @@ impl Monitor {
             {
                 continue; // not due yet
             }
+            if runs.contains(&target.id) {
+                // Its recovery runs: due again at the first tick after the
+                // run has ended.
+                debug!(
+                    "Infra: {}'s recovery run is in progress; not checked",
+                    target.id
+                );
+                continue;
+            }
             let Some(flight) = guard.in_flight.start(&target.id) else {
-                // Still being checked, or its recovery runs: due again at
-                // the next tick.
+                // Still being checked: due again at the next tick.
                 debug!("Infra: {} is still in flight; not started again", target.id);
                 continue;
             };
@@ -434,8 +449,9 @@ pub enum Reading {
 
 /// One check of the monitor, from its permit to its result applied. It
 /// holds its target's place in flight until the result is in, and its
-/// permit only while the check runs. A failed check that leaves the target
-/// Down and starts a recovery hands the place to the run.
+/// permit only while the check runs. A recovery it starts holds no place:
+/// the tick skips the target while the run is in progress, and Check now
+/// still reads it.
 async fn run_check(
     infra: Arc<Mutex<InfraState>>,
     job: Job,
@@ -456,14 +472,14 @@ async fn run_check(
         let mut state = infra.lock().await;
         let (result, recovery) = settle(&mut state, &job, outcome, Reading::Monitor);
         flight.publish(&result);
+        // Out of flight only once its result is in.
+        drop(flight);
         recovery
     };
-    match recovery {
+    if let Some(run) = recovery {
         // The Down is signalled and the lock released: the run goes on in a
-        // task of its own, with the target's place.
-        Some(run) => drop(tokio::spawn(run_recovery(infra, run, flight))),
-        // Out of flight only once its result is in.
-        None => drop(flight),
+        // task of its own.
+        drop(tokio::spawn(run_recovery(infra, run)));
     }
 }
 
@@ -557,9 +573,11 @@ pub enum CheckNowError {
 /// monitor check's is. It counts no round and never starts a recovery. A
 /// target has at most one check in flight: while one is, Check now waits
 /// for it, at most the deadline, and answers its result, and no second
-/// check runs. A result is applied only while the unit still holds the
-/// config the check ran under, the target in it; otherwise it is answered
-/// and nothing is applied.
+/// check runs. A recovery run is not a check: during one Check now reads
+/// the target, and its result moves the record while the target's
+/// recovery count and cooldown stand until the run ends. A result is
+/// applied only while the unit still holds the config the check ran under,
+/// the target in it; otherwise it is answered and nothing is applied.
 pub async fn check_now(
     infra: &Arc<Mutex<InfraState>>,
     target_id: &str,
@@ -688,7 +706,7 @@ fn apply_check_panic(state: &mut InfraState, target: &InfraTarget, config_versio
 /// the monitor (`reading`) that leaves the target Down returns the recovery
 /// run it starts, recorded already: the caller runs it with
 /// `run_recovery`, after the Infra lock is released.
-#[must_use = "a recovery run started must run, holding its target's place"]
+#[must_use = "a recovery run started must run"]
 pub fn apply_result(
     state: &mut InfraState,
     target: &InfraTarget,
@@ -789,14 +807,23 @@ pub fn apply_result(
     // its recovery count (ADR-010 decision 9). A target that answers again
     // starts afresh, also when the agent failed to check it in between, or
     // restarted: a check that panics, and a start, leave the target
-    // `unknown` and the count standing.
+    // `unknown` and the count standing. During the target's recovery run
+    // (a Check now) the count and the cooldown stand: the run's end applies
+    // them ([`RecoveryRun::log`]).
     if result.ok
         && new_status != prev_status
         && matches!(prev_status, TargetStatus::Down | TargetStatus::Unknown)
     {
-        state.clear_recovery_count(&target.id);
         if prev_status == TargetStatus::Down {
             info!("Target {} ({}) recovered", target.id, target.name);
+        }
+        if state.runs_not_ended.contains_key(&target.id) {
+            debug!(
+                "Target {}: its recovery run is in progress; the run's end applies its count",
+                target.id
+            );
+        } else {
+            state.clear_recovery_count(&target.id);
         }
     }
 
@@ -1096,8 +1123,14 @@ impl RecoveryRun {
     }
 
     /// Under the Infra lock: log the run, which moves `seq` and
-    /// `recoveries` and is pushed, and mark it ended. Returns the record
-    /// that saves it as ended, for the caller to write outside the lock.
+    /// `recoveries` and is pushed, mark it ended, and apply its outcome to
+    /// the count and the cooldown that readings during the run left as they
+    /// were. A target that reads Up or Degraded now came back during the run
+    /// (a run starts at Down, and only a good answer leaves Down): it starts
+    /// afresh, as the good answer that moved it would have had it start. One
+    /// that reads Down or `unknown` keeps the count and the cooldown the run
+    /// began. Returns the record that saves all this, for the caller to
+    /// write outside the lock.
     fn log(&self, state: &mut InfraState, ended: Ended) -> RecoverySnapshot {
         info!(
             "Recovery for {}: exit={}, output={}",
@@ -1117,6 +1150,17 @@ impl RecoveryRun {
             .is_some_and(|run| run.started_ms == self.started_ms)
         {
             state.runs_not_ended.remove(&self.target_id);
+        }
+        let came_back = state
+            .results
+            .targets
+            .get(&self.target_id)
+            .is_some_and(|t| matches!(t.status, TargetStatus::Up | TargetStatus::Degraded));
+        if came_back && state.recovery_tracker.remove(&self.target_id).is_some() {
+            info!(
+                "Recovery for {}: the target answered during the run; its count is clear",
+                self.target_id
+            );
         }
         state.recoveries_snapshot()
     }
@@ -1185,11 +1229,12 @@ fn start_recovery(
 /// disk runs the command, which only its 300 s limit or the agent's stop
 /// ends: no push, rebuilt monitor or removed config. A run whose record did
 /// not reach the disk starts no command, and is logged as such. Its output,
-/// masked and cut, is logged under the lock, and the record that saves it
-/// as ended is written outside it. The run is in progress, and `flight`,
-/// the target's place, held, until that record is written: no check of the
-/// target starts before, and a managed upgrade's restart waits for it.
-pub(crate) async fn run_recovery(infra: Arc<Mutex<InfraState>>, run: RecoveryRun, flight: Flight) {
+/// masked and cut, is logged under the lock with the run's outcome applied
+/// to the count, and the record that saves it as ended is written outside
+/// it. The run is in progress until that record is written: the monitor
+/// checks the target again only after, and a managed upgrade's restart
+/// waits for it. Check now reads the target meanwhile.
+pub(crate) async fn run_recovery(infra: Arc<Mutex<InfraState>>, run: RecoveryRun) {
     let (prepared, record) = {
         let state = infra.lock().await;
         (run.prepare(&state), state.recoveries_snapshot())
@@ -1202,7 +1247,6 @@ pub(crate) async fn run_recovery(infra: Arc<Mutex<InfraState>>, run: RecoveryRun
     let record = run.log(&mut *infra.lock().await, ended);
     record.write().await;
     drop(run);
-    drop(flight);
 }
 
 #[cfg(test)]
@@ -2262,6 +2306,68 @@ mod tests {
         assert!(failed(&mut state).is_some(), "the next one may run");
     }
 
+    /// Check now during a recovery run stays a reading: its answers move
+    /// the target's record, its status included, while the count and the
+    /// cooldown stand until the run ends. The run's outcome then applies
+    /// them: a target that reads Up came back during the run and starts
+    /// afresh; one that reads Down keeps the count and the cooldown the run
+    /// began.
+    #[tokio::test]
+    async fn during_a_run_check_now_reads_and_the_run_applies_the_count_at_its_end() {
+        let scratch = Scratch::new("during-run");
+        let t = pdu(60);
+        let mut state = holding(&scratch, vec![t.clone()]);
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let fold = |state: &mut InfraState, ok: bool, secs: u64, reading: Reading| {
+            apply_result(state, &t, answer(ok, 3), 1, at(secs), reading)
+        };
+
+        // Down, and a run starts.
+        assert!(fold(&mut state, false, 0, Reading::Monitor).is_none());
+        assert!(fold(&mut state, false, 10, Reading::Monitor).is_none());
+        let run = fold(&mut state, false, 20, Reading::Monitor).expect("Down: a run");
+        let begun = state.recovery_tracker["pdu"];
+        assert_eq!(begun, (at(20), 1));
+
+        // Two good readings during the run bring it Up, a change pushed,
+        // and leave the count and the cooldown as the run began them.
+        let seq = state.stamp().seq;
+        assert!(fold(&mut state, true, 25, Reading::CheckNow).is_none());
+        assert!(fold(&mut state, true, 26, Reading::CheckNow).is_none());
+        let shown = &state.results.targets["pdu"];
+        assert_eq!((shown.status, shown.consecutive_ok), (TargetStatus::Up, 2));
+        assert_eq!(state.stamp().seq, seq + 1, "Down to Up, pushed");
+        assert_eq!(state.recovery_tracker["pdu"], begun, "they stand");
+
+        // The run ends: the target came back, so it starts afresh.
+        run_inline(&mut state, run).await;
+        assert!(!state.recovery_tracker.contains_key("pdu"));
+        assert_eq!(state.results.recovery_log.len(), 1);
+        assert_eq!(
+            scratch.saved(),
+            serde_json::Value::Null,
+            "no count left to save"
+        );
+
+        // The next outage: Down, a run, a good reading and a failed one
+        // during it. It ends Down: the count and the cooldown stand.
+        for secs in [100, 110] {
+            assert!(fold(&mut state, false, secs, Reading::Monitor).is_none());
+        }
+        let run = fold(&mut state, false, 120, Reading::Monitor).expect("Down again: a run");
+        assert!(fold(&mut state, true, 125, Reading::CheckNow).is_none());
+        assert!(fold(&mut state, false, 126, Reading::CheckNow).is_none());
+        run_inline(&mut state, run).await;
+        assert_eq!(state.results.targets["pdu"].status, TargetStatus::Down);
+        assert_eq!(state.recovery_tracker["pdu"], (at(120), 1));
+        assert!(
+            fold(&mut state, false, 150, Reading::Monitor).is_none(),
+            "within the cooldown the run began"
+        );
+        assert!(fold(&mut state, false, 180, Reading::Monitor).is_some());
+    }
+
     /// What a recovery wrote, as its log entry keeps it.
     async fn logged_output(scratch: &Scratch, command: String) -> RecoveryLogEntry {
         let mut t = pdu(0);
@@ -2520,7 +2626,6 @@ mod tests {
                 )
             })
             .expect("Down within five failures");
-        let flight = state.in_flight.start("pdu").expect("free");
         // The write waits inside itself until the test lets it through, or
         // 10 s whatever happens, so a write that holds the worker fails the
         // test instead of hanging it.
@@ -2528,7 +2633,7 @@ mod tests {
         let infra = Arc::new(Mutex::new(state));
 
         let asked = std::time::Instant::now();
-        let task = tokio::spawn(run_recovery(infra.clone(), run, flight));
+        let task = tokio::spawn(run_recovery(infra.clone(), run));
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             asked.elapsed() < Duration::from_secs(1),
@@ -2590,11 +2695,10 @@ mod tests {
                 let mut state = infra.lock().await;
                 let now = t0 + Duration::from_secs(secs);
                 apply_result(&mut state, &t, answer(false, 0), 1, now, Reading::Monitor)
-                    .map(|run| (run, state.in_flight.start("pdu").expect("free")))
             };
-            if let Some((run, flight)) = started {
+            if let Some(run) = started {
                 started_at.push(secs);
-                run_recovery(infra.clone(), run, flight).await;
+                run_recovery(infra.clone(), run).await;
             }
         }
         assert_eq!(

@@ -914,8 +914,9 @@ leaves within about a second, whatever the run takes. The command can
 start before that message leaves: when a recovery cuts the unit's own
 uplink, the next connection pushes the picture as it then stands. The
 command runs in a task of its own, outside the Infra lock, under a 300 s
-limit, one run per target at a time, and no check of the target starts
-until it ends. Before the command
+limit, one run per target at a time, and the monitor checks the target
+again only once the run has ended; Check now still reads it (below), and
+the run's end applies the count and the cooldown. Before the command
 starts, the run is saved in `<state_dir>/infra-recovery.json`, synced: the
 count holds across restarts (after a start, a target with a saved count
 waits a full cooldown), and the next start logs a run that did not end,
@@ -1036,10 +1037,15 @@ change is pushed like any other, so a few readings of a failing target
 bring its `down` sooner. Check now counts no round and never starts a
 recovery. A target has at most one check in flight: while one is, Check
 now waits for that check, at most 90 s, and answers its result, and no
-second check runs. While a recovery of the target runs, it answers at once
-the result of the check that started the run. A result is applied only
-while the unit still holds the config the check ran under and the target
-is in it; otherwise it is answered and nothing is applied.
+second check runs. A recovery run is not a check: while one of the target
+runs, which the monitor leaves alone, Check now reads the target and its
+result is applied as above, status included, but the target's recovery
+count and cooldown stand until the run ends. The run's end then applies
+them: a target that reads `up` or `degraded` came back during the run and
+starts afresh, its count clear; one that reads `down` or `unknown` keeps
+the count and the cooldown the run began. A result is applied only while
+the unit still holds the config the check ran under and the target is in
+it; otherwise it is answered and nothing is applied.
 
 Response `200`: `{target_id, ok, latency_ms, detail, http_status, data,
 presented_sha256}`. `presented_sha256` is set when a TLS target offered a
