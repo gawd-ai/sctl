@@ -436,6 +436,11 @@ impl Capture {
     fn since(&self, mark: usize) -> Vec<Frame> {
         // Late frames of the step just run land first.
         std::thread::sleep(Duration::from_millis(250));
+        self.so_far(mark)
+    }
+
+    /// The frames since `mark` as they stand, without waiting for late ones.
+    fn so_far(&self, mark: usize) -> Vec<Frame> {
         self.frames.lock().unwrap()[mark..].to_vec()
     }
 
@@ -882,11 +887,16 @@ fn case_4_a_host_route_and_dev(
         received.lock().unwrap().tcp.len() == connections + 1
     });
 
-    // --dev, and the address removed while the tool runs: the requests
-    // after it fail, and none leaves by the LTE veth.
-    let lte_mark = lte.mark();
-    snmp.set_delay(Duration::from_millis(400));
-    let before = snmp.requests().len();
+    // --dev, and the address removed mid-run, between the guard's approval
+    // and the bind. With --expect-mac the tool waits 300 ms past the
+    // target's ARP answer for a second one before it binds, so the address
+    // goes in that wait. The bind to 192.0.2.1 then fails, and the request
+    // is refused: it never leaves, neither by the LTE veth, where an
+    // unbound socket would send it once the host route went with the
+    // address, nor out lan0 from another source, where a socket bound to
+    // the interface alone would.
+    let (mark, lte_mark) = (unit.mark(), lte.mark());
+    let requests = snmp.requests().len();
     let child = net_command(
         u,
         &[
@@ -894,29 +904,45 @@ fn case_4_a_host_route_and_dev(
             "get",
             "--dev",
             "lan0",
-            "--timeout",
-            "1500",
+            "--expect-mac",
+            TARGET_MAC,
             "192.0.2.10",
             "1.3.6.1.2.1.1.1.0",
-            "1.3.6.1.2.1.1.2.0",
-            "1.3.6.1.2.1.1.3.0",
         ],
         env,
     )
     .spawn()
     .unwrap();
     let started = Instant::now();
-    while snmp.requests().len() == before {
+    while !unit
+        .so_far(mark)
+        .iter()
+        .any(|f| f.dev == "lan0" && !f.outgoing && f.to_host && f.arp_about() == Some(TARGET))
+    {
         assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "the first get arrived"
+            started.elapsed() < Duration::from_secs(5),
+            "the target answered the ARP request"
         );
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(5));
     }
     ip(&["-n", u, "addr", "del", "192.0.2.1/32", "dev", "lan0"]);
+    let gone = unit.mark();
     let run = Run::of(&child.wait_with_output().unwrap());
-    snmp.set_delay(Duration::ZERO);
-    assert_eq!(run.code, 1, "the send fails rather than moves: {run:?}");
+    assert_eq!(run.code, 3, "the bind fails, so it is refused: {run:?}");
+    assert_eq!(run.json["refused"], "guard_failed", "{run:?}");
+    assert_eq!(
+        snmp.requests().len(),
+        requests,
+        "no request reached the agent"
+    );
+    let sent: Vec<Frame> = unit
+        .since(gone)
+        .into_iter()
+        .filter(|f| {
+            f.outgoing && (f.dev == "lte9" || (f.dev == "lan0" && f.ipv4_dst() == Some(TARGET)))
+        })
+        .collect();
+    assert!(sent.is_empty(), "nothing after the address went: {sent:?}");
     assert!(
         lte.since(lte_mark).is_empty(),
         "never by the LTE veth after the address went"
