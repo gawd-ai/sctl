@@ -13,6 +13,7 @@ reference both device routes and the tunnel relay share.
 - [Device code catalog](#device-code-catalog)
 - [Comms provider codes](#comms-provider-codes)
 - [STP transfer codes](#stp-transfer-codes)
+- [Net tool refusals](#net-tool-refusals)
 - [Relay-only codes](#relay-only-codes)
 
 ## The unified shape
@@ -160,6 +161,28 @@ catalog, and `FILE_TOO_LARGE` (400) for a file over
 `transfer_max_file_size`. The tunnel's own transfer frames
 (`gx.download.init`) answer `PROTECTED_PATH` with 403 and
 `NOT_A_REGULAR_FILE` with 400 too.
+
+## Net tool refusals
+
+`sctl net snmp|http|tcp` refuse a send they would not make on the unit's
+LAN side (ADR-012) with exit 3 and one JSON object whose `refused` names
+why; the Infra SNMP and Peplink checks put the same code in their detail,
+as `SNMP NOT SENT (<code>): ...` or `API NOT SENT (<code>): ...`. They
+reach the HTTP surface in an exec's output and in
+`GET /api/infra/results`. The request never left, so none is worth a
+retry as it stands. The guide's "Network tools" says what each means.
+
+| `refused` | Meaning |
+|-----------|---------|
+| `not_on_lan` | The kernel would send it through a gateway, by an interface off the LAN side, or nowhere |
+| `no_address` | The interface it would leave by holds no IPv4 address |
+| `not_unicast` | A broadcast or multicast destination |
+| `ipv6` | An IPv6 destination |
+| `own_address` | A destination the unit holds on one of its interfaces, refused before any socket opens: net tools send to devices on its LAN. With `--expect-mac`, the loopback too |
+| `mac_mismatch` | Another MAC answered `--expect-mac`'s ARP request, two did, or the kernel's entry names another |
+| `no_answer` | Nothing answered `--expect-mac`'s ARP request |
+| `config_unreadable` | The agent's config could not be read or parsed |
+| `guard_failed` | The tool could not read the routes, ask the wire or bind |
 
 ## Relay-only codes
 

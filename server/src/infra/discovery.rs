@@ -17,7 +17,8 @@
 //!   searches it on the LAN-side interfaces. arp-scan runs only on a subnet
 //!   it can search within its limit, a /19 at most.
 //! - **The port probe** judges each host by the guard and connects from a
-//!   socket bound where the guard approved.
+//!   socket bound where the guard approved. The guard refuses the unit's
+//!   own addresses (`own_address`), so they get none.
 //! - **A host's MAC** is the one seen answering during the scan: the
 //!   sweep's ARP answer, and the kernel's entry on the interface that
 //!   reaches the host, REACHABLE (or permanent) once the port probe is
@@ -2248,9 +2249,9 @@ mod tests {
     /// TRD-9 3.5: a scan given no subnets, on a unit with a wired network,
     /// an LTE bearer and a mesh, sweeps the wired networks only, on their
     /// own interfaces; the port probe goes where the guard approves, from
-    /// the address it bound; the unit's own addresses are never pinged.
-    /// The /24 guessed from a default route through the wired WAN port is
-    /// not swept, nor searched, nor named in `not_swept`.
+    /// the address it bound; the unit's own addresses are never pinged nor
+    /// probed. The /24 guessed from a default route through the wired WAN
+    /// port is not swept, nor searched, nor named in `not_swept`.
     #[tokio::test]
     async fn a_scan_given_no_subnets_sweeps_only_the_lan() {
         let mut routes = unit_routes();
@@ -2277,11 +2278,10 @@ mod tests {
         assert_eq!(
             fake.log_of("ports"),
             [
-                "ports br-lan 192.0.2.1 from 192.0.2.1",
                 "ports br-lan 192.0.2.10 from 192.0.2.1",
                 "ports eth1 192.168.8.1 from 192.168.8.20",
-                "ports eth1 192.168.8.20 from 192.168.8.20",
-            ]
+            ],
+            "the unit's own addresses are refused by the guard (own_address)"
         );
         assert!(fake.log_of("arp").is_empty(), "every entry was REACHABLE");
 
@@ -2537,10 +2537,8 @@ mod tests {
         );
         assert_eq!(
             fake.log(),
-            [
-                "arp-scan br-lan 10.0.0.0/23",
-                "ports br-lan 10.0.0.1 from 10.0.0.1"
-            ]
+            ["arp-scan br-lan 10.0.0.0/23"],
+            "the unit's own address gets no port probe"
         );
     }
 

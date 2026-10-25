@@ -15,7 +15,9 @@
 //!   `usb*`) counts as LTE, and the answer says the name decided it.
 //! - **On the LAN.** The kernel's route (`source::route_get`) is unicast,
 //!   has no gateway and leaves by a LAN-side interface holding an IPv4
-//!   address. A destination the unit holds itself passes: nothing leaves.
+//!   address. A destination the unit holds on one of its interfaces is
+//!   refused before any socket opens (`own_address`): the tools send to
+//!   devices on its LAN. The loopback passes: nothing leaves the unit.
 //!   With `--dev` the named interface must be on the LAN side, hold an
 //!   address, and the destination must lie under a main-table route through
 //!   it with no gateway, judged from the routes, never from a lookup tied to
@@ -80,7 +82,8 @@ pub enum Code {
     NotUnicast,
     /// An IPv6 destination: the agent reads IPv4 networks only.
     Ipv6,
-    /// `--expect-mac` with a destination the unit holds itself.
+    /// A destination the unit holds on one of its interfaces: the tools
+    /// send to devices on its LAN. With `--expect-mac`, the loopback too.
     OwnAddress,
     /// Another MAC answered, two did, or the kernel's entry names another.
     MacMismatch,
@@ -571,7 +574,8 @@ pub struct Approved {
     pub dev: String,
     /// The source address the socket is bound to.
     pub src: Ipv4Addr,
-    /// The destination is the unit's own: nothing leaves it.
+    /// The destination is the unit's loopback: nothing leaves it. A
+    /// destination the unit holds on another interface is refused.
     pub own: bool,
     /// What the guard read while it approved: a refusal after the approval,
     /// a socket that cannot be bound, shows it.
@@ -684,6 +688,14 @@ pub fn judge(
         ));
     }
     let own = kind == Some(RouteKind::Local);
+    // An address the unit holds on one of its interfaces: refused before
+    // any socket opens, whatever the flags. The loopback's goes on.
+    if own && !address.is_loopback() {
+        return Err(refuse(
+            Code::OwnAddress,
+            format!("{address} is this unit's own address: net tools send to devices on its LAN."),
+        ));
+    }
     if own && expect_mac {
         return Err(refuse(
             Code::OwnAddress,
@@ -715,8 +727,10 @@ pub fn judge(
     };
     match route.kind {
         RouteKind::Local => {
-            // Bound to the interface that holds the address, so the
-            // kernel's local route still matches; else (127/8) the route's.
+            // Only the loopback gets here: the unit's other addresses were
+            // refused above. Bound to the interface that holds the address,
+            // so the kernel's local route still matches; else (an address
+            // of 127/8 that no one holds) the route's.
             let (dev, src) = net.holder_of(address).map_or_else(
                 || (route.dev.clone(), route.src.unwrap_or(Ipv4Addr::LOCALHOST)),
                 |holder| (holder.name.clone(), address),
@@ -1812,28 +1826,52 @@ mod tests {
         );
     }
 
+    /// An address the unit holds on one of its interfaces is refused before
+    /// any socket opens, with or without `--dev` and `--expect-mac`: the
+    /// tools send to devices on its LAN. The loopback passes, bound to `lo`,
+    /// unless a MAC is to be proved.
     #[test]
-    fn the_unit_s_own_address_passes_bound_to_its_holder_but_not_with_a_mac() {
+    fn the_unit_s_own_address_is_refused_and_the_loopback_passes() {
         let net = site(&Lte::named("wwan0"));
-        let local = kernel("lo", 1, None, [192, 0, 2, 1], RouteKind::Local);
-        let approved = judge(&net, ip([192, 0, 2, 1]), &local, None, false).unwrap();
-        assert_eq!(
-            (approved.dev.as_str(), approved.src, approved.own),
-            ("br-lan", ip([192, 0, 2, 1]), true)
-        );
+        for (own, holder) in [
+            ([192, 0, 2, 1], "br-lan"),
+            ([10, 180, 41, 231], "wwan0"),
+            ([10, 99, 0, 2], "wg0"),
+        ] {
+            let local = kernel("lo", 1, None, own, RouteKind::Local);
+            for (dev, expect_mac) in [(None, false), (Some("br-lan"), false), (None, true)] {
+                let refusal = judge(&net, ip(own), &local, dev, expect_mac).unwrap_err();
+                assert_eq!(refusal.refused, Code::OwnAddress, "{holder} {dev:?}");
+                assert_eq!(
+                    refusal.reason,
+                    format!(
+                        "{} is this unit's own address: net tools send to devices on its LAN.",
+                        ip(own)
+                    )
+                );
+                let route = refusal.route.as_ref().expect("the route read");
+                assert_eq!((route.dev.as_str(), route.kind), ("lo", "local"));
+            }
+        }
+
         let loopback = kernel("lo", 1, None, [127, 0, 0, 1], RouteKind::Local);
         let approved = judge(&net, ip([127, 0, 0, 1]), &loopback, None, false).unwrap();
-        assert_eq!((approved.dev.as_str(), approved.own), ("lo", true));
+        assert_eq!(
+            (approved.dev.as_str(), approved.src, approved.own),
+            ("lo", Ipv4Addr::LOCALHOST, true)
+        );
         // 127.0.0.5 is local through lo/8 but held by no one exactly.
         let approved = judge(&net, ip([127, 0, 0, 5]), &loopback, None, false).unwrap();
         assert_eq!(
             (approved.dev.as_str(), approved.src),
             ("lo", Ipv4Addr::LOCALHOST)
         );
-        let refusal = judge(&net, ip([192, 0, 2, 1]), &local, None, true).unwrap_err();
+        let refusal = judge(&net, ip([127, 0, 0, 1]), &loopback, None, true).unwrap_err();
         assert_eq!(refusal.refused, Code::OwnAddress);
-        let refusal = judge(&net, ip([192, 0, 2, 1]), &local, Some("br-lan"), true).unwrap_err();
-        assert_eq!(refusal.refused, Code::OwnAddress);
+        assert_eq!(
+            refusal.reason,
+            "127.0.0.1 is this unit's own address: no device answers for it to prove a MAC."
+        );
     }
 
     #[test]
@@ -2163,8 +2201,8 @@ mod tests {
         let refusal = guard.approve(Ipv4Addr::BROADCAST).await.unwrap_err();
         assert_eq!(refusal.refused, Code::NotUnicast);
         assert!(refusal.lan.is_some(), "the LAN side was read");
-        // With a MAC to prove, the unit's own address is refused before any
-        // packet socket is opened.
+        // With a MAC to prove, the loopback is refused before any packet
+        // socket is opened.
         let guard = Guard {
             expect_mac: Some(Mac(MAC_A)),
             ..Guard::default()

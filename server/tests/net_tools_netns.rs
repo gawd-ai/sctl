@@ -736,7 +736,7 @@ fn the_net_tools_send_only_on_the_lan_to_the_device_expected() {
     let u = lab.unit.as_str();
 
     case_1_on_the_lan_is_sent(u, &env, &received, &snmp, &lte);
-    case_1_the_unit_s_own_addresses_are_sent(&lab, &env, &unit);
+    case_1_the_unit_s_own_addresses_are_refused(&lab, &env, &unit);
     case_2_behind_the_gateway_is_refused(u, &env, &unit, &lte);
     case_3_the_mesh_and_a_gatewayless_lte_route_are_refused(u, &env, &unit, &lte, &mesh);
     case_4_a_host_route_and_dev(u, &env, &received, &snmp, &unit, &lte);
@@ -838,12 +838,13 @@ fn listen(ns: &str, port: u16, stop: &Arc<AtomicBool>) -> Arc<Mutex<Vec<SocketAd
     reached
 }
 
-/// ADR-012 decision 1: a destination the unit holds itself passes, and
-/// nothing leaves the unit. Its LAN address, and an address a dummy
+/// A destination the unit holds on one of its interfaces is refused before
+/// any socket opens (TRD-9 3.4, `own_address`): the tools send to devices
+/// on its LAN. Its LAN address, also with `--dev`, and an address a dummy
 /// interface holds (no ARP, so off the LAN side): `tcp` and `snmp get`
-/// reach a listener and an agent in the unit, and no packet for either
-/// address goes out on a wire.
-fn case_1_the_unit_s_own_addresses_are_sent(lab: &Lab, env: &[(&str, &str)], unit: &Capture) {
+/// exit 3, nothing reaches the listener or the agent in the unit, and no
+/// packet for either address goes out on a wire.
+fn case_1_the_unit_s_own_addresses_are_refused(lab: &Lab, env: &[(&str, &str)], unit: &Capture) {
     let u = lab.unit.as_str();
     let own_lan = Ipv4Addr::new(192, 0, 2, 1);
     let own_dummy = Ipv4Addr::new(10, 77, 0, 1);
@@ -863,34 +864,45 @@ fn case_1_the_unit_s_own_addresses_are_sent(lab: &Lab, env: &[(&str, &str)], uni
     let mark = unit.mark();
     for own in [own_lan, own_dummy] {
         let host = own.to_string();
-        let tcp = net(u, &["tcp", &host, "7000"], env);
-        assert_eq!(tcp.code, 0, "{tcp:?}");
-        eventually("the unit's listener accepted the connection", || {
-            reached
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|local| local.ip() == own)
-        });
-        let get = net(u, &["snmp", "get", &host, "1.3.6.1.2.1.1.1.0"], env);
-        assert_eq!(get.code, 0, "{get:?}");
+        let reason =
+            format!("{own} is this unit's own address: net tools send to devices on its LAN.");
+        for args in [
+            vec!["tcp", host.as_str(), "7000"],
+            vec!["tcp", "--dev", "lan0", host.as_str(), "7000"],
+            vec!["snmp", "get", host.as_str(), "1.3.6.1.2.1.1.1.0"],
+        ] {
+            let refused = net(u, &args, env);
+            assert_eq!(refused.code, 3, "{args:?}: {refused:?}");
+            assert_eq!(refused.json["refused"], "own_address", "{refused:?}");
+            assert_eq!(refused.json["reason"], reason.as_str(), "{refused:?}");
+        }
     }
+    // Long enough for a connection or a request that did leave to arrive.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        reached.lock().unwrap().is_empty(),
+        "no connection reached the unit's listener"
+    );
     let requests = agent.requests();
-    assert_eq!(requests.len(), 2, "{requests:?}");
-    let wire: Vec<Frame> = unit
+    assert!(
+        requests.is_empty(),
+        "no request reached the unit's agent: {requests:?}"
+    );
+    // Nothing was sent to either, on a wire or over the loopback.
+    let sent: Vec<Frame> = unit
         .since(mark)
         .into_iter()
         .filter(|f| {
-            f.outgoing
-                && f.dev != "lo"
-                && (f.ipv4_dst() == Some(own_lan) || f.ipv4_dst() == Some(own_dummy))
+            f.outgoing && (f.ipv4_dst() == Some(own_lan) || f.ipv4_dst() == Some(own_dummy))
         })
         .collect();
-    assert!(wire.is_empty(), "nothing left the unit: {wire:?}");
+    assert!(sent.is_empty(), "nothing was sent: {sent:?}");
     drop(agent);
     done.store(true, Ordering::SeqCst);
     ip(&["-n", u, "link", "del", "dum9"]);
-    eprintln!("case 1: tcp and snmp get reach the unit's own addresses, and nothing leaves it");
+    eprintln!(
+        "case 1: tcp and snmp get to the unit's own addresses are refused, and nothing is sent"
+    );
 }
 
 fn case_2_behind_the_gateway_is_refused(

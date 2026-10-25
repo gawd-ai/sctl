@@ -511,7 +511,7 @@ Before it sends anything, a tool asks the kernel for the route to the destinatio
 - **The LAN side.** An interface is on the LAN side when it is up, is not the loopback, takes ARP, is not point-to-point and is not the LTE bearer. A wired WAN port is on the LAN side: on a probe, the site's network is there. WireGuard, tun, PPP and a raw-IP modem fall out by their flags.
 - **The LTE bearer** is the agent's `[lte] interface`. A modem framed like Ethernet, as the XE300's `wwan0`, falls out only by that name. With no config, a config without `[lte]`, or one whose `[lte] interface` the unit lacks, an interface named `wwan*`, `qmimux*` or `usb*` counts as LTE, and a refusal says the name decided it.
 - **The kernel's route, not a connected network.** A /32 address plus a host route passes, and so does a route a runbook adds one step earlier.
-- **The unit itself.** A destination the unit holds (one of its addresses, the loopback) passes: nothing leaves the unit.
+- **The unit itself.** A destination the unit holds on one of its interfaces is refused before any socket opens (`own_address`): the tools send to devices on its LAN. The loopback passes: nothing leaves the unit.
 - **One device.** Broadcast and multicast destinations are refused, and so is IPv6. A host name is looked up once: the tool judges its first IPv4 address and connects to that address only. HTTP keeps the name for `Host` and TLS.
 - **Bound where it was checked.** The socket is bound to the approved interface (`SO_BINDTODEVICE`) and to the route's source address before anything is sent. An address that goes away during a run makes the send fail rather than move, and mwan3's marks cannot route it elsewhere.
 
@@ -520,7 +520,7 @@ Before it sends anything, a tool asks the kernel for the route to the destinatio
 | Option | Meaning |
 |--------|---------|
 | `--dev <iface>` | Send by this interface. It must be on the LAN side and hold an address (a bridge port is named by its bridge), and the destination must lie under a main-table route through it with no gateway: its network, or a host route. It is judged from the routes, never from a lookup tied to the interface, which the kernel answers as if any address were on the link. |
-| `--expect-mac <mac>` | Send only to the device expected. After the route check, one ARP request for the destination goes out on the approved interface; the tool sends only when every answer, and the kernel's neighbour entry for the address if it holds one, names this MAC. Another MAC or two MACs is `mac_mismatch`, no answer is `no_answer`, and a destination the unit holds itself is `own_address`. Colons or hyphens, either case. The check proves that the device answering holds that MAC, no more: a generated, locally administered or shared MAC passes for whichever device holds it. |
+| `--expect-mac <mac>` | Send only to the device expected. After the route check, one ARP request for the destination goes out on the approved interface; the tool sends only when every answer, and the kernel's neighbour entry for the address if it holds one, names this MAC. Another MAC or two MACs is `mac_mismatch`, no answer is `no_answer`, and the loopback, which no device answers for, is `own_address`. Colons or hyphens, either case. The check proves that the device answering holds that MAC, no more: a generated, locally administered or shared MAC passes for whichever device holds it. |
 | `--config <path>` | The agent's config, for its `[lte] interface`. Default: `SCTL_AGENT_CONFIG`, which the agent sets for every command it runs. A tool never reads `./sctl.toml` from its working directory (`/tmp` on the units). |
 | `--timeout <ms>` | `snmp`: per request, default 3000. `http`: default 10000. `tcp`: default 3000. The ARP request waits within it, at most 1 s. |
 
@@ -567,7 +567,7 @@ A refusal prints `ok: false`, `refused` (the code), a one-line `reason`, `host` 
 | `no_address` | The interface it would leave by holds no IPv4 address, or `--dev` names a bridge's port. |
 | `not_unicast` | A broadcast or multicast destination. |
 | `ipv6` | An IPv6 destination, or a name with only IPv6 addresses. |
-| `own_address` | `--expect-mac` with a destination the unit holds itself. |
+| `own_address` | A destination the unit holds on one of its interfaces: the tools send to devices on its LAN. With `--expect-mac`, the loopback too. |
 | `mac_mismatch` | Another MAC answered, two did, or the kernel's neighbour entry names another. |
 | `no_answer` | Nothing answered the ARP request. |
 | `config_unreadable` | The agent's config could not be read or parsed. The reason names the path and quotes nothing from the file. |

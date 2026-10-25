@@ -759,7 +759,7 @@ mod tests {
     /// either way the GET is sent from a socket bound to lo, and the detail
     /// never carries the community.
     #[tokio::test]
-    async fn the_snmp_check_reaches_the_unit_s_own_address() {
+    async fn the_snmp_check_reaches_the_unit_s_loopback() {
         let r = check_snmp("127.0.0.1", "s3cr3t-c0mm", Some(600)).await;
         assert!(
             r.detail.starts_with("SNMP FAIL") || r.detail.starts_with("SNMP OK"),
@@ -767,6 +767,34 @@ mod tests {
             r.detail
         );
         assert!(!r.detail.contains("s3cr3t"), "{}", r.detail);
+    }
+
+    /// An address this machine holds on an up interface other than the
+    /// loopback reads down with the guard's refusal, and nothing is sent.
+    /// A machine with no such address has nothing to show here.
+    #[tokio::test]
+    async fn the_snmp_check_refuses_the_unit_s_own_address() {
+        use crate::net_tools::guard::{Lte, Network};
+        let net = Network::read(&Lte::from_config(None)).await.unwrap();
+        let Some(own) = net
+            .ifaces
+            .iter()
+            .filter(|i| i.up() && !i.loopback())
+            .flat_map(|i| i.ipv4.iter().map(|(a, _)| *a))
+            .find(|a| !a.is_loopback())
+        else {
+            eprintln!("no address but the loopback's here: nothing to refuse");
+            return;
+        };
+        let r = check_snmp(&own.to_string(), "s3cr3t-c0mm", Some(600)).await;
+        assert!(!r.ok);
+        assert_eq!(
+            r.detail,
+            format!(
+                "SNMP NOT SENT (own_address): {own} is this unit's own address: \
+                 net tools send to devices on its LAN."
+            )
+        );
     }
 
     #[test]

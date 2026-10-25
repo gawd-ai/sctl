@@ -950,7 +950,10 @@ socket bound there (ADR-012, the guide's "Network tools"): a unicast route
 with no gateway, by an interface on the unit's LAN side, the LTE bearer
 being the agent's `[lte] interface`. Off the LAN side the target reads down
 with the guard's reason, as `SNMP NOT SENT (not_on_lan): ...` or
-`API NOT SENT (not_on_lan): ...`, and nothing is sent. No detail quotes a
+`API NOT SENT (not_on_lan): ...`, and nothing is sent. So does a target at
+an address the unit holds on one of its interfaces, which the guard refuses
+before any socket opens: `SNMP NOT SENT (own_address): <ip> is this unit's
+own address: net tools send to devices on its LAN.` No detail quotes a
 community. The `ping`, `http`, `https` and `tcp_port` checks send no secret
 and are not guarded.
 
@@ -1124,7 +1127,8 @@ A scan sends only on the unit's LAN side, as the net tools' guard judges it
 3. **Ports.** The guard judges each host. A host it approves gets a TCP
    connect to each of 22, 80, 443, 554, 8080, 8443, 161, 53, 3389 and 1337,
    2 s each, from a socket bound to the interface and source address it
-   approved, at most 32 hosts at once; any other host gets none.
+   approved, at most 32 hosts at once; any other host gets none, the unit's
+   own addresses included, which the guard refuses (`own_address`).
 4. **Names.** A reverse lookup of each host through the unit's resolver,
    which may answer over the LTE (ADR-012 section 7).
 
