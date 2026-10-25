@@ -29,5 +29,9 @@ sha2 = "0.10"
 base64 = "0.22"
 indexmap = "2"
 
+[dev-dependencies]
+# The paused clock (start_paused) for the tests of an attach's wait.
+tokio = { version = "1", features = ["test-util"] }
+
 [lints]
 workspace = true

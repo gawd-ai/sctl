@@ -25,6 +25,7 @@ use std::sync::Arc;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::time::{Duration, Instant};
 
 /// Session lifecycle status (mirrors sctl server's `SessionStatus`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +63,18 @@ enum Held {
     Marker(String),
 }
 
+/// How long an attach waits for its reply, and so how long live output is
+/// held for one.
+const ATTACH_REPLY_WAIT: Duration = Duration::from_secs(10);
+
+/// Live output held while an attach waits for its reply.
+struct Holding {
+    /// What came, in the order it came.
+    held: Vec<Held>,
+    /// When the hold ends if no reply has come.
+    until: Instant,
+}
+
 /// Max entries per session buffer to prevent unbounded memory growth.
 const MAX_BUFFER_ENTRIES: usize = 5000;
 
@@ -84,8 +97,8 @@ struct SessionBuffer {
     /// Set to true when a session.attached response has been received.
     attached: bool,
     /// Live output held while an attach waits for its reply: kept after the
-    /// replay, in the order it came.
-    held: Option<Vec<Held>>,
+    /// replay, or when the hold ends with no reply, in the order it came.
+    held: Option<Holding>,
 }
 
 impl SessionBuffer {
@@ -150,23 +163,45 @@ impl SessionBuffer {
 
     /// Live output: kept now, or held while an attach waits for its reply.
     fn live(&mut self, entry: DaemonEntry) {
+        self.end_overdue_hold();
         match &mut self.held {
-            Some(held) => held.push(Held::Entry(entry)),
+            Some(holding) => holding.held.push(Held::Entry(entry)),
             None => self.push(entry),
         }
     }
 
     /// A marker, held behind live output while an attach waits.
     fn live_mark(&mut self, data: String) {
+        self.end_overdue_hold();
         match &mut self.held {
-            Some(held) => held.push(Held::Marker(data)),
+            Some(holding) => holding.held.push(Held::Marker(data)),
             None => self.mark(data),
         }
     }
 
-    /// An attach is about to be sent: hold live output until its reply.
+    /// An attach is about to be sent: hold live output until its reply,
+    /// `ATTACH_REPLY_WAIT` from now at most.
     fn hold(&mut self) {
-        self.held.get_or_insert_with(Vec::new);
+        let until = Instant::now() + ATTACH_REPLY_WAIT;
+        self.held
+            .get_or_insert_with(|| Holding {
+                held: Vec::new(),
+                until,
+            })
+            .until = until;
+    }
+
+    /// End a hold whose reply has not come in time: what it held is kept
+    /// now. A reply that comes later is still kept where its seqs are above
+    /// the highest kept.
+    fn end_overdue_hold(&mut self) {
+        if self
+            .held
+            .as_ref()
+            .is_some_and(|holding| Instant::now() >= holding.until)
+        {
+            self.settle(Vec::new());
+        }
     }
 
     /// An attach is about to be sent for a reader at the place `since`:
@@ -193,7 +228,12 @@ impl SessionBuffer {
         for entry in replay {
             self.push(entry);
         }
-        for held in self.held.take().unwrap_or_default() {
+        for held in self
+            .held
+            .take()
+            .map(|holding| holding.held)
+            .unwrap_or_default()
+        {
             match held {
                 Held::Entry(entry) => self.push(entry),
                 Held::Marker(data) => self.mark(data),
@@ -423,18 +463,21 @@ impl DeviceWsConnection {
     /// Read output from a session's local buffer.
     ///
     /// Returns entries with `seq > since`. If no entries are available, waits
-    /// up to `timeout_ms` for new data.
+    /// up to `timeout_ms` for new data. Output held for an attach whose
+    /// reply is overdue is kept first, and the wait ends when such a hold
+    /// does.
     pub async fn read_output(
         &self,
         session_id: &str,
         since: u64,
         timeout_ms: u64,
     ) -> Result<ReadResult, String> {
-        let notify = {
-            let sessions = self.sessions.lock().await;
+        let (notify, wait) = {
+            let mut sessions = self.sessions.lock().await;
             let buf = sessions
-                .get(session_id)
+                .get_mut(session_id)
                 .ok_or_else(|| format!("Session {session_id} not found locally"))?;
+            buf.end_overdue_hold();
 
             // Return at once with new data, or with none from an exited session
             let entries = buf.after(since);
@@ -442,23 +485,25 @@ impl DeviceWsConnection {
                 return Ok(ReadResult::read(buf, entries, since));
             }
 
-            Arc::clone(&buf.notify)
+            let wait = Duration::from_millis(timeout_ms);
+            let wait = buf.held.as_ref().map_or(wait, |holding| {
+                wait.min(holding.until.saturating_duration_since(Instant::now()))
+            });
+            (Arc::clone(&buf.notify), wait)
         };
 
         // Wait for new data with timeout
-        let _ = tokio::time::timeout(
-            tokio::time::Duration::from_millis(timeout_ms),
-            notify.notified(),
-        )
-        .await;
+        let _ = tokio::time::timeout(wait, notify.notified()).await;
 
         // Re-read after wait
-        let sessions = self.sessions.lock().await;
+        let mut sessions = self.sessions.lock().await;
         let buf = sessions
-            .get(session_id)
+            .get_mut(session_id)
             .ok_or_else(|| format!("Session {session_id} not found locally"))?;
+        buf.end_overdue_hold();
 
-        Ok(ReadResult::read(buf, buf.after(since), since))
+        let entries = buf.after(since);
+        Ok(ReadResult::read(buf, entries, since))
     }
 
     /// Check whether the WebSocket is currently connected.
@@ -557,7 +602,7 @@ impl DeviceWsConnection {
         let notified = attach_notify.notified();
         let sent = self.send(attach_message(session_id, from)).await;
         let answered = sent.is_ok()
-            && tokio::time::timeout(tokio::time::Duration::from_secs(10), notified)
+            && tokio::time::timeout(ATTACH_REPLY_WAIT, notified)
                 .await
                 .is_ok();
         if !answered {
@@ -1096,6 +1141,18 @@ async fn dispatch_message(
                 }
             }
         }
+        "tunnel.device_disconnected" => {
+            // The relay lost the device's tunnel: no reply comes to an
+            // attach sent before this, so nothing is held for one.
+            let reason = msg["reason"].as_str().unwrap_or("unknown");
+            eprintln!("mcp-sctl: the relay lost the device (reason: {reason})");
+            let mut sessions = sessions.lock().await;
+            for buf in sessions.values_mut() {
+                if buf.held.is_some() {
+                    buf.settle(Vec::new());
+                }
+            }
+        }
         "session.created"
         | "session.destroyed"
         | "session.renamed"
@@ -1517,5 +1574,93 @@ mod tests {
         // Entries the relay dropped: the daemon's next seq is ahead again.
         buf.push(line(12));
         assert_eq!(places(buf.entries.make_contiguous()), [5, 6, 7, 8, 12]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_re_attach_with_no_reply_holds_live_output_no_longer_than_an_attach_waits() {
+        let (ws, _sent) = connection();
+        let mut buf = SessionBuffer::new();
+        buf.push(line(1));
+        ws.sessions.lock().await.insert("s1".to_string(), buf);
+
+        // A new connection re-attaches, and the reply is lost on the way.
+        reattach_messages(&mut *ws.sessions.lock().await);
+        deliver(&ws, &output(2)).await;
+        let read = ws.read_output("s1", 1, 0).await.unwrap();
+        assert!(read.entries.is_empty(), "held while the reply may come");
+
+        // A reader that would wait an hour reads what it held as the hold
+        // ends.
+        let start = Instant::now();
+        let read = ws.read_output("s1", 1, 3_600_000).await.unwrap();
+        assert_eq!(texts(&read.entries), ["line 2\n"]);
+        assert_eq!(start.elapsed(), ATTACH_REPLY_WAIT);
+        assert!(ws.sessions.lock().await["s1"].held.is_none());
+
+        // Live output that comes later is kept as it comes.
+        deliver(&ws, &output(3)).await;
+        let read = ws.read_output("s1", 2, 0).await.unwrap();
+        assert_eq!(texts(&read.entries), ["line 3\n"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_output_after_a_holds_end_comes_after_what_it_held() {
+        let mut buf = SessionBuffer::new();
+        buf.push(line(1));
+        buf.hold();
+        buf.live(line(2));
+        buf.live_mark("Process exited with code 0".into());
+        tokio::time::advance(ATTACH_REPLY_WAIT).await;
+        buf.live(line(3));
+        assert_eq!(
+            data(&buf),
+            [
+                "line 1\n",
+                "line 2\n",
+                "Process exited with code 0",
+                "line 3\n"
+            ]
+        );
+        assert!(buf.held.is_none());
+
+        // A reply that comes after is kept only above the highest kept.
+        buf.settle([line(2), line(3), line(4)]);
+        assert_eq!(buf.entries.back().unwrap().data, "line 4\n");
+        assert_eq!(buf.entries.len(), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_attach_holds_for_its_own_wait() {
+        let mut buf = SessionBuffer::new();
+        buf.hold();
+        tokio::time::advance(ATTACH_REPLY_WAIT / 2).await;
+        buf.hold();
+        tokio::time::advance(ATTACH_REPLY_WAIT / 2).await;
+        buf.live(line(1));
+        assert!(
+            buf.entries.is_empty(),
+            "held while the second reply may come"
+        );
+        tokio::time::advance(ATTACH_REPLY_WAIT / 2).await;
+        buf.live(line(2));
+        assert_eq!(data(&buf), ["line 1\n", "line 2\n"]);
+    }
+
+    #[tokio::test]
+    async fn the_relay_losing_the_device_ends_every_hold() {
+        let (ws, _sent) = connection();
+        for session_id in ["s1", "s2"] {
+            let mut buf = SessionBuffer::new();
+            buf.hold();
+            buf.live(line(1));
+            ws.sessions.lock().await.insert(session_id.to_string(), buf);
+        }
+        let lost = json!({ "type": "tunnel.device_disconnected", "reason": "tunnel closed" });
+        deliver(&ws, &lost).await;
+        let sessions = ws.sessions.lock().await;
+        for session_id in ["s1", "s2"] {
+            assert_eq!(data(&sessions[session_id]), ["line 1\n"]);
+            assert!(sessions[session_id].held.is_none());
+        }
     }
 }
