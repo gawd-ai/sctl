@@ -1703,10 +1703,10 @@ mod tests {
         assert_eq!(refusal.to_json()["route"]["role"], "tunnel");
         // A PPP link: point-to-point only.
         let links = vec![link(7, "ppp0", IFF_UP | IFF_POINTOPOINT)];
-        let addrs = vec![addr(7, [100, 64, 0, 9], 32, false)];
+        let addrs = vec![addr(7, [10, 64, 0, 9], 32, false)];
         let net = Network::from_dump(&links, &addrs, &[], &Lte::default());
-        let answer = kernel("ppp0", 7, None, [100, 64, 0, 9], RouteKind::Unicast);
-        let refusal = judge(&net, ip([100, 64, 0, 1]), &answer, None, false).unwrap_err();
+        let answer = kernel("ppp0", 7, None, [10, 64, 0, 9], RouteKind::Unicast);
+        let refusal = judge(&net, ip([10, 64, 0, 1]), &answer, None, false).unwrap_err();
         assert!(refusal.reason.contains("(tunnel)"), "{}", refusal.reason);
     }
 
@@ -1829,7 +1829,7 @@ mod tests {
             "{}",
             refusal.reason
         );
-        let refusal = judge(&net, ip([8, 8, 8, 8]), &answer, Some("eth1"), false).unwrap_err();
+        let refusal = judge(&net, ip([203, 0, 113, 8]), &answer, Some("eth1"), false).unwrap_err();
         assert_eq!(refusal.refused, Code::NotOnLan, "an internet address");
     }
 
