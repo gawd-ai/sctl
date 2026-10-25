@@ -5635,6 +5635,22 @@ mod attach_tests {
         handle_forwarded_session_message(state, ws_sink, subscribers, &msg).await;
     }
 
+    /// An attach in a task of its own, which may wait for its slot on the
+    /// request lane.
+    fn spawn_attach(
+        state: &AppState,
+        ws_sink: &WsSink,
+        subscribers: &Subscribers,
+        request_id: &'static str,
+        dedupes: bool,
+    ) -> tokio::task::JoinHandle<()> {
+        let (state, ws_sink, subscribers) =
+            (state.clone(), ws_sink.clone(), Arc::clone(subscribers));
+        tokio::spawn(async move {
+            attach(&state, &ws_sink, &subscribers, request_id, dedupes).await;
+        })
+    }
+
     fn numbers(text: &str) -> Vec<u64> {
         text.lines()
             .map(|line| line.strip_prefix("line ").unwrap().parse().unwrap())
@@ -5911,6 +5927,125 @@ mod attach_tests {
             "the stream carried every line"
         );
         assert_eq!(streamed, (1..=streamed.len() as u64).collect::<Vec<_>>());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_deduping_attach_queues_no_newer_batch_before_its_reply() {
+        const LINES: u64 = 10;
+        let dir = scratch("order");
+        let state = state_in(&dir);
+        let buffer = state.session_manager.insert_for_tests("s1").await;
+        // A request lane of one message, and room on the stream lane.
+        let (ws_sink, lanes) = ws_lanes(16, 1, 64);
+        let link = Link::new(lanes);
+        link.flowing.send(false).unwrap();
+        let subscribers: Subscribers = Arc::new(Mutex::new(HashMap::new()));
+
+        // The first client's attach starts the subscriber, and its reply,
+        // held by the stopped link, fills the request lane.
+        attach(&state, &ws_sink, &subscribers, "a", true).await;
+        assert_eq!(ws_sink.request_tx.capacity(), 0);
+        let cursor = Arc::clone(&subscribers.lock().await["s1"].cursor);
+
+        // A second client's attach waits for its slot on the request lane
+        // while the session prints, and the subscriber queues the lines on
+        // the stream lane.
+        let b = spawn_attach(&state, &ws_sink, &subscribers, "b", true);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!b.is_finished(), "the attach did not wait for its slot");
+        {
+            let mut buf = buffer.lock().await;
+            for n in 1..=LINES {
+                buf.push(OutputStream::Stdout, format!("line {n}\n"));
+            }
+        }
+        wait_until("the lines on the stream lane", || {
+            let queued =
+                ws_sink.stream_tx.capacity() < 64 && cursor.load(Ordering::Relaxed) == LINES;
+            async move { queued }
+        })
+        .await;
+
+        // The link flows: the first reply leaves, and the stream lane's
+        // batch with it while the second attach takes its slot.
+        link.flowing.send(true).unwrap();
+        b.await.unwrap();
+        wait_until("the second reply on the link", || {
+            let answered = link
+                .sent()
+                .iter()
+                .any(|m| m["type"] == "session.attached" && m["request_id"] == "b");
+            async move { answered }
+        })
+        .await;
+        let sent = link.sent();
+        let at = sent
+            .iter()
+            .position(|m| m["type"] == "session.attached" && m["request_id"] == "b")
+            .unwrap();
+        let replay_end = reply(&sent, "b")["entries"]
+            .as_array()
+            .unwrap()
+            .last()
+            .map_or(0, |e| e["seq"].as_u64().unwrap());
+
+        // Every batch that left before the reply ends at or below the
+        // replay's end.
+        let before: Vec<u64> = batches(&sent[..at])
+            .map(|m| m["seq"].as_u64().unwrap())
+            .collect();
+        assert!(!before.is_empty(), "no batch left before the reply");
+        assert!(
+            before.iter().all(|&seq| seq <= replay_end),
+            "a batch above the replay's end {replay_end} left before the reply: {before:?}"
+        );
+        assert_eq!(
+            numbers(&written_keeping_seq(&sent, "b")),
+            (1..=LINES).collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_attaches_at_once_leave_one_subscriber_running() {
+        const LINES: u64 = 20;
+        let dir = scratch("twice");
+        let state = state_in(&dir);
+        let buffer = state.session_manager.insert_for_tests("s1").await;
+        let (ws_sink, lanes) = ws_lanes(16, 1, 64);
+        let link = Link::new(lanes);
+        link.flowing.send(false).unwrap();
+        let subscribers: Subscribers = Arc::new(Mutex::new(HashMap::new()));
+
+        // An attach's reply, held by the stopped link, fills the request
+        // lane.
+        attach(&state, &ws_sink, &subscribers, "a", false).await;
+
+        // Two older clients attach at once: each ends the running
+        // subscriber and replays, waits to queue its reply, then starts a
+        // subscriber of its own.
+        let x = spawn_attach(&state, &ws_sink, &subscribers, "x", false);
+        let y = spawn_attach(&state, &ws_sink, &subscribers, "y", false);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!x.is_finished() && !y.is_finished());
+        link.flowing.send(true).unwrap();
+        x.await.unwrap();
+        y.await.unwrap();
+
+        // Once both run, the session prints: the stream carries each line
+        // once.
+        print_lines(Arc::clone(&buffer), LINES).await.unwrap();
+        wait_until("the last line on the link", || {
+            let last = batches(&link.sent()).last().map(|m| m["seq"].as_u64());
+            async move { last == Some(Some(LINES)) }
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            numbers(&streamed(&link.sent())),
+            (1..=LINES).collect::<Vec<_>>()
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
