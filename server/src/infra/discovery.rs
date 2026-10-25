@@ -14,7 +14,8 @@
 //!   under a no-gateway main-table route through a LAN-side interface
 //!   holding an address, and only on that interface. Any other subnet is
 //!   `not_swept` as `not_on_lan`, and arp-scan, which stays on the link,
-//!   searches it on the LAN-side interfaces.
+//!   searches it on the LAN-side interfaces. arp-scan runs only on a subnet
+//!   it can search within its limit, a /19 at most.
 //! - **The port probe** judges each host by the guard and connects from a
 //!   socket bound where the guard approved.
 //! - **A host's MAC** is the one seen answering during the scan: the
@@ -66,6 +67,13 @@ const AT_ONCE: usize = 32;
 /// nmap's and arp-scan's limit, and one ping's.
 const SWEEP_TIMEOUT_MS: u64 = 60_000;
 const PING_TIMEOUT_MS: u64 = 3_000;
+/// The most hosts arp-scan is asked to search in one subnet: a /19's. It
+/// paces its requests to 256 kbit/s, 380 to 500 a second, and asks each
+/// silent host twice (`--retry=2`), so a /19 takes 33 to 43 s, within
+/// [`SWEEP_TIMEOUT_MS`]. A /18 would not end in time, and a run cut at the
+/// limit keeps none of its answers: it would only fill the LAN with ARP
+/// broadcasts.
+const ARP_SCAN_MAX: u64 = 8190;
 /// Interfaces discovery leaves out by name, whatever their role: container
 /// bridges, veth pairs and legacy tunnels. The loopback is left out by its
 /// flag.
@@ -93,10 +101,11 @@ pub struct DiscoveredDevice {
 #[serde(rename_all = "snake_case")]
 pub enum NotSweptReason {
     /// It does not lie wholly under a no-gateway route through a LAN-side
-    /// interface holding an address: searched by ARP alone, on the LAN side.
+    /// interface holding an address: searched by ARP alone, on the LAN
+    /// side, when it is no larger than a /19.
     NotOnLan,
     /// It holds more hosts than the ping fallback pings, and neither nmap
-    /// nor arp-scan swept it.
+    /// nor arp-scan swept it: arp-scan searches at most a /19.
     TooLarge,
 }
 
@@ -1144,11 +1153,22 @@ impl Sweep {
 /// interface its route leaves by: nmap, else arp-scan, else the ping
 /// fallback, each tried when the one before found nothing; the fallback
 /// pings only what the guard passes there. Off it: arp-scan alone, from
-/// 0.0.0.0, on each LAN-side interface until one finds hosts.
+/// 0.0.0.0, on each LAN-side interface until one finds hosts. arp-scan
+/// runs only on a subnet it can search within its limit
+/// ([`ARP_SCAN_MAX`]).
 async fn sweep(probes: &dyn Probes, net: &Network, subnet: Cidr, own: &[Ipv4Addr]) -> Sweep {
+    let arp_scan_fits = subnet.host_count() <= ARP_SCAN_MAX;
+    if !arp_scan_fits {
+        debug!("Discovery: {subnet} holds more hosts than arp-scan searches within its limit");
+    }
     let Some(iface) = sweep_iface(net, subnet) else {
         let mut answered = Vec::new();
-        for lan in lan_ifaces(net) {
+        let searched = if arp_scan_fits {
+            lan_ifaces(net)
+        } else {
+            Vec::new()
+        };
+        for lan in searched {
             if let Some(found) = probes.arp_scan(&lan.name, subnet, true).await {
                 if !found.is_empty() {
                     debug!(
@@ -1179,7 +1199,12 @@ async fn sweep(probes: &dyn Probes, net: &Network, subnet: Cidr, own: &[Ipv4Addr
             return Sweep::swept(found);
         }
     }
-    if let Some(found) = probes.arp_scan(dev, subnet, false).await {
+    let arp_scan = if arp_scan_fits {
+        probes.arp_scan(dev, subnet, false).await
+    } else {
+        None
+    };
+    if let Some(found) = arp_scan {
         ran = true;
         if !found.is_empty() {
             debug!(
@@ -2283,6 +2308,86 @@ mod tests {
             [
                 "arp-scan br-lan 192.0.2.0/23",
                 "ports br-lan 192.0.2.1 from 192.0.2.1"
+            ]
+        );
+    }
+
+    /// arp-scan cannot search more than a /19 within its 60 s limit, and a
+    /// run cut at the limit keeps none of its answers, so it is not run on
+    /// a larger subnet: a /16 the unit holds is swept by nmap, else is
+    /// `too_large`; a /19 inside it is searched and a /18 is not; off the
+    /// LAN side a named /16 is not searched by ARP alone, and a /24 is.
+    #[tokio::test]
+    async fn arp_scan_runs_only_on_a_subnet_it_can_search_within_its_limit() {
+        let mut addrs = unit_addrs();
+        addrs[1] = addr(4, [10, 0, 0, 1], 16);
+        let mut routes = unit_routes();
+        routes[1] = route(Some(([10, 0, 0, 0], 16)), None, 4, 0);
+        let net = network(&unit_links(), &addrs, &routes);
+        let too_large = |text: &str| NotSwept {
+            cidr: text.to_string(),
+            reason: NotSweptReason::TooLarge,
+        };
+        let not_on_lan = |text: &str| NotSwept {
+            cidr: text.to_string(),
+            reason: NotSweptReason::NotOnLan,
+        };
+
+        // A scan given no subnets, without nmap.
+        let mut fake = Fake::on(net.clone());
+        fake.arp_scan = Some(HashMap::new());
+        let scanned = scan(&fake, &[], &no_progress()).await.unwrap();
+        assert_eq!(scanned.not_swept, [too_large("10.0.0.0/16")]);
+        assert_eq!(fake.log_of("arp-scan"), ["arp-scan eth1 192.168.8.0/24"]);
+        assert!(fake
+            .log_of("ping")
+            .iter()
+            .all(|p| p.starts_with("ping eth1 192.168.8.")));
+
+        // nmap sweeps it.
+        let mut fake = Fake::on(net.clone());
+        fake.nmap = Some(HashMap::new());
+        fake.arp_scan = Some(HashMap::new());
+        let scanned = scan(&fake, &requested(&["10.0.0.0/16"]), &no_progress())
+            .await
+            .unwrap();
+        assert!(scanned.not_swept.is_empty(), "{:?}", scanned.not_swept);
+        assert_eq!(fake.log_of("nmap"), ["nmap br-lan 10.0.0.0/16"]);
+        assert!(fake.log_of("arp-scan").is_empty(), "{:?}", fake.log());
+
+        // The bound: a /19's 8190 hosts, not a /18's.
+        let mut fake = Fake::on(net.clone());
+        fake.arp_scan = Some(HashMap::new());
+        let scanned = scan(
+            &fake,
+            &requested(&["10.0.32.0/19", "10.0.64.0/18"]),
+            &no_progress(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(scanned.not_swept, [too_large("10.0.64.0/18")]);
+        assert_eq!(fake.log_of("arp-scan"), ["arp-scan br-lan 10.0.32.0/19"]);
+        assert_eq!(ARP_SCAN_MAX, cidr("10.0.32.0/19").host_count());
+
+        // Off the LAN side, by ARP alone.
+        let mut fake = Fake::on(net);
+        fake.arp_scan = Some(HashMap::new());
+        let scanned = scan(
+            &fake,
+            &requested(&["172.16.0.0/16", "172.16.5.0/24"]),
+            &no_progress(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scanned.not_swept,
+            [not_on_lan("172.16.0.0/16"), not_on_lan("172.16.5.0/24")]
+        );
+        assert_eq!(
+            fake.log_of("arp-scan"),
+            [
+                "arp-scan br-lan 172.16.5.0/24 from 0.0.0.0",
+                "arp-scan eth1 172.16.5.0/24 from 0.0.0.0",
             ]
         );
     }
