@@ -17,10 +17,12 @@
 //!   searches it on the LAN-side interfaces.
 //! - **The port probe** judges each host by the guard and connects from a
 //!   socket bound where the guard approved.
-//! - **A host's MAC** is one seen answering during the scan: the sweep's ARP
-//!   answer, else the kernel's entry on the interface that reaches the host,
-//!   REACHABLE (or permanent) once the port probe is done, else the answer
-//!   to one ARP request. An address two MACs answered for gets none.
+//! - **A host's MAC** is the one seen answering during the scan: the
+//!   sweep's ARP answer, and the kernel's entry on the interface that
+//!   reaches the host, REACHABLE (or permanent) once the port probe is
+//!   done; with neither, the answer to one ARP request. An address two MACs
+//!   answered for gets none, whether the sweep heard both or the entry
+//!   names another MAC than the sweep's.
 //! - **The unit itself.** A host at an address the unit holds, or with one
 //!   of its MACs, carries `own`, the name of that interface.
 //!
@@ -944,8 +946,11 @@ struct Host {
     /// Where the guard let the port probe go.
     approved: Option<Approved>,
     open_ports: Vec<u16>,
-    /// Decided once the port probe is done.
+    /// The host's MAC once `decided`: none when no MAC or two were seen.
     mac: Option<Mac>,
+    /// Set once the port probe is done; until then the progress shows the
+    /// sweep's one MAC.
+    decided: bool,
     own: Option<String>,
     hostname: Option<String>,
 }
@@ -961,18 +966,21 @@ impl Host {
 }
 
 /// The devices as the answer and the progress show them. Before the MACs
-/// are decided, a host the sweep heard one MAC for shows it.
+/// are decided, a host the sweep heard one MAC for shows it; once they
+/// are, each shows its own, none included.
 fn devices(hosts: &BTreeMap<Ipv4Addr, Host>) -> Vec<DiscoveredDevice> {
     hosts
         .iter()
         .map(|(ip, host)| {
-            let mac = host
-                .mac
-                .or(match host.answered.as_slice() {
+            let mac = if host.decided {
+                host.mac
+            } else {
+                match host.answered.as_slice() {
                     [one] => Some(*one),
                     _ => None,
-                })
-                .map(|m| m.to_string());
+                }
+            };
+            let mac = mac.map(|m| m.to_string());
             DiscoveredDevice {
                 ip: ip.to_string(),
                 inferred_type: infer_type(&host.open_ports, mac.as_deref()),
@@ -1248,25 +1256,32 @@ async fn approve(probes: &dyn Probes, net: &Network, ip: Ipv4Addr) -> Option<App
 /// (ADR-012 decision 11).
 #[derive(Debug, PartialEq, Eq)]
 enum MacStep {
-    /// Decided: the sweep's one answer, none when two MACs answered, or the
-    /// kernel's REACHABLE or permanent entry on the interface that reaches
-    /// the host.
+    /// Decided: the one MAC seen answering, none when two were.
     Known(Option<Mac>),
-    /// Ask the wire: one ARP request.
+    /// None seen: ask the wire, one ARP request.
     Ask,
 }
 
+/// The MACs seen answering at a host's address: each the sweep heard, and
+/// the one the kernel's entry on the interface that reaches it names when
+/// that entry is REACHABLE or permanent. One is the host's MAC; two give
+/// none, the sweep's against the entry's too. A STALE, DELAY or PROBE
+/// entry is not one seen: it may name the device that held the address
+/// before, so it gives way to the sweep's answer, or leads to the ARP
+/// request.
 fn mac_step(answered: &[Mac], entry: Option<&Neighbour>) -> MacStep {
-    match answered {
+    let entry = entry
+        .filter(|e| e.state & (netlink::NUD_REACHABLE | netlink::NUD_PERMANENT) != 0)
+        .and_then(|e| e.lladdr)
+        .map(Mac);
+    let mut seen: Vec<Mac> = answered.to_vec();
+    if let Some(mac) = entry.filter(|m| !seen.contains(m)) {
+        seen.push(mac);
+    }
+    match seen.as_slice() {
+        [] => MacStep::Ask,
         [one] => MacStep::Known(Some(*one)),
         [_, _, ..] => MacStep::Known(None),
-        [] => match entry
-            .filter(|e| e.state & (netlink::NUD_REACHABLE | netlink::NUD_PERMANENT) != 0)
-            .and_then(|e| e.lladdr)
-        {
-            Some(mac) => MacStep::Known(Some(Mac(mac))),
-            None => MacStep::Ask,
-        },
     }
 }
 
@@ -1276,10 +1291,11 @@ fn one_mac(macs: &[Mac]) -> Option<Mac> {
     macs.iter().all(|m| *m == first).then_some(first)
 }
 
-/// Each host's MAC (ADR-012 decision 11): the sweep's answer, else the
-/// kernel's entry on the interface that reaches it, REACHABLE or permanent
-/// now, else one ARP request there. A host the guard keeps from the wire,
-/// or the unit's own, is asked nothing.
+/// Each host's MAC (ADR-012 decision 11): the one seen answering, by the
+/// sweep or in the kernel's entry on the interface that reaches it,
+/// REACHABLE or permanent now ([`mac_step`]); with none, one ARP request
+/// there. A host the guard keeps from the wire, or the unit's own, is asked
+/// nothing.
 async fn resolve_macs(probes: &dyn Probes, net: &Network, hosts: &mut BTreeMap<Ipv4Addr, Host>) {
     let entries = probes.neighbours().await.unwrap_or_else(|e| {
         debug!("Discovery: cannot read the neighbour table: {e}");
@@ -1287,6 +1303,7 @@ async fn resolve_macs(probes: &dyn Probes, net: &Network, hosts: &mut BTreeMap<I
     });
     let mut ask: Vec<(Ipv4Addr, String, Ipv4Addr)> = Vec::new();
     for (&ip, host) in hosts.iter_mut() {
+        host.decided = true;
         let reaches = host
             .approved
             .as_ref()
@@ -2235,16 +2252,37 @@ mod tests {
         assert_eq!(AT_ONCE, 32);
     }
 
-    /// ADR-012 decision 11, step by step.
+    /// ADR-012 decision 11, step by step: the sweep's answers and a
+    /// REACHABLE or permanent entry are each a MAC seen answering; one is
+    /// the host's, two give none; with none seen, the wire is asked.
     #[test]
-    fn a_host_s_mac_is_the_sweep_s_answer_else_a_reachable_entry_else_the_wire_s() {
+    fn a_host_s_mac_is_the_one_seen_by_the_sweep_or_a_reachable_entry_else_the_wire_s() {
         let entry = |state: u16| neighbour(4, state, "192.0.2.50", MAC_B);
-        assert_eq!(
-            mac_step(&[MAC_A], Some(&entry(NUD_REACHABLE))),
-            MacStep::Known(Some(MAC_A)),
-            "the sweep's answer over an older entry"
-        );
+        for state in [NUD_STALE, NUD_DELAY, 0x10, NUD_FAILED, NUD_INCOMPLETE] {
+            assert_eq!(
+                mac_step(&[MAC_A], Some(&entry(state))),
+                MacStep::Known(Some(MAC_A)),
+                "the sweep's answer over an older entry, {state:#x}"
+            );
+        }
+        for state in [NUD_REACHABLE, NUD_PERMANENT] {
+            assert_eq!(
+                mac_step(&[MAC_A], Some(&entry(state))),
+                MacStep::Known(None),
+                "the sweep heard one MAC and the entry names another, {state:#x}"
+            );
+            assert_eq!(
+                mac_step(&[MAC_B], Some(&entry(state))),
+                MacStep::Known(Some(MAC_B)),
+                "both name one MAC, {state:#x}"
+            );
+        }
+        assert_eq!(mac_step(&[MAC_A], None), MacStep::Known(Some(MAC_A)));
         assert_eq!(mac_step(&[MAC_A, MAC_C], None), MacStep::Known(None));
+        assert_eq!(
+            mac_step(&[MAC_A, MAC_B], Some(&entry(NUD_REACHABLE))),
+            MacStep::Known(None)
+        );
         for state in [NUD_REACHABLE, NUD_PERMANENT] {
             assert_eq!(
                 mac_step(&[], Some(&entry(state))),
@@ -2265,7 +2303,8 @@ mod tests {
     }
 
     /// TRD-9 3.5: the sweep's answer is the MAC, whatever an older entry
-    /// says, and no ARP request follows.
+    /// says (STALE before the sweep and still STALE after it), and no ARP
+    /// request follows.
     #[tokio::test]
     async fn a_sweep_s_answer_wins_over_an_older_entry() {
         let mut fake = Fake::on(unit());
@@ -2277,7 +2316,7 @@ mod tests {
             }],
         )]));
         fake.before = vec![neighbour(4, NUD_STALE, "192.0.2.50", MAC_A)];
-        fake.after = vec![neighbour(4, NUD_REACHABLE, "192.0.2.50", MAC_A)];
+        fake.after = vec![neighbour(4, NUD_STALE, "192.0.2.50", MAC_A)];
         let scanned = scan(&fake, &requested(&["192.0.2.0/24"]), &no_progress())
             .await
             .unwrap();
@@ -2285,6 +2324,45 @@ mod tests {
             device(&scanned, "192.0.2.50").mac.as_deref(),
             Some("02:00:00:00:00:0b")
         );
+        assert!(fake.log_of("arp").is_empty(), "{:?}", fake.log());
+    }
+
+    /// ADR-012 decision 11: nmap reports one MAC per host, and the kernel
+    /// keeps the first answer to its own request, so when two devices
+    /// answer at one address the two can name different MACs. A REACHABLE
+    /// or permanent entry that names another MAC than the sweep's is a
+    /// second MAC seen: the host gets none, and no ARP request follows.
+    #[tokio::test]
+    async fn a_reachable_entry_naming_another_mac_than_the_sweep_s_gives_none() {
+        let mut fake = Fake::on(unit());
+        let heard = |at: &str| Answered {
+            ip: ip(at),
+            mac: Some(MAC_B),
+        };
+        fake.nmap = Some(HashMap::from([(
+            cidr("192.0.2.0/24"),
+            vec![
+                heard("192.0.2.73"),
+                heard("192.0.2.74"),
+                heard("192.0.2.75"),
+                heard("192.0.2.76"),
+            ],
+        )]));
+        fake.after = vec![
+            neighbour(4, NUD_REACHABLE, "192.0.2.73", MAC_A),
+            neighbour(4, NUD_PERMANENT, "192.0.2.74", MAC_A),
+            neighbour(4, NUD_REACHABLE, "192.0.2.75", MAC_B),
+            // On another interface: not the one that reaches the host.
+            neighbour(3, NUD_REACHABLE, "192.0.2.76", MAC_A),
+        ];
+        let scanned = scan(&fake, &requested(&["192.0.2.0/24"]), &no_progress())
+            .await
+            .unwrap();
+        let mac = |at: &str| device(&scanned, at).mac.clone();
+        assert_eq!(mac("192.0.2.73"), None, "nmap's B, a REACHABLE A");
+        assert_eq!(mac("192.0.2.74"), None, "nmap's B, a permanent A");
+        assert_eq!(mac("192.0.2.75").as_deref(), Some("02:00:00:00:00:0b"));
+        assert_eq!(mac("192.0.2.76").as_deref(), Some("02:00:00:00:00:0b"));
         assert!(fake.log_of("arp").is_empty(), "{:?}", fake.log());
     }
 

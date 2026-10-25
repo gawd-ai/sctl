@@ -1090,15 +1090,17 @@ A scan sends only on the unit's LAN side, as the net tools' guard judges it
 4. **Names.** A reverse lookup of each host through the unit's resolver,
    which may answer over the LTE (ADR-012 section 7).
 
-A host's `mac` is one seen answering during the scan: an ARP answer the
-sweep received (arp-scan's, or nmap's report of one); else the kernel's
-neighbour entry for the host on the interface that reaches it, read once
-the port probe is done, when it is REACHABLE or permanent; else the answer
-to one ARP request for the host on that interface. An address two MACs
-answered for gets none. A STALE, DELAY or PROBE entry is never reported:
-it may name the device that held the address before. A host the guard
-keeps from the wire gets the sweep's MAC or none, and the unit's own
-addresses get none.
+A host's `mac` is the one MAC seen answering at its address during the
+scan. Two things count as seen: an ARP answer the sweep received
+(arp-scan's, or nmap's report of one), and the kernel's neighbour entry
+for the host on the interface that reaches it, read once the port probe is
+done, when it is REACHABLE or permanent then. A host with neither gets the
+answer to one ARP request on that interface. An address two MACs answered
+for gets none, whether the sweep heard both or the entry names another MAC
+than the sweep's. A STALE, DELAY or PROBE entry is never reported and
+never outweighs the sweep's answer: it may name the device that held the
+address before. A host the guard keeps from the wire gets the sweep's MAC
+or none, and the unit's own addresses get none.
 
 Response `200`: `{ts, devices: [{ip, mac, hostname, open_ports,
 inferred_type, mdns_services, own?}], scan_duration_ms, not_swept: [{cidr,
