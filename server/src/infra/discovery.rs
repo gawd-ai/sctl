@@ -2156,16 +2156,29 @@ mod tests {
 
     /// TRD-9 3.5: with no subnets, a scan picks the unit's own `lan`
     /// networks only: never the LTE, the mesh or a container bridge, nor a
-    /// port that is down.
+    /// port that is down, nor the /24 guessed from a default route through
+    /// the wired WAN port, which the subnet list gives role `lan`.
     #[test]
     fn a_scan_given_no_subnets_picks_the_unit_s_own_lan_networks() {
+        let mut routes = unit_routes();
+        routes.push(route(None, Some([192, 168, 9, 1]), 3, 50));
+        let net = network(&unit_links(), &unit_addrs(), &routes);
+        assert!(
+            listed_subnets(&net)
+                .iter()
+                .any(|s| s.cidr == "192.168.9.0/24"
+                    && s.role == Role::Lan
+                    && s.source == SubnetSource::Route),
+            "listed, with role lan"
+        );
         assert_eq!(
-            default_subnets(&unit()),
+            default_subnets(&net),
             [cidr("192.168.8.0/24"), cidr("192.0.2.0/24")]
         );
+        assert_eq!(default_subnets(&unit()), default_subnets(&net));
         let mut links = unit_links();
         links[2].flags &= !IFF_UP;
-        let down = network(&links, &unit_addrs(), &unit_routes());
+        let down = network(&links, &unit_addrs(), &routes);
         assert_eq!(default_subnets(&down), [cidr("192.0.2.0/24")]);
     }
 
@@ -2233,9 +2246,14 @@ mod tests {
     /// an LTE bearer and a mesh, sweeps the wired networks only, on their
     /// own interfaces; the port probe goes where the guard approves, from
     /// the address it bound; the unit's own addresses are never pinged.
+    /// The /24 guessed from a default route through the wired WAN port is
+    /// not swept, nor searched, nor named in `not_swept`.
     #[tokio::test]
     async fn a_scan_given_no_subnets_sweeps_only_the_lan() {
-        let mut fake = Fake::on(unit());
+        let mut routes = unit_routes();
+        routes.push(route(None, Some([192, 168, 9, 1]), 3, 50));
+        let mut fake = Fake::on(network(&unit_links(), &unit_addrs(), &routes));
+        fake.arp_scan = Some(HashMap::new());
         fake.up = vec![ip("192.0.2.10"), ip("192.168.8.1")];
         fake.open = HashMap::from([(ip("192.0.2.10"), vec![80, 7000])]);
         fake.after = vec![
@@ -2277,6 +2295,11 @@ mod tests {
         assert_eq!(
             device(&scanned, "192.168.8.1").mac.as_deref(),
             Some("02:00:00:00:00:0b")
+        );
+        assert!(
+            fake.log().iter().all(|l| !l.contains("192.168.9.")),
+            "nothing for the guessed /24: {:?}",
+            fake.log_of("arp-scan")
         );
     }
 
