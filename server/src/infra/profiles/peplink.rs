@@ -1110,4 +1110,86 @@ mod tests {
             "an ethernet WAN has no radio keys"
         );
     }
+
+    fn with_login(password: &str) -> CheckContext {
+        CheckContext {
+            credential: Some(crate::infra::Credential {
+                username: "admin".into(),
+                password: password.into(),
+            }),
+            ..CheckContext::default()
+        }
+    }
+
+    /// ADR-012 decision 9: the login is a stored secret, so it goes only
+    /// where the net tools' guard approves. A broadcast base is refused
+    /// before any socket opens, and the detail quotes no password.
+    #[tokio::test]
+    async fn a_login_the_guard_refuses_is_not_sent() {
+        let r = check(
+            &with_login("p4ss-n0t-sent"),
+            "http://255.255.255.255",
+            None,
+            Some(600),
+        )
+        .await;
+        assert!(!r.ok, "{}", r.detail);
+        assert!(
+            r.detail.starts_with("API NOT SENT (not_unicast): "),
+            "off the LAN it reads down with the guard's reason: {}",
+            r.detail
+        );
+        assert!(!r.detail.contains("p4ss"), "{}", r.detail);
+    }
+
+    /// The login goes where the guard approved: here the unit's own
+    /// loopback, from the source address it bound.
+    #[tokio::test]
+    async fn the_login_goes_where_the_guard_approved() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, peer) = listener.accept().await.unwrap();
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 4096];
+            // The head, then as much body as Content-Length says.
+            while let Ok(n @ 1..) = stream.read(&mut buf).await {
+                seen.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&seen).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let want = text
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if seen.len() >= end + 4 + want {
+                        break;
+                    }
+                }
+            }
+            let reply = "HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"stat\":\"fail\"}";
+            stream.write_all(reply.as_bytes()).await.unwrap();
+            (peer, String::from_utf8_lossy(&seen).to_string())
+        });
+        let r = check(
+            &with_login("p4ss-l00pback"),
+            &format!("http://{addr}"),
+            None,
+            Some(3000),
+        )
+        .await;
+        assert!(
+            r.detail.starts_with("API LOGIN FAILED"),
+            "the login was answered: {}",
+            r.detail
+        );
+        let (peer, login) = server.await.unwrap();
+        assert!(login.starts_with("POST /api/login "), "{login}");
+        assert!(login.contains("\"username\":\"admin\""), "{login}");
+        assert_eq!(peer.ip(), std::net::Ipv4Addr::LOCALHOST);
+    }
 }
