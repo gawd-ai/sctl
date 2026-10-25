@@ -501,9 +501,10 @@ pub struct SubnetEntry {
     /// L3 interfaces like `wg0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
-    /// How this subnet was learned. Lets the UI show provenance and the
-    /// scanner choose the right probe strategy (e.g. `--arpspa=0.0.0.0`
-    /// for `Route`-sourced subnets where the agent has no local IP).
+    /// How this subnet was learned, for the UI. A scan does not read it:
+    /// it judges each subnet by the unit's routes, and searches one off
+    /// the LAN side by ARP alone from 0.0.0.0, whatever its source (ADR-012
+    /// decision 10).
     #[serde(default)]
     pub source: SubnetSource,
     /// The interface's role by the net tools' guard (ADR-012 decision 2):
