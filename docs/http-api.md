@@ -1053,16 +1053,66 @@ Response `200`: `{status: "ok", id, existed, persisted}`.
 
 ### `POST /api/infra/discover`
 
-Run a LAN discovery scan (ARP, ping sweep, port probe, identification) and
-return the results synchronously — can take on the order of minutes; poll
+Run a LAN discovery scan (neighbour table, sweep, port probe, names) and
+return the results when it ends, which can take minutes; poll
 `GET /api/infra/discover/progress` from another request for live progress.
 **Auth: API key Bearer.**
 
-Request body: `{subnets?: ["192.168.1.0/24", ...]}` — auto-detected from
-the routing table when omitted or empty.
+Request body: `{subnets?: ["192.168.1.0/24", ...]}`. With none, or an
+empty list, the scan sweeps the networks the unit holds an address on, on
+its LAN-side interfaces: the `addr` subnets of up `lan` interfaces in
+[`GET /api/infra/discover/subnets`](#get-apiinfradiscoversubnets). Its LTE
+and tunnel networks are never swept, and a `route` or `arp` subnet is swept
+only when a request names it. An entry that is not an IPv4 CIDR is left
+out.
 
-Response `200`: discovery results (`devices` found with addresses, open
-ports, and identification hints).
+A scan sends only on the unit's LAN side, as the net tools' guard judges it
+(ADR-012; the guide's "Network tools"):
+
+1. **Neighbours.** The kernel's neighbour table, read over netlink, gives
+   the hosts on LAN-side interfaces: an entry holding a MAC the kernel
+   would send to, at a unicast address. Their MACs are not taken from it.
+2. **Sweep.** A subnet that lies wholly under a main-table route with no
+   gateway through a LAN-side interface holding an address is swept on that
+   interface only: `nmap -sn`, else `arp-scan` from the interface's address,
+   else, for a subnet of at most 254 hosts, one ping to each host, 32 at a
+   time, the network and broadcast addresses and the unit's own left out.
+   Each runs when the one before found nothing. Any other subnet (an LTE or
+   tunnel network, one behind a gateway, one the unit has lost its address
+   on) is not swept: `arp-scan` from 0.0.0.0, which stays on the link,
+   searches it on each LAN-side interface, bridges first, until one finds
+   hosts. A LAN subnet of more than 254 hosts that neither nmap nor
+   arp-scan swept is not swept either. The tools a unit lacks are skipped.
+3. **Ports.** The guard judges each host. A host it approves gets a TCP
+   connect to each of 22, 80, 443, 554, 8080, 8443, 161, 53, 3389 and 1337,
+   2 s each, from a socket bound to the interface and source address it
+   approved, at most 32 hosts at once; any other host gets none.
+4. **Names.** A reverse lookup of each host through the unit's resolver,
+   which may answer over the LTE (ADR-012 section 7).
+
+A host's `mac` is one seen answering during the scan: an ARP answer the
+sweep received (arp-scan's, or nmap's report of one); else the kernel's
+neighbour entry for the host on the interface that reaches it, read once
+the port probe is done, when it is REACHABLE or permanent; else the answer
+to one ARP request for the host on that interface. An address two MACs
+answered for gets none. A STALE, DELAY or PROBE entry is never reported:
+it may name the device that held the address before. A host the guard
+keeps from the wire gets the sweep's MAC or none, and the unit's own
+addresses get none.
+
+Response `200`: `{ts, devices: [{ip, mac, hostname, open_ports,
+inferred_type, mdns_services, own?}], scan_duration_ms, not_swept: [{cidr,
+reason}]}`.
+
+- `own`: present on a host that is the unit itself, naming the interface
+  that holds its address, or else the one whose MAC answered for it (a
+  bridge before its ports). The unit's own addresses in a swept subnet are
+  listed without a probe.
+- `not_swept`: each subnet the scan did not sweep, in network form, and
+  why: `not_on_lan` (searched by ARP alone, as above) or `too_large`.
+
+Errors: `503` `NET_UNAVAILABLE` when the unit's network cannot be read:
+the scan judges nothing, so it sends nothing.
 
 ### `GET /api/infra/discover/progress`
 
@@ -1070,16 +1120,35 @@ Current discovery scan progress. **Auth: API key Bearer.**
 
 Response `200`: `{active, phase, phase_number, total_phases, hosts_found,
 devices, started_at, elapsed_ms}`; `{active: false, phase: "idle"}` when no
-scan is running.
+scan is running. `phase` is `arp` (the neighbour table), `ping` (the sweep),
+`ports`, `hostname`, then `complete`, or `error` when the unit's network
+could not be read. A device's `mac` is the sweep's until the scan decides
+it.
 
 ### `GET /api/infra/discover/subnets`
 
-Auto-detected LAN subnets (from `ip` routing information). **Auth: API key
-Bearer.**
+The unit's subnets, each with its role and how it was learned. The tunnel's
+`tunnel.infra.discover.subnets` answers the same. **Auth: API key Bearer.**
 
-Response `200`: `{subnets: [{cidr, ...}]}`.
+Response `200`: `{subnets: [{iface, cidr, host_ip?, mac?, source,
+role}]}`, `cidr` in network form and `mac` the interface's.
 
-Errors: `503` `EXEC_FAILED` (the `ip` command failed).
+- `source`: `addr`, a network an interface holds, `host_ip` being the
+  unit's address there; `route`, a /24 around a default route's gateway
+  that no network of its interface holds; `arp`, a /24 a 5 s passive sniff
+  of the LAN-side interfaces heard (only when `tcpdump` is installed).
+- `role`: the interface's, by the net tools' guard (ADR-012 decision 2):
+  `lte` for the agent's `[lte] interface` (with none the unit has, an
+  interface named `wwan*`, `qmimux*` or `usb*`); `tunnel` for a
+  point-to-point or no-ARP link (WireGuard, PPP, a raw-IP modem); else
+  `lan`, a wired WAN port included.
+
+The loopback, container bridges (`docker*`), veth pairs (`veth*`) and
+legacy tunnels (`tun*`) are left out. A scan given no subnets sweeps the
+`addr` subnets of up `lan` interfaces.
+
+Errors: `503` `NET_UNAVAILABLE` when the unit's network cannot be read; the
+body's `reason` is `ip_command_failed`, its name from before 0.6.12.
 
 ---
 

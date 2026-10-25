@@ -1868,7 +1868,7 @@ async fn handle_relay_message(
             handle_tunnel_infra_discover_progress(state, ws_sink, request_id.as_deref()).await;
         }
         "tunnel.infra.discover.subnets" => {
-            handle_tunnel_infra_discover_subnets(ws_sink, request_id.as_deref()).await;
+            handle_tunnel_infra_discover_subnets(state, ws_sink, request_id.as_deref()).await;
         }
         "tunnel.infra.config" => {
             handle_tunnel_infra_config(state, ws_sink, &msg, request_id.as_deref()).await;
@@ -4423,12 +4423,18 @@ async fn handle_tunnel_infra_discover_progress(
     .await;
 }
 
-/// Handle `tunnel.infra.discover.subnets` — return auto-detected LAN subnets.
-async fn handle_tunnel_infra_discover_subnets(ws_sink: &WsSink, request_id: Option<&str>) {
-    let (status, body) = match crate::infra::discovery::auto_detect_subnets().await {
-        Ok(subnets) => (200, json!({ "subnets": subnets })),
-        Err(e) => (503, json!({ "error": e, "reason": "ip_command_failed" })),
-    };
+/// Handle `tunnel.infra.discover.subnets`: the subnets route's answer, each
+/// subnet's role by the agent's `[lte] interface` (ADR-012).
+async fn handle_tunnel_infra_discover_subnets(
+    state: &AppState,
+    ws_sink: &WsSink,
+    request_id: Option<&str>,
+) {
+    let (status, body) =
+        match crate::infra::routes::discover_subnets(axum::extract::State(state.clone())).await {
+            Ok(axum::Json(body)) => (200, body),
+            Err((status, axum::Json(body))) => (status.as_u16(), body),
+        };
     send_response_async(
         ws_sink,
         json!({

@@ -307,7 +307,7 @@ LTE/cellular signal monitoring and the autonomous recovery watchdog
 | `device` | *(none)* | AT serial device hint. `[comms].device` takes precedence; the Quectel provider autodetects via sysfs. |
 | `poll_interval_secs` | `60` | Seconds between LTE signal polls. |
 | `watchdog` | `true` | Enable the LTE watchdog for autonomous modem recovery. It only acts when the tunnel is down and grace has elapsed, and diagnoses from kernel truth (interface IPv4 + interface-bound ping). |
-| `interface` | `"wwan0"` | Network interface name for the LTE modem (IP checks, speed tests, interface-bound pings). The net tools and the Infra checks that send a secret never send by it (ADR-012). |
+| `interface` | `"wwan0"` | Network interface name for the LTE modem (IP checks, speed tests, interface-bound pings). The net tools, the Infra checks that send a secret and a discovery scan's sweep and port probe never send by it, and the discovery subnet list gives its networks the role `lte` (ADR-012). |
 | `speed_test_url` | *(none)* | Download speed-test URL for band scans. |
 | `speed_test_upload_url` | *(none)* | Upload speed-test URL for band scans (server must accept POST data). |
 | `reachability_host` | *(derived)* | Host pinged for internet reachability before modem escalation. Default: the relay host from `tunnel.url`, else `8.8.8.8`. |

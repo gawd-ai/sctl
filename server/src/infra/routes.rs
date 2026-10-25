@@ -311,14 +311,22 @@ pub async fn discover_progress(State(state): State<AppState>) -> Json<Value> {
     )
 }
 
-/// `GET /api/infra/discover/subnets` — return auto-detected LAN subnets.
-pub async fn discover_subnets() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match super::discovery::auto_detect_subnets().await {
+/// `GET /api/infra/discover/subnets`: the unit's subnets, each with its
+/// role by the agent's `[lte] interface` (ADR-012) and its source. The
+/// tunnel's `tunnel.infra.discover.subnets` answers with this too.
+///
+/// `503 NET_UNAVAILABLE` when the unit's network cannot be read; `reason`
+/// keeps its name from before 0.6.12, when an `ip` command read it.
+pub async fn discover_subnets(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let lte = crate::net_tools::guard::Lte::from_config(Some(&state.config));
+    match super::discovery::auto_detect_subnets(&lte).await {
         Ok(subnets) => Ok(Json(json!({ "subnets": subnets }))),
         Err(e) => Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
-                json!({ "error": e, "reason": "ip_command_failed", "code": "EXEC_FAILED", "message": e }),
+                json!({ "error": e, "reason": "ip_command_failed", "code": crate::error::codes::NET_UNAVAILABLE, "message": e }),
             ),
         )),
     }

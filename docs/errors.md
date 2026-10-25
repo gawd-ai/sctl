@@ -122,7 +122,7 @@ one status depending on the route.
 | `SERVER_CONFIG_ERROR` | 500 | The server's own configuration is broken (e.g. no API key set) |
 | `TOO_MANY_CONNECTIONS` | 429 | Connection-count limit reached (SSE) |
 | `INFRA_UNAVAILABLE` | 404 | Infra monitoring subsystem not available on this device |
-| `NET_UNAVAILABLE` | 503 | The device cannot read its network from the kernel (`GET /api/net` in relay mode, or no route socket) |
+| `NET_UNAVAILABLE` | 503 | The device cannot read its network from the kernel (`GET /api/net` in relay mode, or no route socket). A discovery scan then sends nothing, and `GET /api/infra/discover/subnets` keeps `reason: "ip_command_failed"` beside it |
 
 ## Comms provider codes
 

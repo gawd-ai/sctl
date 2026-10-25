@@ -22,7 +22,7 @@
 //! activity log keeps the command. That string is a constant: the binary's
 //! path and the community reach it through the request's environment.
 //!
-//! The cases are 1 to 8 of TRD-9 3.4; case 9, a scan, comes with 3.5.
+//! The cases are 1 to 9 of TRD-9 3.4, case 9 being a scan (3.5).
 //!
 //! Needs root, so it is ignored by default. Build it as yourself, then run
 //! the binary with sudo:
@@ -635,6 +635,25 @@ impl RunningAgent {
     }
 }
 
+impl RunningAgent {
+    /// Start the agent and wait until it answers.
+    fn answering(ns: &str, config: &Path, dir: &Path) -> Self {
+        let agent = Self::start(ns, config, dir);
+        let started = Instant::now();
+        loop {
+            if matches!(try_api(ns, "GET", "/api/health", None), Ok((200, _))) {
+                return agent;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the agent answers: {}",
+                std::fs::read_to_string(dir.join("agent.err")).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
 impl Drop for RunningAgent {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -725,6 +744,7 @@ fn the_net_tools_send_only_on_the_lan_to_the_device_expected() {
     case_6_expect_mac(&lab, &env, &received, &unit, &twin);
     case_7_redirects(u, &env, &received, &unit, &lte);
     case_8_the_community(&lab, &config, &env, &snmp);
+    case_9_a_scan(&lab, &config, &unit, &lte, &mesh);
 
     // On every wire, the community travels only to and from the target:
     // never by the LTE veth, never to the twin or the mesh. The Peplink
@@ -1521,19 +1541,7 @@ fn case_8_the_community(lab: &Lab, config: &Path, env: &[(&str, &str)], snmp: &A
     // Through the agent: its exec gives the command SCTL_AGENT_CONFIG, the
     // activity log keeps the command as written, and the Infra SNMP check's
     // detail quotes no community.
-    let agent = RunningAgent::start(u, config, &lab.dir);
-    let started = Instant::now();
-    loop {
-        if matches!(try_api(u, "GET", "/api/health", None), Ok((200, _))) {
-            break;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "the agent answers: {}",
-            std::fs::read_to_string(lab.dir.join("agent.err")).unwrap_or_default()
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    let agent = RunningAgent::answering(u, config, &lab.dir);
     for (command, host) in [
         (EXEC_SET_TARGET, TARGET),
         (EXEC_SET_BEHIND_GATEWAY, BEHIND_GATEWAY),
@@ -1639,4 +1647,183 @@ fn case_8_the_community(lab: &Lab, config: &Path, env: &[(&str, &str)], snmp: &A
         assert!(!text.contains(LOGIN_PASSWORD), "the login in {log}");
     }
     eprintln!("case 8: the community reaches the agent and shows nowhere else");
+}
+
+/// A frame of Phase 4's reverse lookups, which go wherever the unit's
+/// resolver sends them (ADR-012 section 7), the LTE included: DNS over UDP,
+/// the ARP that finds the LTE gateway, and the ICMP error a resolver that
+/// is not there answers with. A sweep or a port probe is none of these.
+fn phase_4(frame: &Frame) -> bool {
+    let b = &frame.bytes;
+    match frame.ethertype() {
+        0x0806 => frame.arp_about().is_some_and(|at| {
+            at == Ipv4Addr::new(198, 51, 100, 1) || at == Ipv4Addr::new(198, 51, 100, 2)
+        }),
+        0x0800 if b.len() >= 34 => {
+            let l4 = 14 + usize::from(b[14] & 0x0f) * 4;
+            let port =
+                |at: usize| (b.len() >= at + 2).then(|| u16::from_be_bytes([b[at], b[at + 1]]));
+            match b[23] {
+                17 => port(l4) == Some(53) || port(l4 + 2) == Some(53),
+                1 => b.get(l4) == Some(&3),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// TRD-9 3.4 case 9 and 3.5 (ADR-012 decisions 10 to 13): a scan through
+/// the agent sweeps the unit's LAN network only, reports the MACs it saw
+/// and marks the unit's own address; named subnets off the LAN side are
+/// not swept. Nothing goes by the LTE veth or the mesh, Phase 4's lookups
+/// aside.
+fn case_9_a_scan(lab: &Lab, config: &Path, unit: &Capture, lte: &Capture, mesh: &Capture) {
+    let u = lab.unit.as_str();
+    let agent = RunningAgent::answering(u, config, &lab.dir);
+    // The monitor case 8 configured stops, so the captures see the scan.
+    let (status, body) = api(u, "DELETE", "/api/infra/config", None);
+    assert_eq!(status, 200, "{body}");
+
+    // The subnets route lists all three networks with their role.
+    let (status, body) = api(u, "GET", "/api/infra/discover/subnets", None);
+    assert_eq!(status, 200, "{body}");
+    let listed: Value = serde_json::from_str(&body).unwrap();
+    let role = |cidr: &str| {
+        listed["subnets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["cidr"] == cidr && s["source"] == "addr")
+            .map(|s| s["role"].clone())
+    };
+    assert_eq!(role("192.0.2.0/24"), Some(json!("lan")), "{body}");
+    assert_eq!(role("198.51.100.0/24"), Some(json!("lte")), "{body}");
+    assert_eq!(role("10.99.0.0/24"), Some(json!("tunnel")), "{body}");
+
+    let nothing_off_the_lan = |what: &str, mark: (usize, usize, usize)| {
+        let (unit_mark, lte_mark, mesh_mark) = mark;
+        let by_lte: Vec<Frame> = lte
+            .since(lte_mark)
+            .into_iter()
+            .filter(|f| !phase_4(f))
+            .collect();
+        assert!(
+            by_lte.is_empty(),
+            "{what}: nothing by the LTE veth: {by_lte:?}"
+        );
+        let by_mesh = mesh.since(mesh_mark);
+        assert!(
+            by_mesh.is_empty(),
+            "{what}: nothing by the mesh: {by_mesh:?}"
+        );
+        let out: Vec<Frame> = unit
+            .since(unit_mark)
+            .into_iter()
+            .filter(|f| f.outgoing && (f.dev == "lte9" || f.dev == "wg9") && !phase_4(f))
+            .collect();
+        assert!(
+            out.is_empty(),
+            "{what}: the unit sent nothing off the LAN: {out:?}"
+        );
+    };
+
+    // The target's first address is new to the unit, so the sweep finds it
+    // first; its second is known by a STALE entry naming the twin, as after
+    // an address shuffle.
+    ip(&["-n", u, "neigh", "flush", "dev", "lan0"]);
+    ip(&[
+        "-n",
+        u,
+        "neigh",
+        "replace",
+        "192.0.2.11",
+        "lladdr",
+        TWIN_MAC,
+        "dev",
+        "lan0",
+        "nud",
+        "stale",
+    ]);
+    let mark = (unit.mark(), lte.mark(), mesh.mark());
+    let (status, body) = api(u, "POST", "/api/infra/discover", Some(&json!({})));
+    assert_eq!(status, 200, "{body}");
+    let scan: Value = serde_json::from_str(&body).unwrap();
+    nothing_off_the_lan("a default scan", mark);
+    assert_eq!(scan["not_swept"], json!([]), "{body}");
+    let devices = scan["devices"].as_array().unwrap();
+    let found = |at: Ipv4Addr| {
+        devices
+            .iter()
+            .find(|d| d["ip"] == at.to_string())
+            .unwrap_or_else(|| panic!("{at} was found: {body}"))
+    };
+    for host in [TARGET, OTHER] {
+        assert_eq!(found(host)["mac"], TARGET_MAC, "{host}: {body}");
+        assert_eq!(found(host).get("own"), None, "{body}");
+    }
+    assert!(
+        found(TARGET)["open_ports"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(HTTP_PORT)),
+        "the port probe reached the target: {body}"
+    );
+    assert_eq!(found(Ipv4Addr::new(192, 0, 2, 1))["own"], "lan0", "{body}");
+    assert!(
+        devices.iter().all(|d| d["mac"] != TWIN_MAC),
+        "the twin's stale MAC is never reported: {body}"
+    );
+    assert!(
+        devices
+            .iter()
+            .all(|d| d["ip"].as_str().is_some_and(|a| a.starts_with("192.0.2."))),
+        "only the LAN network: {body}"
+    );
+
+    // Named subnets off the LAN side: one behind the LTE gateway, one the
+    // unit has no address or route for, the LTE bearer's network and the
+    // mesh. None is swept, and none gets an IPv4 packet.
+    let named = [
+        "203.0.113.0/24",
+        "192.168.77.0/24",
+        "198.51.100.0/24",
+        "10.99.0.0/24",
+    ];
+    let mark = (unit.mark(), lte.mark(), mesh.mark());
+    let (status, body) = api(
+        u,
+        "POST",
+        "/api/infra/discover",
+        Some(&json!({ "subnets": named })),
+    );
+    assert_eq!(status, 200, "{body}");
+    let scan: Value = serde_json::from_str(&body).unwrap();
+    nothing_off_the_lan("named subnets", mark);
+    let not_swept: Vec<Value> = named
+        .iter()
+        .map(|cidr| json!({"cidr": cidr, "reason": "not_on_lan"}))
+        .collect();
+    assert_eq!(scan["not_swept"], json!(not_swept), "{body}");
+    let inside = |at: Ipv4Addr| {
+        named.iter().any(|cidr| {
+            let (net, prefix) = cidr.split_once('/').unwrap();
+            let net: Ipv4Addr = net.parse().unwrap();
+            let netmask = u32::MAX << (32 - prefix.parse::<u32>().unwrap());
+            u32::from(at) & netmask == u32::from(net)
+        })
+    };
+    let sent: Vec<Frame> = unit
+        .since(mark.0)
+        .into_iter()
+        .filter(|f| f.outgoing && f.dev != "lo" && !phase_4(f) && f.ipv4_dst().is_some_and(inside))
+        .collect();
+    assert!(
+        sent.is_empty(),
+        "no IPv4 packet to a named subnet: {sent:?}"
+    );
+    drop(agent);
+    eprintln!(
+        "case 9: a scan sweeps the LAN only, with the MACs it saw and its own address marked"
+    );
 }

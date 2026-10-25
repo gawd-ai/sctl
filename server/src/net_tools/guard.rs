@@ -39,13 +39,13 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{json, Value};
 use tokio::io::unix::AsyncFd;
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
 use crate::config::Config;
-use crate::netwatch::netlink::{self, Addr, Link, NlSocket, Order, Route};
+use crate::netwatch::netlink::{self, Addr, Link, Neighbour, NlSocket, Order, Route};
 use crate::netwatch::source::{self, KernelRoute, RouteKind};
 
 /// The variable the agent sets, in the environment of every command it
@@ -57,7 +57,7 @@ pub const AGENT_CONFIG_ENV: &str = "SCTL_AGENT_CONFIG";
 const BEARER_PREFIXES: [&str; 3] = ["wwan", "qmimux", "usb"];
 
 /// The longest wait for answers to the ARP request, and the shortest.
-const ARP_WAIT_MAX: Duration = Duration::from_secs(1);
+pub(crate) const ARP_WAIT_MAX: Duration = Duration::from_secs(1);
 const ARP_WAIT_MIN: Duration = Duration::from_millis(100);
 /// After the first answer, how long a second one is still waited for.
 const ARP_SETTLE: Duration = Duration::from_millis(300);
@@ -114,8 +114,8 @@ impl fmt::Display for Code {
     }
 }
 
-/// What an interface is to the guard.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+/// What an interface is to the guard, and to discovery's subnet list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     /// Takes ARP, is not point-to-point and is not the LTE bearer: the
@@ -340,6 +340,11 @@ impl Iface {
         self.up() && !self.loopback() && self.role == Role::Lan
     }
 
+    /// A port of a bridge or a bond, which stands for it.
+    pub fn enslaved(&self) -> bool {
+        self.enslaved
+    }
+
     /// The role, as a view shows it: none for the loopback.
     fn view_role(&self) -> Option<Role> {
         (!self.loopback()).then_some(self.role)
@@ -479,12 +484,17 @@ impl Network {
         self.ifaces.iter().find(|i| i.name == name)
     }
 
-    fn iface_at(&self, index: u32) -> Option<&Iface> {
+    pub(crate) fn iface_at(&self, index: u32) -> Option<&Iface> {
         self.ifaces.iter().find(|i| i.index == index)
     }
 
+    /// The main table's routes, in the kernel's order.
+    pub(crate) fn routes(&self) -> &[Route] {
+        &self.routes
+    }
+
     /// The interface holding `ip` as one of its addresses.
-    fn holder_of(&self, ip: Ipv4Addr) -> Option<&Iface> {
+    pub(crate) fn holder_of(&self, ip: Ipv4Addr) -> Option<&Iface> {
         self.ifaces
             .iter()
             .find(|i| i.ipv4.iter().any(|(addr, _)| *addr == ip))
@@ -1060,19 +1070,53 @@ async fn ask_wire(
     Ok(answers)
 }
 
+/// One ARP request for `target` on `iface`, from its MAC and `src`, as
+/// `--expect-mac` sends it: the MACs that answered within `wait`, each
+/// once. Discovery asks it for a host still without a MAC (ADR-012
+/// decision 11). An interface that is not an Ethernet link is an error.
+pub(crate) async fn ask_arp(
+    iface: &Iface,
+    src: Ipv4Addr,
+    target: Ipv4Addr,
+    wait: Duration,
+) -> io::Result<Vec<Mac>> {
+    let Some(mac) = iface.mac.filter(|_| iface.kind == netlink::ARPHRD_ETHER) else {
+        return Err(io::Error::other(format!(
+            "{} is not an Ethernet link",
+            iface.name
+        )));
+    };
+    let answers = ask_wire(iface, mac, src, target, wait).await?;
+    Ok(answers.into_iter().map(Mac).collect())
+}
+
+/// The kernel's IPv4 neighbour table, read over netlink now: every entry
+/// with its interface and state.
+pub(crate) async fn read_neighbours() -> io::Result<Vec<Neighbour>> {
+    let mut socket = NlSocket::open(0)?;
+    let mut buf = vec![0; netlink::RECV_BUF];
+    let (request, reply, family) = netlink::neighbour_dump_request();
+    let payloads = socket.dump(request, reply, &family, &mut buf).await?;
+    Ok(parse_neighbours(&payloads, Order::NATIVE))
+}
+
+/// The entries of a neighbour dump's payloads.
+pub(crate) fn parse_neighbours(payloads: &[Vec<u8>], order: Order) -> Vec<Neighbour> {
+    payloads
+        .iter()
+        .filter_map(|p| netlink::parse_neighbour(p, order))
+        .collect()
+}
+
 /// The MAC the kernel's neighbour entry for `address` on interface `index`
 /// names, with the entry's state, if it holds a usable one.
 async fn neighbour_of(
     index: u32,
     address: Ipv4Addr,
 ) -> io::Result<Option<([u8; 6], &'static str)>> {
-    let mut socket = NlSocket::open(0)?;
-    let mut buf = vec![0; netlink::RECV_BUF];
-    let (request, reply, family) = netlink::neighbour_dump_request();
-    let payloads = socket.dump(request, reply, &family, &mut buf).await?;
-    Ok(payloads
+    Ok(read_neighbours()
+        .await?
         .iter()
-        .filter_map(|p| netlink::parse_neighbour(p, Order::NATIVE))
         .filter(|n| n.index == index && n.dst == address)
         .find_map(|n| n.usable_lladdr().map(|mac| (mac, n.state_word()))))
 }
@@ -1173,17 +1217,9 @@ impl Guard {
         let net = Network::read(&self.lte)
             .await
             .map_err(|e| failed("read this unit's network", &e, None))?;
-        let answer = match source::route_get(address).await {
-            Ok(route) => Answer::Route(route),
-            Err(e) if is_no_route(&e) => Answer::NoRoute,
-            Err(e) => {
-                return Err(failed(
-                    "ask the kernel for the route",
-                    &e,
-                    Some(net.lan_views()),
-                ))
-            }
-        };
+        let answer = kernel_answer(address)
+            .await
+            .map_err(|e| failed("ask the kernel for the route", &e, Some(net.lan_views())))?;
         let approved = judge(
             &net,
             address,
@@ -1243,6 +1279,16 @@ impl Guard {
             |(code, reason)| refuse(code, reason, macs.clone(), entry.map(|(mac, _)| Mac(mac))),
         )?;
         Ok(approved)
+    }
+}
+
+/// The kernel's answer for `address` now: the route it would take, or
+/// none. Sends nothing to `address`. An error is a lookup that failed.
+pub(crate) async fn kernel_answer(address: Ipv4Addr) -> io::Result<Answer> {
+    match source::route_get(address).await {
+        Ok(route) => Ok(Answer::Route(route)),
+        Err(e) if is_no_route(&e) => Ok(Answer::NoRoute),
+        Err(e) => Err(e),
     }
 }
 
@@ -2179,6 +2225,25 @@ mod tests {
         assert_eq!(refusal.dev.as_deref(), Some("eth9"));
         assert!(refusal.lan.is_some(), "the LAN side was read");
         assert!(refusal.route.is_none(), "{refusal:?}");
+    }
+
+    /// What discovery shares: the kernel's answer and its neighbour table,
+    /// read without sending, and an ARP request only on an Ethernet link,
+    /// refused elsewhere before any socket opens.
+    #[tokio::test]
+    async fn discovery_s_reads_send_nothing_and_its_arp_request_needs_ethernet() {
+        let Answer::Route(route) = kernel_answer(Ipv4Addr::LOCALHOST).await.unwrap() else {
+            panic!("the loopback has a route");
+        };
+        assert_eq!(route.kind, RouteKind::Local);
+        assert!(read_neighbours().await.is_ok());
+        // The fixture's mesh: no MAC, no Ethernet framing.
+        let net = site(&Lte::named("wwan0"));
+        let wg0 = net.iface("wg0").unwrap();
+        let error = ask_arp(wg0, ip([10, 99, 0, 2]), ip([10, 99, 0, 7]), ARP_WAIT_MAX)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "wg0 is not an Ethernet link");
     }
 
     #[tokio::test]
