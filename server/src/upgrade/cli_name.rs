@@ -15,17 +15,18 @@
 //! wrapper (known by the marker) with other content, through a temporary
 //! entry renamed over it. It never replaces a regular file that is not its
 //! wrapper, and it leaves a name already right alone, so a restart writes
-//! nothing to flash. A `ramboot` unit that runs its agent under a loader its
-//! `install.json` does not name gets no link: `current_exe()` is then the
-//! loader, not the agent. `GET /api/health` and `sctl install-info` report the
-//! path as `cli`; it is absent when the agent could not make the name, and
-//! a log line says why. `SCTL_CLI_PATH` moves the name for tests and
-//! benches, as `SCTL_INSTALL_JSON` moves `install.json`.
+//! nothing to flash. A `ramboot` unit without `helper_prefix` whose
+//! `ramboot.conf` runs its agent under a loader (`LOADER` or
+//! `MUSL_LIBC_URL`) gets no name: `current_exe()` is then the loader, not the
+//! agent. `GET /api/health` and `sctl install-info` report the path as `cli`;
+//! it is absent when the agent could not make the name, and a log line says
+//! why. `SCTL_CLI_PATH` moves the name for tests and benches, as
+//! `SCTL_INSTALL_JSON` moves `install.json`.
 
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
@@ -113,18 +114,20 @@ pub fn want(install: &InstallInfo, running: &Running) -> Result<Want, String> {
         }
         Layout::GzTmp => link_to(&running.binary),
         Layout::Ramboot if running.loader.is_empty() => {
-            // The kernel runs the binary itself only when the binary
-            // running is the one the boot fetcher runs. Under a loader that
-            // install.json does not name (a WE826 not yet moved by TRD-8,
-            // as during that move's trial), `current_exe()` is the loader,
-            // and a link to it would run the loader as sctl.
-            let bin = install.ramboot_bin()?;
-            if !same_file(&running.binary, &bin) {
+            // A link to the running binary, unless ramboot.conf has the boot
+            // fetcher run the agent under a loader that install.json does
+            // not name (a WE826 whose install.json predates 0.6.9, during
+            // TRD-8's trial): `current_exe()` is then the loader, and a link
+            // to it would run the loader, not the tools. Which name such a
+            // unit gets is open (TRD-9 slice 6); until then it gets none.
+            let loader = install
+                .ramboot_loader()
+                .map_err(|e| format!("{e}: whether the agent runs under a loader is not known"))?;
+            if let Some(key) = loader {
                 return Err(format!(
-                    "the agent runs as {}, not as {} ({}'s BIN): under a loader install.json does not name (helper_prefix)",
-                    running.binary.display(),
-                    bin.display(),
-                    install.ramboot_conf_path().display()
+                    "{} runs the agent under a loader ({key}) that install.json does not name (helper_prefix): the running binary, {}, is then the loader, and a link to it would not run the tools",
+                    install.ramboot_conf_path().display(),
+                    running.binary.display()
                 ));
             }
             link_to(&running.binary)
@@ -146,13 +149,6 @@ fn is_file(path: &Path, what: &str) -> Result<(), String> {
         Ok(meta) if meta.is_file() => Ok(()),
         Ok(_) => Err(format!("{what} {} is not a file", path.display())),
         Err(e) => Err(format!("{what} {}: {e}", path.display())),
-    }
-}
-
-fn same_file(a: &Path, b: &Path) -> bool {
-    match (std::fs::metadata(a), std::fs::metadata(b)) {
-        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
-        _ => false,
     }
 }
 
@@ -411,6 +407,7 @@ pub fn reported(install: &InstallInfo) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt;
 
     /// A scratch directory, removed on drop.
     struct Scratch(PathBuf);
@@ -732,25 +729,69 @@ mod tests {
         );
     }
 
-    /// A WE826 whose install.json does not name its loader runs the agent
-    /// as the loader: no link to the loader is made, and nothing is written.
+    /// A WE826 whose install.json does not name its loader, while its
+    /// ramboot.conf runs the agent under one, runs the agent as the loader:
+    /// no link to the loader is made, and nothing is written. Nor for a
+    /// unit whose ramboot.conf cannot be read: nothing then says whether a
+    /// loader runs.
     #[test]
     fn ramboot_under_a_loader_install_json_does_not_name_makes_no_link() {
         let s = Scratch::new("unnamed-loader");
         let server = s.file("sctl-server");
         let loader = s.file("libc.so");
         let conf = s.path("ramboot.conf");
-        std::fs::write(&conf, format!("BIN='{}'\n", server.display())).unwrap();
         let mut ramboot = InstallInfo::defaults(Layout::Ramboot, "mips_24kc");
-        ramboot.ramboot_conf = Some(conf);
+        ramboot.ramboot_conf = Some(conf.clone());
         let under_loader = Running {
             binary: loader,
             loader: Vec::new(),
         };
-        let err = want(&ramboot, &under_loader).unwrap_err();
-        assert!(err.contains("helper_prefix"), "{err}");
+        // A WE826's ramboot.conf names the musl libc the fetcher runs as the
+        // loader; one may name the loader itself.
+        for (key, line) in [
+            (
+                "MUSL_LIBC_URL",
+                "MUSL_LIBC_URL='http://192.0.2.10/libc.so.gz'",
+            ),
+            ("LOADER", "LOADER='/tmp/sctl/lib/libc.so'"),
+        ] {
+            std::fs::write(&conf, format!("BIN='{}'\n{line}\n", server.display())).unwrap();
+            let err = want(&ramboot, &under_loader).unwrap_err();
+            assert!(err.contains("helper_prefix"), "{err}");
+            assert!(err.contains(key), "{err}");
+        }
         ramboot.ramboot_conf = Some(s.path("absent.conf"));
-        assert!(want(&ramboot, &under_loader).is_err());
+        let err = want(&ramboot, &under_loader).unwrap_err();
+        assert!(err.contains("not known"), "{err}");
+    }
+
+    /// A `ramboot` unit whose ramboot.conf has the kernel run the binary
+    /// itself gets the link to the running binary, whatever ramboot.conf's
+    /// `BIN` line says: none (the fetcher's default), one written with the
+    /// fetcher's variables, or another binary (an agent started by hand).
+    #[test]
+    fn ramboot_without_a_loader_links_the_running_binary_whatever_bin_says() {
+        let s = Scratch::new("no-loader");
+        let server = s.file("sctl-server");
+        let conf = s.path("ramboot.conf");
+        let mut ramboot = InstallInfo::defaults(Layout::Ramboot, "mipsel_24kc");
+        ramboot.ramboot_conf = Some(conf.clone());
+        let plain = Running {
+            binary: server.clone(),
+            loader: Vec::new(),
+        };
+        for text in [
+            "RUN_DIR='/tmp/sctl'\nSERVER_URL='http://192.0.2.10/s'\n",
+            "RUN_DIR='/tmp/sctl'\nBIN=$RUN_DIR/sctl-server\n",
+            "BIN='/tmp/sctl/another-sctl-server'\nMUSL_LIBC_URL=''\n",
+        ] {
+            std::fs::write(&conf, text).unwrap();
+            assert_eq!(
+                want(&ramboot, &plain).unwrap(),
+                Want::Link(server.clone()),
+                "{text}"
+            );
+        }
     }
 
     #[test]

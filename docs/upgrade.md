@@ -97,7 +97,7 @@ from `/tmp`. At `serve` start the agent makes it:
 |---|---|
 | `usr-bin` | the installed binary itself; nothing is made |
 | `gz-tmp` | a symbolic link to the running binary (`/tmp/sctl/sctl-server`) |
-| `ramboot` without `helper_prefix` | a symbolic link to the running binary, the one `ramboot.conf` names as `BIN` |
+| `ramboot` without `helper_prefix` | a symbolic link to the running binary (`/tmp/sctl/sctl-server`) |
 | `ramboot` with `helper_prefix` (the WE826) | a wrapper that runs `BIN` through the loader's words |
 | `systemd` | nothing: the relay runs its tools as `/usr/local/bin/sctl` |
 
@@ -114,10 +114,13 @@ wrapper. The agent writes the name only when it is absent, a symbolic link, or
 its own wrapper with other content, through a temporary entry renamed over it
 (`.sctl.new` beside it). It never replaces a regular file that is not its
 wrapper, and it leaves a name already right alone, so a restart writes nothing
-to flash. With no `install.json` it makes nothing. A `ramboot` unit that runs
-its agent under a loader its `install.json` does not name (a WE826 before its
-move, [below](#a-we826-installed-before-069)) gets no link: the link would
-name the loader. `SCTL_CLI_PATH` moves the name for tests and benches, as
+to flash. With no `install.json` it makes nothing. A `ramboot` unit without
+`helper_prefix` whose `ramboot.conf` runs the agent under a loader (`LOADER`,
+or `MUSL_LIBC_URL`, whose `libc` the boot fetcher runs as the loader), as a
+WE826 does before its move ([below](#a-we826-installed-before-069)), gets no
+name, and its log says why: the running binary is then the loader, and a link
+to it would not run the tools. So does one whose `ramboot.conf` cannot be
+read. `SCTL_CLI_PATH` moves the name for tests and benches, as
 `SCTL_INSTALL_JSON` moves `install.json`. A rollback to 0.6.11 keeps the name,
 which still runs the agent's tools: 0.6.11 runs from the same path, through
 the same loader words.

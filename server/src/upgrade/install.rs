@@ -308,17 +308,34 @@ impl InstallInfo {
             .unwrap_or_else(|| PathBuf::from(RAMBOOT_CONF_PATH))
     }
 
-    /// The binary the boot fetcher runs: `ramboot.conf`'s `BIN`.
-    pub fn ramboot_bin(&self) -> Result<PathBuf, String> {
+    /// The boot fetcher's config, read: its path and its text.
+    fn read_ramboot_conf(&self) -> Result<(PathBuf, String), String> {
         let conf_path = self.ramboot_conf_path();
         let conf = std::fs::read_to_string(&conf_path)
             .map_err(|e| format!("{}: {e}", conf_path.display()))?;
+        Ok((conf_path, conf))
+    }
+
+    /// The binary the boot fetcher runs: `ramboot.conf`'s `BIN`.
+    pub fn ramboot_bin(&self) -> Result<PathBuf, String> {
+        let (conf_path, conf) = self.read_ramboot_conf()?;
         conf_value(&conf, "BIN").map(PathBuf::from).ok_or_else(|| {
             format!(
                 "{}: no BIN, the binary the boot fetcher runs",
                 conf_path.display()
             )
         })
+    }
+
+    /// The key by which `ramboot.conf` has the boot fetcher run the agent
+    /// under a loader: `LOADER`, or `MUSL_LIBC_URL`, whose `libc` the
+    /// fetcher then runs as the loader (`devices/common/sctl-ramboot.sh`).
+    /// `None` when neither holds a value: the kernel runs `BIN` itself.
+    pub fn ramboot_loader(&self) -> Result<Option<&'static str>, String> {
+        let (_, conf) = self.read_ramboot_conf()?;
+        Ok(["LOADER", "MUSL_LIBC_URL"]
+            .into_iter()
+            .find(|key| conf_value(&conf, key).is_some()))
     }
 
     /// How this agent runs, for the upgrade's helper and the tools' name.
@@ -560,6 +577,36 @@ mod tests {
             InstallInfo::defaults(Layout::GzTmp, "mips_24kc").ramboot_conf_path(),
             PathBuf::from(RAMBOOT_CONF_PATH)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The boot fetcher runs the agent under a loader when `ramboot.conf`
+    /// names one (`LOADER`) or names the musl `libc` it runs as one
+    /// (`MUSL_LIBC_URL`); an empty value names none, as in the fetcher.
+    #[test]
+    fn ramboot_conf_says_whether_a_loader_runs_the_agent() {
+        let dir = std::env::temp_dir().join(format!("sctl-install-loader-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("ramboot.conf");
+        let mut install = InstallInfo::defaults(Layout::Ramboot, "mipsel_24kc");
+        install.ramboot_conf = Some(conf.clone());
+        let err = install.ramboot_loader().unwrap_err();
+        assert!(err.contains("ramboot.conf"), "no file, not known: {err}");
+        for (text, loader) in [
+            ("RUN_DIR='/tmp/sctl'\nBIN='/tmp/sctl/sctl-server'\n", None),
+            ("SERVER_URL='http://192.0.2.10/s'\n", None),
+            ("MUSL_LIBC_URL=''\nLOADER=\n", None),
+            ("# LOADER='/tmp/sctl/lib/libc.so'\nLOADER_ARGS=1\n", None),
+            (
+                "BIN='/tmp/sctl/sctl-server'\nMUSL_LIBC_URL='http://192.0.2.10/libc.so.gz'\n",
+                Some("MUSL_LIBC_URL"),
+            ),
+            ("LOADER='/tmp/sctl/lib/libc.so'\n", Some("LOADER")),
+        ] {
+            std::fs::write(&conf, text).unwrap();
+            assert_eq!(install.ramboot_loader().unwrap(), loader, "{text}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
