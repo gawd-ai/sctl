@@ -128,7 +128,10 @@ the same loader words.
 `rundev.sh device deploy`, `device upgrade`, its watchdog's rollback and the
 generic path of `device upgrade-remote` write `/usr/bin/sctl`, so they refuse a
 unit whose `/usr/bin/sctl` is a symbolic link or the agent's wrapper rather than
-write through it: such a unit upgrades itself.
+write through it: such a unit upgrades itself. The paths that ask the unit go
+on only once it answers that the name is neither, and ask again just before
+they write: `device deploy` before it copies the binary, `device upgrade` in
+the command that stops the agent. A unit that does not answer is refused.
 
 **Bundle retention.** A ramboot unit's rollback restores its previous
 `ramboot.conf`, and its next boot fetches that version from that mirror; so a

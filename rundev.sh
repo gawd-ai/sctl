@@ -1471,19 +1471,28 @@ do_device_ls() {
 
 # ─── device deploy ───────────────────────────────────────────────────
 
-# Refuse a unit whose /usr/bin/sctl is the name its agent made for its tools
-# (AGENT_CLI_TEST): a copy there would write through the name into the
-# binary the agent runs from /tmp, or replace its wrapper. Such a unit
-# upgrades itself (docs/upgrade.md).
+# Go on only when the unit says plainly that its /usr/bin/sctl is not the
+# name its agent made for its tools (AGENT_CLI_TEST). A unit whose name is
+# the agent's is refused: a copy there would write through the name into
+# the binary the agent runs from /tmp, or replace its wrapper, and such a
+# unit upgrades itself (docs/upgrade.md). A unit that does not answer is
+# refused too: nothing then says which it is. Asked before the build, and
+# again just before the first write.
 # Usage: refuse_agent_cli_over_ssh <name> <host> <ssh_opts> <what>
 refuse_agent_cli_over_ssh() {
     local name="$1" host="$2" ssh_opts="$3" what="$4" answer
-    answer=$(ssh $ssh_opts "root@$host" "if $AGENT_CLI_TEST; then echo agent-cli; fi" 2>/dev/null) || true
+    answer=$(ssh $ssh_opts "root@$host" "if $AGENT_CLI_TEST; then echo agent-cli; else echo plain; fi" 2>/dev/null) || true
+    if [[ "$answer" == "plain" ]]; then
+        return 0
+    fi
     if [[ "$answer" == "agent-cli" ]]; then
         err "/usr/bin/sctl on '$name' is a link or the agent's wrapper, the name an agent from 0.6.12 makes for its tools."
         err "$what would write through it. The unit upgrades itself: ask it through a managed rollout (docs/upgrade.md)."
-        exit 1
+    else
+        err "'$name' ($host) did not say whether /usr/bin/sctl is the agent's name: $what wrote nothing."
+        err "Run $what again once ssh root@$host answers."
     fi
+    exit 1
 }
 
 do_device_deploy() {
@@ -1535,7 +1544,9 @@ do_device_deploy() {
 
     build_comms_provider "$comms_provider" "$arch"
 
-    # Upload binary
+    # Upload binary, once the unit says again that /usr/bin/sctl is not the
+    # agent's name: an agent may have made it during the build.
+    refuse_agent_cli_over_ssh "$name" "$host" "$ssh_opts" "device deploy"
     log "Uploading sctl binary to $host..."
     scp $ssh_opts "$bin_path" "root@$host:/usr/bin/sctl"
     ok "Binary uploaded"
@@ -1622,9 +1633,21 @@ do_device_upgrade() {
 
     build_comms_provider "$comms_provider" "$arch"
 
-    # Stop, upload, start
+    # Stop, upload, start. The stop asks once more, in the same command, and
+    # touches nothing on a unit whose /usr/bin/sctl is now the agent's name.
     log "Stopping sctl on $host..."
-    ssh $ssh_opts "root@$host" "/etc/init.d/sctl stop; rm -f /usr/bin/sctl" 2>/dev/null || true
+    local stopped
+    stopped=$(ssh $ssh_opts "root@$host" "if $AGENT_CLI_TEST; then echo agent-cli; exit 0; fi; /etc/init.d/sctl stop >/dev/null 2>&1; rm -f /usr/bin/sctl && echo stopped" 2>/dev/null) || true
+    if [[ "$stopped" == "agent-cli" ]]; then
+        err "/usr/bin/sctl on '$name' is now a link or the agent's wrapper: nothing was written."
+        err "The unit upgrades itself: ask it through a managed rollout (docs/upgrade.md)."
+        exit 1
+    fi
+    if [[ "$stopped" != "stopped" ]]; then
+        err "'$name' ($host) did not confirm the stop: sctl there may be stopped, and /usr/bin/sctl gone. No binary was copied."
+        err "Run device upgrade again once ssh root@$host answers."
+        exit 1
+    fi
 
     log "Uploading new binary..."
     scp $ssh_opts "$bin_path" "root@$host:/usr/bin/sctl"

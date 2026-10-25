@@ -13,7 +13,10 @@
 //! `rundev.sh`'s paths that write `/usr/bin/sctl` first ask the unit whether
 //! the name is the agent's: the question answers yes for the link and the
 //! wrapper the agent writes, and no for a file whose marker line is past its
-//! second line, a script's or the agent's own binary.
+//! second line, a script's or the agent's own binary. `device deploy` and
+//! `device upgrade` run under bash as they are, every call beyond bash stood
+//! in by a function that records it and reaches nothing: they write only
+//! after the unit answered plain, and ask again just before the first write.
 //!
 //! An agent started on the bench layout `gz-tmp` (`SCTL_INSTALL_JSON`) makes
 //! the name where `SCTL_CLI_PATH` puts it, `/api/health` names it as `cli`,
@@ -216,13 +219,14 @@ fn the_wrapper_runs_the_binary_through_its_loader_with_busybox() {
 
 // ─── rundev.sh's question ───────────────────────────────────────────────
 
-/// `rundev.sh`'s `AGENT_CLI_TEST`, as its paths that write `/usr/bin/sctl`
-/// ask it on a unit first, with `/usr/bin/sctl` moved to `name`. The one
-/// shell string here: a constant of `rundev.sh` that only tests, reads and
-/// prints, and a scratch path the shell takes as it is.
-fn rundev_question(name: &Path) -> String {
-    let rundev = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../rundev.sh"))
-        .expect("rundev.sh");
+/// `rundev.sh`, as it is.
+fn rundev_text() -> String {
+    std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../rundev.sh"))
+        .expect("rundev.sh")
+}
+
+/// `rundev.sh`'s `AGENT_CLI_TEST`: the condition it runs on a unit.
+fn agent_cli_test(rundev: &str) -> &str {
     let test = rundev
         .lines()
         .find_map(|line| line.strip_prefix("AGENT_CLI_TEST='")?.strip_suffix('\''))
@@ -231,16 +235,29 @@ fn rundev_question(name: &Path) -> String {
         test.contains(MARKER),
         "rundev.sh asks for the agent's marker"
     );
+    test
+}
+
+/// `rundev.sh`'s question, as its paths that write `/usr/bin/sctl` ask it
+/// on a unit, with `/usr/bin/sctl` moved to `name`: a constant of
+/// `rundev.sh` that only tests, reads and prints, and a scratch path the
+/// shell takes as it is.
+fn rundev_question(name: &Path) -> String {
+    let rundev = rundev_text();
+    let test = agent_cli_test(&rundev);
     let name = name.to_str().unwrap();
     assert!(
         name.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b)),
         "a path no shell splits or expands: {name}"
     );
-    format!(
-        "if {}; then echo agent-cli; else echo plain; fi",
-        test.replace("/usr/bin/sctl", name)
-    )
+    question(&test.replace("/usr/bin/sctl", name))
+}
+
+/// The question `rundev.sh` sends: it answers `agent-cli` or `plain`, so a
+/// unit that answers neither has not answered.
+fn question(test: &str) -> String {
+    format!("if {test}; then echo agent-cli; else echo plain; fi")
 }
 
 fn ask(busybox: Option<&Path>, question: &str) -> String {
@@ -339,6 +356,275 @@ fn rundev_knows_the_agents_name_and_not_its_binary() {
             "plain",
             "{shell:?}: the agent's binary"
         );
+    }
+}
+
+// ─── rundev.sh's paths that write /usr/bin/sctl ─────────────────────────
+
+/// Stand-ins for everything `do_device_deploy` and `do_device_upgrade` call
+/// beyond bash's builtins and the functions taken from `rundev.sh`. Each
+/// records its call in `$CALLS` and runs nothing: ssh and scp reach no
+/// host, the build builds nothing. `PATH` names an empty directory, so a
+/// call with no stand-in fails rather than reaches anything. ssh answers a
+/// command that asks for the agent's name (one that holds `echo agent-cli`)
+/// with the next line of `$REPLIES`: `fail` exits 255 with no output, as a
+/// connection that drops; `silent` exits 0 with none; anything else is
+/// printed. It answers any other command with nothing.
+const STAND_INS: &str = r#"
+log()  { printf 'log %s\n' "$*" >> "$CALLS"; }
+ok()   { printf 'ok %s\n' "$*" >> "$CALLS"; }
+warn() { printf 'warn %s\n' "$*" >> "$CALLS"; }
+err()  { printf 'err %s\n' "$*" >> "$CALLS"; }
+require_jq() { :; }
+ensure_config() { :; }
+cfg_device_exists() { :; }
+cfg_device_get() {
+    case $2 in
+        host) echo 192.0.2.10 ;;
+        arch) echo mipsel ;;
+        url) echo http://192.0.2.10:1337 ;;
+        api_key) echo bench ;;
+    esac
+}
+arch_to_target() { echo mipsel-unknown-linux-musl; }
+arch_to_bin() { echo "$SCRATCH/sctl-built"; }
+device_comms_provider() { :; }
+build_comms_provider() { :; }
+upload_comms_provider() { :; }
+deploy_playbooks_to_device() { :; }
+install_json_usr_bin() { printf '{"v":1,"layout":"usr-bin","target":"mipsel_24kc"}'; }
+cargo() { printf 'build cargo\n' >> "$CALLS"; }
+cross() { printf 'build cross\n' >> "$CALLS"; }
+curl() { return 7; }
+jq() { return 1; }
+sleep() { :; }
+seq() { local i=$1; while [ "$i" -le "$2" ]; do echo "$i"; i=$((i + 1)); done; }
+scp() { printf 'scp %s\n' "${!#}" >> "$CALLS"; }
+ssh() {
+    local command=${!#} reply replies
+    printf 'ssh %s\n' "$command" >> "$CALLS"
+    case $command in
+        *'echo agent-cli'*)
+            mapfile -t replies < "$REPLIES"
+            reply=${replies[0]:-fail}
+            printf '%s\n' "${replies[@]:1}" > "$REPLIES"
+            case $reply in
+                fail) return 255 ;;
+                silent) return 0 ;;
+                *) printf '%s\n' "$reply" ;;
+            esac
+            ;;
+    esac
+}
+"#;
+
+/// bash, which runs `rundev.sh`.
+fn bash() -> PathBuf {
+    std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("bash"))
+                .find(|candidate| candidate.is_file())
+        })
+        .expect("bash, which runs rundev.sh")
+}
+
+/// One function of `rundev.sh`, as it is: from its `name() {` line to the
+/// first line that is `}`.
+fn rundev_function(rundev: &str, name: &str) -> String {
+    let start = format!("{name}() {{");
+    let mut text = String::new();
+    for line in rundev.lines().skip_while(|line| *line != start) {
+        text.push_str(line);
+        text.push('\n');
+        if line == "}" {
+            return text;
+        }
+    }
+    panic!("rundev.sh has no function {name}");
+}
+
+/// What a run of a `rundev.sh` device command did.
+struct RundevRun {
+    /// Whether it exited 0.
+    ok: bool,
+    /// Every call it made to a stand-in, in order.
+    calls: Vec<String>,
+}
+
+impl RundevRun {
+    /// Where the first call that begins with `prefix` is.
+    fn find(&self, prefix: &str) -> Option<usize> {
+        self.calls.iter().position(|call| call.starts_with(prefix))
+    }
+
+    /// Where every call that begins with `prefix` is.
+    fn every(&self, prefix: &str) -> Vec<usize> {
+        self.calls
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| call.starts_with(prefix))
+            .map(|(i, _)| i)
+            .collect()
+    }
+}
+
+/// Run `function` (`do_device_deploy` or `do_device_upgrade`) for a unit
+/// named bench under bash: it and `refuse_agent_cli_over_ssh` as they are in
+/// `rundev.sh`, everything else stood in ([`STAND_INS`]), and ssh's answers
+/// to the questions taken from `replies` in order.
+fn rundev_run(case: &str, function: &str, replies: &[&str]) -> RundevRun {
+    let rundev = rundev_text();
+    let test_line = rundev
+        .lines()
+        .find(|line| line.starts_with("AGENT_CLI_TEST='"))
+        .expect("rundev.sh defines AGENT_CLI_TEST");
+    let script = format!(
+        "set -euo pipefail\n{test_line}\n{STAND_INS}\n{}{}SCTL_DIR=$SCRATCH\nCONFIG_FILE=$SCRATCH/devices.json\n{function} bench\n",
+        rundev_function(&rundev, "refuse_agent_cli_over_ssh"),
+        rundev_function(&rundev, function),
+    );
+    let scratch = Scratch::new(case);
+    let nothing = scratch.path("path");
+    std::fs::create_dir(&nothing).unwrap();
+    let mut queued = replies.join("\n");
+    queued.push('\n');
+    std::fs::write(scratch.path("replies"), queued).unwrap();
+    let out = Command::new(bash())
+        .arg("-c")
+        .arg(&script)
+        .env_clear()
+        .env("PATH", &nothing)
+        .env("CALLS", scratch.path("calls"))
+        .env("REPLIES", scratch.path("replies"))
+        .env("SCRATCH", &scratch.0)
+        .current_dir(&scratch.0)
+        .stdin(Stdio::null())
+        .output()
+        .expect("bash runs");
+    let calls: Vec<String> = std::fs::read_to_string(scratch.path("calls"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("command not found"),
+        "{case}: a call with no stand-in: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    RundevRun {
+        ok: out.status.success(),
+        calls,
+    }
+}
+
+/// `device deploy` copies its binary to `/usr/bin/sctl` only after the unit
+/// answered plain twice: before the build, and again just before the copy.
+/// No answer, an empty one, another one or the agent's name stops it before
+/// the build; the name made during the build, or no answer then, stops it
+/// before the copy.
+#[test]
+fn rundev_device_deploy_writes_only_after_two_plain_answers() {
+    let rundev = rundev_text();
+    let asked = format!("ssh {}", question(agent_cli_test(&rundev)));
+
+    let run = rundev_run("deploy-plain", "do_device_deploy", &["plain", "plain"]);
+    assert!(run.ok, "{:?}", run.calls);
+    let questions = run.every("ssh if ");
+    assert_eq!(questions.len(), 2, "{:?}", run.calls);
+    for &i in &questions {
+        assert_eq!(run.calls[i], asked);
+    }
+    let built = run.find("build ").expect("built");
+    let copied = run
+        .find("scp root@192.0.2.10:/usr/bin/sctl")
+        .expect("copied");
+    assert!(
+        questions[0] < built && built < questions[1] && questions[1] < copied,
+        "{:?}",
+        run.calls
+    );
+    assert_eq!(
+        run.find("scp "),
+        Some(copied),
+        "the binary is the first write"
+    );
+
+    for (case, reply) in [
+        ("deploy-fail", "fail"),
+        ("deploy-silent", "silent"),
+        ("deploy-garbled", "yes"),
+        ("deploy-agent-cli", "agent-cli"),
+    ] {
+        let run = rundev_run(case, "do_device_deploy", &[reply]);
+        assert!(!run.ok, "{case}: {:?}", run.calls);
+        assert_eq!(run.find("build "), None, "{case}: {:?}", run.calls);
+        assert_eq!(run.find("scp "), None, "{case}: {:?}", run.calls);
+    }
+    for (case, reply) in [("deploy-made", "agent-cli"), ("deploy-lost", "fail")] {
+        let run = rundev_run(case, "do_device_deploy", &["plain", reply]);
+        assert!(!run.ok, "{case}: {:?}", run.calls);
+        assert!(run.find("build ").is_some(), "{case}: {:?}", run.calls);
+        assert_eq!(run.find("scp "), None, "{case}: {:?}", run.calls);
+    }
+}
+
+/// `device upgrade` stops the agent and removes `/usr/bin/sctl` only in a
+/// command that asks first and touches nothing when the name is the
+/// agent's, and copies its binary only after that command said it stopped.
+/// No answer before the build stops it there; the agent's name, or no
+/// answer, at the stop leaves it before the copy.
+#[test]
+fn rundev_device_upgrade_writes_only_after_a_plain_answer_and_its_own_stop() {
+    let rundev = rundev_text();
+    let test = agent_cli_test(&rundev);
+    let stop = format!("ssh if {test}; then echo agent-cli; exit 0; fi; ");
+
+    let run = rundev_run("upgrade-plain", "do_device_upgrade", &["plain", "stopped"]);
+    assert!(run.ok, "{:?}", run.calls);
+    assert_eq!(
+        run.calls[run.find("ssh if ").unwrap()],
+        format!("ssh {}", question(test))
+    );
+    let built = run.find("build ").expect("built");
+    let stopped = run.find(&stop).expect("the stop asks first");
+    let removal = run.calls[stopped].find("rm -f /usr/bin/sctl").unwrap();
+    assert!(stop.len() <= removal, "{}", run.calls[stopped]);
+    let copied = run
+        .find("scp root@192.0.2.10:/usr/bin/sctl")
+        .expect("copied");
+    assert!(built < stopped && stopped < copied, "{:?}", run.calls);
+    let removals: Vec<_> = run
+        .calls
+        .iter()
+        .filter(|call| call.contains("rm -f /usr/bin/sctl"))
+        .collect();
+    assert_eq!(removals.len(), 1, "only the stop removes the name");
+
+    for (case, reply) in [
+        ("upgrade-fail", "fail"),
+        ("upgrade-silent", "silent"),
+        ("upgrade-agent-cli", "agent-cli"),
+    ] {
+        let run = rundev_run(case, "do_device_upgrade", &[reply]);
+        assert!(!run.ok, "{case}: {:?}", run.calls);
+        assert_eq!(run.find("build "), None, "{case}: {:?}", run.calls);
+        assert!(
+            !run.calls.iter().any(|call| call.contains("rm -f")),
+            "{case}: {:?}",
+            run.calls
+        );
+        assert_eq!(run.find("scp "), None, "{case}: {:?}", run.calls);
+    }
+    for (case, reply) in [
+        ("upgrade-made", "agent-cli"),
+        ("upgrade-lost", "fail"),
+        ("upgrade-unconfirmed", "silent"),
+    ] {
+        let run = rundev_run(case, "do_device_upgrade", &["plain", reply]);
+        assert!(!run.ok, "{case}: {:?}", run.calls);
+        assert!(run.find(&stop).is_some(), "{case}: {:?}", run.calls);
+        assert_eq!(run.find("scp "), None, "{case}: {:?}", run.calls);
     }
 }
 
