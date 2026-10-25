@@ -1685,7 +1685,10 @@ fn case_9_a_scan(lab: &Lab, config: &Path, unit: &Capture, lte: &Capture, mesh: 
     let (status, body) = api(u, "DELETE", "/api/infra/config", None);
     assert_eq!(status, 200, "{body}");
 
-    // The subnets route lists all three networks with their role.
+    // The subnets route lists all three networks with their role. Its
+    // passive sniff runs tcpdump, when the PATH has it, as an argument
+    // vector: it only listens on lan0, and runs no shell and writes no
+    // file.
     let (status, body) = api(u, "GET", "/api/infra/discover/subnets", None);
     assert_eq!(status, 200, "{body}");
     let listed: Value = serde_json::from_str(&body).unwrap();

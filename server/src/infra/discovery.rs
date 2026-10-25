@@ -35,6 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 use std::net::Ipv4Addr;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,6 +44,7 @@ use futures_util::future::{join_all, BoxFuture};
 use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -74,6 +76,15 @@ const PING_TIMEOUT_MS: u64 = 3_000;
 /// limit keeps none of its answers: it would only fill the LAN with ARP
 /// broadcasts.
 const ARP_SCAN_MAX: u64 = 8190;
+/// The packets the passive sniff takes on one interface at most: tcpdump
+/// stops after them (`-c`), and the reader after as many lines.
+const SNIFF_PACKETS: usize = 200;
+/// ARP and the broadcast UDP protocols the passive sniff listens for: DHCP,
+/// mDNS, SSDP, NetBIOS and Ubiquiti's discovery.
+const SNIFF_FILTER: &str = "arp or (udp and (port 67 or port 68 or port 5353 or port 1900 or port 137 or port 138 or portrange 5245-5246))";
+/// The most a listened-to child's stdout is read: 200 of tcpdump's lines
+/// take a few tens of KiB.
+const LISTEN_BYTES: u64 = 256 * 1024;
 /// Interfaces discovery leaves out by name, whatever their role: container
 /// bridges, veth pairs and legacy tunnels. The loopback is left out by its
 /// flag.
@@ -645,9 +656,9 @@ fn listed_subnets(net: &Network) -> Vec<SubnetEntry> {
 /// discovery). Silent no-op when `tcpdump` isn't installed.
 ///
 /// Sniffs run per-iface in parallel (Linux kernels don't support promisc
-/// mode on the `any` pseudo-iface). Each iface's capture is bounded by
-/// wall-clock `secs + 2` via the exec timeout, so total auto-detect
-/// latency is ~`secs + 1` regardless of iface count.
+/// mode on the `any` pseudo-iface). Each iface's capture lasts at most
+/// `secs`, so auto-detect takes about `secs` whatever the number of
+/// interfaces.
 async fn passive_sniff_subnets(ifaces: Vec<String>, secs: u64) -> Vec<(String, Cidr)> {
     let handles: Vec<_> = ifaces
         .into_iter()
@@ -670,6 +681,9 @@ async fn passive_sniff_subnets(ifaces: Vec<String>, secs: u64) -> Vec<(String, C
 /// Sniff a single iface for `secs` seconds. Parses sender IPs from tcpdump
 /// text output and groups by /24. Reserved / link-local / multicast sender
 /// IPs are filtered out.
+///
+/// tcpdump runs as an argument vector ([`sniff_args`]) and its output is
+/// read from its stdout as it comes ([`listen`]): no shell, and no file.
 async fn sniff_iface(iface: String, secs: u64) -> Vec<(String, Cidr)> {
     if !iface
         .chars()
@@ -677,23 +691,15 @@ async fn sniff_iface(iface: String, secs: u64) -> Vec<(String, Cidr)> {
     {
         return Vec::new();
     }
-
-    let filter = "arp or (udp and (port 67 or port 68 or port 5353 or port 1900 or port 137 or port 138 or portrange 5245-5246))";
-    let tmp = format!("/tmp/sctl-sniff-{iface}.out");
-    let cmd = format!(
-        "command -v tcpdump >/dev/null 2>&1 && \
-         ( tcpdump -i {iface} -nn -l -c 200 '{filter}' > {tmp} 2>/dev/null & \
-           P=$!; sleep {secs}; kill -TERM $P 2>/dev/null; wait $P 2>/dev/null; \
-           cat {tmp} 2>/dev/null; rm -f {tmp} )"
-    );
-
-    let exec_timeout_ms = secs * 1000 + 3000;
-    let Ok((_code, stdout, _stderr)) = checks::exec_simple_pub(&cmd, exec_timeout_ms).await else {
+    let args = sniff_args(&iface);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let Some(lines) = listen("tcpdump", &args, Duration::from_secs(secs), SNIFF_PACKETS).await
+    else {
         return Vec::new();
     };
 
     let mut cidrs: BTreeSet<Cidr> = BTreeSet::new();
-    for line in stdout.lines() {
+    for line in &lines {
         if let Some(ip) = parse_sender_ip(line) {
             if !is_usable_sender(ip) {
                 continue;
@@ -704,6 +710,64 @@ async fn sniff_iface(iface: String, secs: u64) -> Vec<(String, Cidr)> {
         }
     }
     cidrs.into_iter().map(|c| (iface.clone(), c)).collect()
+}
+
+/// tcpdump's arguments for the passive sniff on `iface`: numeric, a line
+/// per packet as it comes, [`SNIFF_PACKETS`] packets at most, of ARP and
+/// the broadcast UDP protocols [`SNIFF_FILTER`] names.
+fn sniff_args(iface: &str) -> Vec<String> {
+    let count = SNIFF_PACKETS.to_string();
+    ["-i", iface, "-nn", "-l", "-c", count.as_str(), SNIFF_FILTER]
+        .map(String::from)
+        .to_vec()
+}
+
+/// What `program` prints on stdout within `limit`, [`read_lines_until`]'s
+/// way: then the child is killed, and what it printed by then is kept.
+/// None when it cannot be started, as when the unit lacks it. It runs as
+/// an argument vector, with no shell; its stdin is empty and its stderr
+/// dropped.
+async fn listen(program: &str, args: &[&str], limit: Duration, max: usize) -> Option<Vec<String>> {
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| debug!("Discovery: {program} not run: {e}"))
+        .ok()?;
+    let deadline = tokio::time::Instant::now() + limit;
+    let lines = match child.stdout.take() {
+        Some(stdout) => read_lines_until(stdout, deadline, max).await,
+        None => Vec::new(),
+    };
+    // It may have ended already; either way it is reaped here, or by
+    // tokio once this returns.
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    Some(lines)
+}
+
+/// The lines `reader` gives until `deadline`, `max` lines or
+/// [`LISTEN_BYTES`] bytes, or until it ends. A line the deadline cuts is
+/// left out; bytes that are not UTF-8 are replaced.
+async fn read_lines_until(
+    reader: impl AsyncRead + Unpin,
+    deadline: tokio::time::Instant,
+    max: usize,
+) -> Vec<String> {
+    let mut reader = BufReader::new(reader.take(LISTEN_BYTES));
+    let mut lines = Vec::new();
+    let mut line = Vec::new();
+    while lines.len() < max {
+        line.clear();
+        match tokio::time::timeout_at(deadline, reader.read_until(b'\n', &mut line)).await {
+            Ok(Ok(1..)) => lines.push(String::from_utf8_lossy(&line).trim_end().to_string()),
+            _ => break,
+        }
+    }
+    lines
 }
 
 /// Extract the most plausible sender IPv4 from one tcpdump text line.
@@ -2776,6 +2840,86 @@ mod tests {
                     mac: Some(MAC_B),
                 },
             ]
+        );
+    }
+
+    /// The passive sniff runs tcpdump itself, as an argument vector: no
+    /// shell, no file in /tmp, the filter one argument.
+    #[test]
+    fn the_sniff_runs_tcpdump_as_an_argument_vector() {
+        assert_eq!(
+            sniff_args("br-lan"),
+            ["-i", "br-lan", "-nn", "-l", "-c", "200", SNIFF_FILTER]
+        );
+        assert!(SNIFF_FILTER.starts_with("arp or (udp and (port 67 "));
+    }
+
+    /// What a child printed by the deadline is kept, a line the deadline
+    /// cuts left out; no more than `max` lines are taken; the end of the
+    /// stream ends the read; bytes that are not UTF-8 are replaced.
+    #[tokio::test]
+    async fn a_listened_child_s_lines_are_kept_to_the_deadline() {
+        use tokio::io::AsyncWriteExt;
+        let arp = "ARP, Request who-has 192.0.2.1 tell 192.0.2.7, length 46";
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        writer
+            .write_all(format!("{arp}\nhalf a li").as_bytes())
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let lines = read_lines_until(reader, deadline, 10).await;
+        assert_eq!(lines, [arp], "the writer is still open");
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        writer.write_all(b"one\ntwo\nthree\n").await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        assert_eq!(read_lines_until(reader, deadline, 2).await, ["one", "two"]);
+
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        writer.write_all(b"one\n\xff two\n").await.unwrap();
+        drop(writer);
+        let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        assert_eq!(
+            read_lines_until(reader, deadline, 10).await,
+            ["one", "\u{fffd} two"]
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the end ends it"
+        );
+    }
+
+    /// A child is run as an argument vector and read to its end; one still
+    /// running at its limit is killed, so the listen ends with the limit;
+    /// one the unit lacks is None. Each program only prints or sleeps.
+    #[tokio::test]
+    async fn a_listened_child_is_killed_at_its_limit_and_a_missing_one_is_none() {
+        // Only printed: no shell reads the second argument.
+        let probe = "a;b $(printf EXPANDED)";
+        let printed = listen(
+            "printf",
+            &["%s\n", "one", probe],
+            Duration::from_secs(30),
+            10,
+        )
+        .await;
+        assert_eq!(printed.unwrap(), ["one", probe]);
+
+        let started = Instant::now();
+        let slept = listen("sleep", &["30"], Duration::from_millis(300), 10).await;
+        assert_eq!(slept.unwrap(), Vec::<String>::new());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "killed at its limit, not waited for: {:?}",
+            started.elapsed()
+        );
+
+        assert_eq!(
+            listen("sctl-no-such-program-0", &[], Duration::from_secs(1), 10).await,
+            None
         );
     }
 }

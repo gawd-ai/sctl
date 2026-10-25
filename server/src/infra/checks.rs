@@ -560,12 +560,6 @@ pub async fn exec_args_pub(
     exec_args(program, args, timeout_ms).await
 }
 
-/// Execute a shell command with timeout, returning (exit_code, stdout, stderr).
-/// Public variant for use by the recovery action executor and discovery module.
-pub async fn exec_simple_pub(cmd: &str, timeout_ms: u64) -> Result<(i32, String, String), String> {
-    exec_simple(cmd, timeout_ms).await
-}
-
 /// `exec_simple` with extra environment (a recovery's credentials). Both
 /// streams come back: a recovery logs its stdout and its stderr, where a
 /// failed command says why, each masked and cut by the caller (ADR-010).
