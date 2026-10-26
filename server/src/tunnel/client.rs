@@ -3322,7 +3322,8 @@ async fn handle_forwarded_session_message(
             let shell = msg["shell"].as_str().map(ToString::to_string);
             let use_pty = msg["pty"].as_bool().unwrap_or(false);
             let name = msg["name"].as_str().map(ToString::to_string);
-            let user_allows_ai = msg["user_allows_ai"].as_bool();
+            // Closed to AI clients unless the start asks (ADR-013).
+            let allows_ai = crate::sessions::start_allows_ai(msg);
             let rows = msg["rows"]
                 .as_u64()
                 .unwrap_or(u64::from(state.config.server.default_terminal_rows))
@@ -3341,7 +3342,6 @@ async fn handle_forwarded_session_message(
             let sh = shell
                 .as_deref()
                 .unwrap_or(&state.config.shell.default_shell);
-            let allows_ai = user_allows_ai.unwrap_or(true);
 
             info!(
                 request_id = request_id.as_deref().unwrap_or(""),
@@ -3372,6 +3372,7 @@ async fn handle_forwarded_session_message(
                     cols,
                     idle_timeout,
                     name.as_deref(),
+                    allows_ai,
                 )
                 .await
             {
@@ -3382,12 +3383,6 @@ async fn handle_forwarded_session_message(
                         pid,
                         "Tunnel: session.start PTY spawn succeeded"
                     );
-                    if !allows_ai {
-                        let _ = state
-                            .session_manager
-                            .set_user_allows_ai(&session_id, false)
-                            .await;
-                    }
 
                     // Send session.started BEFORE spawning subscriber to avoid
                     // a race where the subscriber grabs ws_sink first and blocks
@@ -3524,7 +3519,8 @@ async fn handle_forwarded_session_message(
                             "pid": pid,
                             "persistent": true,
                             "pty": false,
-                            "user_allows_ai": true,
+                            // A job starts closed to AI clients (ADR-013).
+                            "user_allows_ai": false,
                             "created_at": crate::sessions::journal::now_ms(),
                         });
                         if let Some(n) = name.as_deref() {
@@ -3733,6 +3729,8 @@ async fn handle_forwarded_session_message(
         }
         "session.list" => {
             let items = state.session_manager.list_sessions().await;
+            // `kind` as the direct socket's list carries it, so a client
+            // behind a relay tells a job from a terminal (ADR-013).
             let sessions_json: Vec<Value> = items
                 .iter()
                 .map(|s| {
@@ -3741,6 +3739,7 @@ async fn handle_forwarded_session_message(
                         "pid": s.pid,
                         "persistent": s.persistent,
                         "pty": s.pty,
+                        "kind": s.kind,
                         "attached": s.attached,
                         "status": s.status,
                         "idle": s.idle,
@@ -6109,6 +6108,190 @@ mod attach_tests {
         assert_eq!(sent[0]["code"], "SESSION_NOT_FOUND");
         assert_eq!(sent[0]["request_id"], "d");
         assert!(subscribers.lock().await.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod ai_client_tests {
+    //! Sessions started through the tunnel start closed to AI clients, and
+    //! the tunnel's list says a job from a terminal (ADR-013). The sessions
+    //! run `/bin/true`, which reads nothing and exits at once.
+
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use serde_json::{json, Value};
+    use tokio::sync::Mutex;
+
+    use super::{handle_forwarded_session_message, ws_lanes, Subscribers, WsSink};
+    use crate::config::Config;
+    use crate::file_access::Gate;
+    use crate::state::AppState;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sctl-tunnel-ai-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The tunnel client's session handler, with what it sends kept.
+    struct Tunnel {
+        state: AppState,
+        ws_sink: WsSink,
+        subscribers: Subscribers,
+        sent: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+
+    impl Tunnel {
+        fn new(dir: &Path) -> Self {
+            let mut config: Config = toml::from_str("").unwrap();
+            config.server.data_dir = dir.join("data").display().to_string();
+            let gate = Arc::new(Gate::for_agent(&config, None, None));
+            let state = AppState::for_tests(config, gate);
+            let (ws_sink, mut lanes) = ws_lanes(16, 256, 256);
+            let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let out = Arc::clone(&sent);
+            tokio::spawn(async move {
+                while let Some(msg) = lanes.next().await {
+                    if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+                        out.lock()
+                            .unwrap()
+                            .push(serde_json::from_str(text.as_str()).unwrap());
+                    }
+                }
+            });
+            Self {
+                state,
+                ws_sink,
+                subscribers: Arc::new(Mutex::new(HashMap::new())),
+                sent,
+            }
+        }
+
+        /// Hand `msg` to the handler and return the answer that carries
+        /// its `request_id`; a wait past 10 s fails the test.
+        async fn ask(&self, msg: &Value) -> Value {
+            handle_forwarded_session_message(&self.state, &self.ws_sink, &self.subscribers, msg)
+                .await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let answer = self
+                    .sent
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|m| m["request_id"] == msg["request_id"])
+                    .cloned();
+                if let Some(answer) = answer {
+                    return answer;
+                }
+                assert!(tokio::time::Instant::now() < deadline, "no answer to {msg}");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }
+
+    /// A start of `/bin/true` in `/`, with `extra` fields.
+    fn start(request_id: &str, extra: &Value) -> Value {
+        let mut msg = json!({
+            "type": "session.start",
+            "shell": "/bin/true",
+            "working_dir": "/",
+            "request_id": request_id,
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            msg[key] = value.clone();
+        }
+        msg
+    }
+
+    fn listed<'a>(list: &'a Value, session_id: &Value) -> &'a Value {
+        list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["session_id"] == *session_id)
+            .expect("the session is listed")
+    }
+
+    #[tokio::test]
+    async fn a_start_through_the_tunnel_is_closed_unless_it_asks() {
+        let dir = scratch("start");
+        let tunnel = Tunnel::new(&dir);
+
+        let omitted = tunnel.ask(&start("a", &json!({}))).await;
+        let refused = tunnel
+            .ask(&start("b", &json!({"user_allows_ai": false})))
+            .await;
+        let asked = tunnel
+            .ask(&start("c", &json!({"user_allows_ai": true})))
+            .await;
+        for (answer, open) in [(&omitted, false), (&refused, false), (&asked, true)] {
+            assert_eq!(answer["type"], "session.started", "{answer}");
+            assert_eq!(answer["user_allows_ai"], open, "{answer}");
+        }
+        // The broadcast to every client says what the answer says.
+        let mut events = tunnel.state.session_events.subscribe();
+        let broadcast = tunnel.ask(&start("d", &json!({}))).await;
+        let created = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event["type"] == "session.created" {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("session.created within 10 s");
+        assert_eq!(created["session_id"], broadcast["session_id"]);
+        assert_eq!(created["user_allows_ai"], false, "{created}");
+
+        let status = |request_id: &str, session_id: &Value| {
+            json!({
+                "type": "session.ai_status",
+                "session_id": session_id,
+                "working": true,
+                "activity": "write",
+                "request_id": request_id,
+            })
+        };
+        let closed = tunnel.ask(&status("s1", &omitted["session_id"])).await;
+        assert_eq!(closed["code"], "AI_NOT_ALLOWED", "{closed}");
+        let open = tunnel.ask(&status("s2", &asked["session_id"])).await;
+        assert_eq!(open["type"], "session.ai_status.ack", "{open}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_job_through_the_tunnel_is_closed_and_the_list_carries_kind() {
+        let dir = scratch("job");
+        let tunnel = Tunnel::new(&dir);
+        let job = tunnel
+            .ask(&json!({
+                "type": "job.start",
+                "shell": "/bin/true",
+                "working_dir": "/",
+                "command": "true",
+                "request_id": "j",
+            }))
+            .await;
+        assert_eq!(job["type"], "session.started", "{job}");
+        assert_eq!(job["user_allows_ai"], false, "{job}");
+        let terminal = tunnel.ask(&start("t", &json!({}))).await;
+
+        let list = tunnel
+            .ask(&json!({"type": "session.list", "request_id": "l"}))
+            .await;
+        let item = listed(&list, &job["session_id"]);
+        assert_eq!(item["kind"], "job", "{item}");
+        assert_eq!(item["user_allows_ai"], false, "{item}");
+        let item = listed(&list, &terminal["session_id"]);
+        assert_eq!(item["kind"], "terminal", "{item}");
+        assert_eq!(item["user_allows_ai"], false, "{item}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

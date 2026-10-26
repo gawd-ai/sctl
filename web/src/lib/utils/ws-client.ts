@@ -381,7 +381,9 @@ export class SctlWsClient {
 			pty: opts?.pty ?? true,
 			rows: opts?.rows,
 			cols: opts?.cols,
-			name: opts?.name
+			name: opts?.name,
+			// Closed to AI clients unless the embedder asks (sctl ADR-013).
+			user_allows_ai: opts?.userAllowsAi === true
 		});
 	}
 

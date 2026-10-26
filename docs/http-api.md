@@ -637,6 +637,19 @@ Interactive shell sessions are **created** over the WebSocket
 (`session.start`); the REST surface lists and manages them. All session
 lifecycle changes are broadcast on the WS/SSE event streams.
 
+A session starts closed to AI clients (ADR-013): its `user_allows_ai` is
+false unless the `session.start` that made it carries `user_allows_ai:
+true`. A job (`job.start`) and a session brought back from its journal
+after a restart start closed too. A person opens a session, or closes it,
+with the WebSocket's `session.allow_ai` or this API's `PATCH
+/api/sessions/{id}` `allowed`: the person's switch. The agent cannot tell
+a person's client from an AI client on one key, so the clients sctl ships
+send it only for a person: sctlin's Allow AI button, never mcp-sctl. The
+flag gates the AI status, never a keystroke: `working: true` is refused
+with `AI_NOT_ALLOWED` on a closed session, and an AI client that follows
+the protocol, as mcp-sctl does, types only into a session whose AI status
+the agent accepted.
+
 ### `GET /api/sessions`
 
 List all sessions. **Auth: API key Bearer.**
@@ -644,7 +657,7 @@ List all sessions. **Auth: API key Bearer.**
 Response `200`: `{sessions: [...]}` — each entry: `session_id`, `pid`,
 `persistent`, `pty`, `kind`, `attached`, `status`, `idle`, `idle_timeout`,
 `created_at`, `user_allows_ai`, `ai_is_working`, plus optional `exit_code`,
-`name`, `ai_activity`, `ai_status_message`.
+`name`, `ai_activity`, `ai_status_message`. `kind` is `terminal` or `job`.
 
 ### `DELETE /api/sessions/{id}`
 
@@ -665,7 +678,7 @@ Request body (all optional):
 | Field | Type | Effect |
 |-------|------|--------|
 | `name` | string | Rename (broadcasts `session.renamed`) |
-| `allowed` | bool | Set user's AI permission (broadcasts `session.ai_permission_changed`; revoking clears any AI-working state) |
+| `allowed` | bool | The person's switch: open the session to AI clients or close it (broadcasts `session.ai_permission_changed`; closing clears any AI-working state) |
 | `working` | bool | Set AI working status (broadcasts `session.ai_status_changed`) |
 | `activity` | string | AI activity label (with `working`) |
 | `message` | string | AI status message (with `working`) |
@@ -1318,6 +1331,18 @@ response(s). Client → server types: `ping`, `session.start`,
 session_id?}`). The full message table lives in `server/src/ws/mod.rs`.
 A `session.start`'s `env` is merged as exec's is: `SCTL_AGENT_CONFIG` is
 the agent's own (`docs/config.md`).
+
+A `session.start` takes `user_allows_ai`, false when absent: only `true`
+opens the session to AI clients at its start, for a person's choice
+(ADR-013). Agents before 0.6.12 read an absent field as true. The
+`session.started` answer carries the session's `user_allows_ai`, and a
+`job.start` is answered `false`. `session.allow_ai` (`session_id`,
+`allowed`) is the person's switch, answered `session.allow_ai.ack` and
+broadcast as `session.ai_permission_changed`. `session.ai_status` with
+`working: true` is refused with `AI_NOT_ALLOWED` on a closed session.
+`session.listed` carries each session's `kind` (`terminal` or `job`) and
+`user_allows_ai`, on this socket and through a relay
+(`GET /d/{serial}/api/ws`), where agents before 0.6.12 leave `kind` out.
 
 On disconnect, non-persistent sessions are killed; persistent sessions
 detach and keep buffering output for later re-attach.

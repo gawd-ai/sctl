@@ -11,6 +11,9 @@
 //!   that exceed their client-requested `idle_timeout`.
 //! - **Journal** — session output is persisted to disk for crash recovery.
 //! - **PTY** — sessions can be backed by a PTY for full terminal emulation.
+//! - **Closed to AI clients** at the start (ADR-013): a session is open to
+//!   them only once a person's client asks, at its start or later with
+//!   `session.allow_ai`.
 //!
 //! ## Concurrency
 //!
@@ -106,6 +109,16 @@ impl SessionKind {
     }
 }
 
+/// Whether a `session.start` opens its session to AI clients (ADR-013):
+/// only an explicit `user_allows_ai: true` does. An omitted field, `null`,
+/// `false` or any other value starts the session closed. Both start paths,
+/// the direct socket and the tunnel, read the request with this.
+pub fn start_allows_ai(msg: &serde_json::Value) -> bool {
+    msg.get("user_allows_ai")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Idle timeout (seconds) applied to one-shot jobs: a job abandoned *while still
 /// running* (detached, no activity) is reaped after this long. An *exited* job is
 /// cleaned up by the next sweep regardless. Generous enough to survive a page
@@ -195,11 +208,14 @@ impl SessionManager {
             None,
             SessionKind::Terminal,
             None,
+            false,
         )
         .await
     }
 
-    /// Create a new session with optional PTY support.
+    /// Create a new session with optional PTY support. It is open to AI
+    /// clients only when `user_allows_ai` says so: a person's client asked
+    /// for it at the start (ADR-013).
     #[allow(clippy::too_many_arguments)]
     pub async fn create_session_with_pty(
         &self,
@@ -212,6 +228,7 @@ impl SessionManager {
         cols: u16,
         idle_timeout: u64,
         name: Option<&str>,
+        user_allows_ai: bool,
     ) -> Result<(String, u32), String> {
         self.create_session_inner(
             shell,
@@ -226,6 +243,7 @@ impl SessionManager {
             None,
             SessionKind::Terminal,
             None,
+            user_allows_ai,
         )
         .await
     }
@@ -237,7 +255,8 @@ impl SessionManager {
     ///
     /// Jobs are `persistent` so they survive a brief WS reconnect (page reload →
     /// re-attach). `idle_timeout` reaps a job abandoned *while still running*; an
-    /// *exited* job is cleaned up by the next sweep regardless.
+    /// *exited* job is cleaned up by the next sweep regardless. A job starts
+    /// closed to AI clients, as every session does (ADR-013).
     #[allow(clippy::too_many_arguments)]
     pub async fn create_job(
         &self,
@@ -262,6 +281,7 @@ impl SessionManager {
             Some(command),
             SessionKind::Job,
             Some(exit_events),
+            false,
         )
         .await
     }
@@ -281,6 +301,7 @@ impl SessionManager {
         command: Option<&str>,
         kind: SessionKind,
         exit_events: Option<broadcast::Sender<serde_json::Value>>,
+        user_allows_ai: bool,
     ) -> Result<(String, u32), String> {
         let mut sessions = self.sessions.write().await;
 
@@ -364,7 +385,7 @@ impl SessionManager {
                 idle_timeout,
                 name: session_name,
                 created_at,
-                user_allows_ai: true,
+                user_allows_ai,
                 ai_is_working: false,
                 ai_activity: None,
                 ai_status_message: None,
@@ -611,7 +632,7 @@ impl SessionManager {
                 idle_timeout: 0,
                 name: None,
                 created_at: 0,
-                user_allows_ai: true,
+                user_allows_ai: false,
                 ai_is_working: false,
                 ai_activity: None,
                 ai_status_message: None,
@@ -836,7 +857,10 @@ impl SessionManager {
                     idle_timeout: 0,
                     name: None,
                     created_at: arch.metadata.created,
-                    user_allows_ai: true,
+                    // Closed to AI clients, whatever it was before the
+                    // restart (ADR-013): the journal does not keep the
+                    // flag, and no person has opened it since.
+                    user_allows_ai: false,
                     ai_is_working: false,
                     ai_activity: None,
                     ai_status_message: None,
@@ -971,5 +995,128 @@ impl SessionManager {
         }
 
         events
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Every path that makes a session starts it closed to AI clients
+    //! (ADR-013). The sessions here run `/bin/true`, which reads nothing and
+    //! exits at once; the journal test starts no process at all.
+
+    use std::path::PathBuf;
+
+    use serde_json::json;
+    use tokio::sync::broadcast;
+
+    use super::journal::{SessionJournal, SessionMetadata};
+    use super::{start_allows_ai, SessionManager};
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sctl-ai-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn allows_ai(sessions: &SessionManager, session_id: &str) -> bool {
+        sessions
+            .list_sessions()
+            .await
+            .into_iter()
+            .find(|s| s.session_id == session_id)
+            .expect("the session is listed")
+            .user_allows_ai
+    }
+
+    #[test]
+    fn only_an_explicit_true_opens_a_start() {
+        assert!(!start_allows_ai(&json!({"type": "session.start"})));
+        assert!(!start_allows_ai(&json!({"user_allows_ai": null})));
+        assert!(!start_allows_ai(&json!({"user_allows_ai": false})));
+        assert!(!start_allows_ai(&json!({"user_allows_ai": "true"})));
+        assert!(!start_allows_ai(&json!({"user_allows_ai": 1})));
+        assert!(start_allows_ai(&json!({"user_allows_ai": true})));
+    }
+
+    #[tokio::test]
+    async fn a_session_is_open_only_when_its_start_asks_and_a_job_never_is() {
+        let sessions = SessionManager::new(8, 100);
+        let start = |open: bool| {
+            let sessions = sessions.clone();
+            async move {
+                sessions
+                    .create_session_with_pty(
+                        "/bin/true",
+                        "/",
+                        None,
+                        false,
+                        false,
+                        24,
+                        80,
+                        0,
+                        None,
+                        open,
+                    )
+                    .await
+                    .unwrap()
+                    .0
+            }
+        };
+        let closed = start(false).await;
+        let open = start(true).await;
+        let (events, _) = broadcast::channel(16);
+        let (job, _) = sessions
+            .create_job("/bin/true", "/", "true", None, None, 60, events)
+            .await
+            .unwrap();
+        let (plain, _) = sessions
+            .create_session("/bin/true", "/", None, false)
+            .await
+            .unwrap();
+
+        assert!(!allows_ai(&sessions, &closed).await);
+        assert!(allows_ai(&sessions, &open).await);
+        assert!(!allows_ai(&sessions, &job).await, "a job");
+        assert!(!allows_ai(&sessions, &plain).await, "create_session");
+
+        // The flag gates the AI status: refused on a closed session.
+        assert!(sessions
+            .set_ai_status(&closed, true, Some("write"), None)
+            .await
+            .is_err());
+        assert!(sessions
+            .set_ai_status(&open, true, Some("write"), None)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_session_brought_back_from_its_journal_is_closed() {
+        let dir = scratch("journal");
+        // A session that was still running when the agent stopped: its
+        // journal holds the header and output, and no exit.
+        let metadata = SessionMetadata {
+            v: 1,
+            pid: 0,
+            shell: "/bin/sh".into(),
+            working_dir: "/".into(),
+            persistent: true,
+            pty: true,
+            created: 1,
+        };
+        let journal = SessionJournal::create(&dir.join("sessions"), "s1", &metadata)
+            .await
+            .unwrap();
+        drop(journal);
+
+        let sessions = SessionManager::new(8, 100);
+        sessions.recover_from_journal(&dir).await;
+        assert!(!allows_ai(&sessions, "s1").await);
+        assert!(sessions
+            .set_ai_status("s1", true, Some("read"), None)
+            .await
+            .is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

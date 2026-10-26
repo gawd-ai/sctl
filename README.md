@@ -65,9 +65,10 @@ Result: the board can be inspected and recovered without inbound network access.
 **Persistent human/AI handoff**
 
 ```text
-session_start    { persistent: true, pty: true, name: "field-debug" }
+session_start    { persistent: true, pty: true, name: "field-debug" }  # starts closed to AI
+                 # a person switches Allow AI on in sctlin
 session_exec     { command: "make test" }
-session_allow_ai { allowed: false }  # human takes over in sctlin
+                 # the person switches Allow AI off and takes over
 session_attach   { session_id: "...", since: 0 }  # agent replays missed output
 ```
 
@@ -181,7 +182,7 @@ When connected through `mcp-sctl`, agents get tools for:
 - Device discovery, health, info, command execution, and activity history.
 - Atomic file read/write/delete operations.
 - Persistent session lifecycle, raw terminal input, signals, resize, attach, and wait helpers.
-- AI collaboration controls such as `session_allow_ai` and `session_ai_status`.
+- AI status reporting (`session_ai_status`). A session is open to AI only once a person allows it in sctlin; no tool opens one.
 - Playbook CRUD and auto-generated `pb_*` tools from device-stored Markdown playbooks.
 
 See [mcp/README.md](mcp/README.md) for the complete tool catalog and config format.

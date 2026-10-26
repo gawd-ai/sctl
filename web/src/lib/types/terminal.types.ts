@@ -81,6 +81,12 @@ export interface SessionStartOptions {
 	cols?: number;
 	/** Human-readable session name. */
 	name?: string;
+	/**
+	 * Open the session to AI clients at its start. Default false: a session
+	 * starts closed to AI clients, and a person opens it with the Allow AI
+	 * control (sctl ADR-013). Pass true only for a person's own choice.
+	 */
+	userAllowsAi?: boolean;
 }
 
 /**
@@ -208,6 +214,8 @@ export interface WsSessionStartMsg {
 	rows?: number;
 	cols?: number;
 	name?: string;
+	/** Open to AI clients at the start; the agent reads an absent field as false. */
+	user_allows_ai?: boolean;
 }
 
 export interface WsJobStartMsg {

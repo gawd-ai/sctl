@@ -175,14 +175,20 @@
 		onnavigate?.(parent);
 	}
 
-	function highlightMatch(name: string): string {
-		if (!filterText) return name;
+	/**
+	 * A name split around the filter's first match, or null when it has none.
+	 * The template renders the parts as text, so a name is never read as HTML:
+	 * a file on the unit may be named with markup (sctl ADR-013).
+	 */
+	function matchParts(name: string): { before: string; match: string; after: string } | null {
+		if (!filterText) return null;
 		const idx = name.toLowerCase().indexOf(filterText.toLowerCase());
-		if (idx === -1) return name;
-		const before = name.slice(0, idx);
-		const match = name.slice(idx, idx + filterText.length);
-		const after = name.slice(idx + filterText.length);
-		return `${before}<mark class="bg-yellow-500/30 text-yellow-200 rounded-sm">${match}</mark>${after}`;
+		if (idx === -1) return null;
+		return {
+			before: name.slice(0, idx),
+			match: name.slice(idx, idx + filterText.length),
+			after: name.slice(idx + filterText.length)
+		};
 	}
 </script>
 
@@ -300,9 +306,10 @@
 						/>
 					</div>
 				{:else}
+					{@const parts = matchParts(entry.name)}
 					<span class="flex-1 truncate">
-						{#if filterText}
-							{@html highlightMatch(entry.name)}
+						{#if parts}
+							{parts.before}<mark class="bg-yellow-500/30 text-yellow-200 rounded-sm">{parts.match}</mark>{parts.after}
 						{:else}
 							{entry.name}
 						{/if}

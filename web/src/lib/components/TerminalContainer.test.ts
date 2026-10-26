@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { render } from '@testing-library/svelte';
+import { render, screen } from '@testing-library/svelte';
 import TerminalContainer from './TerminalContainer.svelte';
 import { SctlWsClient } from '../utils/ws-client';
 import type { WsSessionOutputMsg } from '../types/terminal.types';
@@ -134,5 +134,61 @@ describe('TerminalContainer', () => {
 
 		const lines = ['line 1\n', 'line 2\n', 'line 3\n', 'line 4\n', 'line 5\n'];
 		await vi.waitFor(() => expect(terminal.written).toEqual(lines));
+	});
+
+	/**
+	 * Start a session from a container whose embedder gives `sessionDefaults`,
+	 * answered by an agent that says `user_allows_ai` only when `answer` is
+	 * given. Returns the start frame and the Allow AI button.
+	 */
+	async function started(
+		sessionDefaults: { userAllowsAi?: boolean } | undefined,
+		answer: boolean | undefined
+	): Promise<{ start: Frame; button: HTMLElement }> {
+		vi.stubGlobal('ResizeObserver', SizedResizeObserver);
+		vi.stubGlobal('WebSocket', FakeSocket);
+		const wsUrl = 'ws://192.0.2.1:1337/api/ws';
+		const client = new SctlWsClient(wsUrl, 'test-key');
+		client.connect();
+		const socket = FakeSocket.last!;
+		socket.open();
+		let start: Frame | null = null;
+		socket.onSend = (frame) => {
+			if (frame.type === 'session.list') {
+				socket.deliver({ type: 'session.listed', sessions: [], request_id: frame.request_id });
+			}
+			if (frame.type !== 'session.start') return;
+			start = frame;
+			const reply: Frame = {
+				type: 'session.started',
+				session_id: 's1',
+				pid: 1,
+				persistent: false,
+				pty: true,
+				created_at: 0,
+				request_id: frame.request_id
+			};
+			if (answer !== undefined) reply.user_allows_ai = answer;
+			socket.deliver(reply);
+		};
+		const { component } = render(TerminalContainer, {
+			props: { config: { wsUrl, apiKey: 'test-key', client, autoStartSession: false, sessionDefaults } }
+		});
+		await component.startSession();
+		expect(start).not.toBeNull();
+		const button = await vi.waitFor(() => screen.getByRole('button', { name: 'Allow AI' }));
+		return { start: start!, button };
+	}
+
+	it('starts a session closed to AI clients and reads an absent answer as closed', async () => {
+		const { start, button } = await started(undefined, undefined);
+		expect(start).toMatchObject({ type: 'session.start', user_allows_ai: false });
+		expect(button.getAttribute('aria-pressed')).toBe('false');
+	});
+
+	it('starts a session open to AI clients only when the embedder asks', async () => {
+		const { start, button } = await started({ userAllowsAi: true }, true);
+		expect(start).toMatchObject({ type: 'session.start', user_allows_ai: true });
+		expect(button.getAttribute('aria-pressed')).toBe('true');
 	});
 });

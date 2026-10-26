@@ -15,7 +15,8 @@
 //! | Type              | Fields                                                        | Response type(s)                |
 //! |-------------------|---------------------------------------------------------------|---------------------------------|
 //! | `ping`            | —                                                             | `pong`                          |
-//! | `session.start`   | `working_dir?`, `persistent?`, `env?`, `shell?`, `pty?`, `rows?`, `cols?`, `idle_timeout?` | `session.started` or `error` |
+//! | `session.start`   | `working_dir?`, `persistent?`, `env?`, `shell?`, `pty?`, `rows?`, `cols?`, `idle_timeout?`, `name?`, `user_allows_ai?` | `session.started` or `error` |
+//! | `job.start`       | `command`, `working_dir?`, `env?`, `shell?`, `name?`          | `session.started` or `error`    |
 //! | `session.exec`    | `session_id`, `command`                                       | `session.exec.ack` or `error`   |
 //! | `session.stdin`   | `session_id`, `data`                                          | (none on success, `error` on failure) |
 //! | `session.kill`    | `session_id`                                                  | `session.closed` or `error`     |
@@ -23,7 +24,7 @@
 //! | `session.attach`  | `session_id`, `since?`                                        | `session.attached` or `error`   |
 //! | `session.resize`  | `session_id`, `rows`, `cols`                                  | `session.resize.ack` or `error` |
 //! | `session.list`    | —                                                             | `session.listed`                |
-//! | `session.allow_ai`    | `session_id`, `allowed` (bool)                                | `session.allow_ai.ack` + broadcast `session.ai_permission_changed` |
+//! | `session.allow_ai`    | `session_id`, `allowed` (bool): the person's switch          | `session.allow_ai.ack` + broadcast `session.ai_permission_changed` |
 //! | `session.ai_status`   | `session_id`, `working` (bool), `activity?`, `message?`       | `session.ai_status.ack` + broadcast `session.ai_status_changed` |
 //! | `shell.list`      | —                                                             | `shell.listed`                  |
 //!
@@ -42,9 +43,19 @@
 //! | `session.signal.ack` | `session_id`                          |
 //! | `session.attached`   | `session_id`, `entries[]`             |
 //! | `session.resize.ack` | `session_id`, `rows`, `cols`          |
-//! | `session.listed`     | `sessions[]` (incl. `status`, `idle`) |
+//! | `session.listed`     | `sessions[]` (incl. `kind`, `status`, `idle`) |
 //! | `shell.listed`       | `shells[]`, `default_shell`           |
 //! | `error`              | `code`, `message`, `session_id?`      |
+//!
+//! ## Sessions start closed to AI clients (ADR-013)
+//!
+//! A session, a job and a session brought back from its journal start with
+//! `user_allows_ai` false. Only `user_allows_ai: true` on a `session.start`
+//! opens one at its start; `session.allow_ai` opens or closes it later.
+//! Both are a person's frames: the agent cannot tell a person's client from
+//! an AI client on one key, so the clients sctl ships send them only for a
+//! person. The flag gates `session.ai_status` with `working: true`, never a
+//! keystroke.
 
 pub mod messages;
 
@@ -243,7 +254,7 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
                                 let shell = parsed["shell"].as_str().map(ToString::to_string);
                                 let use_pty = parsed["pty"].as_bool().unwrap_or(false);
                                 let name = parsed["name"].as_str().map(ToString::to_string);
-                                let user_allows_ai = parsed["user_allows_ai"].as_bool();
+                                let user_allows_ai = crate::sessions::start_allows_ai(&parsed);
                                 let rows = parsed["rows"]
                                     .as_u64()
                                     .unwrap_or(u64::from(state.config.server.default_terminal_rows))
@@ -648,7 +659,8 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
     send_task.abort();
 }
 
-/// Handle `session.start` — spawn a new shell session.
+/// Handle `session.start`: spawn a new shell session, open to AI clients
+/// only when `user_allows_ai` (ADR-013).
 ///
 /// Returns the `session_id` on success (used for connection-scoped cleanup).
 #[allow(clippy::too_many_arguments)]
@@ -665,13 +677,12 @@ async fn handle_session_start(
     cols: u16,
     idle_timeout: u64,
     name: Option<&str>,
-    user_allows_ai: Option<bool>,
+    allows_ai: bool,
 ) -> Option<String> {
     let raw_dir = working_dir.unwrap_or(&state.config.shell.default_working_dir);
     let expanded = crate::util::expand_tilde(raw_dir);
     let dir = expanded.as_ref();
     let sh = shell.unwrap_or(&state.config.shell.default_shell);
-    let allows_ai = user_allows_ai.unwrap_or(true);
 
     tracing::info!(
         request_id = request_id.unwrap_or(""),
@@ -696,6 +707,7 @@ async fn handle_session_start(
             cols,
             idle_timeout,
             name,
+            allows_ai,
         )
         .await
     {
@@ -706,13 +718,6 @@ async fn handle_session_start(
                 pid,
                 "WS: session.start PTY spawn succeeded"
             );
-            // Override default AI permission if explicitly disabled
-            if !allows_ai {
-                let _ = state
-                    .session_manager
-                    .set_user_allows_ai(&session_id, false)
-                    .await;
-            }
 
             let queued = tx
                 .send(
@@ -847,7 +852,8 @@ async fn handle_job_start(
                         pid,
                         persistent: true,
                         pty: false,
-                        user_allows_ai: true,
+                        // A job starts closed to AI clients (ADR-013).
+                        user_allows_ai: false,
                         created_at: crate::sessions::journal::now_ms(),
                         name: name.map(String::from),
                         request_id: request_id.map(String::from),
@@ -1182,5 +1188,164 @@ async fn handle_session_attach(
                 .to_value(),
             )
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The direct socket's starts, end to end over a loopback port: a
+    //! session starts closed to AI clients unless its start asks (ADR-013).
+    //! The sessions run `/bin/true`, which reads nothing and exits at once.
+
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::{json, Value};
+    use tokio::net::TcpStream;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+
+    use crate::config::Config;
+    use crate::file_access::Gate;
+    use crate::state::AppState;
+
+    type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    const KEY: &str = "ws-key-for-tests";
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sctl-ws-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The agent's `/api/ws` on a loopback port, and a client on it.
+    async fn agent(dir: &Path) -> Ws {
+        let mut config: Config = toml::from_str("").unwrap();
+        config.server.data_dir = dir.join("data").display().to_string();
+        config.auth.api_key = KEY.to_string();
+        let gate = Arc::new(Gate::for_agent(&config, None, None));
+        let state = AppState::for_tests(config, gate);
+        let app = axum::Router::new()
+            .route("/api/ws", axum::routing::get(super::ws_upgrade))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        connect_async(format!("ws://{addr}/api/ws?token={KEY}"))
+            .await
+            .unwrap()
+            .0
+    }
+
+    /// Send `msg` and return the answer that carries its `request_id`.
+    async fn ask(ws: &mut Ws, msg: &Value) -> Value {
+        ws.send(Message::Text(msg.to_string().into()))
+            .await
+            .unwrap();
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(10), ws.next())
+                .await
+                .expect("an answer within 10 s")
+                .expect("the socket is open")
+                .expect("a readable frame");
+            if let Message::Text(text) = frame {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value["request_id"] == msg["request_id"] {
+                    return value;
+                }
+            }
+        }
+    }
+
+    /// A start of `/bin/true` in `/`, with `extra` fields.
+    fn start(request_id: &str, extra: &Value) -> Value {
+        let mut msg = json!({
+            "type": "session.start",
+            "shell": "/bin/true",
+            "working_dir": "/",
+            "request_id": request_id,
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            msg[key] = value.clone();
+        }
+        msg
+    }
+
+    fn listed<'a>(list: &'a Value, session_id: &Value) -> &'a Value {
+        list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["session_id"] == *session_id)
+            .expect("the session is listed")
+    }
+
+    #[tokio::test]
+    async fn a_start_is_closed_to_ai_clients_unless_it_asks() {
+        let dir = scratch("start");
+        let mut ws = agent(&dir).await;
+
+        let omitted = ask(&mut ws, &start("a", &json!({}))).await;
+        let refused = ask(&mut ws, &start("b", &json!({"user_allows_ai": false}))).await;
+        let a_string = ask(&mut ws, &start("c", &json!({"user_allows_ai": "true"}))).await;
+        let asked = ask(&mut ws, &start("d", &json!({"user_allows_ai": true}))).await;
+        for (answer, open) in [
+            (&omitted, false),
+            (&refused, false),
+            (&a_string, false),
+            (&asked, true),
+        ] {
+            assert_eq!(answer["type"], "session.started", "{answer}");
+            assert_eq!(answer["user_allows_ai"], open, "{answer}");
+        }
+
+        let list = ask(&mut ws, &json!({"type": "session.list", "request_id": "l"})).await;
+        for (answer, open) in [(&omitted, false), (&a_string, false), (&asked, true)] {
+            let item = listed(&list, &answer["session_id"]);
+            assert_eq!(item["user_allows_ai"], open, "{item}");
+            assert_eq!(item["kind"], "terminal", "{item}");
+        }
+
+        // The flag gates the AI status, refused on the closed session.
+        let status = |request_id: &str, session_id: &Value| {
+            json!({
+                "type": "session.ai_status",
+                "session_id": session_id,
+                "working": true,
+                "activity": "write",
+                "request_id": request_id,
+            })
+        };
+        let closed = ask(&mut ws, &status("s1", &omitted["session_id"])).await;
+        assert_eq!(closed["code"], "AI_NOT_ALLOWED", "{closed}");
+        let open = ask(&mut ws, &status("s2", &asked["session_id"])).await;
+        assert_eq!(open["type"], "session.ai_status.ack", "{open}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_job_is_started_and_answered_closed() {
+        let dir = scratch("job");
+        let mut ws = agent(&dir).await;
+        let job = json!({
+            "type": "job.start",
+            "shell": "/bin/true",
+            "working_dir": "/",
+            "command": "true",
+            "request_id": "j",
+        });
+        let answer = ask(&mut ws, &job).await;
+        assert_eq!(answer["type"], "session.started", "{answer}");
+        assert_eq!(answer["user_allows_ai"], false, "{answer}");
+
+        let list = ask(&mut ws, &json!({"type": "session.list", "request_id": "l"})).await;
+        let item = listed(&list, &answer["session_id"]);
+        assert_eq!(item["user_allows_ai"], false, "{item}");
+        assert_eq!(item["kind"], "job", "{item}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

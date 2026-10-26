@@ -14,6 +14,13 @@
 //! - `session_start`, `session_exec`, `session_send`
 //! - `session_read`, `session_signal`, `session_kill`
 //!
+//! A session starts closed to AI clients, and only a person opens it, with
+//! the Allow AI control in a console (ADR-013): `session_start` asks for a
+//! closed one, no tool opens one, and `session_exec`, `session_send`,
+//! `session_exec_wait` and `session_signal` send nothing into a session the
+//! agent does not confirm a person opened. The device tools still run as
+//! root for whoever holds a unit's key: the MCP is a root channel.
+//!
 //! **Playbook management tools** (always present):
 //! - `playbook_list`, `playbook_get`, `playbook_put`
 //!
@@ -271,7 +278,7 @@ fn builtin_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "session_start",
-            "description": "Start a persistent interactive shell session on a device. Returns a session_id for subsequent calls. Sessions are NEVER killed automatically unless you set idle_timeout. Use idle_timeout to control cleanup of sessions you may not return to.\n\nSession lifecycle:\n- idle_timeout=0 (default): session lives forever until explicitly killed via session_kill\n- idle_timeout=N: session is gracefully terminated after N seconds of inactivity while detached (no client connected)\n- For long-running work, use 0 or a high value (3600). For quick one-off commands, use a lower value (300-600).\n- Activity resets whenever you send input or re-attach.\n\nSet pty=true for full terminal emulation (TUI programs like nano, vi, htop).\n\nPTY workflow:\n1. session_exec to run commands — works in both shell prompts and TUI programs (auto-appends Enter)\n2. session_send for raw keystrokes without Enter (arrow keys, Ctrl combos, Escape sequences)\n3. session_read to see output (contains ANSI escape codes in PTY mode)\n\nSee session_send description for full list of control characters and escape sequences (arrow keys, function keys, navigation keys, etc.).\n\nPTY workflow for TUI programs (Claude Code, fzf, dialog, etc.):\n- Use session_send to type text (no Enter appended)\n- Use session_send with \\n to press Enter (auto-translated to \\r)\n- Do NOT use session_exec for TUI input fields — it sends text+Enter as one write, which TUIs may interpret as embedded newline rather than submit",
+            "description": "Start a persistent interactive shell session on a device. Returns a session_id for subsequent calls. Sessions are NEVER killed automatically unless you set idle_timeout. Use idle_timeout to control cleanup of sessions you may not return to.\n\nSession lifecycle:\n- idle_timeout=0 (default): session lives forever until explicitly killed via session_kill\n- idle_timeout=N: session is gracefully terminated after N seconds of inactivity while detached (no client connected)\n- For long-running work, use 0 or a high value (3600). For quick one-off commands, use a lower value (300-600).\n- Activity resets whenever you send input or re-attach.\n\nSet pty=true for full terminal emulation (TUI programs like nano, vi, htop).\n\nPTY workflow:\n1. session_exec to run commands: works in both shell prompts and TUI programs (auto-appends Enter)\n2. session_send for raw keystrokes without Enter (arrow keys, Ctrl combos, Escape sequences)\n3. session_read to see output (contains ANSI escape codes in PTY mode)\n\nSee session_send description for full list of control characters and escape sequences (arrow keys, function keys, navigation keys, etc.).\n\nPTY workflow for TUI programs (Claude Code, fzf, dialog, etc.):\n- Use session_send to type text (no Enter appended)\n- Use session_send with \\n to press Enter (auto-translated to \\r)\n- Do NOT use session_exec for TUI input fields: it sends text+Enter as one write, which TUIs may interpret as embedded newline rather than submit\n\nThe session starts closed to AI clients (user_allows_ai: false). session_exec, session_send, session_exec_wait and session_signal refuse it, sending nothing, until a person opens it to AI with the Allow AI control in its console. No tool opens a session to AI.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -322,7 +329,7 @@ fn builtin_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "session_exec",
-            "description": "Execute a command in an existing interactive session and press Enter. The server automatically uses the correct line ending (\\r for PTY, \\n for pipe sessions), so this works in both shell prompts and TUI programs. Use session_read to get output. For raw keystrokes without Enter (arrow keys, Ctrl combos, Escape), use session_send instead.\n\nIMPORTANT for TUI programs (like Claude Code, fzf, dialog): session_exec sends text+Enter as a single write. Some TUI input fields treat this as \"insert text with embedded newline\" rather than \"type text then submit\". For TUI programs, prefer session_send with text first, then a separate session_send with \\n (translated to Enter) to submit. session_exec is best for shell prompts where command+Enter is the standard pattern.\n\nAI STATUS (sessions the user is watching): call session_ai_status with activity='write' (green 'AI Executing' badge) in the SAME step you begin executing, activity='read' (blue 'AI Reading' badge) while only inspecting, and working=false when done. Set it as part of acting — do not wait to be reminded.",
+            "description": "Execute a command in an existing interactive session and press Enter. The server automatically uses the correct line ending (\\r for PTY, \\n for pipe sessions), so this works in both shell prompts and TUI programs. Use session_read to get output. For raw keystrokes without Enter (arrow keys, Ctrl combos, Escape), use session_send instead.\n\nIMPORTANT for TUI programs (like Claude Code, fzf, dialog): session_exec sends text+Enter as a single write. Some TUI input fields treat this as \"insert text with embedded newline\" rather than \"type text then submit\". For TUI programs, prefer session_send with text first, then a separate session_send with \\n (translated to Enter) to submit. session_exec is best for shell prompts where command+Enter is the standard pattern.\n\nOPEN TO AI: refused, with nothing sent, unless a person opened the session to AI with the Allow AI control in its console. Before sending, the tool sets the AI status to working with activity='write' (green 'AI Executing' badge), which the agent accepts only for such a session. Call session_ai_status with activity='read' (blue 'AI Reading' badge) while only inspecting, and working=false when done.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -345,7 +352,7 @@ fn builtin_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "session_send",
-            "description": "Send raw data to a session's stdin. No newline is appended — use session_exec instead if you want to run a command. In PTY mode, \\n is automatically translated to \\r (Enter key). Common control chars: Ctrl+C=\\u0003, Ctrl+D=\\u0004, Ctrl+Z=\\u001a, Ctrl+O=\\u000f, Ctrl+X=\\u0018, Ctrl+\\\\=\\u001c, Escape=\\u001b, Tab=\\t. Arrow keys (ANSI escape sequences): Up=\\u001b[A, Down=\\u001b[B, Right=\\u001b[C, Left=\\u001b[D. Other navigation: Home=\\u001b[H, End=\\u001b[F, PageUp=\\u001b[5~, PageDown=\\u001b[6~, Insert=\\u001b[2~, Delete=\\u001b[3~. Function keys: F1=\\u001bOP, F2=\\u001bOQ, F3=\\u001bOR, F4=\\u001bOS, F5=\\u001b[15~, F6=\\u001b[17~. Enter key (\\n) is auto-translated to \\r for PTY sessions.\n\nAI STATUS (sessions the user is watching): before sending input that executes or changes state, call session_ai_status with activity='write' (green 'AI Executing' badge); use activity='read' (blue 'AI Reading' badge) for inspection only, and working=false when done. Switch modes as part of acting — do not wait to be reminded.",
+            "description": "Send raw data to a session's stdin. No newline is appended: use session_exec instead if you want to run a command. In PTY mode, \\n is automatically translated to \\r (Enter key). Common control chars: Ctrl+C=\\u0003, Ctrl+D=\\u0004, Ctrl+Z=\\u001a, Ctrl+O=\\u000f, Ctrl+X=\\u0018, Ctrl+\\\\=\\u001c, Escape=\\u001b, Tab=\\t. Arrow keys (ANSI escape sequences): Up=\\u001b[A, Down=\\u001b[B, Right=\\u001b[C, Left=\\u001b[D. Other navigation: Home=\\u001b[H, End=\\u001b[F, PageUp=\\u001b[5~, PageDown=\\u001b[6~, Insert=\\u001b[2~, Delete=\\u001b[3~. Function keys: F1=\\u001bOP, F2=\\u001bOQ, F3=\\u001bOR, F4=\\u001bOS, F5=\\u001b[15~, F6=\\u001b[17~. Enter key (\\n) is auto-translated to \\r for PTY sessions.\n\nOPEN TO AI: refused, with nothing sent, unless a person opened the session to AI with the Allow AI control in its console. Before sending, the tool sets the AI status to working with activity='write' (green 'AI Executing' badge), which the agent accepts only for such a session. Use session_ai_status with activity='read' (blue 'AI Reading' badge) for inspection only, and working=false when done.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -395,7 +402,7 @@ fn builtin_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "session_signal",
-            "description": "Send a POSIX signal to a session's process group. Common signals: 2=SIGINT (Ctrl-C), 15=SIGTERM, 9=SIGKILL.\n\nNote: In non-PTY sessions, signals are delivered to the entire process group including the shell, which will typically terminate the session. Use PTY sessions for interactive signal handling where the kernel provides job control protection.",
+            "description": "Send a POSIX signal to a session's process group. Common signals: 2=SIGINT (Ctrl-C), 15=SIGTERM, 9=SIGKILL.\n\nNote: In non-PTY sessions, signals are delivered to the entire process group including the shell, which will typically terminate the session. Use PTY sessions for interactive signal handling where the kernel provides job control protection.\n\nOPEN TO AI: refused, with nothing sent, unless a person opened the session to AI with the Allow AI control in its console, as typing is: a Ctrl-C reaches the person's command.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -464,7 +471,7 @@ fn builtin_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "session_list",
-            "description": "List all sessions on a sctl device. Shows session IDs, status, PTY mode, idle time, and whether each session is currently attached. Returns all sessions on the server, including those created by other clients.\n\nResponse fields per session: id, name, status (running/exited), pty, shell, working_dir, idle_secs, attached, ai_is_working, ai_activity, ai_message, user_allows_ai, exit_code, created_at, idle_timeout.\n\nWhen device is omitted, iterates all configured devices and merges results.",
+            "description": "List all sessions on a sctl device. Shows session IDs, status, PTY mode, idle time, and whether each session is currently attached. Returns all sessions on the server, including those created by other clients.\n\nResponse fields per session: id, name, status (running/exited), pty, shell, working_dir, idle_secs, attached, ai_is_working, ai_activity, ai_message, user_allows_ai, exit_code, created_at, idle_timeout, kind (terminal or job).\n\nuser_allows_ai is true only for a session a person opened to AI with the Allow AI control in its console; session_exec, session_send, session_exec_wait and session_signal refuse the others.\n\nWhen device is omitted, iterates all configured devices and merges results.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -478,7 +485,7 @@ fn builtin_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "session_exec_wait",
-            "description": "Execute a command in a session and wait for it to complete. Returns the full output and exit code in a single call — no need for separate session_exec + session_read. Uses a marker-based completion detection approach. Best for non-interactive commands with finite output.",
+            "description": "Execute a command in a session and wait for it to complete. Returns the full output and exit code in a single call, with no need for separate session_exec + session_read. Uses a marker-based completion detection approach. Best for non-interactive commands with finite output.\n\nOPEN TO AI: refused, with nothing sent, unless a person opened the session to AI with the Allow AI control in its console.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -550,31 +557,8 @@ fn builtin_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "session_allow_ai",
-            "description": "Set whether AI is permitted to control a session. This is the human-side toggle — the user grants or revokes AI access. AI agents should NOT call this on themselves; it is meant for the human operator (typically via the terminal UI). If allowed=false while the AI is working, the server automatically clears the AI working state and notifies all clients.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "session_id": {
-                        "type": "string",
-                        "description": "Session ID from session_start."
-                    },
-                    "allowed": {
-                        "type": "boolean",
-                        "description": "true = permit AI to work in this session, false = revoke AI access (also force-stops any active AI work)."
-                    },
-                    "device": {
-                        "type": "string",
-                        "description": "Device name. Omit to use the default device."
-                    }
-                },
-                "required": ["session_id", "allowed"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
             "name": "session_ai_status",
-            "description": "Report AI working status for a session. Call this to tell the terminal UI what you are doing.\n\nWorkflow:\n1. Before starting work: call with working=true, activity, and message.\n2. While working: call again to update activity or message as your task changes.\n3. When done: call with working=false to clear the status.\n\nEnforcement: working=true will fail if the user has not allowed AI for this session (via session_allow_ai). Always handle this error gracefully.\n\nVisual effect in the terminal UI:\n- activity='read' → blue border, 'AI Reading' badge (use for inspection, reading files, no side effects)\n- activity='write' → green border, 'AI Executing' badge (use when running commands, writing files, making changes)\n- message is shown in the status bar (e.g. 'Running tests', 'Reading config')\n\nWhile working=true, keyboard input from the human is blocked on that session.\n\nNote: If session_start returned user_allows_ai: false, do not call with working=true — it will be rejected. The user must grant AI access first via session_allow_ai or the terminal UI.",
+            "description": "Report AI working status for a session. Call this to tell the terminal UI what you are doing.\n\nWorkflow:\n1. Before starting work: call with working=true, activity, and message.\n2. While working: call again to update activity or message as your task changes.\n3. When done: call with working=false to clear the status.\n\nEnforcement: working=true is refused for a session no person opened to AI. A session starts closed to AI clients, and only a person opens it, with the Allow AI control in its console; no tool opens it. Handle the refusal by asking the person.\n\nVisual effect in the terminal UI:\n- activity='read' → blue border, 'AI Reading' badge (use for inspection, reading files, no side effects)\n- activity='write' → green border, 'AI Executing' badge (use when running commands, writing files, making changes)\n- message is shown in the status bar (e.g. 'Running tests', 'Reading config')\n\nWhile working=true, keyboard input from the human is blocked on that session.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -698,7 +682,6 @@ pub async fn handle_tool_call(
         "session_exec_wait" => handle_session_exec_wait(args, registry).await,
         "session_attach" => handle_session_attach(args, registry).await,
         "session_rename" => handle_session_rename(args, registry).await,
-        "session_allow_ai" => handle_session_allow_ai(args, registry).await,
         "session_ai_status" => handle_session_ai_status(args, registry).await,
         "playbook_list" => handle_playbook_list(args, registry, pb_reg).await,
         "playbook_get" => handle_playbook_get(args, registry, pb_reg).await,
@@ -1021,7 +1004,6 @@ async fn handle_session_start(args: &Value, registry: &DeviceRegistry) -> ToolRe
             cols,
             idle_timeout,
             name,
-            true,
         )
         .await
     {
@@ -1066,17 +1048,8 @@ async fn handle_session_exec(args: &Value, registry: &DeviceRegistry) -> ToolRes
         return ToolResult::error("Missing required parameter: command");
     };
 
-    // Auto-set AI working status
-    ws.auto_set_ai_working(session_id, "write").await;
-
-    match ws
-        .send(json!({
-            "type": "session.exec",
-            "session_id": session_id,
-            "command": command,
-        }))
-        .await
-    {
+    // Only into a session a person opened to AI (ADR-013).
+    match ws.exec(session_id, command).await {
         Ok(()) => ToolResult::success(&json!({ "ok": true })),
         Err(e) => ToolResult::error(&e),
     }
@@ -1171,9 +1144,6 @@ async fn handle_session_send(args: &Value, registry: &DeviceRegistry) -> ToolRes
         return ToolResult::error("Missing required parameter: data");
     };
 
-    // Auto-set AI working status
-    ws.auto_set_ai_working(session_id, "write").await;
-
     // First: interpret literal escape sequences (e.g. `\u0003` → Ctrl-C).
     // MCP clients often send these as literal text rather than decoded bytes.
     let unescaped = unescape_control_chars(raw_data);
@@ -1185,14 +1155,8 @@ async fn handle_session_send(args: &Value, registry: &DeviceRegistry) -> ToolRes
         unescaped
     };
 
-    match ws
-        .send(json!({
-            "type": "session.stdin",
-            "session_id": session_id,
-            "data": data,
-        }))
-        .await
-    {
+    // Only into a session a person opened to AI (ADR-013).
+    match ws.send_input(session_id, &data).await {
         Ok(()) => ToolResult::success(&json!({ "ok": true })),
         Err(e) => ToolResult::error(&e),
     }
@@ -1263,14 +1227,8 @@ async fn handle_session_signal(args: &Value, registry: &DeviceRegistry) -> ToolR
         return ToolResult::error("Missing required parameter: signal");
     };
 
-    match ws
-        .send(json!({
-            "type": "session.signal",
-            "session_id": session_id,
-            "signal": signal,
-        }))
-        .await
-    {
+    // Only to a session a person opened to AI (ADR-013).
+    match ws.signal(session_id, signal).await {
         Ok(()) => ToolResult::success(&json!({ "ok": true })),
         Err(e) => ToolResult::error(&e),
     }
@@ -1413,9 +1371,7 @@ async fn handle_session_exec_wait(args: &Value, registry: &DeviceRegistry) -> To
         .and_then(Value::as_u64)
         .unwrap_or(30000);
 
-    // Auto-set AI working status
-    ws.auto_set_ai_working(session_id, "write").await;
-
+    // exec_wait sends only into a session a person opened to AI (ADR-013).
     match ws.exec_wait(session_id, command, timeout_ms).await {
         Ok(result) => ToolResult::success(&json!({
             "output": result.output,
@@ -1496,36 +1452,6 @@ async fn handle_session_rename(args: &Value, registry: &DeviceRegistry) -> ToolR
             "ok": true,
             "session_id": session_id,
             "name": name,
-        })),
-        Err(e) => ToolResult::error(&e),
-    }
-}
-
-async fn handle_session_allow_ai(args: &Value, registry: &DeviceRegistry) -> ToolResult {
-    let ws = match get_ws_connection(args, registry).await {
-        Ok(ws) => ws,
-        Err(e) => return e,
-    };
-
-    let Some(session_id) = args.get("session_id").and_then(Value::as_str) else {
-        return ToolResult::error("Missing required parameter: session_id");
-    };
-    let Some(allowed) = args.get("allowed").and_then(Value::as_bool) else {
-        return ToolResult::error("Missing required parameter: allowed (bool)");
-    };
-
-    match ws
-        .send(json!({
-            "type": "session.allow_ai",
-            "session_id": session_id,
-            "allowed": allowed,
-        }))
-        .await
-    {
-        Ok(()) => ToolResult::success(&json!({
-            "ok": true,
-            "session_id": session_id,
-            "allowed": allowed,
         })),
         Err(e) => ToolResult::error(&e),
     }
@@ -1919,5 +1845,37 @@ mod tests {
     #[test]
     fn unescape_trailing_backslash() {
         assert_eq!(unescape_control_chars("test\\"), "test\\");
+    }
+
+    #[tokio::test]
+    async fn no_tool_opens_a_session_to_ai() {
+        let pb_reg = PlaybookRegistry::new(String::new(), HashMap::new());
+        let tools = all_tool_definitions(&pb_reg).await;
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"session_ai_status"));
+        assert!(!names.contains(&"session_allow_ai"));
+        for tool in &tools {
+            assert!(
+                !tool.to_string().contains("session_allow_ai"),
+                "{} names the removed tool",
+                tool["name"]
+            );
+        }
+
+        // Its dispatch is gone too: a client that calls it by name is told
+        // there is no such tool, and nothing is resolved or sent.
+        let registry = DeviceRegistry::from_config(crate::config::ResolvedConfig {
+            devices: HashMap::new(),
+            default_device: String::new(),
+        });
+        let result = handle_tool_call(
+            "session_allow_ai",
+            &json!({"session_id": "s1", "allowed": true}),
+            &registry,
+            &pb_reg,
+        )
+        .await;
+        assert!(result.is_error);
+        assert_eq!(result.content[0]["text"], "Unknown tool: session_allow_ai");
     }
 }

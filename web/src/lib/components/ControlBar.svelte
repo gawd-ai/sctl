@@ -37,14 +37,16 @@
 		onsplitvertical = undefined
 	}: Props = $props();
 
-	// Four visual states:
-	// 1. Dim: !userAllowsAi — user hasn't enabled AI
-	// 2. Amber: userAllowsAi && !aiIsWorking — AI permitted, standing by
-	// 3. Blue: aiIsWorking && activity === 'read' — AI reading
-	// 4. Green: aiIsWorking && activity === 'write' (or unspecified) — AI executing
+	// The Allow AI button reads "Allow AI" with its state, on or off, in four
+	// looks (sctl ADR-013: a session starts closed to AI clients, and the
+	// person opens it here):
+	// 1. Plain, off: !userAllowsAi, closed to AI clients
+	// 2. Amber, on: userAllowsAi && !aiIsWorking, AI allowed and standing by
+	// 3. Blue, on: aiIsWorking && activity === 'read', AI reading
+	// 4. Green, on: aiIsWorking && activity === 'write' (or unspecified), AI executing
 	const aiButtonClass = $derived(
 		!userAllowsAi
-			? 'text-neutral-600 hover:bg-neutral-800 hover:text-neutral-400'
+			? 'text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200'
 			: aiIsWorking
 				? aiActivity === 'read'
 					? 'bg-blue-900/50 text-blue-400 hover:bg-blue-900/70'
@@ -54,12 +56,12 @@
 
 	const aiTitle = $derived(
 		!userAllowsAi
-			? 'AI not permitted — click to allow AI'
+			? 'AI clients may not type in this session. Click to allow AI.'
 			: aiIsWorking
 				? aiActivity === 'read'
-					? 'AI is reading — click to revoke AI'
-					: 'AI is executing — click to revoke AI'
-				: 'AI permitted (standing by) — click to revoke AI'
+					? 'AI is reading. Click to stop allowing AI.'
+					: 'AI is executing. Click to stop allowing AI.'
+				: 'AI allowed, standing by. Click to stop allowing AI.'
 	);
 </script>
 
@@ -170,20 +172,24 @@
 			</button>
 		{/if}
 		<button
-			class="w-5 h-5 flex items-center justify-center rounded transition-colors {disabled ? 'text-neutral-700 cursor-default' : aiButtonClass}"
+			class="h-5 flex items-center gap-1 px-1.5 rounded transition-colors {disabled ? 'text-neutral-700 cursor-default' : aiButtonClass}"
 			onclick={ontoggleai}
 			title={disabled ? 'Session detached' : aiTitle}
+			aria-label="Allow AI"
+			aria-pressed={userAllowsAi}
 			{disabled}
 		>
 			{#if aiIsWorking}
-				<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
+				<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
 					<path d="M12 2L14.09 8.26L20 9.27L15.55 13.97L16.91 20L12 16.9L7.09 20L8.45 13.97L4 9.27L9.91 8.26L12 2Z" />
 				</svg>
 			{:else}
-				<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+				<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
 					<path stroke-linecap="round" stroke-linejoin="round" d="M12 2L14.09 8.26L20 9.27L15.55 13.97L16.91 20L12 16.9L7.09 20L8.45 13.97L4 9.27L9.91 8.26L12 2Z" />
 				</svg>
 			{/if}
+			<span>Allow AI</span>
+			<span class="font-semibold uppercase" data-testid="allow-ai-state">{userAllowsAi ? 'on' : 'off'}</span>
 		</button>
 	</div>
 </div>

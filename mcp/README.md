@@ -244,6 +244,8 @@ Session tools provide persistent interactive shells. Output is buffered both ser
 
 Sessions survive WebSocket disconnects -- mcp-sctl automatically reconnects and re-attaches with the last known sequence number, replaying any missed output.
 
+A session is closed to AI clients until a person opens it with the Allow AI control in its console (sctl ADR-013). `session_start` starts one closed, and no tool opens one. `session_exec`, `session_send`, `session_exec_wait` and `session_signal` first set the AI status to working, which the agent accepts only for a session a person opened, and send nothing to the session on any other answer or on none; the refusal says how a person opens it. `session_read`, `session_list`, `session_attach`, `session_kill`, `session_resize` and `session_rename` type nothing and work on any session. The device tools (`device_exec`, `device_exec_batch`, `device_file_write`, `device_file_delete`, `playbook_put`) still run as root on a unit for whoever holds its key: this protects a person's console session from an AI client, and does not make mcp-sctl safe to hand to one.
+
 #### `session_start`
 
 Start a new interactive shell session. Returns a `session_id` for subsequent calls.
@@ -261,7 +263,7 @@ Start a new interactive shell session. Returns a `session_id` for subsequent cal
 | `idle_timeout` | integer | no | Seconds of inactivity (while detached) before auto-kill. 0 = never (default). |
 | `name` | string | no | Human-readable session name |
 
-Returns: `{session_id, pid, persistent, pty}`
+Returns: `{session_id, pid, persistent, pty, user_allows_ai}`. `user_allows_ai` is `false`: the session starts closed to AI clients, and the typing tools refuse it until a person opens it.
 
 #### `session_exec`
 
@@ -377,19 +379,9 @@ Rename a session. The new name is broadcast to all connected clients.
 | `name` | string | yes | New session name |
 | `device` | string | no | Device name |
 
-#### `session_allow_ai`
-
-Toggle whether AI is allowed to send input to a session. Used for AI/human handoff -- when AI is disallowed, only the web UI can control the session.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `session_id` | string | yes | Session ID |
-| `allowed` | boolean | yes | Whether AI input is allowed |
-| `device` | string | no | Device name |
-
 #### `session_ai_status`
 
-Report AI working status for a session. The status is broadcast to all connected clients for real-time UI feedback.
+Report AI working status for a session. The status is broadcast to all connected clients for real-time UI feedback. `working: true` is refused for a session no person opened to AI.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

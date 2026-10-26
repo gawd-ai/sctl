@@ -228,7 +228,8 @@
 				pid: result.pid,
 				persistent: defaults.persistent ?? false,
 				pty: result.pty,
-				userAllowsAi: serverAllowsAi ?? true,
+				// An agent that does not say reads closed (sctl ADR-013).
+				userAllowsAi: serverAllowsAi === true,
 				aiIsWorking: false,
 				lastSeq: 0,
 				label: serverName || label,
@@ -274,7 +275,7 @@
 				sessionId,
 				persistent: true,
 				pty: remote?.pty ?? true,
-				userAllowsAi: remote?.user_allows_ai ?? true,
+				userAllowsAi: remote?.user_allows_ai === true,
 				aiIsWorking: remote?.ai_is_working ?? false,
 				aiActivity: remote?.ai_activity,
 				aiStatusMessage: remote?.ai_status_message,

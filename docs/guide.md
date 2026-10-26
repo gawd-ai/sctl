@@ -700,14 +700,15 @@ sctl supports real-time AI/human collaboration on sessions.
 
 ### Session-level AI control
 
-Each session has an `allow_ai` flag. When `false`, mcp-sctl cannot send input to the session -- only the web UI can. This enables handoff patterns:
+Each session has a `user_allows_ai` flag, and every session starts with it off (ADR-013): a session, a job and a session brought back after a restart are closed to AI clients until a person opens them. While it is off, mcp-sctl sends no input and no signal to the session; a person types there as always. This enables handoff patterns:
 
-1. AI starts a session and begins debugging
-2. Human sees something interesting in sctlin, disables AI input
-3. Human takes over, types commands manually
-4. Human re-enables AI, which continues from where it left off
+1. A person opens a session in sctlin and switches Allow AI on, or an AI starts one through mcp-sctl and a person switches Allow AI on for it
+2. The AI works in the session
+3. The person sees something interesting in sctlin and switches Allow AI off
+4. The person takes over and types commands
+5. The person switches Allow AI on again, and the AI continues from where it left off
 
-Toggle via MCP (`session_allow_ai`) or the sctlin UI.
+Only a person switches it, with sctlin's Allow AI button in the bar under the terminal. mcp-sctl has no tool for it. The agent cannot tell a person's client from an AI client on one key, so the flag holds for the clients sctl ships, which follow the protocol; mcp-sctl's device tools still run as root for whoever holds a unit's key.
 
 ### AI status tracking
 
@@ -725,6 +726,7 @@ The sctlin web UI shows AI status in real time:
 
 - Working indicator on session tabs
 - Activity type (reading/writing) visible
+- The Allow AI button in the bar under the terminal says whether the session is open to AI, on or off
 - Human can see what the AI is doing and take over at any point
 
 ### Best practices

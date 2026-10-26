@@ -553,7 +553,7 @@ Connect to `GET /api/ws?token=<api_key>`. All messages are JSON with a `"type"` 
 | Type                | Fields                                                                            | Response                             |
 |---------------------|-----------------------------------------------------------------------------------|--------------------------------------|
 | `ping`              | --                                                                                | `pong`                               |
-| `session.start`     | `working_dir?`, `persistent?`, `env?`, `shell?`, `pty?`, `rows?`, `cols?`, `idle_timeout?`, `name?` | `session.started` or `error` |
+| `session.start`     | `working_dir?`, `persistent?`, `env?`, `shell?`, `pty?`, `rows?`, `cols?`, `idle_timeout?`, `name?`, `user_allows_ai?` | `session.started` or `error` |
 | `session.exec`      | `session_id`, `command`                                                           | `session.exec.ack` or `error`        |
 | `session.stdin`     | `session_id`, `data`                                                              | (none on success)                    |
 | `session.kill`      | `session_id`                                                                      | `session.closed` or `error`          |
@@ -562,7 +562,7 @@ Connect to `GET /api/ws?token=<api_key>`. All messages are JSON with a `"type"` 
 | `session.list`      | --                                                                                | `session.listed`                     |
 | `session.resize`    | `session_id`, `rows`, `cols`                                                      | `session.resize.ack` or `error`      |
 | `session.rename`    | `session_id`, `name`                                                              | `session.rename.ack` or `error`      |
-| `session.allow_ai`  | `session_id`, `allowed`                                                           | `session.allow_ai.ack` or `error`    |
+| `session.allow_ai`  | `session_id`, `allowed`: the person's switch                                      | `session.allow_ai.ack` or `error`    |
 | `session.ai_status` | `session_id`, `working`, `activity?`, `message?`                                  | `session.ai_status.ack` or `error`   |
 | `shell.list`        | --                                                                                | `shell.listed`                       |
 
@@ -571,7 +571,7 @@ Connect to `GET /api/ws?token=<api_key>`. All messages are JSON with a `"type"` 
 | Type                            | Key fields                                                                |
 |---------------------------------|---------------------------------------------------------------------------|
 | `pong`                          | --                                                                        |
-| `session.started`               | `session_id`, `pid`, `persistent`, `pty`                                  |
+| `session.started`               | `session_id`, `pid`, `persistent`, `pty`, `user_allows_ai`                |
 | `session.exec.ack`              | `session_id`                                                              |
 | `session.stdout`                | `session_id`, `data`, `seq`, `timestamp_ms`                               |
 | `session.stderr`                | `session_id`, `data`, `seq`, `timestamp_ms`                               |
@@ -580,7 +580,7 @@ Connect to `GET /api/ws?token=<api_key>`. All messages are JSON with a `"type"` 
 | `session.closed`                | `session_id`, `reason`                                                    |
 | `session.signal.ack`            | `session_id`, `signal`                                                    |
 | `session.attached`              | `session_id`, `entries[]`, `dropped`                                      |
-| `session.listed`                | `sessions[]` (id, pid, persistent, pty, attached, status, idle, name ...) |
+| `session.listed`                | `sessions[]` (id, pid, persistent, pty, kind, attached, status, idle, name, user_allows_ai ...) |
 | `session.resize.ack`            | `session_id`                                                              |
 | `session.rename.ack`            | `session_id`, `name`                                                      |
 | `session.allow_ai.ack`          | `session_id`, `allowed`                                                   |
@@ -609,6 +609,7 @@ Output messages (`session.stdout`, `session.stderr`, `session.system`) include a
 | `cols`         | number | `80`                      | Initial PTY columns (only with `pty: true`)                |
 | `idle_timeout` | number | `0`                       | Seconds of inactivity (while detached) before auto-kill. 0 = never. |
 | `name`         | string | --                        | Human-readable session name                                |
+| `user_allows_ai` | bool | `false`                   | Open the session to AI clients at its start: a person's choice (ADR-013) |
 
 ### Persistent sessions
 
@@ -645,8 +646,9 @@ Common signals: `2` = SIGINT (Ctrl-C), `15` = SIGTERM, `9` = SIGKILL.
 
 Sessions support AI/human collaboration via permission and status tracking:
 
-- **`session.allow_ai`** -- toggle whether AI is allowed to send input to a session
-- **`session.ai_status`** -- AI reports its working state (`working`, `activity`, `message`)
+- **Closed to AI clients at the start**: a session's `user_allows_ai` is `false` unless the `session.start` that made it says `true`; a job and a session brought back after a restart start closed too (ADR-013)
+- **`session.allow_ai`** is the person's switch: it opens a session to AI clients or closes it. The agent cannot tell a person's client from an AI client on one key, so the clients sctl ships send it only for a person (sctlin's Allow AI button); mcp-sctl has no tool for it
+- **`session.ai_status`**: AI reports its working state (`working`, `activity`, `message`); `working: true` is refused on a session no person opened to AI, and mcp-sctl types into a session only once the agent accepts it
 - Changes are broadcast to all connected clients for real-time UI updates
 
 ## Reverse Tunnel

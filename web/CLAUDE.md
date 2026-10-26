@@ -247,7 +247,7 @@ ws.connect();
 | `on(type, cb)` | `() => void` | Subscribe to a message type (returns unsub fn) |
 | `onOutput(sessionId, cb)` | `() => void` | Subscribe to session output (stdout/stderr/system) |
 | `onSessionEnd(sessionId, cb)` | `() => void` | Subscribe to session close/exit |
-| `startSession(opts?)` | `Promise<WsSessionStartedMsg>` | Start a shell session |
+| `startSession(opts?)` | `Promise<WsSessionStartedMsg>` | Start a shell session, closed to AI clients unless `opts.userAllowsAi` is `true` (sctl ADR-013) |
 | `attachSession(sessionId, since?, opts?)` | `Promise<WsSessionAttachedMsg>` | Attach to existing session. `{ dedupes: true }` only for a caller that writes an entry only when its seq is above the highest it holds, and that listens before it attaches |
 | `killSession(sessionId)` | `Promise<WsSessionClosedMsg>` | Kill a session |
 | `sendStdin(sessionId, data)` | `void` | Send keystrokes (fire-and-forget) |
@@ -257,7 +257,7 @@ ws.connect();
 | `listSessions()` | `Promise<WsSessionListedMsg>` | List server sessions |
 | `listShells()` | `Promise<WsShellListedMsg>` | List available shells |
 | `renameSession(sessionId, name)` | `Promise<...>` | Rename session |
-| `setUserAllowsAi(sessionId, allowed)` | `Promise<...>` | Set AI permission |
+| `setUserAllowsAi(sessionId, allowed)` | `Promise<...>` | Open a session to AI clients or close it: the person's switch, sent only for a person |
 
 ### SctlRestClient
 

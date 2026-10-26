@@ -329,6 +329,8 @@ Configuration object passed to `TerminalContainer`:
 
 ### AI Control
 
+A session starts closed to AI clients (sctl ADR-013). The Allow AI button in the bar under the terminal says whether the focused session is open to AI, on or off, and a person switches it there. An embedder opens a session at its start only for a person's own choice, with `userAllowsAi: true` in `sessionDefaults`, or in the options of `SctlWsClient.startSession`.
+
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `setAllAi(allowed)` | `Promise<void>` | Set AI permission for all attached sessions |

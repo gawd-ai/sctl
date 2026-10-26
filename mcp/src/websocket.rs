@@ -17,6 +17,13 @@
 //! attaches go by that counter, which follows the daemon's seq where it can.
 //! An attach asks the daemon for its entries above the highest the buffer
 //! holds.
+//!
+//! A session is closed to AI clients until a person opens it with the Allow
+//! AI control in a console (ADR-013). This client starts every session
+//! closed, and types or signals only into a session the agent confirms a
+//! person opened: it asks for the AI status `working: true` first, which
+//! the agent answers only for such a session, and sends nothing to the
+//! session on any other answer or on none.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -334,6 +341,8 @@ impl DeviceWsConnection {
     }
 
     /// Start a new session and wait for the `session.started` response.
+    /// The session starts closed to AI clients: this client never asks for
+    /// one open to them, since a person opens a session (ADR-013).
     #[allow(clippy::too_many_arguments)]
     pub async fn start_session(
         &self,
@@ -346,7 +355,6 @@ impl DeviceWsConnection {
         cols: Option<u64>,
         idle_timeout: Option<u64>,
         name: Option<&str>,
-        user_allows_ai: bool,
     ) -> Result<Value, String> {
         // Clear any stale start result
         *self.notifiers.start_result.lock().await = None;
@@ -354,10 +362,8 @@ impl DeviceWsConnection {
         let mut msg = json!({
             "type": "session.start",
             "persistent": persistent,
+            "user_allows_ai": false,
         });
-        if !user_allows_ai {
-            msg["user_allows_ai"] = json!(false);
-        }
         if let Some(d) = working_dir {
             msg["working_dir"] = json!(d);
         }
@@ -535,9 +541,79 @@ impl DeviceWsConnection {
         self.ai_working_sessions.lock().await.remove(session_id);
     }
 
+    /// Whether a person opened `session_id` to AI clients, asked of the
+    /// agent before anything is typed or signalled into it (ADR-013). The
+    /// agent answers the AI status `working: true` with an ack only for
+    /// such a session, so the ack is the answer; it also marks the AI
+    /// working, as a person watching the console sees. A refusal, an ack
+    /// for another session or no answer refuses, and the caller sends
+    /// nothing to the session.
+    pub async fn require_open_to_ai(&self, session_id: &str, activity: &str) -> Result<(), String> {
+        let why = match self
+            .set_ai_status(session_id, true, Some(activity), None)
+            .await
+        {
+            Ok(ack)
+                if ack["type"] == "session.ai_status.ack"
+                    && ack["session_id"] == session_id
+                    && ack["working"] == true =>
+            {
+                self.mark_ai_working(session_id).await;
+                return Ok(());
+            }
+            Ok(other) => format!("its answer was not for this session: {other}"),
+            Err(e) => e,
+        };
+        self.clear_ai_working(session_id).await;
+        Err(format!(
+            "Nothing was sent to session {session_id}: the agent did not confirm that a person \
+             opened it to AI clients ({why}). A person opens a session to AI with the Allow AI \
+             control in its console."
+        ))
+    }
+
+    /// `session.exec` into a session a person opened to AI clients, else
+    /// nothing is sent ([`Self::require_open_to_ai`]).
+    pub async fn exec(&self, session_id: &str, command: &str) -> Result<(), String> {
+        self.require_open_to_ai(session_id, "write").await?;
+        self.send(json!({
+            "type": "session.exec",
+            "session_id": session_id,
+            "command": command,
+        }))
+        .await
+    }
+
+    /// `session.stdin` into a session a person opened to AI clients, else
+    /// nothing is sent ([`Self::require_open_to_ai`]).
+    pub async fn send_input(&self, session_id: &str, data: &str) -> Result<(), String> {
+        self.require_open_to_ai(session_id, "write").await?;
+        self.send(json!({
+            "type": "session.stdin",
+            "session_id": session_id,
+            "data": data,
+        }))
+        .await
+    }
+
+    /// `session.signal` to a session a person opened to AI clients, else
+    /// nothing is sent ([`Self::require_open_to_ai`]): a Ctrl-C reaches the
+    /// person's command as a keystroke does.
+    pub async fn signal(&self, session_id: &str, signal: i64) -> Result<(), String> {
+        self.require_open_to_ai(session_id, "write").await?;
+        self.send(json!({
+            "type": "session.signal",
+            "session_id": session_id,
+            "signal": signal,
+        }))
+        .await
+    }
+
     /// Auto-set AI working status if not already working.
     /// Sends `session.ai_status` with `working=true` to the server.
-    /// On failure (e.g. AI_NOT_ALLOWED), logs but does not propagate the error.
+    /// On failure (e.g. AI_NOT_ALLOWED), logs but does not propagate the
+    /// error: a read needs no person's switch. Typing and signals go
+    /// through [`Self::require_open_to_ai`] instead.
     pub async fn auto_set_ai_working(&self, session_id: &str, activity: &str) {
         if self.is_ai_working(session_id).await {
             return;
@@ -628,7 +704,8 @@ impl DeviceWsConnection {
     /// Execute a command and wait for it to complete, returning all output.
     ///
     /// Wraps the command with a unique end marker, then polls for output until
-    /// the marker is found or the timeout expires.
+    /// the marker is found or the timeout expires. Sends the command only into
+    /// a session a person opened to AI clients ([`Self::require_open_to_ai`]).
     pub async fn exec_wait(
         &self,
         session_id: &str,
@@ -661,6 +738,8 @@ impl DeviceWsConnection {
                 .ok_or_else(|| format!("Session {session_id} not found locally"))?;
             buf.last_place
         };
+
+        self.require_open_to_ai(session_id, "write").await?;
 
         // Send the wrapped command
         self.send(json!({
@@ -1188,8 +1267,8 @@ async fn dispatch_message(
             let session_id = msg["session_id"].as_str().unwrap_or("unknown");
             eprintln!("mcp-sctl: broadcast {msg_type} for session {session_id}");
         }
-        // pong plus the acks that need no action (resize/rename/allow_ai —
-        // the tool already returned ok).
+        // pong plus the acks that need no action (resize, rename: the tool
+        // already returned ok).
         _ => {}
     }
 }
@@ -1918,5 +1997,157 @@ mod tests {
         assert!(buf.held.is_none());
         buf.live(line(2));
         assert_eq!(data(buf), ["line 1\n", "line 2\n"]);
+    }
+
+    /// What an AI client's typing call sends into `s1`, if anything.
+    #[derive(Clone, Copy, Debug)]
+    enum Typing {
+        Exec,
+        Input,
+        Signal,
+        ExecWait,
+    }
+
+    async fn type_into(ws: &DeviceWsConnection, how: Typing) -> Result<(), String> {
+        match how {
+            Typing::Exec => ws.exec("s1", "true").await,
+            Typing::Input => ws.send_input("s1", "true\n").await,
+            Typing::Signal => ws.signal("s1", 2).await,
+            Typing::ExecWait => ws.exec_wait("s1", "true", 1_000).await.map(|_| ()),
+        }
+    }
+
+    /// The call in a task of its own, on a connection that holds `s1`.
+    async fn typing(
+        how: Typing,
+    ) -> (
+        Arc<DeviceWsConnection>,
+        mpsc::Receiver<Value>,
+        tokio::task::JoinHandle<Result<(), String>>,
+    ) {
+        let (ws, sent) = connection();
+        ws.sessions
+            .lock()
+            .await
+            .insert("s1".to_string(), SessionBuffer::new());
+        let ws = Arc::new(ws);
+        let call = tokio::spawn({
+            let ws = Arc::clone(&ws);
+            async move { type_into(&ws, how).await }
+        });
+        (ws, sent, call)
+    }
+
+    /// The agent's answer to `working: true` on a session no person opened.
+    fn refusal(session_id: &str) -> Value {
+        json!({
+            "type": "error",
+            "code": "AI_NOT_ALLOWED",
+            "session_id": session_id,
+            "message": "Cannot set working=true: user has not allowed AI for this session",
+        })
+    }
+
+    fn ack(session_id: &str) -> Value {
+        json!({
+            "type": "session.ai_status.ack",
+            "session_id": session_id,
+            "working": true,
+            "activity": "write",
+        })
+    }
+
+    const TYPING: [Typing; 4] = [
+        Typing::Exec,
+        Typing::Input,
+        Typing::Signal,
+        Typing::ExecWait,
+    ];
+
+    #[tokio::test]
+    async fn a_session_start_asks_for_a_session_closed_to_ai() {
+        let (ws, mut sent) = connection();
+        let ws = Arc::new(ws);
+        let start = tokio::spawn({
+            let ws = Arc::clone(&ws);
+            async move {
+                ws.start_session(None, None, None, true, true, None, None, None, None)
+                    .await
+            }
+        });
+        let msg = sent.recv().await.unwrap();
+        assert_eq!(msg["type"], "session.start");
+        assert_eq!(msg["user_allows_ai"], false, "{msg}");
+        deliver(
+            &ws,
+            &json!({
+                "type": "session.started",
+                "session_id": "s1",
+                "pid": 1,
+                "persistent": true,
+                "pty": true,
+                "user_allows_ai": false,
+            }),
+        )
+        .await;
+        let started = start.await.unwrap().unwrap();
+        assert_eq!(started["user_allows_ai"], false);
+    }
+
+    #[tokio::test]
+    async fn typing_into_a_closed_session_is_refused_with_nothing_sent() {
+        for how in TYPING {
+            let (ws, mut sent, call) = typing(how).await;
+            let asked = sent.recv().await.unwrap();
+            assert_eq!(asked["type"], "session.ai_status", "{how:?}");
+            assert_eq!(asked["session_id"], "s1", "{how:?}");
+            assert_eq!(asked["working"], true, "{how:?}");
+            deliver(&ws, &refusal("s1")).await;
+
+            let refused = call.await.unwrap().unwrap_err();
+            assert!(
+                refused.starts_with("Nothing was sent to session s1")
+                    && refused.contains("Allow AI"),
+                "{how:?}: {refused}"
+            );
+            assert!(sent.try_recv().is_err(), "{how:?} sent nothing more");
+            assert!(!ws.is_ai_working("s1").await, "{how:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn typing_into_an_open_session_asks_first_then_sends() {
+        for (how, kind) in [
+            (Typing::Exec, "session.exec"),
+            (Typing::Input, "session.stdin"),
+            (Typing::Signal, "session.signal"),
+        ] {
+            let (ws, mut sent, call) = typing(how).await;
+            assert_eq!(sent.recv().await.unwrap()["type"], "session.ai_status");
+            deliver(&ws, &ack("s1")).await;
+            call.await.unwrap().unwrap();
+            let typed = sent.recv().await.unwrap();
+            assert_eq!(typed["type"], kind, "{how:?}");
+            assert_eq!(typed["session_id"], "s1", "{how:?}");
+            assert!(ws.is_ai_working("s1").await, "{how:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_ack_for_another_session_or_no_answer_sends_nothing() {
+        for how in TYPING {
+            let (ws, mut sent, call) = typing(how).await;
+            assert_eq!(sent.recv().await.unwrap()["type"], "session.ai_status");
+            deliver(&ws, &ack("s2")).await;
+            assert!(call.await.unwrap().is_err(), "{how:?}: another's ack");
+            assert!(sent.try_recv().is_err(), "{how:?}: another's ack");
+
+            // No answer: the wait for it ends, and nothing follows.
+            let (_ws, mut sent, call) = typing(how).await;
+            assert_eq!(sent.recv().await.unwrap()["type"], "session.ai_status");
+            let refused = call.await.unwrap().unwrap_err();
+            assert!(refused.contains("Timeout"), "{how:?}: {refused}");
+            assert!(sent.try_recv().is_err(), "{how:?}: no answer");
+        }
     }
 }
