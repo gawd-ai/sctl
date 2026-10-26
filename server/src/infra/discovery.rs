@@ -161,12 +161,20 @@ pub async fn discover(
     State(state): State<AppState>,
     Json(payload): Json<Value>,
 ) -> Result<Json<DiscoveryResults>, (StatusCode, Json<Value>)> {
-    let requested = requested_entries(&payload);
     let probes = AgentProbes {
         lte: Lte::from_config(Some(&state.config)),
     };
+    discover_with(&probes, state.infra_state.clone(), &payload).await
+}
 
-    let infra = state.infra_state.clone();
+/// [`discover`] with the probes given: the agent's own, or a test's fakes.
+/// It reads the request, runs the scan and keeps its progress in `infra`.
+async fn discover_with(
+    probes: &dyn Probes,
+    infra: Option<Arc<Mutex<InfraState>>>,
+    payload: &Value,
+) -> Result<Json<DiscoveryResults>, (StatusCode, Json<Value>)> {
+    let requested = requested_entries(payload);
     info!(
         "Starting LAN discovery scan (subnets: {requested:?}; none: the unit's own LAN networks)"
     );
@@ -201,7 +209,7 @@ pub async fn discover(
         })
     };
 
-    let scanned = scan(&probes, &requested, &progress).await;
+    let scanned = scan(probes, &requested, &progress).await;
     elapsed_ticker.abort();
     let scan_duration_ms = progress.start.elapsed().as_millis() as u64;
 
@@ -2128,6 +2136,47 @@ mod tests {
                     .iter()
                     .all(|p| p.starts_with("ping br-lan 192.0.2.")),
             "the network named is swept, and only it: {:?}",
+            fake.log()
+        );
+    }
+
+    /// The handler itself reads each entry on its own, the route's and the
+    /// tunnel's alike: both call [`discover`], which only adds the agent's
+    /// own probes to [`discover_with`]. A list that held one entry of
+    /// another type used to make the whole list unreadable there, and the
+    /// scan swept the default networks.
+    #[tokio::test]
+    async fn the_handler_reads_each_entry_of_the_requests_subnets_on_its_own() {
+        let fake = Fake::on(unit());
+        let payload = json!({"subnets": [5, "192.0.2.0/24", {"a": 1}]});
+        let Ok(Json(results)) = discover_with(&fake, None, &payload).await else {
+            panic!("the scan ran");
+        };
+        assert_eq!(
+            serde_json::to_value(&results.not_swept).unwrap(),
+            json!([
+                {"cidr": "5", "reason": "invalid"},
+                {"cidr": r#"{"a":1}"#, "reason": "invalid"}
+            ])
+        );
+        let pings = fake.log_of("ping");
+        assert!(
+            !pings.is_empty() && pings.iter().all(|p| p.starts_with("ping br-lan 192.0.2.")),
+            "the network named is swept, and only it: {:?}",
+            fake.log()
+        );
+        assert!(
+            !fake.log().iter().any(|line| line.contains("192.168.8.")),
+            "no default network is swept: {:?}",
+            fake.log()
+        );
+
+        // With no list, the default pick: both of the unit's LAN networks.
+        let fake = Fake::on(unit());
+        assert!(discover_with(&fake, None, &json!({})).await.is_ok());
+        assert!(
+            fake.log().iter().any(|line| line.contains("192.168.8.")),
+            "{:?}",
             fake.log()
         );
     }
