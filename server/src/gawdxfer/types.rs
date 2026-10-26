@@ -71,8 +71,41 @@ pub enum Phase {
 #[cfg_attr(test, ts(export, optional_fields))]
 pub struct InitDownload {
     pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // The chunk size asked for. Any whole number is taken, one above
+    // `u32::MAX` as `u32::MAX`: the init answers every size above the
+    // ceiling as the ceiling, never refusing it (TRD-9 3.1).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "asked_chunk_size"
+    )]
+    #[cfg_attr(test, ts(as = "Option<u32>"))]
     pub chunk_size: Option<u32>,
+}
+
+/// A download's `chunk_size` as asked, held in a `u32`: a size above
+/// `u32::MAX` is `u32::MAX`, still above the ceiling the init answers it
+/// with, never a smaller size that a narrowing cast would give.
+pub fn saturating_chunk_size(asked: u64) -> u32 {
+    u32::try_from(asked).unwrap_or(u32::MAX)
+}
+
+/// [`InitDownload::chunk_size`] on the wire: read as a whole number of any
+/// size and saturated ([`saturating_chunk_size`]), written as it is.
+mod asked_chunk_size {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    // serde's `with` takes the field by reference.
+    #[allow(clippy::ref_option, clippy::trivially_copy_pass_by_ref)]
+    pub fn serialize<S: Serializer>(value: &Option<u32>, serializer: S) -> Result<S::Ok, S::Error> {
+        value.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<u32>, D::Error> {
+        Ok(Option::<u64>::deserialize(deserializer)?.map(super::saturating_chunk_size))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -281,5 +314,63 @@ impl Phase {
             Phase::Failed(_) => "failed",
             Phase::Aborted => "aborted",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::InitDownload;
+
+    fn asked(body: &serde_json::Value) -> Option<u32> {
+        serde_json::from_value::<InitDownload>(body.clone())
+            .unwrap()
+            .chunk_size
+    }
+
+    /// A `chunk_size` too large for a `u32` is read as `u32::MAX`, above the
+    /// ceiling the init answers it with: never refused, and never wrapped to
+    /// a small size.
+    #[test]
+    fn a_chunk_size_of_any_size_is_read_and_saturated() {
+        assert_eq!(asked(&json!({"path": "/x"})), None, "absent");
+        assert_eq!(asked(&json!({"path": "/x", "chunk_size": null})), None);
+        assert_eq!(
+            asked(&json!({"path": "/x", "chunk_size": 65536})),
+            Some(65536)
+        );
+        for big in [
+            u64::from(u32::MAX),
+            u64::from(u32::MAX) + 1,
+            u64::from(u32::MAX) + 1001,
+            u64::MAX,
+        ] {
+            assert_eq!(
+                asked(&json!({"path": "/x", "chunk_size": big})),
+                Some(u32::MAX),
+                "{big}"
+            );
+        }
+        assert!(
+            serde_json::from_value::<InitDownload>(json!({"path": "/x", "chunk_size": -1}))
+                .is_err(),
+            "not a size"
+        );
+
+        // Written as it is, and absent when there is none.
+        let init = InitDownload {
+            path: "/x".into(),
+            chunk_size: Some(2048),
+        };
+        assert_eq!(
+            serde_json::to_value(&init).unwrap(),
+            json!({"path": "/x", "chunk_size": 2048})
+        );
+        let init = InitDownload {
+            path: "/x".into(),
+            chunk_size: None,
+        };
+        assert_eq!(serde_json::to_value(&init).unwrap(), json!({"path": "/x"}));
     }
 }

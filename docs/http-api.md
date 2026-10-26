@@ -552,9 +552,10 @@ Initialize a chunked download (device → client). **Auth: API key Bearer.**
 Request body: `{path, chunk_size?}` (`chunk_size` in bytes; server default
 when omitted). A `chunk_size` under 1024 is raised to 1024, as an upload's
 is. One above 4 MiB, asked for or the server's default, is answered as
-4 MiB, never refused: 4 MiB is the most a file read returns through the
-relay. The answer gives the size used, and the client reads its chunks by
-it.
+4 MiB, never refused, however large: 4 MiB is the most a file read
+returns through the relay. The same holds for `gx.download.init` through
+the tunnel. The answer gives the size used, and the client reads its
+chunks by it.
 
 Response `200`: `{transfer_id, file_size, file_hash, chunk_size,
 total_chunks, filename}`.

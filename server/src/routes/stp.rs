@@ -192,4 +192,60 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR
         );
     }
+
+    /// `POST /api/stp/download` with a `chunk_size` too large for a `u32` is
+    /// answered as the 4 MiB ceiling, as any size above it is (TRD-9 3.1).
+    /// The request used to be refused, 422, before the init saw it.
+    #[tokio::test]
+    async fn a_download_init_answers_any_size_above_the_ceiling_as_the_ceiling() {
+        use std::sync::Arc;
+        use tower::ServiceExt as _;
+
+        let dir = std::env::temp_dir().join(format!("sctl-stp-ceiling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("data.bin");
+        std::fs::write(&file, vec![7_u8; 3000]).unwrap();
+        let mut config: crate::config::Config = toml::from_str("").unwrap();
+        config.server.data_dir = dir.join("data").display().to_string();
+        let gate = Arc::new(crate::file_access::Gate::for_agent(&config, None, None));
+        let state = AppState::for_tests(config, gate);
+        let router = axum::Router::new()
+            .route("/api/stp/download", axum::routing::post(init_download))
+            .with_state(state.clone());
+
+        let ceiling = crate::routes::files::TUNNEL_READ_CAP as u64;
+        for (asked, answered) in [
+            (4096, 4096),
+            (ceiling + 1, ceiling),
+            (u64::from(u32::MAX), ceiling),
+            (u64::from(u32::MAX) + 1, ceiling),
+            (u64::from(u32::MAX) + 1001, ceiling),
+            (u64::MAX, ceiling),
+        ] {
+            let body = json!({"path": file.display().to_string(), "chunk_size": asked});
+            let resp = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::post("/api/stp/download")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{asked}");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let out: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(out["chunk_size"], answered, "{asked}");
+            state
+                .transfer_manager
+                .abort(out["transfer_id"].as_str().unwrap(), "test")
+                .await
+                .unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

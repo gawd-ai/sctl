@@ -3016,7 +3016,10 @@ async fn handle_gx_download_init(
     request_id: Option<&str>,
 ) {
     let path = msg["path"].as_str().unwrap_or("");
-    let chunk_size = msg["chunk_size"].as_u64().map(|v| v as u32);
+    // Saturated, never narrowed: 2^32 would wrap to 0, a small size.
+    let chunk_size = msg["chunk_size"]
+        .as_u64()
+        .map(crate::gawdxfer::types::saturating_chunk_size);
 
     match state.transfer_manager.init_download(path, chunk_size).await {
         Ok(result) => {
@@ -5416,7 +5419,7 @@ mod file_read_tests {
     use serde_json::{json, Value};
     use tower::ServiceExt as _;
 
-    use super::{gx_error_response, run_tunnel_http_request};
+    use super::{gx_error_response, handle_gx_download_init, run_tunnel_http_request, ws_lanes};
     use crate::config::Config;
     use crate::file_access::Gate;
     use crate::gawdxfer::types::TransferError;
@@ -5517,6 +5520,46 @@ mod file_read_tests {
         assert_eq!(status("NOT_A_REGULAR_FILE"), 400);
         assert_eq!(status("PERMISSION_DENIED"), 403);
         assert_eq!(status("MAX_TRANSFERS"), 429);
+    }
+
+    /// `gx.download.init` with a `chunk_size` too large for a `u32` is
+    /// answered as the 4 MiB ceiling, as any size above it is (TRD-9 3.1).
+    /// A narrowing cast wrapped 2^32 to 0 and 2^32 + 1000 to 1000, each then
+    /// answered as 1024.
+    #[tokio::test]
+    async fn the_tunnels_download_init_answers_any_size_above_the_ceiling_as_the_ceiling() {
+        let dir = scratch("gx-ceiling");
+        let (state, _) = state_with_router(&dir);
+        let file = dir.join("data.bin");
+        std::fs::write(&file, vec![7_u8; 3000]).unwrap();
+        let (sink, mut lanes) = ws_lanes(4, 4, 4);
+        let ceiling = crate::routes::files::TUNNEL_READ_CAP as u64;
+        for (asked, answered) in [
+            (json!(4096), 4096),
+            (json!(ceiling + 1), ceiling),
+            (json!(u64::from(u32::MAX)), ceiling),
+            (json!(u64::from(u32::MAX) + 1), ceiling),
+            (json!(u64::from(u32::MAX) + 1001), ceiling),
+            (json!(u64::MAX), ceiling),
+        ] {
+            let msg = json!({"path": file.display().to_string(), "chunk_size": asked});
+            handle_gx_download_init(&state, &sink, &msg, Some("r1")).await;
+            let Some(tokio_tungstenite::tungstenite::Message::Text(text)) =
+                lanes.request_rx.recv().await
+            else {
+                panic!("{asked}: no answer on the request lane");
+            };
+            let out: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(out["status"], 200, "{asked}: {out}");
+            assert_eq!(out["body"]["chunk_size"], answered, "{asked}");
+            let transfer = out["body"]["transfer_id"].as_str().unwrap().to_string();
+            state
+                .transfer_manager
+                .abort(&transfer, "test")
+                .await
+                .unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 
