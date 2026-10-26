@@ -29,11 +29,14 @@ check_pattern() {
     label="$1"
     pattern="$2"
     # Search staged diff for added lines (^+) matching the pattern,
-    # excluding lines with the allow comment.
-    matches=$(echo "$STAGED" | grep -E '^\+' | grep -v '^+++' | grep -v 'secret-scan: allow' | grep -E "$pattern" || true)
+    # excluding lines with the allow comment. printf, not echo: dash's echo
+    # turns a backslash-zero in the diff into a NUL byte, and grep then
+    # calls the whole diff binary and prints none of its lines. grep -a
+    # reads a diff that holds a real NUL as text all the same.
+    matches=$(printf '%s\n' "$STAGED" | grep -a -E '^\+' | grep -v '^+++' | grep -v 'secret-scan: allow' | grep -E "$pattern" || true)
     if [ -n "$matches" ]; then
         echo "secret-scan: possible $label detected in staged changes:"
-        echo "$matches" | head -10
+        printf '%s\n' "$matches" | head -10
         echo ""
         found=1
     fi
@@ -41,13 +44,13 @@ check_pattern() {
 
 # 32+ char hex string (API keys, tokens)
 # Exclude common false positives: git SHAs in diff headers, hash literals in test assertions
-hex_matches=$(echo "$STAGED" | grep -E '^\+' | grep -v '^+++' | grep -v 'secret-scan: allow' \
+hex_matches=$(printf '%s\n' "$STAGED" | grep -a -E '^\+' | grep -v '^+++' | grep -v 'secret-scan: allow' \
     | grep -v 'assert' | grep -v '#\[test\]' | grep -v '\.sha256' | grep -v 'sha256sum' \
     | grep -v 'commit ' | grep -v 'index ' \
     | grep -oE '\b[a-fA-F0-9]{32,}\b' || true)
 if [ -n "$hex_matches" ]; then
     echo "secret-scan: possible hex token (32+ chars) detected in staged changes:"
-    echo "$hex_matches" | head -10
+    printf '%s\n' "$hex_matches" | head -10
     echo ""
     found=1
 fi
