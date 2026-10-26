@@ -224,14 +224,31 @@ fn guarded(loader: &[String], binary: &Path) -> Result<Want, String> {
 /// which anyone can write, is never one of them.
 pub fn root_alone(binary: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let roots = |meta: &std::fs::Metadata| meta.uid() == 0 && meta.mode() & 0o022 == 0;
     let Ok(real) = std::fs::canonicalize(binary) else {
         return false;
     };
-    std::fs::symlink_metadata(&real).is_ok_and(|meta| meta.is_file() && roots(&meta))
-        && real.ancestors().skip(1).all(|dir| {
-            std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir() && roots(&meta))
-        })
+    root_alone_by(&real, |path| {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|meta| (meta.mode(), meta.uid()))
+    })
+}
+
+/// [`root_alone`]'s judgment of `real`, a path with no link in it, from
+/// what `facts_of` says of each of its parts: its mode, type bits included,
+/// and its owner's uid; `None` for a part that cannot be read. The binary
+/// must be a regular file and each directory above it a directory, each
+/// owned by uid 0 with neither the group's nor the others' write bit set.
+fn root_alone_by(real: &Path, facts_of: impl Fn(&Path) -> Option<(u32, u32)>) -> bool {
+    let roots = |path: &Path, kind: libc::mode_t| {
+        facts_of(path)
+            .is_some_and(|(mode, uid)| mode & libc::S_IFMT == kind && uid == 0 && mode & 0o022 == 0)
+    };
+    roots(real, libc::S_IFREG)
+        && real
+            .ancestors()
+            .skip(1)
+            .all(|dir| roots(dir, libc::S_IFDIR))
 }
 
 fn is_file(path: &Path, what: &str) -> Result<(), String> {
@@ -972,8 +989,12 @@ exec '/tmp/sctl/lib/libc.so' '--library-path' '/tmp/sctl/lib' '/tmp/sctl/sctl-se
     }
 
     /// A link is as safe as what it names only where root alone can change
-    /// the binary and every directory above it: never under /tmp, which
-    /// anyone can write, nor in a directory another account owns.
+    /// the binary and every directory above it. On real paths, read as the
+    /// agent reads them: this account's own file, a missing path and a
+    /// directory get none, and a root system binary does, also through a
+    /// link. Run as an ordinary account, no real path here shows the mode
+    /// refusing anything: [`root_alone_judges_each_parts_owner_and_mode`]
+    /// does.
     #[test]
     fn root_alone_holds_only_for_a_binary_and_a_path_that_are_root_s() {
         let s = Scratch::new("root-alone");
@@ -993,6 +1014,79 @@ exec '/tmp/sctl/lib/libc.so' '--library-path' '/tmp/sctl/lib' '/tmp/sctl/sctl-se
             std::os::unix::fs::symlink(&system, s.path("alias")).unwrap();
             assert!(root_alone(&s.path("alias")));
         }
+    }
+
+    /// The judgment behind the link, on each part's mode and owner as a
+    /// unit's layouts give them. The agent under `/tmp`, which anyone can
+    /// write (1777), never gets a link, though root owns every part: only
+    /// the mode refuses it. A part its group or others can write refuses
+    /// it too, and so does one that is not root's, not of its kind, or
+    /// that cannot be read.
+    #[test]
+    fn root_alone_judges_each_parts_owner_and_mode() {
+        use std::collections::HashMap;
+        const DIR: u32 = 0o040_000;
+        const FILE: u32 = 0o100_000;
+        const LINK: u32 = 0o120_000;
+        let judge = |parts: &[(&str, u32, u32)], binary: &str| {
+            let parts: HashMap<PathBuf, (u32, u32)> = parts
+                .iter()
+                .map(|&(path, mode, uid)| (PathBuf::from(path), (mode, uid)))
+                .collect();
+            root_alone_by(Path::new(binary), |path| parts.get(path).copied())
+        };
+        let gz_tmp = |tmp: u32, sctl: u32, binary: u32, uid: u32| {
+            [
+                ("/", DIR | 0o755, 0),
+                ("/tmp", DIR | tmp, 0),
+                ("/tmp/sctl", DIR | sctl, 0),
+                ("/tmp/sctl/sctl-server", FILE | binary, uid),
+            ]
+        };
+        let binary = "/tmp/sctl/sctl-server";
+
+        assert!(
+            !judge(&gz_tmp(0o1777, 0o755, 0o755, 0), binary),
+            "a unit's /tmp, all root's: no link"
+        );
+        assert!(
+            judge(&gz_tmp(0o755, 0o755, 0o755, 0), binary),
+            "the same path, root's alone: a link"
+        );
+        assert!(judge(&gz_tmp(0o755, 0o700, 0o500, 0), binary));
+        for (what, parts) in [
+            ("/tmp writable by others", gz_tmp(0o757, 0o755, 0o755, 0)),
+            ("/tmp writable by its group", gz_tmp(0o775, 0o755, 0o755, 0)),
+            (
+                "a directory its group can write",
+                gz_tmp(0o755, 0o775, 0o755, 0),
+            ),
+            ("a binary others can write", gz_tmp(0o755, 0o755, 0o757, 0)),
+            (
+                "a binary its group can write",
+                gz_tmp(0o755, 0o755, 0o775, 0),
+            ),
+            ("a binary not root's", gz_tmp(0o755, 0o755, 0o755, 1000)),
+        ] {
+            assert!(!judge(&parts, binary), "{what}");
+        }
+
+        let mut parts = gz_tmp(0o755, 0o755, 0o755, 0);
+        parts[2].2 = 1000;
+        assert!(!judge(&parts, binary), "a directory not root's");
+        parts = gz_tmp(0o755, 0o755, 0o755, 0);
+        parts[3].1 = LINK | 0o777;
+        assert!(!judge(&parts, binary), "not a regular file");
+        parts = gz_tmp(0o755, 0o755, 0o755, 0);
+        parts[2].1 = FILE | 0o755;
+        assert!(
+            !judge(&parts, binary),
+            "a part above that is not a directory"
+        );
+        assert!(
+            !judge(&gz_tmp(0o755, 0o755, 0o755, 0)[1..], binary),
+            "a part that cannot be read"
+        );
     }
 
     /// The wrapper checks each file it runs by an absolute path, and is
