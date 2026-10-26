@@ -4,16 +4,31 @@
 //! the agent's files only while root alone can change them. Its guard is
 //! run here by the system `sh` and, when BusyBox is installed, by BusyBox's
 //! `sh`, the units' shell, with each path passed as an argument, never
-//! inside a shell string. It passes a regular file and a directory that
-//! root owns and no one else can write, and refuses a link, a file or a
-//! directory others can write, one this account owns, a missing one and a
-//! file named as a directory, saying why, with exit 126 and nothing run.
-//! The whole wrapper runs root's own `env` as the loader and `printf` as
-//! the binary, programs that only run the words after their options and
-//! print their arguments, with arguments a shell would split, glob, expand
-//! or run, passed as an argument vector: each arrives as it was given, and
-//! nothing is expanded. A wrapper for a stand-in of this account's own, in
-//! a scratch directory, runs nothing.
+//! inside a shell string, and only on files in the test's own scratch
+//! directory. It refuses a link, a file or a directory others can write,
+//! one this account owns, a missing one and a file named as a directory,
+//! saying why, with exit 126 and nothing run.
+//!
+//! What the guard reads of a file's mode and owner comes from `ls -ldn`. A
+//! stand-in `ls`, first in `PATH` and printing one fixed line, shows the
+//! guard's reading of that line under the system `sh`: it passes a mode
+//! root alone can write, with or without an SELinux `.`, and refuses one
+//! its group or others can write (`/tmp`'s `drwxrwxrwt` among them), one
+//! with an access list (`+`) and one not owned by uid 0. BusyBox's `sh`
+//! runs its own `ls` applet whatever `PATH` says, so these cases run under
+//! the system `sh` only.
+//!
+//! The whole wrapper, as the agent writes it, runs stand-ins in the scratch
+//! directory, a loader and a binary that each print their arguments and
+//! exit, with arguments a shell would split, glob, expand or run, passed as
+//! an argument vector: each arrives as it was given, and nothing is
+//! expanded. Unprivileged, the stand-in `ls` vouches for them, so the
+//! kernel and the system `sh` run it. As root (`#[ignore]`, run with
+//! `SCTL_ROOT_TEST=1`), the stand-ins are root's in a scratch directory
+//! root made, and the real `ls`, BusyBox's applet included, is read: the
+//! wrapper runs under the kernel, the system `sh` and BusyBox's, and the
+//! guard refuses root's own files and directories that others can write.
+//! A wrapper for a stand-in this account can change runs nothing.
 //!
 //! `rundev.sh`'s paths that write `/usr/bin/sctl` first ask the unit whether
 //! the name is the agent's: the question answers yes for the link and the
@@ -32,6 +47,14 @@
 //! With no `install.json`, or one it cannot use, it makes no name, and its
 //! log says which. It listens on the loopback under a key of this run's
 //! own, kept in a scratch directory only this account can read.
+//!
+//! Run the root case as the netns tests are run: build as yourself, then
+//! run the binary with sudo.
+//!
+//! ```sh
+//! cargo test -p sctl --test cli_name --no-run
+//! sudo -n env SCTL_ROOT_TEST=1 target/debug/deps/cli_name-<hash> --ignored --nocapture
+//! ```
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -49,11 +72,16 @@ const PATH: &str = "/usr/bin:/bin";
 /// A stand-in of this account's own: were it run, it would say so.
 const RAN: &str = "#!/bin/sh\nprintf RAN\n";
 
-/// Root's own programs as the stand-ins of a run: `env -u <name>` runs the
-/// words after its option, as the loader runs the agent with its own, and
-/// `printf '%s\0'` prints each argument it is given.
-const ENV: &str = "/usr/bin/env";
-const PRINTF: &str = "/usr/bin/printf";
+/// The stand-in loader: it prints its role, how many arguments it was
+/// given and each of them, then exits.
+const LOADER: &str = "#!/bin/sh\n\
+printf 'loader\\0%s\\0' \"$#\"\n\
+for a do printf '%s\\0' \"$a\"; done\n";
+
+/// The stand-in binary: the same, as the binary.
+const BINARY: &str = "#!/bin/sh\n\
+printf 'binary\\0%s\\0' \"$#\"\n\
+for a do printf '%s\\0' \"$a\"; done\n";
 
 /// What a shell would split, glob, expand or run, were it given the chance.
 const ARGS: [&str; 15] = [
@@ -115,6 +143,12 @@ fn set_mode(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
+/// A directory in `scratch`, with `mode` whatever the umask.
+fn directory(path: &Path, mode: u32) {
+    std::fs::create_dir(path).unwrap();
+    set_mode(path, mode);
+}
+
 /// busybox, when installed.
 fn busybox() -> Option<PathBuf> {
     let found = std::env::var_os("PATH").and_then(|paths| {
@@ -137,8 +171,9 @@ fn shells() -> Vec<Option<PathBuf>> {
     shells
 }
 
-/// `sh`, the system's or BusyBox's, with an environment of `PATH` alone.
-fn sh(busybox: Option<&Path>) -> Command {
+/// `sh`, the system's or BusyBox's, with an environment of `path` as
+/// `PATH` alone.
+fn sh_with(busybox: Option<&Path>, path: &str) -> Command {
     let mut command = match busybox {
         Some(busybox) => {
             let mut c = Command::new(busybox);
@@ -147,7 +182,7 @@ fn sh(busybox: Option<&Path>) -> Command {
         }
         None => Command::new("sh"),
     };
-    command.env_clear().env("PATH", PATH).stdin(Stdio::null());
+    command.env_clear().env("PATH", path).stdin(Stdio::null());
     command
 }
 
@@ -158,27 +193,47 @@ fn roots(path: &Path) -> bool {
         .is_ok_and(|m| !m.file_type().is_symlink() && m.uid() == 0 && m.mode() & 0o022 == 0)
 }
 
-/// Root's own `env` and `printf`, when the guard passes them and their
-/// directory, as it passes the agent's files on a unit.
-fn root_s_stand_ins() -> Option<(PathBuf, PathBuf)> {
-    let (env, printf) = (PathBuf::from(ENV), PathBuf::from(PRINTF));
-    if [&env, &printf, &PathBuf::from("/usr/bin")]
-        .iter()
-        .all(|path| roots(path))
-    {
-        Some((env, printf))
-    } else {
-        eprintln!("{ENV} and {PRINTF} are not root's alone here: no run of the wrapper to show");
-        None
+/// A stand-in `ls` in a directory of its own in `scratch`, and the `PATH`
+/// that finds it first. Whatever it is asked, it prints one `ls -ldn` line,
+/// `dir` for a directory and `file` for anything else, each a mode and an
+/// owner's uid, then exits. The guard reads the mode and the uid from that
+/// line; it judges the kind and a link with `test`, on the real path.
+fn stand_in_ls(scratch: &Scratch, tag: &str, dir: (&str, u32), file: (&str, u32)) -> String {
+    for (mode, _) in [dir, file] {
+        assert!(
+            mode.bytes().all(|b| b"-dlrwxsStT+.".contains(&b)),
+            "a mode as ls prints it: {mode}"
+        );
     }
+    let bin = scratch.path(&format!("ls-{tag}"));
+    std::fs::create_dir(&bin).unwrap();
+    let line = |(mode, uid): (&str, u32)| format!("{mode} 1 {uid} 0 0 Jan  1 00:00 x");
+    executable(
+        &bin.join("ls"),
+        &format!(
+            "#!/bin/sh\n\
+             if [ -d \"$2\" ]; then printf '%s\\n' '{}'; else printf '%s\\n' '{}'; fi\n",
+            line(dir),
+            line(file)
+        ),
+    );
+    let bin = bin.to_str().unwrap();
+    assert!(!bin.contains(':'), "a PATH entry: {bin}");
+    format!("{bin}:{PATH}")
 }
 
-/// What the guard answers for `path` taken as a `kind`: the exit code, and
-/// what it printed on stdout and stderr. The script is a constant: the
-/// guard, one check of `$1` as `$2`, and a word that it passed.
-fn guard_answers(busybox: Option<&Path>, path: &Path, kind: &str) -> (i32, String, String) {
+/// What the guard answers for `path` taken as a `kind`, run by `sh` with
+/// `path_var` as `PATH`: the exit code, and what it printed on stdout and
+/// stderr. The script is a constant: the guard, one check of `$1` as `$2`,
+/// and a word that it passed.
+fn guard_answers(
+    busybox: Option<&Path>,
+    path_var: &str,
+    path: &Path,
+    kind: &str,
+) -> (i32, String, String) {
     let script = format!("{GUARD}root_only \"$1\" \"$2\"\nprintf 'passed\\n'\n");
-    let out = sh(busybox)
+    let out = sh_with(busybox, path_var)
         .arg("-c")
         .arg(&script)
         .arg("sh")
@@ -193,27 +248,43 @@ fn guard_answers(busybox: Option<&Path>, path: &Path, kind: &str) -> (i32, Strin
     )
 }
 
-/// The guard passes what root alone can change, and refuses anything else
-/// before the wrapper runs it, saying why.
+/// The guard's refusal of `path` as a `kind`.
+fn refusal(path: &Path, kind: &str) -> (i32, String, String) {
+    (
+        126,
+        String::new(),
+        format!(
+            "sctl: not run: {} is not a {kind} owned by root and writable by no one else\n",
+            path.display()
+        ),
+    )
+}
+
+fn passed() -> (i32, String, String) {
+    (0, "passed\n".to_string(), String::new())
+}
+
+/// The guard refuses, with the real `ls`, what is not root's alone in the
+/// scratch directory: links, files and directories others can write, this
+/// account's own, a missing path and a file named as a directory.
 #[test]
-fn the_guard_passes_only_what_root_alone_can_change() {
+fn the_guard_refuses_what_root_alone_cannot_change() {
     let scratch = Scratch::new("guard");
     // A directory a shell would split at its space, end a quote at its
     // quote and expand at its `$(...)`.
     let dir = scratch.path("it's a $(printf EXPANDED) dir");
-    std::fs::create_dir(&dir).unwrap();
+    directory(&dir, 0o755);
     let mine = dir.join("mine");
     executable(&mine, RAN);
     let open_file = dir.join("anyone may write it");
     executable(&open_file, RAN);
     set_mode(&open_file, 0o777);
     let open_dir = dir.join("anyone may write in it");
-    std::fs::create_dir(&open_dir).unwrap();
-    set_mode(&open_dir, 0o777);
-    let link_to_file = dir.join("a link to printf");
-    std::os::unix::fs::symlink(PRINTF, &link_to_file).unwrap();
-    let link_to_dir = dir.join("a link to usr-bin");
-    std::os::unix::fs::symlink("/usr/bin", &link_to_dir).unwrap();
+    directory(&open_dir, 0o777);
+    let link_to_file = dir.join("a link to mine");
+    std::os::unix::fs::symlink(&mine, &link_to_file).unwrap();
+    let link_to_dir = dir.join("a link to the directory");
+    std::os::unix::fs::symlink(&dir, &link_to_dir).unwrap();
     let mine_is_root_s = std::fs::metadata(&mine).unwrap().uid() == 0;
 
     let file = "regular file";
@@ -231,126 +302,297 @@ fn the_guard_passes_only_what_root_alone_can_change() {
     }
     for shell in shells() {
         let shell = shell.as_deref();
-        if root_s_stand_ins().is_some() {
-            for (path, kind) in [
-                (Path::new(PRINTF), file),
-                (Path::new("/usr/bin"), "directory"),
-            ] {
+        for (path, kind) in &refused {
+            assert_eq!(
+                guard_answers(shell, PATH, path, kind),
+                refusal(path, kind),
+                "{shell:?}: {}, the path as given, nothing expanded",
+                path.display()
+            );
+        }
+        if mine_is_root_s {
+            // Root's alone: the real `ls` reads them as such.
+            for (path, kind) in [(&mine, file), (&dir, "directory")] {
                 assert_eq!(
-                    guard_answers(shell, path, kind),
-                    (0, "passed\n".to_string(), String::new()),
+                    guard_answers(shell, PATH, path, kind),
+                    passed(),
                     "{shell:?}: {}",
                     path.display()
                 );
             }
         }
-        for (path, kind) in &refused {
-            let (code, out, err) = guard_answers(shell, path, kind);
-            assert_eq!(
-                (code, out.as_str()),
-                (126, ""),
-                "{shell:?}: {}: {err}",
-                path.display()
+    }
+}
+
+/// The guard's reading of `ls -ldn`, under the system `sh` with a stand-in
+/// `ls` that prints one line: it passes a mode root alone can write, with
+/// or without an SELinux `.`, and refuses a mode its group or others can
+/// write, `/tmp`'s among them, an access list and an owner other than uid
+/// 0. A link, a missing path and a file named as a directory are refused
+/// whatever `ls` says. Only this shows the mode refusing anything when an
+/// ordinary account runs the tests: every file it makes is its own.
+#[test]
+fn the_guard_reads_the_mode_and_the_owner_that_ls_prints() {
+    let scratch = Scratch::new("guard-modes");
+    let dir = scratch.path("it's a $(printf EXPANDED) dir");
+    directory(&dir, 0o755);
+    let file = dir.join("binary");
+    executable(&file, RAN);
+    let link = dir.join("a link to the binary");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    let regular = "regular file";
+
+    let cases: [(&str, u32, &Path, &str, bool); 19] = [
+        ("drwxr-xr-x", 0, &dir, "directory", true),
+        ("drwxr-xr-x.", 0, &dir, "directory", true),
+        ("dr-x------", 0, &dir, "directory", true),
+        ("-rwxr-xr-x", 0, &file, regular, true),
+        ("-rwxr-xr-x.", 0, &file, regular, true),
+        ("-r-x------", 0, &file, regular, true),
+        // /tmp on every unit.
+        ("drwxrwxrwt", 0, &dir, "directory", false),
+        ("drwxrwxr-x", 0, &dir, "directory", false),
+        ("drwxr-xrwx", 0, &dir, "directory", false),
+        ("drwxr-xr-x+", 0, &dir, "directory", false),
+        ("drwxr-xr-x", 1000, &dir, "directory", false),
+        ("-rwxrwxr-x", 0, &file, regular, false),
+        ("-rwxr-xrwx", 0, &file, regular, false),
+        ("-rwxr-xr-x+", 0, &file, regular, false),
+        ("-rwxr-xr-x", 1000, &file, regular, false),
+        ("-rwxr-xr-x", 0, &link, regular, false),
+        ("-rwxr-xr-x", 0, &dir.join("missing"), regular, false),
+        ("-rwxr-xr-x", 0, &file, "directory", false),
+        ("drwxr-xr-x", 0, &dir, regular, false),
+    ];
+    for (n, (mode, uid, path, kind, passes)) in cases.into_iter().enumerate() {
+        let path_var = stand_in_ls(&scratch, &n.to_string(), (mode, uid), (mode, uid));
+        let expected = if passes {
+            passed()
+        } else {
+            refusal(path, kind)
+        };
+        assert_eq!(
+            guard_answers(None, &path_var, path, kind),
+            expected,
+            "{mode} {uid}: {} as a {kind}",
+            path.display()
+        );
+    }
+}
+
+/// The records the stand-ins printed: each its role and its arguments.
+fn records(out: &[u8]) -> Vec<(String, Vec<String>)> {
+    let mut fields = out
+        .split(|&b| b == 0)
+        .map(|f| String::from_utf8(f.to_vec()).unwrap());
+    let mut records = Vec::new();
+    while let Some(role) = fields.next() {
+        if role.is_empty() {
+            break;
+        }
+        let count: usize = fields.next().unwrap().parse().unwrap();
+        let args = (0..count).map(|_| fields.next().unwrap()).collect();
+        records.push((role, args));
+    }
+    assert!(fields.next().is_none(), "nothing after the records");
+    records
+}
+
+/// Who runs a wrapper: the kernel, through its `#!/bin/sh`, or a shell.
+enum By {
+    Kernel,
+    Shell(Option<PathBuf>),
+}
+
+/// The stand-ins in `dir`, two wrappers for them written as the agent
+/// writes them (one through the loader's words, one for the binary alone),
+/// and each wrapper run `by` each of `runners` with `path_var` as `PATH`:
+/// every argument reaches the stand-in as it was given, and nothing is
+/// expanded.
+fn check_wrappers(scratch: &Scratch, dir: &Path, runners: &[By], path_var: &str) {
+    let loader = dir.join("loader");
+    let binary = dir.join("binary");
+    executable(&loader, LOADER);
+    executable(&binary, BINARY);
+    let words = vec![
+        loader.display().to_string(),
+        "--library-path".to_string(),
+        dir.join("lib").display().to_string(),
+    ];
+    let mut through_loader = words[1..].to_vec();
+    through_loader.push(binary.display().to_string());
+    through_loader.extend(ARGS.iter().map(ToString::to_string));
+    let args: Vec<String> = ARGS.iter().map(ToString::to_string).collect();
+
+    for (tag, want, expected) in [
+        (
+            "under-a-loader",
+            Want::wrapper(&words, &binary),
+            ("loader".to_string(), through_loader),
+        ),
+        (
+            "alone",
+            Want::wrapper(&[], &binary),
+            ("binary".to_string(), args.clone()),
+        ),
+    ] {
+        let wrapper = scratch.path(&format!("sctl-{tag}"));
+        assert!(cli_name::make(&wrapper, &want).unwrap().written);
+        // The kernel runs a copy that `cp` wrote: an exec of a file this
+        // process wrote fails (ETXTBSY) while a child another test forked
+        // meanwhile still holds the descriptor it inherited, and this
+        // process never opens the copy for writing.
+        let copy = scratch.path(&format!("sctl-{tag}-copy"));
+        let copied = Command::new("cp")
+            .arg(&wrapper)
+            .arg(&copy)
+            .env_clear()
+            .env("PATH", PATH)
+            .status()
+            .expect("cp runs");
+        assert!(copied.success());
+        assert_eq!(
+            std::fs::read(&copy).unwrap(),
+            std::fs::read(&wrapper).unwrap()
+        );
+        for runner in runners {
+            let (who, mut command) = match runner {
+                By::Kernel => ("the kernel".to_string(), Command::new(&copy)),
+                By::Shell(shell) => {
+                    let mut command = sh_with(shell.as_deref(), path_var);
+                    command.arg(&wrapper);
+                    (format!("{shell:?}"), command)
+                }
+            };
+            let out = command
+                .args(ARGS)
+                .env_clear()
+                .env("PATH", path_var)
+                .env("HOME", "/nonexistent-home")
+                .current_dir(&scratch.0)
+                .output()
+                .unwrap_or_else(|e| panic!("{who}: the wrapper runs: {e}"));
+            assert!(
+                out.status.success() && out.stderr.is_empty(),
+                "{who} {tag}: {}",
+                String::from_utf8_lossy(&out.stderr)
             );
+            let got = records(&out.stdout);
             assert_eq!(
-                err,
-                format!(
-                    "sctl: not run: {} is not a {kind} owned by root and writable by no one else\n",
-                    path.display()
-                ),
-                "{shell:?}: the path as given, nothing expanded"
+                got,
+                std::slice::from_ref(&expected),
+                "{who} {tag}: every word arrives as it was given"
+            );
+            assert!(
+                !got.iter().flat_map(|(_, a)| a).any(|a| a == "EXPANDED"),
+                "{who} {tag}: nothing was expanded"
             );
         }
     }
 }
 
-/// The wrapper, as the agent writes it, runs root's own programs through a
-/// loader's words with every argument as it was given. The kernel runs it
-/// through its `#!/bin/sh`, and so do the system `sh` and BusyBox's.
+/// The wrapper, as the agent writes it, runs its stand-ins with every
+/// argument as it was given, the kernel through its `#!/bin/sh` and the
+/// system `sh` alike. The stand-in `ls` vouches for them as root's alone,
+/// as the real one does on a unit; the files and the directory are this
+/// account's, in the scratch directory.
 #[test]
-fn the_wrapper_runs_root_s_programs_with_every_word_as_given() {
-    let Some((env, printf)) = root_s_stand_ins() else {
-        return;
-    };
+fn the_wrapper_runs_its_files_with_every_word_as_given() {
     let scratch = Scratch::new("wrapper");
-    let words = vec![
-        env.display().to_string(),
-        "-u".to_string(),
-        "SCTL_NO_SUCH_NAME".to_string(),
-    ];
-    let wrapper = scratch.path("sctl");
-    let made = cli_name::make(&wrapper, &Want::wrapper(&words, &printf)).unwrap();
-    assert!(made.written);
-    // The kernel runs a copy that `cp` wrote: an exec of a file this
-    // process wrote fails (ETXTBSY) while a child another test forked
-    // meanwhile still holds the descriptor it inherited, and this process
-    // never opens the copy for writing.
-    let copy = scratch.path("sctl-copy");
-    let copied = Command::new("cp")
-        .arg(&wrapper)
-        .arg(&copy)
-        .env_clear()
-        .env("PATH", PATH)
-        .status()
-        .expect("cp runs");
-    assert!(copied.success());
-    assert_eq!(
-        std::fs::read(&copy).unwrap(),
-        std::fs::read(&wrapper).unwrap()
-    );
-    let mut runs: Vec<(String, Command)> = vec![("the kernel".into(), Command::new(&copy))];
+    // A directory a shell would split at its space, end a quote at its
+    // quote and expand at its `$(...)`.
+    let dir = scratch.path("it's a $(printf EXPANDED) dir");
+    directory(&dir, 0o755);
+    let path_var = stand_in_ls(&scratch, "root-s", ("drwxr-xr-x", 0), ("-rwxr-xr-x", 0));
+    check_wrappers(&scratch, &dir, &[By::Kernel, By::Shell(None)], &path_var);
+}
+
+/// As root, with the real `ls`: the wrapper runs root's stand-ins under the
+/// kernel, the system `sh` and BusyBox's, and the guard refuses root's own
+/// files and directories that others or the group can write, `/tmp`'s mode
+/// among them, reading `ls -ldn` as the unit's BusyBox prints it.
+#[test]
+#[ignore = "needs root: sudo -n env SCTL_ROOT_TEST=1 <test binary> --ignored"]
+fn as_root_the_wrapper_runs_root_s_files_and_refuses_open_ones() {
+    if std::env::var_os("SCTL_ROOT_TEST").is_none() {
+        eprintln!("skipped: set SCTL_ROOT_TEST=1 and run the test binary as root");
+        return;
+    }
+    // SAFETY: geteuid has no preconditions.
+    assert_eq!(unsafe { libc::geteuid() }, 0, "SCTL_ROOT_TEST needs root");
+    let scratch = Scratch::new("as-root");
+    let dir = scratch.path("it's a $(printf EXPANDED) dir");
+    directory(&dir, 0o755);
+
+    let file = "regular file";
+    let root_s = dir.join("root's");
+    executable(&root_s, RAN);
+    let mut refused = Vec::new();
+    for (name, mode) in [
+        ("like /tmp", 0o1777),
+        ("group may write in it", 0o775),
+        ("others may write in it", 0o757),
+    ] {
+        let path = dir.join(name);
+        directory(&path, mode);
+        refused.push((path, "directory"));
+    }
+    for (name, mode) in [
+        ("group may write it", 0o775),
+        ("others may write it", 0o757),
+    ] {
+        let path = dir.join(name);
+        executable(&path, RAN);
+        set_mode(&path, mode);
+        refused.push((path, file));
+    }
     for shell in shells() {
-        let mut command = sh(shell.as_deref());
-        command.arg(&wrapper);
-        runs.push((format!("{shell:?}"), command));
+        let shell = shell.as_deref();
+        for (path, kind) in [(&root_s, file), (&dir, "directory")] {
+            assert_eq!(
+                guard_answers(shell, PATH, path, kind),
+                passed(),
+                "{shell:?}: {}",
+                path.display()
+            );
+        }
+        for (path, kind) in &refused {
+            assert_eq!(
+                guard_answers(shell, PATH, path, kind),
+                refusal(path, kind),
+                "{shell:?}: {}",
+                path.display()
+            );
+        }
     }
-    for (by, mut command) in runs {
-        let out = command
-            .arg("%s\\0")
-            .args(ARGS)
-            .env_clear()
-            .env("PATH", PATH)
-            .env("HOME", "/nonexistent-home")
-            .current_dir(&scratch.0)
-            .output()
-            .unwrap_or_else(|e| panic!("{by}: the wrapper runs: {e}"));
-        assert!(
-            out.status.success() && out.stderr.is_empty(),
-            "{by}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let printed: Vec<String> = out
-            .stdout
-            .split(|&b| b == 0)
-            .map(|field| String::from_utf8(field.to_vec()).unwrap())
-            .collect();
-        let mut expected: Vec<String> = ARGS.iter().map(ToString::to_string).collect();
-        expected.push(String::new());
-        assert_eq!(
-            printed, expected,
-            "{by}: every word arrives as it was given"
-        );
-        assert!(
-            !printed.iter().any(|a| a == "EXPANDED"),
-            "{by}: nothing was expanded"
-        );
-    }
+
+    let mut runners = vec![By::Kernel];
+    runners.extend(shells().into_iter().map(By::Shell));
+    check_wrappers(&scratch, &dir, &runners, PATH);
 }
 
 /// A wrapper for a stand-in this account owns, or that anyone may write,
 /// as a unit's would be for a binary another account put under /tmp, runs
-/// nothing: exit 126, saying why.
+/// nothing: exit 126, saying why. Run by an ordinary account the real `ls`
+/// refuses it at the scratch directory, which is the account's; under the
+/// stand-in `ls`, which says the directory is root's alone, at the binary,
+/// which anyone may write.
 #[test]
 fn a_wrapper_for_a_binary_root_cannot_trust_runs_nothing() {
     let scratch = Scratch::new("untrusted");
     let binary = scratch.path("sctl-server");
     executable(&binary, RAN);
-    // Writable by anyone: refused whoever runs this test.
     set_mode(&binary, 0o777);
     let wrapper = scratch.path("sctl");
     cli_name::make(&wrapper, &Want::wrapper(&[], &binary)).unwrap();
-    for shell in shells() {
-        let out = sh(shell.as_deref())
+    let open = stand_in_ls(&scratch, "open", ("drwx------", 0), ("-rwxrwxrwx", 0));
+    let mut runs: Vec<(Option<PathBuf>, String)> = shells()
+        .into_iter()
+        .map(|shell| (shell, PATH.to_string()))
+        .collect();
+    runs.push((None, open.clone()));
+    for (shell, path_var) in runs {
+        let out = sh_with(shell.as_deref(), &path_var)
             .arg(&wrapper)
             .arg("net")
             .output()
@@ -358,10 +600,12 @@ fn a_wrapper_for_a_binary_root_cannot_trust_runs_nothing() {
         let err = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(126), "{shell:?}: {err}");
         assert!(out.stdout.is_empty(), "{shell:?}: nothing ran");
-        assert!(
-            err.starts_with(&format!("sctl: not run: {}", scratch.0.display())),
-            "{shell:?}: {err}"
-        );
+        let refused_at = if path_var == open {
+            refusal(&binary, "regular file").2
+        } else {
+            format!("sctl: not run: {}", scratch.0.display())
+        };
+        assert!(err.starts_with(&refused_at), "{shell:?} {path_var}: {err}");
     }
 }
 
