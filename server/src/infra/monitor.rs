@@ -2749,14 +2749,16 @@ mod tests {
     /// is free and the worker goes on, and the command waits for the
     /// record. A FIFO in place of the file cannot hold it: a FIFO takes no
     /// sync, so the write fails, and a run whose record did not reach the
-    /// disk starts no command.
+    /// disk starts no command. The command sleeps 1 s and the write is held
+    /// longer than that, so the run ends 1 s after the write is let through
+    /// only when the command started after it.
     #[tokio::test]
     async fn a_runs_record_is_written_outside_the_lock_and_off_the_async_worker() {
         let scratch = Scratch::new("slow-disk");
         let mut t = target_every("pdu", 60);
         t.recovery = Some(RecoveryConfig {
             enabled: true,
-            command: "true".into(),
+            command: "sleep 1".into(),
             cooldown_secs: 0,
             max_retries: 5,
             credential_ids: Vec::new(),
@@ -2794,12 +2796,21 @@ mod tests {
             "the command waits for its record"
         );
         assert!(!task.is_finished());
+        // Held past the second a command started with the run would take.
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert!(!task.is_finished(), "the run waits for its write");
 
+        let released = std::time::Instant::now();
         release.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(10), task)
             .await
             .expect("the run ends once its write does")
             .unwrap();
+        assert!(
+            released.elapsed() >= Duration::from_millis(800),
+            "the command started only once its record was on disk: the run ended {:?} after the write",
+            released.elapsed()
+        );
         let log = infra.lock().await.results.recovery_log.clone();
         assert_eq!((log.len(), log[0].exit_code), (1, 0), "it ran, once");
         assert_eq!(
@@ -2813,7 +2824,9 @@ mod tests {
     /// is what bounds a recovery that power-cycles the unit's own supply
     /// across the restarts it causes. No command starts, the run is logged
     /// with exit -1 saying so, and it counts as an attempt: no run starts
-    /// within the cooldown, and none past `max_retries`.
+    /// within the cooldown, and none past `max_retries`. The command sleeps
+    /// 5 s and each run must end within 2 s, so a command that started,
+    /// even one whose run was then logged as not run, fails the test.
     #[tokio::test]
     async fn a_run_whose_record_did_not_reach_the_disk_does_not_run() {
         let scratch = Scratch::new("unrecorded");
@@ -2825,8 +2838,8 @@ mod tests {
         t.down_after_consecutive = 1;
         t.recovery = Some(RecoveryConfig {
             enabled: true,
-            // Its output would be in the log, were it run.
-            command: "echo ran".into(),
+            // A run that started it would last 5 s.
+            command: "sleep 5".into(),
             cooldown_secs: 60,
             max_retries: 2,
             credential_ids: Vec::new(),
@@ -2846,7 +2859,9 @@ mod tests {
             };
             if let Some(run) = started {
                 started_at.push(secs);
-                run_recovery(infra.clone(), run).await;
+                tokio::time::timeout(Duration::from_secs(2), run_recovery(infra.clone(), run))
+                    .await
+                    .unwrap_or_else(|_| panic!("at {secs}s: the command started"));
             }
         }
         assert_eq!(
@@ -2865,7 +2880,7 @@ mod tests {
                     entry.exit_code,
                     entry.stdout.as_str()
                 ),
-                ("echo ran", -1, NOT_RECORDED),
+                ("sleep 5", -1, NOT_RECORDED),
                 "no command started"
             );
             assert!(entry.stderr.is_empty());
