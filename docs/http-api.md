@@ -1049,11 +1049,14 @@ second check runs. A recovery run is not a check: while one of the target
 runs, which the monitor leaves alone, Check now reads the target and its
 result is applied as above, status included, but the target's recovery
 count and cooldown stand until the run ends. The run's end then applies
-them: a target that reads `up` or `degraded` came back during the run and
-starts afresh, its count clear; one that reads `down` or `unknown` keeps
-the count and the cooldown the run began. A result is applied only while
-the unit still holds the config the check ran under and the target is in
-it; otherwise it is answered and nothing is applied.
+them: a target that a good answer moved out of `down` or `unknown` during
+the run, and that reads `up` or `degraded` when it ends, came back and
+starts afresh, its count clear. Any other keeps the count and the cooldown
+the run began: one that reads `down` or `unknown`, and one that never
+answered, as a check that panicked (`unknown`) and then a failure leave
+`degraded`. A result is applied only while the unit still holds the config
+the check ran under and the target is in it; otherwise it is answered and
+nothing is applied.
 
 Response `200`: `{target_id, ok, latency_ms, detail, http_status, data,
 presented_sha256}`. `presented_sha256` is set when a TLS target offered a

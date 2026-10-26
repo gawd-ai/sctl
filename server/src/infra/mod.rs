@@ -37,8 +37,8 @@
 //! is applied as a monitor check's is, and it never starts a recovery. The
 //! monitor checks no target while its recovery runs; Check now still reads
 //! it, and leaves the target's count and cooldown to the run, whose end
-//! applies its outcome: a target that came back during the run starts
-//! afresh.
+//! applies its outcome: a target that a good answer brought back during the
+//! run starts afresh.
 //!
 //! Results are served via `GET /api/infra/results` for external health polling,
 //! and pushed over the tunnel as `infra.state` (see `tunnel::infra_state`)
@@ -756,6 +756,10 @@ pub struct InfraState {
     /// The recovery runs started and not yet logged, by target id: saved
     /// as not ended before each command starts.
     pub runs_not_ended: HashMap<String, SavedRun>,
+    /// The targets whose recovery run is in progress and that a good answer
+    /// (a Check now) moved out of Down or `unknown` during it: the run's end
+    /// clears the count only for these. In memory only.
+    pub answered_during_run: HashSet<String>,
     /// The saved recovery counts and runs (mode 0600), and the order its
     /// writes reach it in.
     pub recovery_file: RecoveryFile,
@@ -829,6 +833,7 @@ impl InfraState {
             },
             recovery_tracker: HashMap::new(),
             runs_not_ended: HashMap::new(),
+            answered_during_run: HashSet::new(),
             recovery_file: RecoveryFile::new(Path::new(state_dir).join("infra-recovery.json")),
             config_path: Path::new(state_dir).join("infra-monitor.json"),
             config_saved: false,

@@ -42,9 +42,12 @@
 //! counts no round and starts no recovery. During a recovery run of its
 //! target it still reads the target and moves its record, its status
 //! included, while the target's recovery count and cooldown stand until the
-//! run ends. The run's outcome then applies them: a target that reads Up or
-//! Degraded came back during the run and starts afresh; one that reads Down
-//! or `unknown` keeps the count and the cooldown the run began.
+//! run ends. The run's outcome then applies them: a target that a good
+//! answer moved out of Down or `unknown` during the run, and that reads Up
+//! or Degraded when it ends, came back and starts afresh. Any other keeps
+//! the count and the cooldown the run began: one that reads Down or
+//! `unknown`, and one that left Down with no good answer, as a check that
+//! panicked and then a failure take it to Degraded.
 //!
 //! `SCTL_INFRA_TEST_STALL_SECS`, for tests and benches, stops the loop that
 //! many seconds after it starts, so a stopped monitor can be seen while the
@@ -808,8 +811,8 @@ pub fn apply_result(
     // starts afresh, also when the agent failed to check it in between, or
     // restarted: a check that panics, and a start, leave the target
     // `unknown` and the count standing. During the target's recovery run
-    // (a Check now) the count and the cooldown stand: the run's end applies
-    // them ([`RecoveryRun::log`]).
+    // (a Check now) the count and the cooldown stand: the answer is noted,
+    // and the run's end applies them ([`RecoveryRun::log`]).
     if result.ok
         && new_status != prev_status
         && matches!(prev_status, TargetStatus::Down | TargetStatus::Unknown)
@@ -822,6 +825,7 @@ pub fn apply_result(
                 "Target {}: its recovery run is in progress; the run's end applies its count",
                 target.id
             );
+            state.answered_during_run.insert(target.id.clone());
         } else {
             state.clear_recovery_count(&target.id);
         }
@@ -1125,12 +1129,14 @@ impl RecoveryRun {
     /// Under the Infra lock: log the run, which moves `seq` and
     /// `recoveries` and is pushed, mark it ended, and apply its outcome to
     /// the count and the cooldown that readings during the run left as they
-    /// were. A target that reads Up or Degraded now came back during the run
-    /// (a run starts at Down, and only a good answer leaves Down): it starts
-    /// afresh, as the good answer that moved it would have had it start. One
-    /// that reads Down or `unknown` keeps the count and the cooldown the run
-    /// began. Returns the record that saves all this, for the caller to
-    /// write outside the lock.
+    /// were. A target that a good answer moved out of Down or `unknown`
+    /// during the run, and that reads Up or Degraded now, came back: it
+    /// starts afresh, as that good answer would have had it start outside a
+    /// run (ADR-010 decision 9). Any other keeps the count and the cooldown
+    /// the run began: one that reads Down or `unknown`, and one that never
+    /// answered, which a check that panicked (`unknown`) and then a failure
+    /// leave Degraded. Returns the record that saves all this, for the caller
+    /// to write outside the lock.
     fn log(&self, state: &mut InfraState, ended: Ended) -> RecoverySnapshot {
         info!(
             "Recovery for {}: exit={}, output={}",
@@ -1151,11 +1157,13 @@ impl RecoveryRun {
         {
             state.runs_not_ended.remove(&self.target_id);
         }
-        let came_back = state
-            .results
-            .targets
-            .get(&self.target_id)
-            .is_some_and(|t| matches!(t.status, TargetStatus::Up | TargetStatus::Degraded));
+        let answered = state.answered_during_run.remove(&self.target_id);
+        let came_back = answered
+            && state
+                .results
+                .targets
+                .get(&self.target_id)
+                .is_some_and(|t| matches!(t.status, TargetStatus::Up | TargetStatus::Degraded));
         if came_back && state.recovery_tracker.remove(&self.target_id).is_some() {
             info!(
                 "Recovery for {}: the target answered during the run; its count is clear",
@@ -1206,6 +1214,8 @@ fn start_recovery(
     state
         .recovery_tracker
         .insert(target_id.to_string(), (now, count + 1));
+    // Only an answer during this run counts at its end.
+    state.answered_during_run.remove(target_id);
     state.runs_not_ended.insert(
         target_id.to_string(),
         SavedRun {
@@ -2309,9 +2319,9 @@ mod tests {
     /// Check now during a recovery run stays a reading: its answers move
     /// the target's record, its status included, while the count and the
     /// cooldown stand until the run ends. The run's outcome then applies
-    /// them: a target that reads Up came back during the run and starts
-    /// afresh; one that reads Down keeps the count and the cooldown the run
-    /// began.
+    /// them: a target that good answers brought Up came back during the run
+    /// and starts afresh; one that reads Down keeps the count and the
+    /// cooldown the run began.
     #[tokio::test]
     async fn during_a_run_check_now_reads_and_the_run_applies_the_count_at_its_end() {
         let scratch = Scratch::new("during-run");
@@ -2366,6 +2376,144 @@ mod tests {
             "within the cooldown the run began"
         );
         assert!(fold(&mut state, false, 180, Reading::Monitor).is_some());
+    }
+
+    /// A run that ends with its target Degraded, which good answers during
+    /// it brought out of Down (one of them slow), came back: its count is
+    /// clear, and the next outage starts afresh.
+    #[tokio::test]
+    async fn a_run_that_ends_degraded_after_a_good_answer_clears_the_count() {
+        let scratch = Scratch::new("ends-degraded");
+        let t = pdu(60);
+        let mut state = holding(&scratch, vec![t.clone()]);
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let fold = |state: &mut InfraState, result: CheckResult, secs: u64, reading: Reading| {
+            apply_result(state, &t, result, 1, at(secs), reading)
+        };
+
+        for secs in [0, 10] {
+            assert!(fold(&mut state, answer(false, 0), secs, Reading::Monitor).is_none());
+        }
+        let run = fold(&mut state, answer(false, 0), 20, Reading::Monitor).expect("Down: a run");
+        let begun = state.recovery_tracker["pdu"];
+        assert!(fold(&mut state, answer(true, 3), 25, Reading::CheckNow).is_none());
+        assert!(fold(&mut state, answer(true, 500), 26, Reading::CheckNow).is_none());
+        assert_eq!(
+            state.results.targets["pdu"].status,
+            TargetStatus::Degraded,
+            "two good answers, one slow"
+        );
+        assert_eq!(state.recovery_tracker["pdu"], begun, "they stand");
+
+        run_inline(&mut state, run).await;
+        assert_eq!(state.results.targets["pdu"].status, TargetStatus::Degraded);
+        assert!(!state.recovery_tracker.contains_key("pdu"), "it came back");
+
+        // The next outage: a run at once, its count 1.
+        for secs in [30, 40] {
+            assert!(fold(&mut state, answer(false, 0), secs, Reading::Monitor).is_none());
+        }
+        let run = fold(&mut state, answer(false, 0), 50, Reading::Monitor).expect("afresh");
+        assert_eq!(state.recovery_tracker["pdu"], (at(50), 1));
+        run_inline(&mut state, run).await;
+    }
+
+    /// A check that panics during a run leaves its target `unknown`: that is
+    /// the agent's defect, not an answer (ADR-010 decision 5). A run that
+    /// ends with its target `unknown` keeps the count and the cooldown it
+    /// began, so the target's next Down within the cooldown starts no run.
+    #[tokio::test]
+    async fn a_run_that_ends_unknown_keeps_the_count_and_the_cooldown() {
+        let scratch = Scratch::new("ends-unknown");
+        let t = pdu(60);
+        let mut state = holding(&scratch, vec![t.clone()]);
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let failed = |state: &mut InfraState, secs: u64| {
+            apply_result(state, &t, answer(false, 0), 1, at(secs), Reading::Monitor)
+        };
+
+        for secs in [0, 10] {
+            assert!(failed(&mut state, secs).is_none());
+        }
+        let run = failed(&mut state, 20).expect("Down: a run");
+        apply_check_panic(&mut state, &t, 1);
+        assert_eq!(state.results.targets["pdu"].status, TargetStatus::Unknown);
+
+        run_inline(&mut state, run).await;
+        assert_eq!(state.results.targets["pdu"].status, TargetStatus::Unknown);
+        assert_eq!(state.recovery_tracker["pdu"], (at(20), 1), "they stand");
+
+        // Degraded at 30, Down at 50: within the cooldown the run began.
+        for secs in [30, 40, 50] {
+            assert!(
+                failed(&mut state, secs).is_none(),
+                "cooling down at {secs}s"
+            );
+        }
+        assert_eq!(state.results.targets["pdu"].status, TargetStatus::Down);
+        let run = failed(&mut state, 80).expect("past the cooldown");
+        assert_eq!(
+            state.recovery_tracker["pdu"],
+            (at(80), 2),
+            "the count went on"
+        );
+        run_inline(&mut state, run).await;
+    }
+
+    /// A check that panics during a run (`unknown`), then a failed one, leave
+    /// the target Degraded with no answer: Unknown and a failure make
+    /// Degraded. It did not come back, so the run's end keeps the count and
+    /// the cooldown, as outside a run. Its status alone used to clear them,
+    /// and the next Down started a run within the cooldown, its count back
+    /// at 1.
+    #[tokio::test]
+    async fn a_panic_then_a_failure_during_a_run_is_no_answer_and_the_count_stands() {
+        let scratch = Scratch::new("panic-then-failure");
+        let t = pdu(60);
+        let mut state = holding(&scratch, vec![t.clone()]);
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let failed = |state: &mut InfraState, secs: u64, reading: Reading| {
+            apply_result(state, &t, answer(false, 0), 1, at(secs), reading)
+        };
+
+        for secs in [0, 10] {
+            assert!(failed(&mut state, secs, Reading::Monitor).is_none());
+        }
+        let run = failed(&mut state, 20, Reading::Monitor).expect("Down: a run");
+        let begun = state.recovery_tracker["pdu"];
+        apply_check_panic(&mut state, &t, 1);
+        assert!(failed(&mut state, 25, Reading::CheckNow).is_none());
+        let shown = &state.results.targets["pdu"];
+        assert_eq!(
+            (shown.status, shown.consecutive_ok, shown.consecutive_fail),
+            (TargetStatus::Degraded, 0, 1),
+            "out of unknown by a failure"
+        );
+
+        run_inline(&mut state, run).await;
+        assert_eq!(
+            state.recovery_tracker["pdu"], begun,
+            "no answer: they stand"
+        );
+
+        // Down at 40, within the cooldown the run began: no run.
+        for secs in [30, 40] {
+            assert!(
+                failed(&mut state, secs, Reading::Monitor).is_none(),
+                "cooling down at {secs}s"
+            );
+        }
+        assert_eq!(state.results.targets["pdu"].status, TargetStatus::Down);
+        let run = failed(&mut state, 80, Reading::Monitor).expect("past the cooldown");
+        assert_eq!(
+            state.recovery_tracker["pdu"],
+            (at(80), 2),
+            "the count went on"
+        );
+        run_inline(&mut state, run).await;
     }
 
     /// What a recovery wrote, as its log entry keeps it.
