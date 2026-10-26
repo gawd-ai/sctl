@@ -1105,7 +1105,9 @@ and tunnel networks are never swept, and a `route` or `arp` subnet is swept
 only when a request names it. An entry that is not an IPv4 network is not
 swept, and `not_swept` names it as given: `not_ipv4` for an IPv6 address or
 network, `invalid` for anything else not in `a.b.c.d/p` form (no prefix, a
-prefix over 32, a word).
+prefix over 32, a word). Each entry is read on its own: one that is not a
+string is `invalid`, named by its JSON text, and the other entries still
+count. A `subnets` that is not a list is read as a list of that one entry.
 
 A scan sends only on the unit's LAN side, as the net tools' guard judges it
 (ADR-012; the guide's "Network tools"):

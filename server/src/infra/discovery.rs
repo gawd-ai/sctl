@@ -161,10 +161,7 @@ pub async fn discover(
     State(state): State<AppState>,
     Json(payload): Json<Value>,
 ) -> Result<Json<DiscoveryResults>, (StatusCode, Json<Value>)> {
-    let requested: Vec<String> = payload
-        .get("subnets")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
+    let requested = requested_entries(&payload);
     let probes = AgentProbes {
         lte: Lte::from_config(Some(&state.config)),
     };
@@ -425,6 +422,25 @@ fn default_subnets(net: &Network) -> Vec<Cidr> {
         }
     }
     out
+}
+
+/// The entries of a request's `subnets`, each read on its own: a string as
+/// given, anything else as its JSON text, which names no network, so
+/// `not_swept` names it as `invalid`. Absent or null, none: the default
+/// pick. A value that is not a list is one entry. A list that held one
+/// entry of another type used to read as no list at all, and the scan then
+/// swept the default networks, naming nothing it was asked for.
+fn requested_entries(payload: &Value) -> Vec<String> {
+    let text = |entry: &Value| {
+        entry
+            .as_str()
+            .map_or_else(|| entry.to_string(), str::to_string)
+    };
+    match payload.get("subnets") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(entries)) => entries.iter().map(text).collect(),
+        Some(other) => vec![text(other)],
+    }
 }
 
 /// The subnets a request names, in network form, each once, and each entry
@@ -2073,6 +2089,47 @@ mod tests {
             .iter()
             .all(|p| p.starts_with("ping br-lan 192.0.2.")));
         assert!(!fake.log_of("ping").is_empty(), "the IPv4 network is swept");
+    }
+
+    /// Each entry of a request's `subnets` is read on its own: one that is
+    /// not a string is named by its JSON text, as `invalid`, and the rest
+    /// of the list still counts. It used to make the whole list unreadable,
+    /// and the scan then swept the default networks instead.
+    #[tokio::test]
+    async fn an_entry_that_is_not_a_string_is_named_and_the_list_still_counts() {
+        assert!(requested_entries(&json!({})).is_empty(), "the default pick");
+        assert!(requested_entries(&json!({"subnets": null})).is_empty());
+        assert!(requested_entries(&json!({"subnets": []})).is_empty());
+        assert_eq!(
+            requested_entries(&json!({"subnets": ["192.0.2.0/24", 5, {"a": 1}, ["x"], true]})),
+            ["192.0.2.0/24", "5", r#"{"a":1}"#, r#"["x"]"#, "true"]
+        );
+        assert_eq!(
+            requested_entries(&json!({"subnets": "192.0.2.0/24"})),
+            ["192.0.2.0/24"],
+            "one entry not in a list"
+        );
+        assert_eq!(requested_entries(&json!({"subnets": 24})), ["24"]);
+
+        let fake = Fake::on(unit());
+        let requested = requested_entries(&json!({"subnets": [5, "192.0.2.0/24", {"a": 1}]}));
+        let scanned = scan(&fake, &requested, &no_progress()).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&scanned.not_swept).unwrap(),
+            json!([
+                {"cidr": "5", "reason": "invalid"},
+                {"cidr": r#"{"a":1}"#, "reason": "invalid"}
+            ])
+        );
+        assert!(
+            !fake.log_of("ping").is_empty()
+                && fake
+                    .log_of("ping")
+                    .iter()
+                    .all(|p| p.starts_with("ping br-lan 192.0.2.")),
+            "the network named is swept, and only it: {:?}",
+            fake.log()
+        );
     }
 
     /// TRD-9 3.5: the hosts a prefix yields, and a /23 too large for the
