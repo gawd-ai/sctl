@@ -279,15 +279,21 @@ probe_case no-init 'rm -f "$tree/etc/init.d/sctl"' other
 probe_case we826-0.6.2 'printf "MUSL_LIBC_URL=x\n" > "$tree/etc/sctl/ramboot.conf"; : > "$tree/tmp/sctl/lib/libc.so"' we826
 probe_case we826-0.6.7 'printf "MUSL_LIBC_URL=x\n" > "$tree/etc/sctl/ramboot.conf"; : > "$tree/tmp/sctl/lib/libc.so"; echo "{\"layout\":\"ramboot\"}" > "$tree/etc/sctl/install.json"' we826
 probe_case we826-current 'printf "MUSL_LIBC_URL=x\n" > "$tree/etc/sctl/ramboot.conf"; : > "$tree/tmp/sctl/lib/libc.so"; echo "{\"helper_prefix\":[]}" > "$tree/etc/sctl/install.json"' we826-managed
-# What an agent from 0.6.12 makes at /usr/bin/sctl (docs/upgrade.md): a link
-# to the binary it runs from /tmp, or on a unit that runs it under a loader
-# its wrapper, known by its second line (the agent's own text, which
-# server/tests/cli_name.rs runs this condition on). None of these takes the
-# generic path, the one that writes /usr/bin/sctl.
+# What an agent from 0.6.12 makes at /usr/bin/sctl (docs/upgrade.md): where
+# it runs from /tmp, its guarded wrapper, known by its first two lines (the
+# agent's own text, which server/tests/cli_name.rs runs this condition on).
+# The two wrappers below stand for the WE826's, through its loader, and an
+# XE300's or a ramboot RUT241's, with none: each is its first two lines and
+# its exec, without the guard. A link, as an earlier build of 0.6.12 made,
+# is known too. None of these takes the generic path, the one that writes
+# /usr/bin/sctl.
 CLI_LINK='mkdir -p "$tree/usr/bin" && ln -s "$tree/tmp/sctl/sctl-server" "$tree/usr/bin/sctl"'
 CLI_WRAPPER='mkdir -p "$tree/usr/bin" && printf "#!/bin/sh\n# sctl: the agent writes this file at start\nexec '"'"'/tmp/sctl/lib/libc.so'"'"' '"'"'--library-path'"'"' '"'"'/tmp/sctl/lib'"'"' '"'"'/tmp/sctl/sctl-server'"'"' \"\$@\"\n" > "$tree/usr/bin/sctl"'
+CLI_WRAPPER_PLAIN='mkdir -p "$tree/usr/bin" && printf "#!/bin/sh\n# sctl: the agent writes this file at start\nexec '"'"'/tmp/sctl/sctl-server'"'"' \"\$@\"\n" > "$tree/usr/bin/sctl"'
 probe_case xe300-with-the-link ': > "$tree/usr/local/lib/sctl/sctl-server-mips_24kc.gz"; '"$CLI_LINK" xe300
 probe_case rut241-ramboot-with-the-link 'printf "SERVER_URL=x\n" > "$tree/etc/sctl/ramboot.conf"; '"$CLI_LINK" agent-cli
+probe_case xe300-with-the-wrapper ': > "$tree/usr/local/lib/sctl/sctl-server-mips_24kc.gz"; '"$CLI_WRAPPER_PLAIN" xe300
+probe_case rut241-ramboot-with-the-wrapper 'printf "SERVER_URL=x\n" > "$tree/etc/sctl/ramboot.conf"; '"$CLI_WRAPPER_PLAIN" agent-cli
 probe_case we826-with-the-wrapper 'printf "MUSL_LIBC_URL=x\n" > "$tree/etc/sctl/ramboot.conf"; : > "$tree/tmp/sctl/lib/libc.so"; echo "{\"helper_prefix\":[]}" > "$tree/etc/sctl/install.json"; '"$CLI_WRAPPER" we826-managed
 probe_case the-wrapper-alone "$CLI_WRAPPER" agent-cli
 probe_case a-script-of-ones-own 'mkdir -p "$tree/usr/bin" && printf "#!/bin/sh\nexec /opt/sctl \"\$@\"\n" > "$tree/usr/bin/sctl"' other
@@ -334,11 +340,15 @@ dispatch() {
 }
 dispatch d-rut241-ramboot 'printf "SERVER_URL=x\n" > "$tree/etc/sctl/ramboot.conf"; '"$CLI_LINK"
 check "a ramboot RUT241 with the link: refused before anything is built or written" \
-    '[ "$DRC" = 1 ] && grep -q "would write through it" "$TOP/dispatch.out" && [ ! -e "$TOP/unexpected" ] && [ ! -e "$TOP/paths" ]' \
+    '[ "$DRC" = 1 ] && grep -q "would replace it or write through it" "$TOP/dispatch.out" && [ ! -e "$TOP/unexpected" ] && [ ! -e "$TOP/paths" ]' \
+    "$(tr '\n' '|' < "$TOP/dispatch.out") $(cat "$TOP/unexpected" 2>/dev/null)"
+dispatch d-rut241-ramboot-wrapper 'printf "SERVER_URL=x\n" > "$tree/etc/sctl/ramboot.conf"; '"$CLI_WRAPPER_PLAIN"
+check "a ramboot RUT241 with the wrapper: refused before anything is built or written" \
+    '[ "$DRC" = 1 ] && grep -q "would replace it or write through it" "$TOP/dispatch.out" && [ ! -e "$TOP/unexpected" ] && [ ! -e "$TOP/paths" ]' \
     "$(tr '\n' '|' < "$TOP/dispatch.out") $(cat "$TOP/unexpected" 2>/dev/null)"
 dispatch d-wrapper-alone "$CLI_WRAPPER"
 check "the agent's wrapper alone: refused the same way" \
-    '[ "$DRC" = 1 ] && grep -q "would write through it" "$TOP/dispatch.out" && [ ! -e "$TOP/unexpected" ] && [ ! -e "$TOP/paths" ]' \
+    '[ "$DRC" = 1 ] && grep -q "would replace it or write through it" "$TOP/dispatch.out" && [ ! -e "$TOP/unexpected" ] && [ ! -e "$TOP/paths" ]' \
     "$(tr '\n' '|' < "$TOP/dispatch.out") $(cat "$TOP/unexpected" 2>/dev/null)"
 dispatch d-we826 'printf "MUSL_LIBC_URL=x\n" > "$tree/etc/sctl/ramboot.conf"; : > "$tree/tmp/sctl/lib/libc.so"; echo "{\"helper_prefix\":[]}" > "$tree/etc/sctl/install.json"; '"$CLI_WRAPPER"
 check "a WE826 with the wrapper: refused as a rollout citizen" \
@@ -346,6 +356,10 @@ check "a WE826 with the wrapper: refused as a rollout citizen" \
     "$(tr '\n' '|' < "$TOP/dispatch.out") $(cat "$TOP/unexpected" 2>/dev/null)"
 dispatch d-xe300 ': > "$tree/usr/local/lib/sctl/sctl-server-mips_24kc.gz"; '"$CLI_LINK"
 check "an XE300 with the link: its own path, which writes its payloads, not /usr/bin/sctl" \
+    '[ "$(cat "$TOP/paths" 2>/dev/null)" = "the xe300 path" ] && [ ! -e "$TOP/unexpected" ]' \
+    "$(tr '\n' '|' < "$TOP/dispatch.out") $(cat "$TOP/paths" "$TOP/unexpected" 2>/dev/null)"
+dispatch d-xe300-wrapper ': > "$tree/usr/local/lib/sctl/sctl-server-mips_24kc.gz"; '"$CLI_WRAPPER_PLAIN"
+check "an XE300 with the wrapper: its own path, which writes its payloads, not /usr/bin/sctl" \
     '[ "$(cat "$TOP/paths" 2>/dev/null)" = "the xe300 path" ] && [ ! -e "$TOP/unexpected" ]' \
     "$(tr '\n' '|' < "$TOP/dispatch.out") $(cat "$TOP/paths" "$TOP/unexpected" 2>/dev/null)"
 

@@ -6,10 +6,17 @@
 //!
 //! | Layout | The name |
 //! |---|---|
-//! | `gz-tmp`, and `ramboot` without `helper_prefix` | a symbolic link to the running binary |
-//! | `ramboot` with `helper_prefix` (the WE826) | a wrapper: `#!/bin/sh`, [`MARKER`], then `exec` of the loader's words, `ramboot.conf`'s `BIN` and `"$@"`, each word shell-quoted |
-//! | `usr-bin`, `systemd` | nothing: the installed binary is the name (`/usr/local/bin/sctl` on the relay) |
+//! | `gz-tmp`, `ramboot` (the agent under `/tmp`) | the guarded wrapper ([`wrapper_text`]): it runs the loader's words, if any, the binary and `"$@"` only while root alone can change those files |
+//! | the same, a binary root alone can change, every directory above it included | a symbolic link to the running binary |
+//! | `usr-bin`, `systemd` | nothing: the installed binary, in a root-owned system path, is the name (`/usr/local/bin/sctl` on the relay) |
 //! | no `install.json` | nothing |
+//!
+//! Not a link where the agent runs from `/tmp`: while the agent is held
+//! down, its files there may be gone, and a link would point root into a
+//! directory anyone can write. The wrapper checks, each time it runs, that
+//! each file it runs is a regular file owned by root that no one else can
+//! write, in a directory owned by root that no one else can write; else it
+//! says why on stderr and exits 126, running nothing.
 //!
 //! The agent writes the name only when it is absent, a link, or its own
 //! wrapper (known by the marker) with other content, through a temporary
@@ -17,11 +24,13 @@
 //! wrapper, and it leaves a name already right alone, so a restart writes
 //! nothing to flash. A `ramboot` unit without `helper_prefix` whose
 //! `ramboot.conf` runs its agent under a loader (`LOADER` or
-//! `MUSL_LIBC_URL`) gets no name: `current_exe()` is then the loader, not the
-//! agent. `GET /api/health` and `sctl install-info` report the path as `cli`;
-//! it is absent when the agent could not make the name, and a log line says
-//! why. `SCTL_CLI_PATH` moves the name for tests and benches, as
-//! `SCTL_INSTALL_JSON` moves `install.json`.
+//! `MUSL_LIBC_URL`) gets no name, nor does one whose `ramboot.conf` cannot
+//! be read: `current_exe()` is then the loader, or may be, not the agent,
+//! and the fleet reaches such a unit's tools through the agent path it
+//! resolves per unit. `GET /api/health` and `sctl install-info` report the
+//! path as `cli`; it is absent when the agent could not make the name, and a
+//! log line says why. `SCTL_CLI_PATH` moves the name for tests and benches,
+//! as `SCTL_INSTALL_JSON` moves `install.json`.
 
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -43,8 +52,29 @@ pub const PATH_ENV: &str = "SCTL_CLI_PATH";
 pub const MARKER: &str = "# sctl: the agent writes this file at start";
 /// The wrapper's mode.
 const WRAPPER_MODE: u32 = 0o755;
-/// Longer than any wrapper: a regular file longer than this is not one.
+/// Longer than any wrapper: a regular file longer than this is not one,
+/// and a wrapper that would be longer is not written.
 const MAX_WRAPPER_BYTES: u64 = 4096;
+/// The wrapper's guard, after its marker: `root_only <path> <kind>` goes on
+/// only when the path is a `directory` or a `regular file`, not a link,
+/// owned by root (uid 0) and writable by neither its group nor others, an
+/// access list (`+` after the mode) counting as writable; else it says why
+/// on stderr and exits 126. POSIX sh as BusyBox runs it: `ls -ldn` and
+/// `test`, no `stat`, which a BusyBox may lack. `set -f` keeps `ls`'s
+/// fields from being globbed.
+pub const GUARD: &str = concat!(
+    "# It runs the agent only while root alone can change its files.\n",
+    "set -f\n",
+    "root_only() {\n",
+    "\tif [ \"$2\" = directory ]; then [ -d \"$1\" ]; else [ -f \"$1\" ]; fi &&\n",
+    "\t\t[ ! -L \"$1\" ] &&\n",
+    "\t\tset -- \"$1\" \"$2\" $(ls -ldn \"$1\" 2>/dev/null) &&\n",
+    "\t\t[ \"$5\" = 0 ] &&\n",
+    "\t\tcase $3 in ?????-??-?|?????-??-?.) return 0 ;; esac\n",
+    "\tprintf 'sctl: not run: %s is not a %s owned by root and writable by no one else\\n' \"$1\" \"$2\" >&2\n",
+    "\texit 126\n",
+    "}\n",
+);
 /// What the log says of a regular file the agent never replaces.
 const NOT_THE_WRAPPER: &str = "a regular file that is not the agent's wrapper";
 
@@ -54,14 +84,15 @@ pub enum Want {
     /// The layout's own binary runs the tools (`usr-bin`, `systemd`):
     /// nothing is made.
     Installed(PathBuf),
-    /// A symbolic link to this binary.
+    /// A symbolic link to this binary, which root alone can change, every
+    /// directory above it included ([`root_alone`]).
     Link(PathBuf),
-    /// The wrapper's whole text, and the binary it runs.
+    /// The guarded wrapper's whole text, and the binary it runs.
     Wrapper { text: Vec<u8>, binary: PathBuf },
 }
 
 impl Want {
-    /// The wrapper that runs `binary` through `loader`.
+    /// The guarded wrapper that runs `binary` through `loader`.
     pub fn wrapper(loader: &[String], binary: &Path) -> Self {
         Self::Wrapper {
             text: wrapper_text(loader, binary),
@@ -75,7 +106,10 @@ impl Want {
             Self::Installed(path) => format!("the installed binary {}", path.display()),
             Self::Link(target) => format!("a link to {}", target.display()),
             Self::Wrapper { binary, .. } => {
-                format!("the agent's wrapper, which runs {}", binary.display())
+                format!(
+                    "the agent's guarded wrapper, which runs {}",
+                    binary.display()
+                )
             }
         }
     }
@@ -112,36 +146,92 @@ pub fn want(install: &InstallInfo, running: &Running) -> Result<Want, String> {
             is_file(server, "the installed binary")?;
             Ok(Want::Installed(server.clone()))
         }
-        Layout::GzTmp => link_to(&running.binary),
+        Layout::GzTmp => link_or_wrapper(&running.binary),
         Layout::Ramboot if running.loader.is_empty() => {
-            // A link to the running binary, unless ramboot.conf has the boot
+            // The running binary's name, unless ramboot.conf has the boot
             // fetcher run the agent under a loader that install.json does
             // not name (a WE826 whose install.json predates 0.6.9, during
-            // TRD-8's trial): `current_exe()` is then the loader, and a link
-            // to it would run the loader, not the tools. Which name such a
-            // unit gets is open (TRD-9 slice 6); until then it gets none.
+            // TRD-8's trial): `current_exe()` is then the loader, and a name
+            // for it would run the loader, not the tools. Such a unit gets
+            // none, nor one whose ramboot.conf cannot be read (TRD-9 3.6):
+            // the fleet reaches its tools through the agent path it resolves
+            // per unit.
             let loader = install
                 .ramboot_loader()
                 .map_err(|e| format!("{e}: whether the agent runs under a loader is not known"))?;
             if let Some(key) = loader {
                 return Err(format!(
-                    "{} runs the agent under a loader ({key}) that install.json does not name (helper_prefix): the running binary, {}, is then the loader, and a link to it would not run the tools",
+                    "{} runs the agent under a loader ({key}) that install.json does not name (helper_prefix): the running binary, {}, is then the loader, and a name for it would not run the tools",
                     install.ramboot_conf_path().display(),
                     running.binary.display()
                 ));
             }
-            link_to(&running.binary)
+            link_or_wrapper(&running.binary)
         }
         Layout::Ramboot => {
             is_file(&running.binary, "the binary the loader runs")?;
-            Ok(Want::wrapper(&running.loader, &running.binary))
+            guarded(&running.loader, &running.binary)
         }
     }
 }
 
-fn link_to(binary: &Path) -> Result<Want, String> {
+/// The name for a binary the kernel runs itself: a link to it where root
+/// alone can change it ([`root_alone`]); anywhere else, the agent under
+/// `/tmp` above all, the guarded wrapper.
+fn link_or_wrapper(binary: &Path) -> Result<Want, String> {
     is_file(binary, "the running binary")?;
-    Ok(Want::Link(binary.to_path_buf()))
+    if root_alone(binary) {
+        Ok(Want::Link(binary.to_path_buf()))
+    } else {
+        guarded(&[], binary)
+    }
+}
+
+/// The guarded wrapper for `binary` run through `loader`. Each file it runs
+/// is checked by an absolute path, and a wrapper too long to be known again
+/// at the next start is not written.
+fn guarded(loader: &[String], binary: &Path) -> Result<Want, String> {
+    for (path, what) in loader
+        .first()
+        .map(|program| (Path::new(program), "the loader"))
+        .into_iter()
+        .chain([(binary, "the binary")])
+    {
+        if !path.is_absolute() {
+            return Err(format!(
+                "{what} {} is not an absolute path: the wrapper could not check it",
+                path.display()
+            ));
+        }
+    }
+    let want = Want::wrapper(loader, binary);
+    if let Want::Wrapper { text, .. } = &want {
+        if text.len() as u64 > MAX_WRAPPER_BYTES {
+            return Err(format!(
+                "the wrapper for {} would be {} bytes, over {MAX_WRAPPER_BYTES}",
+                binary.display(),
+                text.len()
+            ));
+        }
+    }
+    Ok(want)
+}
+
+/// Whether root alone can change what `binary` is: a regular file owned by
+/// root that neither its group nor others can write, under directories
+/// each owned by root that neither their group nor others can write, from
+/// `/` down. A link to such a binary is as safe as the binary. `/tmp`,
+/// which anyone can write, is never one of them.
+pub fn root_alone(binary: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let roots = |meta: &std::fs::Metadata| meta.uid() == 0 && meta.mode() & 0o022 == 0;
+    let Ok(real) = std::fs::canonicalize(binary) else {
+        return false;
+    };
+    std::fs::symlink_metadata(&real).is_ok_and(|meta| meta.is_file() && roots(&meta))
+        && real.ancestors().skip(1).all(|dir| {
+            std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir() && roots(&meta))
+        })
 }
 
 fn is_file(path: &Path, what: &str) -> Result<(), String> {
@@ -152,13 +242,34 @@ fn is_file(path: &Path, what: &str) -> Result<(), String> {
     }
 }
 
-/// The wrapper's text: `#!/bin/sh`, [`MARKER`], then `exec` of the loader's
-/// words, the binary and `"$@"`, each word in single quotes.
+/// The guarded wrapper's text: `#!/bin/sh`, [`MARKER`], the guard
+/// ([`GUARD`]), then for the loader, if any, and the binary, a check of the
+/// directory that holds it and of the file itself, then `exec` of the
+/// loader's words, the binary and `"$@"`. Each path and word is in single
+/// quotes: the shell expands nothing inside.
 pub fn wrapper_text(loader: &[String], binary: &Path) -> Vec<u8> {
-    let mut text = Vec::with_capacity(160);
+    let mut text = Vec::with_capacity(GUARD.len() + 320);
     text.extend_from_slice(b"#!/bin/sh\n");
     text.extend_from_slice(MARKER.as_bytes());
-    text.extend_from_slice(b"\nexec");
+    text.push(b'\n');
+    text.extend_from_slice(GUARD.as_bytes());
+    let mut checked: Vec<&Path> = Vec::new();
+    for program in loader.first().map(Path::new).into_iter().chain([binary]) {
+        let dir = program
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or(Path::new("/"));
+        for (path, kind) in [(dir, &b" directory\n"[..]), (program, b" 'regular file'\n")] {
+            if checked.contains(&path) {
+                continue;
+            }
+            checked.push(path);
+            text.extend_from_slice(b"root_only ");
+            quote_into(&mut text, path.as_os_str().as_bytes());
+            text.extend_from_slice(kind);
+        }
+    }
+    text.extend_from_slice(b"exec");
     for word in loader {
         text.push(b' ');
         quote_into(&mut text, word.as_bytes());
@@ -571,6 +682,9 @@ mod tests {
         assert!(err.contains("not a regular file"), "{err}");
     }
 
+    /// The WE826's guarded wrapper, byte for byte: the loader and the
+    /// binary are each checked with the directory that holds it before the
+    /// loader runs the binary.
     #[test]
     fn a_loader_prefix_gets_the_wrappers_exact_text_mode_0755() {
         let s = Scratch::new("wrapper");
@@ -580,18 +694,54 @@ mod tests {
         let text = std::fs::read_to_string(&name).unwrap();
         assert_eq!(
             text,
-            "#!/bin/sh\n\
-             # sctl: the agent writes this file at start\n\
-             exec '/tmp/sctl/lib/libc.so' '--library-path' '/tmp/sctl/lib' '/tmp/sctl/sctl-server' \"$@\"\n"
+            r#"#!/bin/sh
+# sctl: the agent writes this file at start
+# It runs the agent only while root alone can change its files.
+set -f
+root_only() {
+	if [ "$2" = directory ]; then [ -d "$1" ]; else [ -f "$1" ]; fi &&
+		[ ! -L "$1" ] &&
+		set -- "$1" "$2" $(ls -ldn "$1" 2>/dev/null) &&
+		[ "$5" = 0 ] &&
+		case $3 in ?????-??-?|?????-??-?.) return 0 ;; esac
+	printf 'sctl: not run: %s is not a %s owned by root and writable by no one else\n' "$1" "$2" >&2
+	exit 126
+}
+root_only '/tmp/sctl/lib' directory
+root_only '/tmp/sctl/lib/libc.so' 'regular file'
+root_only '/tmp/sctl' directory
+root_only '/tmp/sctl/sctl-server' 'regular file'
+exec '/tmp/sctl/lib/libc.so' '--library-path' '/tmp/sctl/lib' '/tmp/sctl/sctl-server' "$@"
+"#
         );
         assert!(
-            text.len() <= 160,
-            "about 150 bytes on a WE826's flash: {}",
+            text.len() <= 800,
+            "under 800 bytes on a WE826's flash: {}",
             text.len()
         );
         let mode = std::fs::metadata(&name).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o755);
         assert_eq!(s.entries(), ["sctl"], "no temporary entry left");
+    }
+
+    /// Where the kernel runs the binary itself (an XE300), the wrapper
+    /// checks the binary and its directory, then runs it.
+    #[test]
+    fn a_binary_under_tmp_gets_the_guarded_wrapper() {
+        let text = wrapper_text(&[], Path::new("/tmp/sctl/sctl-server"));
+        let expected = format!(
+            "#!/bin/sh\n{MARKER}\n{GUARD}\
+             root_only '/tmp/sctl' directory\n\
+             root_only '/tmp/sctl/sctl-server' 'regular file'\n\
+             exec '/tmp/sctl/sctl-server' \"$@\"\n"
+        );
+        assert_eq!(String::from_utf8(text).unwrap(), expected);
+        // A binary at the root checks `/` as its directory.
+        let at_root = String::from_utf8(wrapper_text(&[], Path::new("/sctl"))).unwrap();
+        assert!(
+            at_root.contains("root_only '/' directory\nroot_only '/sctl' 'regular file'\n"),
+            "{at_root}"
+        );
     }
 
     #[test]
@@ -708,20 +858,38 @@ mod tests {
             "the relay's cli"
         );
 
+        // A binary in a directory anyone may come to own, as /tmp/sctl:
+        // the guarded wrapper.
         let gz_tmp = InstallInfo::defaults(Layout::GzTmp, "mips_24kc");
-        assert_eq!(want(&gz_tmp, &plain).unwrap(), Want::Link(server.clone()));
+        assert_eq!(want(&gz_tmp, &plain).unwrap(), Want::wrapper(&[], &server));
         let gone = Running {
             binary: s.path("deleted"),
             loader: Vec::new(),
         };
         assert!(
             want(&gz_tmp, &gone).is_err(),
-            "no link to a binary that is not there"
+            "no name for a binary that is not there"
         );
+        // A binary root alone can change, every directory above it
+        // included: the link.
+        match ["/usr/bin/env", "/bin/sh"]
+            .map(PathBuf::from)
+            .into_iter()
+            .find(|path| root_alone(path))
+        {
+            Some(system) => {
+                let running = Running {
+                    binary: system.clone(),
+                    loader: Vec::new(),
+                };
+                assert_eq!(want(&gz_tmp, &running).unwrap(), Want::Link(system));
+            }
+            None => eprintln!("no binary here that root alone can change: no link to show"),
+        }
 
         let mut ramboot = InstallInfo::defaults(Layout::Ramboot, "mipsel_24kc");
         ramboot.ramboot_conf = Some(conf.clone());
-        assert_eq!(want(&ramboot, &plain).unwrap(), Want::Link(server.clone()));
+        assert_eq!(want(&ramboot, &plain).unwrap(), Want::wrapper(&[], &server));
 
         ramboot.helper_prefix = vec![
             loader.display().to_string(),
@@ -738,11 +906,12 @@ mod tests {
 
     /// A WE826 whose install.json does not name its loader, while its
     /// ramboot.conf runs the agent under one, runs the agent as the loader:
-    /// no link to the loader is made, and nothing is written. Nor for a
+    /// no name is made for the loader, and nothing is written. Nor for a
     /// unit whose ramboot.conf cannot be read: nothing then says whether a
-    /// loader runs.
+    /// loader runs. The fleet reaches such a unit's tools through the agent
+    /// path it resolves per unit.
     #[test]
-    fn ramboot_under_a_loader_install_json_does_not_name_makes_no_link() {
+    fn ramboot_under_a_loader_install_json_does_not_name_gets_no_name() {
         let s = Scratch::new("unnamed-loader");
         let server = s.file("sctl-server");
         let loader = s.file("libc.so");
@@ -773,11 +942,12 @@ mod tests {
     }
 
     /// A `ramboot` unit whose ramboot.conf has the kernel run the binary
-    /// itself gets the link to the running binary, whatever ramboot.conf's
-    /// `BIN` line says: none (the fetcher's default), one written with the
-    /// fetcher's variables, or another binary (an agent started by hand).
+    /// itself gets the guarded wrapper for the running binary, whatever
+    /// ramboot.conf's `BIN` line says: none (the fetcher's default), one
+    /// written with the fetcher's variables, or another binary (an agent
+    /// started by hand).
     #[test]
-    fn ramboot_without_a_loader_links_the_running_binary_whatever_bin_says() {
+    fn ramboot_without_a_loader_names_the_running_binary_whatever_bin_says() {
         let s = Scratch::new("no-loader");
         let server = s.file("sctl-server");
         let conf = s.path("ramboot.conf");
@@ -795,10 +965,54 @@ mod tests {
             std::fs::write(&conf, text).unwrap();
             assert_eq!(
                 want(&ramboot, &plain).unwrap(),
-                Want::Link(server.clone()),
+                Want::wrapper(&[], &server),
                 "{text}"
             );
         }
+    }
+
+    /// A link is as safe as what it names only where root alone can change
+    /// the binary and every directory above it: never under /tmp, which
+    /// anyone can write, nor in a directory another account owns.
+    #[test]
+    fn root_alone_holds_only_for_a_binary_and_a_path_that_are_root_s() {
+        let s = Scratch::new("root-alone");
+        let binary = s.file("sctl-server");
+        if std::fs::metadata(&binary).unwrap().uid() != 0 {
+            assert!(!root_alone(&binary), "this account's own file");
+        }
+        assert!(!root_alone(&s.path("missing")));
+        assert!(!root_alone(Path::new("/tmp")), "a directory, not a binary");
+        if let Some(system) = ["/usr/bin/env", "/bin/sh"]
+            .map(PathBuf::from)
+            .into_iter()
+            .find(|path| root_alone(path))
+        {
+            // Through a link of this account's own: it names the binary,
+            // and the binary is what is judged.
+            std::os::unix::fs::symlink(&system, s.path("alias")).unwrap();
+            assert!(root_alone(&s.path("alias")));
+        }
+    }
+
+    /// The wrapper checks each file it runs by an absolute path, and is
+    /// never longer than the agent knows its own wrapper to be.
+    #[test]
+    fn a_wrapper_with_a_relative_path_or_too_long_is_not_wanted() {
+        let err = guarded(&["ld.so".into()], Path::new("/tmp/sctl/sctl-server")).unwrap_err();
+        assert!(
+            err.contains("the loader ld.so is not an absolute path"),
+            "{err}"
+        );
+        let err = guarded(&[], Path::new("sctl-server")).unwrap_err();
+        assert!(
+            err.contains("the binary sctl-server is not an absolute path"),
+            "{err}"
+        );
+        let deep = format!("/tmp/{}/sctl-server", "d".repeat(4000));
+        let err = guarded(&[], Path::new(&deep)).unwrap_err();
+        assert!(err.contains("over 4096"), "{err}");
+        assert!(guarded(&loader_words(), Path::new("/tmp/sctl/sctl-server")).is_ok());
     }
 
     #[test]
@@ -812,9 +1026,14 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8(text).unwrap(),
-            "#!/bin/sh\n\
-             # sctl: the agent writes this file at start\n\
-             exec '/opt/it'\\''s here/ld.so' '--x=$(printf EXPANDED)' '/opt/a b/`sctl`' \"$@\"\n"
+            format!(
+                "#!/bin/sh\n{MARKER}\n{GUARD}\
+                 root_only '/opt/it'\\''s here' directory\n\
+                 root_only '/opt/it'\\''s here/ld.so' 'regular file'\n\
+                 root_only '/opt/a b' directory\n\
+                 root_only '/opt/a b/`sctl`' 'regular file'\n\
+                 exec '/opt/it'\\''s here/ld.so' '--x=$(printf EXPANDED)' '/opt/a b/`sctl`' \"$@\"\n"
+            )
         );
         assert!(is_wrapper(&wrapper_text(&[], Path::new("/x"))));
         assert!(!is_wrapper(

@@ -121,10 +121,11 @@ install_json_usr_bin() {
 }
 
 # A shell condition run on a unit: whether /usr/bin/sctl is the name an
-# agent from 0.6.12 makes for its tools (docs/upgrade.md), a symbolic link
-# (gz-tmp, ramboot) or its wrapper, known by its second line (a unit that
-# runs its agent under a loader). Every path here that writes /usr/bin/sctl
-# refuses such a unit rather than write through the name.
+# agent from 0.6.12 makes for its tools (docs/upgrade.md), its guarded
+# wrapper, known by its second line (gz-tmp, ramboot: the agent under
+# /tmp), or a symbolic link (to a binary root alone can change, or as an
+# earlier build of 0.6.12 made). Every path here that writes /usr/bin/sctl
+# refuses such a unit rather than replace the name or write through it.
 AGENT_CLI_TEST='{ [ -L /usr/bin/sctl ] || head -n 2 /usr/bin/sctl 2>/dev/null | grep -qxF "# sctl: the agent writes this file at start"; }'
 
 declare -A ARCH_TARGET=(
@@ -1473,9 +1474,9 @@ do_device_ls() {
 
 # Go on only when the unit says plainly that its /usr/bin/sctl is not the
 # name its agent made for its tools (AGENT_CLI_TEST). A unit whose name is
-# the agent's is refused: a copy there would write through the name into
-# the binary the agent runs from /tmp, or replace its wrapper, and such a
-# unit upgrades itself (docs/upgrade.md). A unit that does not answer is
+# the agent's is refused: a copy there would replace its wrapper, or write
+# through a link into the binary the agent runs, and such a unit upgrades
+# itself (docs/upgrade.md). A unit that does not answer is
 # refused too: nothing then says which it is. Asked before the build, and
 # again just before the first write.
 # Usage: refuse_agent_cli_over_ssh <name> <host> <ssh_opts> <what>
@@ -1486,8 +1487,8 @@ refuse_agent_cli_over_ssh() {
         return 0
     fi
     if [[ "$answer" == "agent-cli" ]]; then
-        err "/usr/bin/sctl on '$name' is a link or the agent's wrapper, the name an agent from 0.6.12 makes for its tools."
-        err "$what would write through it. The unit upgrades itself: ask it through a managed rollout (docs/upgrade.md)."
+        err "/usr/bin/sctl on '$name' is the agent's wrapper or a link, the name an agent from 0.6.12 makes for its tools."
+        err "$what would replace it or write through it. The unit upgrades itself: ask it through a managed rollout (docs/upgrade.md)."
     else
         err "'$name' ($host) did not say whether /usr/bin/sctl is the agent's name: $what wrote nothing."
         err "Run $what again once ssh root@$host answers."
@@ -1639,7 +1640,7 @@ do_device_upgrade() {
     local stopped
     stopped=$(ssh $ssh_opts "root@$host" "if $AGENT_CLI_TEST; then echo agent-cli; exit 0; fi; /etc/init.d/sctl stop >/dev/null 2>&1; rm -f /usr/bin/sctl && echo stopped" 2>/dev/null) || true
     if [[ "$stopped" == "agent-cli" ]]; then
-        err "/usr/bin/sctl on '$name' is now a link or the agent's wrapper: nothing was written."
+        err "/usr/bin/sctl on '$name' is now the agent's wrapper or a link: nothing was written."
         err "The unit upgrades itself: ask it through a managed rollout (docs/upgrade.md)."
         exit 1
     fi
@@ -1733,8 +1734,8 @@ is_healthy() {
 }
 
 # Whether /usr/bin/sctl is the name an agent from 0.6.12 makes for its
-# tools, a link or its wrapper: the agent runs from elsewhere, and a copy
-# over the name would write through it.
+# tools, its wrapper or a link: the agent runs from elsewhere, and a copy
+# over the name would replace it or write through it.
 is_agents_name() { '"$AGENT_CLI_TEST"'; }
 
 # ── Main logic ──
@@ -2358,8 +2359,8 @@ do_device_upgrade_remote() {
         exit 1
     fi
     if [[ "$layout" == "agent-cli" ]]; then
-        err "/usr/bin/sctl on '$name' is a link or the agent's wrapper, the name an agent from 0.6.12 makes for its tools."
-        err "upgrade-remote would write through it. The unit upgrades itself: ask it through a managed rollout (docs/upgrade.md)."
+        err "/usr/bin/sctl on '$name' is the agent's wrapper or a link, the name an agent from 0.6.12 makes for its tools."
+        err "upgrade-remote would replace it or write through it. The unit upgrades itself: ask it through a managed rollout (docs/upgrade.md)."
         exit 1
     fi
 
@@ -2472,7 +2473,7 @@ do_device_upgrade_remote() {
         cli_now=$(remote_exec_stdout_trimmed "$url" "$api_key" \
             "if $AGENT_CLI_TEST; then echo agent_cli; else echo plain; fi" 5000 2 8) || true
         if [[ "$cli_now" == agent_cli ]]; then
-            err "/usr/bin/sctl on '$name' is now a link or the agent's wrapper: nothing was written."
+            err "/usr/bin/sctl on '$name' is now the agent's wrapper or a link: nothing was written."
             err "The unit upgrades itself: ask it through a managed rollout (docs/upgrade.md)."
             exit 1
         fi
@@ -2495,7 +2496,7 @@ do_device_upgrade_remote() {
             "sh -c 'set -e; if $AGENT_CLI_TEST; then echo agent_cli; exit 0; fi; if [ ! -x /usr/bin/sctl.rollback ]; then cp /usr/bin/sctl /usr/bin/sctl.rollback; fi; cp /tmp/sctl-upgrade /usr/bin/sctl; chmod +x /usr/bin/sctl; sync; echo swap_ok; (sleep 1; kill \$(pgrep -f \"[s]ctl serve\") 2>/dev/null || true) >/dev/null 2>&1 &'" \
             8000 2 10) || true
         if [[ "$swap_out" == *agent_cli* ]]; then
-            err "/usr/bin/sctl on '$name' is now a link or the agent's wrapper: no binary was copied."
+            err "/usr/bin/sctl on '$name' is now the agent's wrapper or a link: no binary was copied."
             err "The unit upgrades itself: ask it through a managed rollout (docs/upgrade.md)."
             exit 1
         fi
@@ -3056,7 +3057,7 @@ XE300_LOG="/tmp/sctl-xe300-upgrade.log"
 # (ramboot run through the musl loader, no install.json that names it: the
 # one-time move), we826-managed (install.json names the loader: a rollout
 # citizen), agent-cli (/usr/bin/sctl is the name an agent from 0.6.12 made
-# for its tools, which the generic path would write through: a rollout
+# for its tools, which the generic path would replace or write through: a rollout
 # citizen, as a ramboot RUT241 is from then on), or other.
 XE300_LAYOUT_PROBE="if [ -x /etc/init.d/sctl ] && [ -f /usr/local/lib/sctl/sctl-server-mips_24kc.gz ]; then echo xe300; elif [ -x /etc/init.d/sctl ] && [ -f /usr/local/lib/sctl/sctl-server-mipsel_24kc.gz ]; then echo rut241; elif [ -x /etc/init.d/sctl ] && grep -q '^MUSL_LIBC_URL=' /etc/sctl/ramboot.conf 2>/dev/null && [ -f /tmp/sctl/lib/libc.so ]; then if grep -q helper_prefix /etc/sctl/install.json 2>/dev/null; then echo we826-managed; else echo we826; fi; elif $AGENT_CLI_TEST; then echo agent-cli; else echo other; fi"
 

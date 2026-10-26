@@ -96,16 +96,47 @@ from `/tmp`. At `serve` start the agent makes it:
 | Layout | `/usr/bin/sctl` |
 |---|---|
 | `usr-bin` | the installed binary itself; nothing is made |
-| `gz-tmp` | a symbolic link to the running binary (`/tmp/sctl/sctl-server`) |
-| `ramboot` without `helper_prefix` | a symbolic link to the running binary (`/tmp/sctl/sctl-server`) |
-| `ramboot` with `helper_prefix` (the WE826) | a wrapper that runs `BIN` through the loader's words |
+| `gz-tmp` | the guarded wrapper for the running binary (`/tmp/sctl/sctl-server`) |
+| `ramboot` without `helper_prefix` | the guarded wrapper for the running binary (`/tmp/sctl/sctl-server`) |
+| `ramboot` with `helper_prefix` (the WE826) | the guarded wrapper, which runs `BIN` through the loader's words |
 | `systemd` | nothing: the relay runs its tools as `/usr/local/bin/sctl` |
 
-The wrapper is three lines, each word in single quotes, about 150 bytes:
+Where the agent runs from `/tmp` the name is a guarded wrapper, not a
+symbolic link: while the agent is held down its files there may be gone,
+and a link would point root into a directory anyone can write. The wrapper
+runs each file only while root alone can change it. With `ls -ldn` and
+`test`, POSIX `sh` as BusyBox runs it, it checks the loader, if any, and
+the binary: each must be a regular file, not a link, owned by root and
+writable by no one else, in a directory owned by root and writable by no
+one else. Otherwise it says why on stderr and exits 126, running nothing:
+
+```text
+sctl: not run: /tmp/sctl is not a directory owned by root and writable by no one else
+```
+
+A binary that root alone can change, every directory above it included,
+gets a symbolic link instead; no unit's `/tmp` is one. The WE826's wrapper,
+each path and word in single quotes, is about 720 bytes; an XE300's, with
+no loader, about 570:
 
 ```sh
 #!/bin/sh
 # sctl: the agent writes this file at start
+# It runs the agent only while root alone can change its files.
+set -f
+root_only() {
+	if [ "$2" = directory ]; then [ -d "$1" ]; else [ -f "$1" ]; fi &&
+		[ ! -L "$1" ] &&
+		set -- "$1" "$2" $(ls -ldn "$1" 2>/dev/null) &&
+		[ "$5" = 0 ] &&
+		case $3 in ?????-??-?|?????-??-?.) return 0 ;; esac
+	printf 'sctl: not run: %s is not a %s owned by root and writable by no one else\n' "$1" "$2" >&2
+	exit 126
+}
+root_only '/tmp/sctl/lib' directory
+root_only '/tmp/sctl/lib/libc.so' 'regular file'
+root_only '/tmp/sctl' directory
+root_only '/tmp/sctl/sctl-server' 'regular file'
 exec '/tmp/sctl/lib/libc.so' '--library-path' '/tmp/sctl/lib' '/tmp/sctl/sctl-server' "$@"
 ```
 
@@ -118,20 +149,22 @@ to flash. With no `install.json` it makes nothing. A `ramboot` unit without
 `helper_prefix` whose `ramboot.conf` runs the agent under a loader (`LOADER`,
 or `MUSL_LIBC_URL`, whose `libc` the boot fetcher runs as the loader), as a
 WE826 does before its move ([below](#a-we826-installed-before-069)), gets no
-name, and its log says why: the running binary is then the loader, and a link
-to it would not run the tools. So does one whose `ramboot.conf` cannot be
-read. `SCTL_CLI_PATH` moves the name for tests and benches, as
+name, and its log says why: the running binary is then the loader, and a
+name for it would not run the tools. So does one whose `ramboot.conf` cannot
+be read. The fleet reaches such a unit's tools through the agent path it
+resolves per unit. `SCTL_CLI_PATH` moves the name for tests and benches, as
 `SCTL_INSTALL_JSON` moves `install.json`. A rollback to 0.6.11 keeps the name,
 which still runs the agent's tools: 0.6.11 runs from the same path, through
-the same loader words.
+the same loader words, and its files are root's alone as these are.
 
 `rundev.sh device deploy`, `device upgrade`, its watchdog's rollback and the
 generic path of `device upgrade-remote` write `/usr/bin/sctl`, so they refuse a
-unit whose `/usr/bin/sctl` is a symbolic link or the agent's wrapper rather than
-write through it: such a unit upgrades itself. The paths that ask the unit go
-on only once it answers that the name is neither, and ask again just before
-they write: `device deploy` before it copies the binary, `device upgrade` in
-the command that stops the agent. A unit that does not answer is refused.
+unit whose `/usr/bin/sctl` is the agent's wrapper or a symbolic link rather
+than write over it or through it: such a unit upgrades itself. The paths
+that ask the unit go on only once it answers that the name is neither, and
+ask again just before they write: `device deploy` before it copies the
+binary, `device upgrade` in the command that stops the agent. A unit that
+does not answer is refused.
 
 **Bundle retention.** A ramboot unit's rollback restores its previous
 `ramboot.conf`, and its next boot fetches that version from that mirror; so a

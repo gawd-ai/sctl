@@ -33,13 +33,14 @@ pub enum Layout {
     UsrBin,
     /// Gzipped payloads under `/usr/local/lib/sctl/`, expanded to `/tmp/sctl/`
     /// by the init at every start (the XE300, and a RUT241 as installed).
-    /// The agent links `/usr/bin/sctl` to the binary it runs.
+    /// The agent makes `/usr/bin/sctl` its guarded wrapper for the binary it
+    /// runs from `/tmp`.
     GzTmp,
     /// Nothing but `/etc/sctl/ramboot.conf`; the boot fetcher downloads the
     /// payloads into `/tmp/sctl/cache/` at boot (the WE826, and a RUT241
-    /// after `ramboot-migrate.sh`). The agent links `/usr/bin/sctl` to the
-    /// binary it runs, or on a unit that runs it under a loader (the WE826,
-    /// `helper_prefix`) writes a wrapper there.
+    /// after `ramboot-migrate.sh`). The agent makes `/usr/bin/sctl` its
+    /// guarded wrapper for the binary it runs from `/tmp`, through the
+    /// loader on a unit that runs it under one (the WE826, `helper_prefix`).
     Ramboot,
     /// The raw binary at `/usr/local/bin/sctl` under a systemd unit (the relay).
     Systemd,

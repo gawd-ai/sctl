@@ -113,12 +113,16 @@ Response `200`:
   (`docs/upgrade.md`).
 - `cli` (0.6.12): the path that runs the agent's tools on this unit,
   `/usr/bin/sctl` on every layout but the relay's (`/usr/local/bin/sctl`).
-  On `gz-tmp` and `ramboot` the agent makes it at start, a symbolic link to
-  its binary or, under a loader, a short wrapper (`docs/upgrade.md`, the
-  tools' name). Absent when the agent has no `install.json` it can use or
-  could not make the name, as when a regular file that is not its wrapper
-  is there; its log says why. `SCTL_CLI_PATH` moves the name for tests and
-  benches.
+  On `gz-tmp` and `ramboot` the agent makes it at start: a guarded wrapper
+  that runs its binary, through the loader on a unit that has one, only
+  while root alone can change those files and their directories, and
+  otherwise says why and exits 126; a symbolic link only for a binary root
+  alone can change, every directory above it included (`docs/upgrade.md`,
+  the tools' name). Absent when the agent has no `install.json` it can use
+  or could not make the name, as when a regular file that is not its
+  wrapper is there, or a `ramboot` unit runs its agent under a loader its
+  `install.json` does not name; its log says why. `SCTL_CLI_PATH` moves the
+  name for tests and benches.
 - `tunnel` — in tunnel-client mode, extended with `uptime_secs`,
   `messages_sent/received`, `last_pong_age_ms`, `dropped_outbound`,
   `stream_backpressure_events`, `stream_replay_events`, `rtt_median_ms`,
