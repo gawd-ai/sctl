@@ -529,7 +529,7 @@ fn as_root_the_wrapper_runs_root_s_files_and_refuses_open_ones() {
     executable(&root_s, RAN);
     let mut refused = Vec::new();
     for (name, mode) in [
-        ("like /tmp", 0o1777),
+        ("like the tmp directory", 0o1777),
         ("group may write in it", 0o775),
         ("others may write in it", 0o757),
     ] {

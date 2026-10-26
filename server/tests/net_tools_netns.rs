@@ -120,6 +120,12 @@ impl Lab {
             // No IPv6 chatter: every frame on the wire is one a case made.
             sysctl(ns, "net.ipv6.conf.all.disable_ipv6=1");
             sysctl(ns, "net.ipv6.conf.default.disable_ipv6=1");
+            // No reverse-path filter: a new namespace takes it from the host
+            // on some kernels (loose on many desktops), and a peer would drop
+            // an ARP request whose sender it has no route back to, so a frame
+            // a case steers would never leave. Every drop is then a case's own.
+            sysctl(ns, "net.ipv4.conf.all.rp_filter=0");
+            sysctl(ns, "net.ipv4.conf.default.rp_filter=0");
             ip(&["-n", ns, "link", "set", "lo", "up"]);
         }
         let (unit, switch, target, twin, lte, mesh) = (
@@ -336,6 +342,24 @@ impl Frame {
 
     fn carries(&self, needle: &[u8]) -> bool {
         self.bytes.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// A TCP segment that opens nothing and carries no data: an ACK, FIN
+    /// or RST alone, with no SYN and no payload.
+    fn bare_tcp_control(&self) -> bool {
+        let b = &self.bytes;
+        if b.len() < 34 || self.ethertype() != 0x0800 || b[23] != 6 {
+            return false;
+        }
+        let ihl = usize::from(b[14] & 0x0f) * 4;
+        let total = usize::from(u16::from_be_bytes([b[16], b[17]]));
+        let tcp = 14 + ihl;
+        if b.len() < tcp + 14 {
+            return false;
+        }
+        let doff = usize::from(b[tcp + 12] >> 4) * 4;
+        let syn = b[tcp + 13] & 0x02 != 0;
+        !syn && total == ihl + doff
     }
 }
 
@@ -1256,9 +1280,20 @@ fn case_5_marks_do_not_move_a_bound_request(
         r.tcp.len() == connections + 1 && r.http.len() == pages + 1
     });
     assert_eq!(snmp.requests().len(), requests + 1);
-    let moved = lte.since(mark);
+    // A TCP connection's last bare ACK, sent by the kernel once the tool has
+    // closed it (from a time-wait socket, through the kernel's own unbound
+    // reply socket), is rerouted by the mark like any unbound packet. It
+    // carries nothing and opens nothing; TRD-9 section 4 records it. Every
+    // other frame must stay off the LTE veth.
+    let (control, moved): (Vec<Frame>, Vec<Frame>) = lte
+        .since(mark)
+        .into_iter()
+        .partition(Frame::bare_tcp_control);
     assert!(moved.is_empty(), "no bound request moved to LTE: {moved:?}");
-    eprintln!("case 5: mwan3's marks do not move a bound request");
+    eprintln!(
+        "case 5: mwan3's marks do not move a bound request ({} bare TCP control segment(s) after close followed the mark)",
+        control.len()
+    );
 }
 
 fn case_6_expect_mac(
@@ -1269,10 +1304,13 @@ fn case_6_expect_mac(
     twin: &Capture,
 ) {
     let u = lab.unit.as_str();
+    // A refused run opens no connection and sends no data. A bare ACK of an
+    // earlier run's connection, closing late, can land in its window and is
+    // not the refused run's.
     let only_arp = |frames: &[Frame], at: Ipv4Addr| {
         let sent: Vec<&Frame> = frames
             .iter()
-            .filter(|f| f.outgoing && f.dev == "lan0" && f.concerns(at))
+            .filter(|f| f.outgoing && f.dev == "lan0" && f.concerns(at) && !f.bare_tcp_control())
             .collect();
         assert!(
             sent.iter().all(|f| f.ethertype() == 0x0806),
@@ -1732,10 +1770,13 @@ fn case_9_a_scan(lab: &Lab, config: &Path, unit: &Capture, lte: &Capture, mesh: 
 
     let nothing_off_the_lan = |what: &str, mark: (usize, usize, usize)| {
         let (unit_mark, lte_mark, mesh_mark) = mark;
+        // A probe's connection, closed, is answered by the kernel's own
+        // unbound reply socket (a bare RST or ACK) that the mark reroutes, as
+        // in case 5: it carries nothing and opens nothing (TRD-9 section 4).
         let by_lte: Vec<Frame> = lte
             .since(lte_mark)
             .into_iter()
-            .filter(|f| !phase_4(f))
+            .filter(|f| !phase_4(f) && !f.bare_tcp_control())
             .collect();
         assert!(
             by_lte.is_empty(),
@@ -1749,7 +1790,12 @@ fn case_9_a_scan(lab: &Lab, config: &Path, unit: &Capture, lte: &Capture, mesh: 
         let out: Vec<Frame> = unit
             .since(unit_mark)
             .into_iter()
-            .filter(|f| f.outgoing && (f.dev == "lte9" || f.dev == "wg9") && !phase_4(f))
+            .filter(|f| {
+                f.outgoing
+                    && (f.dev == "lte9" || f.dev == "wg9")
+                    && !phase_4(f)
+                    && !f.bare_tcp_control()
+            })
             .collect();
         assert!(
             out.is_empty(),
