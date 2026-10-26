@@ -1,6 +1,6 @@
 # Architecture decision records
 
-A decision that shapes the agent, the relay or the way they are built and released gets an ADR here: `NNN-slug.md`, three digits. Status `Proposed` → `Accepted (<date>)`; an accepted ADR is frozen and is only ever `Superseded by ADR-NNN`. The build spec that realizes a decision is a TRD in `../trd/`; the ADR names it (`Realized by`), the TRD names the ADR (`Implements`). `docs/upgrade.md`, `docs/config.md` and `docs/http-api.md` stay the wire and configuration contracts; ADRs cite them.
+A decision that shapes the agent, the relay or the way they are built and released gets an ADR here: `NNN-slug.md`, three digits. Status `Proposed` → `Accepted (<date>)`; an accepted ADR is frozen and is only ever `Superseded by ADR-NNN`. The build spec that realizes a decision is a TRD in `../trd/`; the ADR names it (`Realized by`), the TRD names the ADR (`Implements`). Where a TRD, on the lead's ruling, departs from a decision it realizes, the TRD says why and this index notes the departure beside the ADR, which stays as it was. `docs/upgrade.md`, `docs/config.md` and `docs/http-api.md` stay the wire and configuration contracts; ADRs cite them.
 
 | ADR | Title | Status | Realized by |
 |---|---|---|---|
@@ -13,6 +13,6 @@ A decision that shapes the agent, the relay or the way they are built and releas
 | [007](007-the-agent-reports-power-only-from-a-source-the-unit-publishes.md) | The agent reports a unit's power only from a source the unit already publishes; the XE300 publishes none | Accepted (2026-10-08), option A | None: no agent code; TRD-7 only if option B is ever taken |
 | [010](010-a-quiet-agent-proves-it-is-checking.md) | A quiet agent proves it is checking | Accepted (2026-10-21) | [TRD-9](../trd/TRD-9-release-0-6-12.md) (release 0.6.12) |
 | [011](011-file-reads-read-what-is-there-and-refuse-secrets-and-devices.md) | File reads read what is there, and refuse secrets and devices | Accepted (2026-10-21) | [TRD-9](../trd/TRD-9-release-0-6-12.md) (release 0.6.12) |
-| [012](012-net-tools-send-only-on-the-lan-to-the-device-expected.md) | Net tools send only on the LAN, to the device expected | Accepted (2026-10-21) | [TRD-9](../trd/TRD-9-release-0-6-12.md) (release 0.6.12) |
+| [012](012-net-tools-send-only-on-the-lan-to-the-device-expected.md) | Net tools send only on the LAN, to the device expected | Accepted (2026-10-21) | [TRD-9](../trd/TRD-9-release-0-6-12.md) (release 0.6.12). Departs from decision 1: the unit's own addresses do not pass, they are refused as `own_address` (TRD-9 3.4, the lead's ruling of 2026-10-25); only the loopback passes |
 
 ADR-008 and ADR-009 are reserved: ADR-008 for a router's WAN digest (fleet TRD-28, appendix A), ADR-009 for an uplink's throughput (fleet TRD-29). Each ships later with a TRD of its own, so 010 follows 007.
