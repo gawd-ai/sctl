@@ -178,7 +178,7 @@ retry as it stands. The guide's "Network tools" says what each means.
 | `no_address` | The interface it would leave by holds no IPv4 address |
 | `not_unicast` | A broadcast or multicast destination |
 | `ipv6` | An IPv6 destination |
-| `own_address` | A destination the unit holds on one of its interfaces, refused before any socket opens: net tools send to devices on its LAN. With `--expect-mac`, the loopback too |
+| `own_address` | A destination the unit holds on one of its interfaces, up or down, refused before any socket opens: net tools send to devices on its LAN. With `--expect-mac`, the loopback too |
 | `mac_mismatch` | Another MAC answered `--expect-mac`'s ARP request, two did, or the kernel's entry names another |
 | `no_answer` | Nothing answered `--expect-mac`'s ARP request |
 | `config_unreadable` | The agent's config could not be read or parsed |

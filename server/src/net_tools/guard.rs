@@ -15,9 +15,10 @@
 //!   `usb*`) counts as LTE, and the answer says the name decided it.
 //! - **On the LAN.** The kernel's route (`source::route_get`) is unicast,
 //!   has no gateway and leaves by a LAN-side interface holding an IPv4
-//!   address. A destination the unit holds on one of its interfaces is
-//!   refused before any socket opens (`own_address`): the tools send to
-//!   devices on its LAN. The loopback passes: nothing leaves the unit.
+//!   address. A destination the unit holds on one of its interfaces, up or
+//!   down, is refused before any socket opens (`own_address`): the tools
+//!   send to devices on its LAN. The loopback passes: nothing leaves the
+//!   unit.
 //!   With `--dev` the named interface must be on the LAN side, hold an
 //!   address, and the destination must lie under a main-table route through
 //!   it with no gateway, judged from the routes, never from a lookup tied to
@@ -687,7 +688,10 @@ pub fn judge(
             format!("{address} is a {what} address: the tools speak to one device."),
         ));
     }
-    let own = kind == Some(RouteKind::Local);
+    // The kernel's local route, or an address one of the unit's interfaces
+    // holds: one that is down has no local route, and the kernel would
+    // send to whichever device on the LAN answers for it.
+    let own = kind == Some(RouteKind::Local) || net.holder_of(address).is_some();
     // An address the unit holds on one of its interfaces: refused before
     // any socket opens, whatever the flags. The loopback's goes on.
     if own && !address.is_loopback() {
@@ -1872,6 +1876,40 @@ mod tests {
             refusal.reason,
             "127.0.0.1 is this unit's own address: no device answers for it to prove a MAC."
         );
+    }
+
+    /// An address the unit holds on an interface that is down has no local
+    /// route: the kernel would send it out the LAN, to whichever device
+    /// answers for it. It is the unit's own all the same, and refused.
+    #[test]
+    fn an_address_held_on_a_down_interface_is_the_unit_s_own() {
+        let links = vec![
+            link(1, "lo", IFF_UP | IFF_LOOPBACK | 0x40),
+            link(4, "br-lan", ETHER_UP),
+            link(7, "eth2", ETHER_UP & !IFF_UP),
+        ];
+        let addrs = vec![
+            addr(1, [127, 0, 0, 1], 8, false),
+            addr(4, [192, 0, 2, 1], 24, false),
+            addr(7, [192, 0, 2, 77], 24, false),
+        ];
+        let routes = vec![route(Some(([192, 0, 2, 0], 24)), None, 4)];
+        let net = Network::from_dump(&links, &addrs, &routes, &Lte::named("wwan0"));
+        assert!(!net.iface("eth2").unwrap().up());
+
+        // The kernel would send it by br-lan, as to any device there.
+        let by_lan = kernel("br-lan", 4, None, [192, 0, 2, 1], RouteKind::Unicast);
+        for (dev, expect_mac) in [(None, false), (Some("br-lan"), false), (None, true)] {
+            let refusal = judge(&net, ip([192, 0, 2, 77]), &by_lan, dev, expect_mac).unwrap_err();
+            assert_eq!(refusal.refused, Code::OwnAddress, "{dev:?} {expect_mac}");
+            assert_eq!(
+                refusal.reason,
+                "192.0.2.77 is this unit's own address: net tools send to devices on its LAN."
+            );
+        }
+        // Its neighbour on the same network is a device on the LAN.
+        let approved = judge(&net, ip([192, 0, 2, 78]), &by_lan, None, false).unwrap();
+        assert_eq!((approved.dev.as_str(), approved.own), ("br-lan", false));
     }
 
     #[test]
