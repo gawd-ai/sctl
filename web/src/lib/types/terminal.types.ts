@@ -214,7 +214,10 @@ export interface WsSessionStartMsg {
 	rows?: number;
 	cols?: number;
 	name?: string;
-	/** Open to AI clients at the start; the agent reads an absent field as false. */
+	/**
+	 * Open to AI clients at the start. Agents from 0.6.12 read an absent field
+	 * as false, older ones as true, so startSession always sends it.
+	 */
 	user_allows_ai?: boolean;
 }
 

@@ -128,6 +128,10 @@ describe('TerminalContainer', () => {
 			request_id: attach!.request_id
 		});
 		await attached;
+		// The agent listed no such session, so nothing says the tab is open
+		// to AI clients: it reads closed.
+		const allowAi = await vi.waitFor(() => screen.getByRole('button', { name: 'Allow AI' }));
+		expect(allowAi.getAttribute('aria-pressed')).toBe('false');
 		// Later live output: the replay's last line again, then a new one.
 		socket.deliver(out(3));
 		socket.deliver(out(5));

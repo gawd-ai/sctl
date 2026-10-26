@@ -199,8 +199,6 @@
 		activeServerId ? !!(activeViewerKey[activeServerId]) : false
 	);
 
-	// Master AI toggle (per server)
-	let serverMasterAi: Record<string, boolean> = $state({});
 	let serverFragileOps: Record<string, string | null> = $state({});
 
 	// Toast
@@ -472,12 +470,20 @@
 
 	// ── Master AI toggle ────────────────────────────────────────────
 
+	/**
+	 * Whether every open session of the server allows AI. It follows the
+	 * sessions, since a session started later starts closed to AI clients
+	 * (sctl ADR-013) and a person may switch one off on its own.
+	 */
+	function allAiAllowed(serverId: string): boolean {
+		const open = (serverSessions[serverId] ?? []).filter((s) => s.attached && !s.dead);
+		return open.length > 0 && open.every((s) => s.userAllowsAi);
+	}
+
+	/** Allow AI in every open session of the server, or in none once all allow it. */
 	async function toggleMasterAi(serverId: string): Promise<void> {
-		const current = serverMasterAi[serverId] ?? false;
-		const newVal = !current;
-		serverMasterAi = { ...serverMasterAi, [serverId]: newVal };
 		const ref = containerRefs[serverId];
-		if (ref) await ref.setAllAi(newVal);
+		if (ref) await ref.setAllAi(!allAiAllowed(serverId));
 	}
 
 	// ── Server management ────────────────────────────────────────────
@@ -1258,7 +1264,7 @@
 								onOpenViewer={(tab) => openViewerTab(server.id, tab)}
 								sidePanelOpen={serverPanelOpen[server.id] ?? false}
 								sidePanelTab={sessionPanelTab[dpk] ?? 'files'}
-								masterAiEnabled={serverMasterAi[server.id] ?? false}
+								masterAiEnabled={allAiAllowed(server.id)}
 								rightInset={(serverPanelOpen[server.id] ?? false) ? panelWidth : 0}
 								rightInsetAnimate={panelAnimating && !panelResizing}
 							/>

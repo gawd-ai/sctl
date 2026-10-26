@@ -264,6 +264,7 @@ Configuration object passed to `TerminalContainer`:
 | `rows` | `number` | — | Initial terminal rows |
 | `cols` | `number` | — | Initial terminal columns |
 | `name` | `string` | — | Human-readable session name |
+| `userAllowsAi` | `boolean` | `false` | Open the session to AI clients at its start; only for a person's own choice (sctl ADR-013) |
 
 ### ReconnectConfig
 

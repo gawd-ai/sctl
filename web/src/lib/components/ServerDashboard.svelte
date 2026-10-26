@@ -38,6 +38,11 @@
 		onOpenViewer?: (tab: ViewerTab) => void;
 		sidePanelOpen?: boolean;
 		sidePanelTab?: string;
+		/**
+		 * Whether every open session allows AI. The switch acts on the
+		 * sessions open when it is pressed; a session started later starts
+		 * closed to AI clients (sctl ADR-013).
+		 */
 		masterAiEnabled?: boolean;
 		rightInset?: number;
 		rightInsetAnimate?: boolean;
@@ -2130,23 +2135,31 @@ function dotColor(status: ConnectionStatus): string {
 					</svg>
 				</button>
 			{/if}
+			<!-- Allow AI in the sessions open now, labelled as the control bar's
+			     is: on only while every open session allows AI. -->
 			<button
-				class="w-5 h-5 flex items-center justify-center rounded transition-colors
+				class="h-5 flex items-center gap-1 px-1.5 rounded transition-colors
 					{masterAiEnabled
 						? 'bg-amber-900/50 text-amber-400 hover:bg-amber-900/70'
-						: 'text-neutral-600 hover:bg-neutral-800 hover:text-neutral-400'}"
+						: 'text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200'}"
 				onclick={onToggleAi}
-				title={masterAiEnabled ? 'AI enabled for all sessions — click to disable' : 'AI disabled — click to enable for all sessions'}
+				title={masterAiEnabled
+					? 'AI allowed in every open session. Click to stop allowing AI in all of them.'
+					: 'Click to allow AI in every open session. A session started later starts closed.'}
+				aria-label="Allow AI in open sessions"
+				aria-pressed={masterAiEnabled}
 			>
 				{#if masterAiEnabled}
-					<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
+					<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
 						<path d="M12 2L14.09 8.26L20 9.27L15.55 13.97L16.91 20L12 16.9L7.09 20L8.45 13.97L4 9.27L9.91 8.26L12 2Z" />
 					</svg>
 				{:else}
-					<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+					<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
 						<path stroke-linecap="round" stroke-linejoin="round" d="M12 2L14.09 8.26L20 9.27L15.55 13.97L16.91 20L12 16.9L7.09 20L8.45 13.97L4 9.27L9.91 8.26L12 2Z" />
 					</svg>
 				{/if}
+				<span>Allow AI</span>
+				<span class="font-semibold uppercase" data-testid="allow-ai-all-state">{masterAiEnabled ? 'on' : 'off'}</span>
 			</button>
 		</div>
 	</div>
