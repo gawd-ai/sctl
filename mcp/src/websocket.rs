@@ -1140,21 +1140,26 @@ async fn dispatch_message(
             eprintln!("mcp-sctl: broadcast {msg_type} for session {session_id}");
         }
         "session.gap" => {
-            // Relay dropped session output due to backpressure.
-            // Re-attach with last known seq to recover missed output.
+            // The relay dropped session output (backpressure). Nothing is
+            // sent here, no re-attach included: the buffer keeps a marker,
+            // so a reader knows output may be missing. The marker takes the
+            // next place and no seq of the daemon's, so the entry that
+            // follows the gap is still kept. A `session_attach` from the
+            // marker's place asks the daemon for its entries above
+            // `last_seq` and recovers the dropped lines, but only while no
+            // later live output has been kept: the buffer keeps a daemon
+            // entry only above the highest seq it holds, and the attach
+            // asks from there.
             let session_id = msg["session_id"].as_str().unwrap_or("");
             let reason = msg["reason"].as_str().unwrap_or("unknown");
-            eprintln!("mcp-sctl: session.gap for {session_id} (reason: {reason}), will re-attach");
+            eprintln!(
+                "mcp-sctl: session.gap for {session_id} (reason: {reason}): output was dropped; a session_attach from the gap marker's place recovers it while no later output has been kept"
+            );
             if !session_id.is_empty() {
                 let last_seq = {
                     let sessions = sessions.lock().await;
                     sessions.get(session_id).map_or(0, |b| b.last_seq)
                 };
-                // Queue a re-attach. We can't call self.attach_session here since
-                // we don't have the sender. Instead, synthesize a system entry so
-                // the consumer knows output may have been lost. The marker takes
-                // no seq of the daemon's, so the entry that follows the gap is
-                // still kept.
                 let mut sessions = sessions.lock().await;
                 if let Some(buf) = sessions.get_mut(session_id) {
                     buf.live_mark(format!(
@@ -1498,6 +1503,38 @@ mod tests {
         assert_eq!(places(&answer.entries), [7, 8, 9]);
         assert_eq!(answer.last_seq, 9);
         assert_eq!(answer.dropped_count, 0);
+    }
+
+    /// The gap handler sends nothing: it keeps a marker. A `session_attach`
+    /// from the marker's place recovers the dropped lines only while no
+    /// later live output has been kept. Once a later line is kept, the
+    /// attach asks the daemon from that line's seq, and the dropped lines
+    /// are not asked for again.
+    #[tokio::test]
+    async fn a_gap_sends_nothing_and_later_live_output_ends_its_recovery() {
+        let (ws, mut sent) = connection();
+        ws.sessions
+            .lock()
+            .await
+            .insert("s1".to_string(), SessionBuffer::new());
+        for seq in 1..=5 {
+            deliver(&ws, &output(seq)).await;
+        }
+        // The relay drops 6 to 8 and says so.
+        let gap = json!({ "type": "session.gap", "session_id": "s1", "reason": "backpressure" });
+        deliver(&ws, &gap).await;
+        assert!(sent.try_recv().is_err(), "no attach was sent");
+        // Line 9 comes live and is kept before any attach.
+        deliver(&ws, &output(9)).await;
+
+        let (answer, ()) = tokio::join!(ws.attach_session("s1", 6), async {
+            let attach = sent.recv().await.unwrap();
+            assert_eq!(attach["since"], 9, "asked from the line kept, not the gap");
+            deliver(&ws, &replay(&attach, 9)).await;
+        });
+        let answer = answer.unwrap();
+        assert_eq!(texts(&answer.entries), ["line 9\n"]);
+        assert_eq!(answer.dropped_count, 3, "6 to 8 stay missing");
     }
 
     #[tokio::test]
