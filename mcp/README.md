@@ -244,7 +244,7 @@ Session tools provide persistent interactive shells. Output is buffered both ser
 
 Sessions survive WebSocket disconnects -- mcp-sctl automatically reconnects and re-attaches with the last known sequence number, replaying any missed output.
 
-A session is closed to AI clients until a person opens it with the Allow AI control in its console (sctl ADR-013). `session_start` starts one closed, and no tool opens one. `session_exec`, `session_send`, `session_exec_wait` and `session_signal` first set the AI status to working, which the agent accepts only for a session a person opened, and send nothing to the session on any other answer or on none; the refusal says how a person opens it. `session_read`, `session_list`, `session_attach`, `session_kill`, `session_resize` and `session_rename` type nothing and work on any session. The device tools (`device_exec`, `device_exec_batch`, `device_file_write`, `device_file_delete`, `playbook_put`) still run as root on a unit for whoever holds its key: this protects a person's console session from an AI client, and does not make mcp-sctl safe to hand to one.
+A session is closed to AI clients until a person opens it with the Allow AI control in its console (sctl ADR-013). `session_start` starts one closed, and no tool opens one. `session_exec`, `session_send`, `session_exec_wait` and `session_signal` first set the AI status to working, which the agent accepts only for a session a person opened, and send nothing to the session on any other answer or on none; the refusal says how a person opens it. Each request carries a `request_id` of its own, and a call takes only the answer that echoes it, so an answer that comes after its call gave up is never another call's; if that late answer set the AI working, mcp-sctl sets it back to not working. `session_signal` leaves the AI status as it found it, so a person's console takes keys again once the signal is sent. `session_read`, `session_list`, `session_attach`, `session_kill`, `session_resize` and `session_rename` type nothing and work on any session. The device tools (`device_exec`, `device_exec_batch`, `device_file_write`, `device_file_delete`, `playbook_put`) still run as root on a unit for whoever holds its key: this protects a person's console session from an AI client, and does not make mcp-sctl safe to hand to one.
 
 #### `session_start`
 
@@ -308,7 +308,7 @@ Returns: `{entries: [{seq, stream, data, timestamp_ms}], last_seq, status, exit_
 
 #### `session_signal`
 
-Send a POSIX signal to the session's process group.
+Send a POSIX signal to the session's process group. Only to a session a person opened to AI, as typing; the AI status is left as it was before the call.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

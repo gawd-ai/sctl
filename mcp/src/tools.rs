@@ -402,7 +402,7 @@ fn builtin_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "session_signal",
-            "description": "Send a POSIX signal to a session's process group. Common signals: 2=SIGINT (Ctrl-C), 15=SIGTERM, 9=SIGKILL.\n\nNote: In non-PTY sessions, signals are delivered to the entire process group including the shell, which will typically terminate the session. Use PTY sessions for interactive signal handling where the kernel provides job control protection.\n\nOPEN TO AI: refused, with nothing sent, unless a person opened the session to AI with the Allow AI control in its console, as typing is: a Ctrl-C reaches the person's command.",
+            "description": "Send a POSIX signal to a session's process group. Common signals: 2=SIGINT (Ctrl-C), 15=SIGTERM, 9=SIGKILL.\n\nNote: In non-PTY sessions, signals are delivered to the entire process group including the shell, which will typically terminate the session. Use PTY sessions for interactive signal handling where the kernel provides job control protection.\n\nOPEN TO AI: refused, with nothing sent, unless a person opened the session to AI with the Allow AI control in its console, as typing is: a Ctrl-C reaches the person's command. The AI status is left as it was before the call.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1877,5 +1877,120 @@ mod tests {
         .await;
         assert!(result.is_error);
         assert_eq!(result.content[0]["text"], "Unknown tool: session_allow_ai");
+    }
+
+    /// A fake agent on a loopback port, for one connection: it starts `s1`
+    /// closed, refuses every AI status `working: true` as an agent does for
+    /// a session no person opened, answers a list, and records every frame
+    /// it is sent. Returns its URL and the frames.
+    async fn agent_with_s1_closed() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&frames);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                recorded.lock().unwrap().push(frame.clone());
+                let reply = match frame["type"].as_str() {
+                    Some("session.start") => Some(json!({
+                        "type": "session.started",
+                        "session_id": "s1",
+                        "pid": 1,
+                        "persistent": true,
+                        "pty": false,
+                        "user_allows_ai": false,
+                    })),
+                    Some("session.ai_status") if frame["working"] == true => Some(json!({
+                        "type": "error",
+                        "code": "AI_NOT_ALLOWED",
+                        "session_id": frame["session_id"],
+                        "message": "Cannot set working=true: user has not allowed AI for this session",
+                    })),
+                    Some("session.list") => Some(json!({"type": "session.listed", "sessions": []})),
+                    _ => None,
+                };
+                if let Some(mut reply) = reply {
+                    if let Some(request_id) = frame.get("request_id") {
+                        reply["request_id"] = request_id.clone();
+                    }
+                    ws.send(Message::Text(reply.to_string())).await.unwrap();
+                }
+            }
+        });
+        (url, frames)
+    }
+
+    #[tokio::test]
+    async fn no_typing_tool_sends_into_a_session_no_person_opened() {
+        let (url, frames) = agent_with_s1_closed().await;
+        let registry = DeviceRegistry::from_config(crate::config::ResolvedConfig {
+            devices: HashMap::from([(
+                "unit".to_string(),
+                crate::config::DeviceEntry {
+                    url,
+                    api_key: "test-key".to_string(),
+                    playbooks_dir: None,
+                },
+            )]),
+            default_device: "unit".to_string(),
+        });
+        let pb_reg = PlaybookRegistry::new(String::new(), HashMap::new());
+
+        // A start gives session_exec_wait its local buffer.
+        let started = handle_tool_call("session_start", &json!({}), &registry, &pb_reg).await;
+        assert!(!started.is_error, "{:?}", started.content);
+
+        for (tool, args) in [
+            (
+                "session_exec",
+                json!({"session_id": "s1", "command": "true"}),
+            ),
+            (
+                "session_exec_wait",
+                json!({"session_id": "s1", "command": "true", "timeout_ms": 1000}),
+            ),
+            // A literal escape, as a client sends Ctrl-C.
+            (
+                "session_send",
+                json!({"session_id": "s1", "data": "\\u0003"}),
+            ),
+            ("session_signal", json!({"session_id": "s1", "signal": 2})),
+        ] {
+            let result = handle_tool_call(tool, &args, &registry, &pb_reg).await;
+            assert!(result.is_error, "{tool}: {:?}", result.content);
+            let text = result.content[0]["text"].as_str().unwrap_or("");
+            assert!(
+                text.starts_with("Nothing was sent to session s1"),
+                "{tool}: {text}"
+            );
+        }
+
+        // One more round trip on the same socket: the agent has had every
+        // frame sent before it answers.
+        let listed = handle_tool_call(
+            "session_list",
+            &json!({"device": "unit"}),
+            &registry,
+            &pb_reg,
+        )
+        .await;
+        assert!(!listed.is_error, "{:?}", listed.content);
+
+        let frames = frames.lock().unwrap().clone();
+        let kinds: Vec<&str> = frames
+            .iter()
+            .map(|f| f["type"].as_str().unwrap_or(""))
+            .collect();
+        for typed in ["session.exec", "session.stdin", "session.signal"] {
+            assert!(!kinds.contains(&typed), "{typed} was sent: {kinds:?}");
+        }
+        let asked = kinds.iter().filter(|k| **k == "session.ai_status").count();
+        assert_eq!(asked, 4, "each typing tool asked once: {kinds:?}");
     }
 }

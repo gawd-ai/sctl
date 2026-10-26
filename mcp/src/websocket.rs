@@ -23,7 +23,11 @@
 //! closed, and types or signals only into a session the agent confirms a
 //! person opened: it asks for the AI status `working: true` first, which
 //! the agent answers only for such a session, and sends nothing to the
-//! session on any other answer or on none.
+//! session on any other answer or on none. Each AI status request carries
+//! its own `request_id`, which the agent echoes and the relay restores, and
+//! only the call that sent it takes the answer. A late ack that set the AI
+//! working for a call that stopped waiting is undone with `working: false`,
+//! so a person's console does not stay locked by a call that refused.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,8 +35,15 @@ use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::time::{Duration, Instant};
+
+/// How long an AI status request waits for the agent's answer.
+const AI_STATUS_WAIT: Duration = Duration::from_secs(5);
+
+/// How many AI status calls that stopped waiting are remembered, so that a
+/// late ack for one of them is undone and never taken as another's answer.
+const ABANDONED_KEPT: usize = 64;
 
 /// Session lifecycle status (mirrors sctl server's `SessionStatus`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,8 +278,94 @@ struct WsNotifiers {
     start_result: Arc<Mutex<Option<Value>>>,
     list_notify: Arc<Notify>,
     list_result: Arc<Mutex<Option<Value>>>,
-    ai_status_notify: Arc<Notify>,
-    ai_status_result: Arc<Mutex<Option<Value>>>,
+    ai_status: Mutex<AiStatusCalls>,
+}
+
+/// The AI status requests of one connection (ADR-013). Each is sent with a
+/// `request_id` of its own, which the agent echoes on its ack and on its
+/// `AI_NOT_ALLOWED` refusal (every agent version does) and the relay
+/// restores, so an answer goes only to the call that asked.
+#[derive(Default)]
+struct AiStatusCalls {
+    /// The number in the last call's `request_id`.
+    last: u64,
+    /// The calls waiting for their answer, by `request_id`: the session
+    /// each asked about, and where its answer goes.
+    waiting: HashMap<String, (String, oneshot::Sender<Value>)>,
+    /// The `working: true` calls that stopped waiting with no answer, as
+    /// (`request_id`, session), oldest first, at most [`ABANDONED_KEPT`].
+    abandoned: VecDeque<(String, String)>,
+}
+
+impl AiStatusCalls {
+    /// A new call about `session_id`: its `request_id` and its answer.
+    fn ask(&mut self, session_id: &str) -> (String, oneshot::Receiver<Value>) {
+        self.last += 1;
+        let request_id = format!("mcp-ai-status-{}", self.last);
+        let (answer, answered) = oneshot::channel();
+        self.waiting
+            .insert(request_id.clone(), (session_id.to_string(), answer));
+        (request_id, answered)
+    }
+
+    /// The call `request_id` stopped waiting with no answer. A `working:
+    /// true` call is remembered, so that its late ack is undone.
+    fn give_up(&mut self, request_id: &str, session_id: &str, working: bool) {
+        self.waiting.remove(request_id);
+        if working {
+            if self.abandoned.len() == ABANDONED_KEPT {
+                self.abandoned.pop_front();
+            }
+            self.abandoned
+                .push_back((request_id.to_string(), session_id.to_string()));
+        }
+    }
+
+    /// Whether a call about `session_id` is waiting for its answer.
+    fn waits_on(&self, session_id: &str) -> bool {
+        self.waiting.values().any(|(asked, _)| asked == session_id)
+    }
+
+    /// Route the agent's answer `msg` to the call that sent its
+    /// `request_id`, and to no other. Returns a frame to send: `working:
+    /// false` for the session of a call that stopped waiting, when its late
+    /// ack set the AI working there and no other call on that session waits
+    /// for its own answer, which then decides. Any other answer is dropped.
+    fn answer(&mut self, msg: &Value) -> Option<Value> {
+        let request_id = msg["request_id"].as_str()?;
+        if let Some((_, answer)) = self.waiting.remove(request_id) {
+            let _ = answer.send(msg.clone());
+            return None;
+        }
+        let at = self.abandoned.iter().position(|(id, _)| id == request_id)?;
+        let (_, session_id) = self.abandoned.remove(at)?;
+        let set_working = msg["type"] == "session.ai_status.ack"
+            && msg["session_id"] == session_id.as_str()
+            && msg["working"] == true;
+        (set_working && !self.waits_on(&session_id))
+            .then(|| ai_status_message(&session_id, false, None, None))
+    }
+}
+
+/// `session.ai_status` for `session_id`.
+fn ai_status_message(
+    session_id: &str,
+    working: bool,
+    activity: Option<&str>,
+    message: Option<&str>,
+) -> Value {
+    let mut msg = json!({
+        "type": "session.ai_status",
+        "session_id": session_id,
+        "working": working,
+    });
+    if let Some(a) = activity {
+        msg["activity"] = json!(a);
+    }
+    if let Some(m) = message {
+        msg["message"] = json!(m);
+    }
+    msg
 }
 
 /// Persistent WebSocket connection to a sctl device.
@@ -297,8 +394,7 @@ impl DeviceWsConnection {
             start_result: Arc::new(Mutex::new(None)),
             list_notify: Arc::new(Notify::new()),
             list_result: Arc::new(Mutex::new(None)),
-            ai_status_notify: Arc::new(Notify::new()),
-            ai_status_result: Arc::new(Mutex::new(None)),
+            ai_status: Mutex::new(AiStatusCalls::default()),
         });
 
         let ai_working_sessions: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -419,6 +515,11 @@ impl DeviceWsConnection {
     }
 
     /// Set AI working status and wait for the server's ack or rejection.
+    ///
+    /// The request carries a `request_id` of its own, and only the answer
+    /// that echoes it is this call's ([`AiStatusCalls`]). With no answer
+    /// within [`AI_STATUS_WAIT`] the call gives up; if its `working: true`
+    /// is acked later, the connection undoes it.
     pub async fn set_ai_status(
         &self,
         session_id: &str,
@@ -426,44 +527,48 @@ impl DeviceWsConnection {
         activity: Option<&str>,
         message: Option<&str>,
     ) -> Result<Value, String> {
-        // Clear any stale result
-        *self.notifiers.ai_status_result.lock().await = None;
-
-        let mut msg = json!({
-            "type": "session.ai_status",
-            "session_id": session_id,
-            "working": working,
-        });
-        if let Some(a) = activity {
-            msg["activity"] = json!(a);
-        }
-        if let Some(m) = message {
-            msg["message"] = json!(m);
+        let (request_id, mut answered) = self.notifiers.ai_status.lock().await.ask(session_id);
+        let mut msg = ai_status_message(session_id, working, activity, message);
+        msg["request_id"] = json!(request_id);
+        if let Err(e) = self.send(msg).await {
+            self.notifiers
+                .ai_status
+                .lock()
+                .await
+                .waiting
+                .remove(&request_id);
+            return Err(e);
         }
 
-        let notified = self.notifiers.ai_status_notify.notified();
-        self.send(msg).await?;
-
-        let result = tokio::time::timeout(tokio::time::Duration::from_secs(5), notified).await;
-
-        if result.is_err() {
-            return Err("Timeout waiting for session.ai_status response".to_string());
-        }
-
-        let result = self.notifiers.ai_status_result.lock().await.take();
-        match result {
-            Some(v) => {
-                if v["type"].as_str() == Some("error") {
-                    Err(v["message"]
-                        .as_str()
-                        .unwrap_or("AI status rejected")
-                        .to_string())
-                } else {
-                    Ok(v)
-                }
+        let answer = if let Ok(answer) = tokio::time::timeout(AI_STATUS_WAIT, &mut answered).await {
+            answer.ok()
+        } else {
+            let mut calls = self.notifiers.ai_status.lock().await;
+            if calls.waiting.contains_key(&request_id) {
+                calls.give_up(&request_id, session_id, working);
+                return Err("Timeout waiting for session.ai_status response".to_string());
             }
+            // Answered as the wait ended: the answer is in.
+            answered.try_recv().ok()
+        };
+        match answer {
+            Some(v) if v["type"] == "error" => Err(v["message"]
+                .as_str()
+                .unwrap_or("AI status rejected")
+                .to_string()),
+            Some(v) => Ok(v),
             None => Err("No ai_status response received".to_string()),
         }
+    }
+
+    /// `working: false` for `session_id`, with no wait for the ack: the
+    /// agent always takes it for a session it holds.
+    async fn stop_working(&self, session_id: &str) {
+        let msg = ai_status_message(session_id, false, None, None);
+        if let Err(e) = self.send(msg).await {
+            eprintln!("mcp-sctl: could not clear the AI status of {session_id}: {e}");
+        }
+        self.clear_ai_working(session_id).await;
     }
 
     /// Read output from a session's local buffer.
@@ -546,8 +651,9 @@ impl DeviceWsConnection {
     /// agent answers the AI status `working: true` with an ack only for
     /// such a session, so the ack is the answer; it also marks the AI
     /// working, as a person watching the console sees. A refusal, an ack
-    /// for another session or no answer refuses, and the caller sends
-    /// nothing to the session.
+    /// for another session or no answer to this call's own request
+    /// ([`Self::set_ai_status`]) refuses, and the caller sends nothing to
+    /// the session.
     pub async fn require_open_to_ai(&self, session_id: &str, activity: &str) -> Result<(), String> {
         let why = match self
             .set_ai_status(session_id, true, Some(activity), None)
@@ -598,15 +704,24 @@ impl DeviceWsConnection {
 
     /// `session.signal` to a session a person opened to AI clients, else
     /// nothing is sent ([`Self::require_open_to_ai`]): a Ctrl-C reaches the
-    /// person's command as a keystroke does.
+    /// person's command as a keystroke does. A signal is one keystroke, so
+    /// it leaves the AI status as it found it: where the AI was not
+    /// working, `working: false` follows the signal, and the person's
+    /// console takes keys again at once.
     pub async fn signal(&self, session_id: &str, signal: i64) -> Result<(), String> {
+        let was_working = self.is_ai_working(session_id).await;
         self.require_open_to_ai(session_id, "write").await?;
-        self.send(json!({
-            "type": "session.signal",
-            "session_id": session_id,
-            "signal": signal,
-        }))
-        .await
+        let sent = self
+            .send(json!({
+                "type": "session.signal",
+                "session_id": session_id,
+                "signal": signal,
+            }))
+            .await;
+        if !was_working {
+            self.stop_working(session_id).await;
+        }
+        sent
     }
 
     /// Auto-set AI working status if not already working.
@@ -1000,12 +1115,20 @@ async fn ws_io_loop(
                 match msg {
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
                         if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
-                            dispatch_message(
+                            let reply = dispatch_message(
                                 &parsed,
                                 &sessions,
                                 &notifiers,
                                 &ai_working_sessions,
                             ).await;
+                            // A frame that cannot go is lost with the
+                            // connection, which the reader then sees closed.
+                            if let Some(reply) = reply {
+                                let text = serde_json::to_string(&reply).unwrap_or_default();
+                                if ws_sink.send(tokio_tungstenite::tungstenite::Message::Text(text)).await.is_err() {
+                                    eprintln!("mcp-sctl: failed to send {}", reply["type"]);
+                                }
+                            }
                         }
                     }
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => {
@@ -1077,13 +1200,14 @@ async fn ws_io_loop(
     }
 }
 
-/// Dispatch an incoming WS message to the appropriate handler.
+/// Dispatch an incoming WS message to the appropriate handler. Returns a
+/// frame the connection sends in reply, if any ([`AiStatusCalls::answer`]).
 async fn dispatch_message(
     msg: &Value,
     sessions: &Arc<Mutex<HashMap<String, SessionBuffer>>>,
     n: &WsNotifiers,
     ai_working_sessions: &Arc<Mutex<HashSet<String>>>,
-) {
+) -> Option<Value> {
     let msg_type = msg["type"].as_str().unwrap_or("");
 
     match msg_type {
@@ -1166,9 +1290,10 @@ async fn dispatch_message(
             let error_msg = msg["message"].as_str().unwrap_or("unknown");
 
             if code == "AI_NOT_ALLOWED" {
-                *n.ai_status_result.lock().await = Some(msg.clone());
-                n.ai_status_notify.notify_waiters();
-            } else if let Some(session_id) = msg.get("session_id").and_then(Value::as_str) {
+                // The agent's refusal of an AI status request.
+                return n.ai_status.lock().await.answer(msg);
+            }
+            if let Some(session_id) = msg.get("session_id").and_then(Value::as_str) {
                 // Error targeting a specific session (e.g. attach to a session
                 // that no longer exists after device reboot). Mark it dead.
                 let mut sessions = sessions.lock().await;
@@ -1187,24 +1312,12 @@ async fn dispatch_message(
                 n.start_notify.notify_waiters();
             }
 
-            if code != "AI_NOT_ALLOWED" {
-                eprintln!("mcp-sctl: WS error: {error_msg}");
-            }
+            eprintln!("mcp-sctl: WS error: {error_msg}");
         }
         "session.ai_status.ack" => {
-            // Sync local tracking from the ack
-            let session_id = msg["session_id"].as_str().unwrap_or("");
-            let working = msg["working"].as_bool().unwrap_or(false);
-            if !session_id.is_empty() {
-                let mut ai_set = ai_working_sessions.lock().await;
-                if working {
-                    ai_set.insert(session_id.to_string());
-                } else {
-                    ai_set.remove(session_id);
-                }
-            }
-            *n.ai_status_result.lock().await = Some(msg.clone());
-            n.ai_status_notify.notify_waiters();
+            // The call that asked keeps the local tracking from its answer;
+            // an ack no call waits for marks nothing.
+            return n.ai_status.lock().await.answer(msg);
         }
         "session.ai_status_changed" => {
             // Sync local AI working tracking from broadcast
@@ -1271,6 +1384,7 @@ async fn dispatch_message(
         // already returned ok).
         _ => {}
     }
+    None
 }
 
 /// Reconnect with exponential backoff. On success, re-attaches all active sessions.
@@ -1336,8 +1450,7 @@ mod tests {
             start_result: Arc::new(Mutex::new(None)),
             list_notify: Arc::new(Notify::new()),
             list_result: Arc::new(Mutex::new(None)),
-            ai_status_notify: Arc::new(Notify::new()),
-            ai_status_result: Arc::new(Mutex::new(None)),
+            ai_status: Mutex::new(AiStatusCalls::default()),
         }
     }
 
@@ -1355,9 +1468,14 @@ mod tests {
         (ws, sent)
     }
 
-    /// A message from the device, through the connection's reader.
+    /// A message from the device, through the connection's reader, which
+    /// sends the reply it makes, if any.
     async fn deliver(ws: &DeviceWsConnection, msg: &Value) {
-        dispatch_message(msg, &ws.sessions, &ws.notifiers, &ws.ai_working_sessions).await;
+        if let Some(reply) =
+            dispatch_message(msg, &ws.sessions, &ws.notifiers, &ws.ai_working_sessions).await
+        {
+            ws.send(reply).await.unwrap();
+        }
     }
 
     /// `line <seq>`, as the daemon sends it for session `s1`.
@@ -2017,6 +2135,25 @@ mod tests {
         }
     }
 
+    /// A connection that holds `s1`.
+    async fn holding_s1() -> (Arc<DeviceWsConnection>, mpsc::Receiver<Value>) {
+        let (ws, sent) = connection();
+        ws.sessions
+            .lock()
+            .await
+            .insert("s1".to_string(), SessionBuffer::new());
+        (Arc::new(ws), sent)
+    }
+
+    /// The call in a task of its own.
+    fn call(
+        ws: &Arc<DeviceWsConnection>,
+        how: Typing,
+    ) -> tokio::task::JoinHandle<Result<(), String>> {
+        let ws = Arc::clone(ws);
+        tokio::spawn(async move { type_into(&ws, how).await })
+    }
+
     /// The call in a task of its own, on a connection that holds `s1`.
     async fn typing(
         how: Typing,
@@ -2025,36 +2162,56 @@ mod tests {
         mpsc::Receiver<Value>,
         tokio::task::JoinHandle<Result<(), String>>,
     ) {
-        let (ws, sent) = connection();
-        ws.sessions
-            .lock()
-            .await
-            .insert("s1".to_string(), SessionBuffer::new());
-        let ws = Arc::new(ws);
-        let call = tokio::spawn({
-            let ws = Arc::clone(&ws);
-            async move { type_into(&ws, how).await }
-        });
+        let (ws, sent) = holding_s1().await;
+        let call = call(&ws, how);
         (ws, sent, call)
     }
 
-    /// The agent's answer to `working: true` on a session no person opened.
-    fn refusal(session_id: &str) -> Value {
+    /// The AI status request a call sent: `working: true` for `s1`, with a
+    /// `request_id` of its own.
+    async fn the_request(sent: &mut mpsc::Receiver<Value>) -> Value {
+        let asked = sent.recv().await.unwrap();
+        assert_eq!(asked["type"], "session.ai_status", "{asked}");
+        assert_eq!(asked["session_id"], "s1", "{asked}");
+        assert_eq!(asked["working"], true, "{asked}");
+        assert!(
+            asked["request_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "{asked}"
+        );
+        asked
+    }
+
+    /// The agent's answer to `working: true` on a session no person
+    /// opened, to the request `asked`.
+    fn refusal(asked: &Value, session_id: &str) -> Value {
         json!({
             "type": "error",
             "code": "AI_NOT_ALLOWED",
             "session_id": session_id,
             "message": "Cannot set working=true: user has not allowed AI for this session",
+            "request_id": asked["request_id"],
         })
     }
 
-    fn ack(session_id: &str) -> Value {
+    /// The agent's ack of `working: true` on `session_id`, to the request
+    /// `asked`.
+    fn ack(asked: &Value, session_id: &str) -> Value {
         json!({
             "type": "session.ai_status.ack",
             "session_id": session_id,
             "working": true,
             "activity": "write",
+            "request_id": asked["request_id"],
         })
+    }
+
+    /// Asserts that `msg` sets the AI status of `s1` to not working.
+    fn assert_stops_working(msg: &Value) {
+        assert_eq!(msg["type"], "session.ai_status", "{msg}");
+        assert_eq!(msg["session_id"], "s1", "{msg}");
+        assert_eq!(msg["working"], false, "{msg}");
     }
 
     const TYPING: [Typing; 4] = [
@@ -2098,11 +2255,8 @@ mod tests {
     async fn typing_into_a_closed_session_is_refused_with_nothing_sent() {
         for how in TYPING {
             let (ws, mut sent, call) = typing(how).await;
-            let asked = sent.recv().await.unwrap();
-            assert_eq!(asked["type"], "session.ai_status", "{how:?}");
-            assert_eq!(asked["session_id"], "s1", "{how:?}");
-            assert_eq!(asked["working"], true, "{how:?}");
-            deliver(&ws, &refusal("s1")).await;
+            let asked = the_request(&mut sent).await;
+            deliver(&ws, &refusal(&asked, "s1")).await;
 
             let refused = call.await.unwrap().unwrap_err();
             assert!(
@@ -2120,34 +2274,143 @@ mod tests {
         for (how, kind) in [
             (Typing::Exec, "session.exec"),
             (Typing::Input, "session.stdin"),
-            (Typing::Signal, "session.signal"),
         ] {
             let (ws, mut sent, call) = typing(how).await;
-            assert_eq!(sent.recv().await.unwrap()["type"], "session.ai_status");
-            deliver(&ws, &ack("s1")).await;
+            let asked = the_request(&mut sent).await;
+            deliver(&ws, &ack(&asked, "s1")).await;
             call.await.unwrap().unwrap();
-            let typed = sent.recv().await.unwrap();
+            let typed = sent.try_recv().unwrap();
             assert_eq!(typed["type"], kind, "{how:?}");
             assert_eq!(typed["session_id"], "s1", "{how:?}");
             assert!(ws.is_ai_working("s1").await, "{how:?}");
+            assert!(sent.try_recv().is_err(), "{how:?} sent nothing more");
         }
+    }
+
+    #[tokio::test]
+    async fn a_signal_leaves_the_ai_status_as_it_found_it() {
+        // The AI was not working: once the signal is sent, the status is
+        // cleared, so the person's console takes keys again at once.
+        let (ws, mut sent, signal) = typing(Typing::Signal).await;
+        let asked = the_request(&mut sent).await;
+        deliver(&ws, &ack(&asked, "s1")).await;
+        signal.await.unwrap().unwrap();
+        let signalled = sent.try_recv().unwrap();
+        assert_eq!(signalled["type"], "session.signal", "{signalled}");
+        assert_eq!(signalled["signal"], 2, "{signalled}");
+        assert_stops_working(&sent.try_recv().unwrap());
+        assert!(!ws.is_ai_working("s1").await);
+        assert!(sent.try_recv().is_err());
+
+        // The AI was working: it still is, as it was told.
+        let (ws, mut sent) = holding_s1().await;
+        ws.mark_ai_working("s1").await;
+        let signal = call(&ws, Typing::Signal);
+        let asked = the_request(&mut sent).await;
+        deliver(&ws, &ack(&asked, "s1")).await;
+        signal.await.unwrap().unwrap();
+        assert_eq!(sent.try_recv().unwrap()["type"], "session.signal");
+        assert!(sent.try_recv().is_err(), "the status is left on");
+        assert!(ws.is_ai_working("s1").await);
     }
 
     #[tokio::test(start_paused = true)]
     async fn an_ack_for_another_session_or_no_answer_sends_nothing() {
         for how in TYPING {
             let (ws, mut sent, call) = typing(how).await;
-            assert_eq!(sent.recv().await.unwrap()["type"], "session.ai_status");
-            deliver(&ws, &ack("s2")).await;
+            let asked = the_request(&mut sent).await;
+            deliver(&ws, &ack(&asked, "s2")).await;
             assert!(call.await.unwrap().is_err(), "{how:?}: another's ack");
             assert!(sent.try_recv().is_err(), "{how:?}: another's ack");
 
             // No answer: the wait for it ends, and nothing follows.
             let (_ws, mut sent, call) = typing(how).await;
-            assert_eq!(sent.recv().await.unwrap()["type"], "session.ai_status");
+            the_request(&mut sent).await;
             let refused = call.await.unwrap().unwrap_err();
             assert!(refused.contains("Timeout"), "{how:?}: {refused}");
             assert!(sent.try_recv().is_err(), "{how:?}: no answer");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_ack_to_no_request_of_the_call_is_not_its_answer() {
+        for how in TYPING {
+            let (ws, mut sent, call) = typing(how).await;
+            let asked = the_request(&mut sent).await;
+            // An ack for the session that echoes no request, and one that
+            // echoes a request this connection never sent.
+            let mut stale = ack(&asked, "s1");
+            stale.as_object_mut().unwrap().remove("request_id");
+            deliver(&ws, &stale).await;
+            stale["request_id"] = json!("mcp-ai-status-0");
+            deliver(&ws, &stale).await;
+
+            let refused = call.await.unwrap().unwrap_err();
+            assert!(refused.contains("Timeout"), "{how:?}: {refused}");
+            assert!(sent.try_recv().is_err(), "{how:?}: nothing typed");
+            assert!(!ws.is_ai_working("s1").await, "{how:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_ack_for_a_call_that_gave_up_is_undone() {
+        let (ws, mut sent, call) = typing(Typing::Exec).await;
+        let asked = the_request(&mut sent).await;
+        let refused = call.await.unwrap().unwrap_err();
+        assert!(refused.contains("Timeout"), "{refused}");
+
+        // The agent applied it after all, and its ack comes late: the AI
+        // status it set is cleared, and nothing is typed.
+        deliver(&ws, &ack(&asked, "s1")).await;
+        assert_stops_working(&sent.try_recv().unwrap());
+        assert!(sent.try_recv().is_err(), "nothing typed");
+        assert!(!ws.is_ai_working("s1").await);
+
+        // The same answer again is no one's.
+        deliver(&ws, &ack(&asked, "s1")).await;
+        assert!(sent.try_recv().is_err());
+
+        // A late refusal leaves nothing to undo.
+        let (ws, mut sent, call) = typing(Typing::Exec).await;
+        let asked = the_request(&mut sent).await;
+        assert!(call.await.unwrap().is_err());
+        deliver(&ws, &refusal(&asked, "s1")).await;
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_ack_is_not_the_next_calls_answer() {
+        // The next call's own answer: an ack, or the refusal of a session
+        // the person closed meanwhile.
+        for opened in [true, false] {
+            let (ws, mut sent, first) = typing(Typing::Exec).await;
+            let first_asked = the_request(&mut sent).await;
+            assert!(first.await.unwrap().is_err(), "the first call gave up");
+
+            let next = call(&ws, Typing::Exec);
+            let next_asked = the_request(&mut sent).await;
+            assert_ne!(first_asked["request_id"], next_asked["request_id"]);
+
+            // The first call's ack comes now. It is not the next call's
+            // answer, and that answer, still to come, decides the status,
+            // so nothing is sent for it.
+            deliver(&ws, &ack(&first_asked, "s1")).await;
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!next.is_finished(), "the next call waits for its own");
+            assert!(sent.try_recv().is_err());
+
+            if opened {
+                deliver(&ws, &ack(&next_asked, "s1")).await;
+                next.await.unwrap().unwrap();
+                assert_eq!(sent.try_recv().unwrap()["type"], "session.exec");
+            } else {
+                deliver(&ws, &refusal(&next_asked, "s1")).await;
+                let refused = next.await.unwrap().unwrap_err();
+                assert!(refused.starts_with("Nothing was sent"), "{refused}");
+            }
+            assert!(sent.try_recv().is_err(), "opened {opened}");
         }
     }
 }

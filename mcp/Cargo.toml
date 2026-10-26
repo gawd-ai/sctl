@@ -30,8 +30,9 @@ base64 = "0.22"
 indexmap = "2"
 
 [dev-dependencies]
-# The paused clock (start_paused) for the tests of an attach's wait.
-tokio = { version = "1", features = ["test-util"] }
+# The paused clock (start_paused) for the tests of an attach's wait, and a
+# loopback listener for the tools' tests against a fake agent.
+tokio = { version = "1", features = ["test-util", "net"] }
 
 [lints]
 workspace = true
