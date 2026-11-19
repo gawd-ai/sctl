@@ -58,10 +58,11 @@ pub mod monitor;
 pub mod profiles;
 pub mod routes;
 
+use crate::atomic::AtomicU64;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 use std::time::Duration;
 

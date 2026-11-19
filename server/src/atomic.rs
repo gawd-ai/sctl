@@ -39,6 +39,19 @@ mod fallback {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         }
     }
+
+    /// Prints the value, as the standard `AtomicU64` does.
+    impl std::fmt::Debug for AtomicU64 {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Debug::fmt(&*self.guard(), f)
+        }
+    }
+
+    impl Default for AtomicU64 {
+        fn default() -> Self {
+            Self::new(0)
+        }
+    }
 }
 
 #[cfg(not(target_has_atomic = "64"))]
