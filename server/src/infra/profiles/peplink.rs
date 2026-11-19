@@ -724,20 +724,21 @@ pub fn build_snapshot(
 mod tests {
     use super::*;
 
-    /// Verbatim shape from a Peplink MAX BR1 on a customer's coach,
-    /// 2026-08-11 19:52 UTC. WAN1 connected, cellular in cold standby.
+    /// Shape from a Peplink MAX BR1 on a customer's coach, 2026-08-11 19:52
+    /// UTC, its WAN address and its SIM and modem identifiers replaced. WAN1
+    /// connected, cellular in cold standby.
     fn real_wan() -> Value {
         json!({
-            "1": {"name":"WAN","enable":true,"ip":"100.98.218.234","statusLed":"green",
+            "1": {"name":"WAN","enable":true,"ip":"100.64.100.234","statusLed":"green",
                   "message":"Connected","uptime":10228,"type":"ethernet","priority":1},
             "2": {"name":"Cellular","enable":true,"ip":"10.5.217.34","statusLed":"yellow",
                   "message":"Standby","uptime":0,"type":"cellular","priority":2,
                   "cellular":{"carrier":{"name":"ROGERS"},
                               "manufacturer":"Quectel","model":"RM520N-GL","firmware":"RM520NGLAAR01A08M4G",
-                              "sim":{"1":{"active":false,"simCardDetected":true,"imsi":"302720713604621","iccid":"89302720554119789815"},
+                              "sim":{"1":{"active":false,"simCardDetected":true,"imsi":"001010000000001","iccid":"89000000000000000001"},
                                      "2":{"active":false,"simCardDetected":false}},
-                              "speedfusionConnect5gLte":{"active":true,"imsi":"454006344183417"},
-                              "imei":"868371053659609",
+                              "speedfusionConnect5gLte":{"active":true,"imsi":"001010000000002"},
+                              "imei":"860000000000001",
                               "rat":[{"band":[{"signal":{"rsrp":-111,"rsrq":-18.0}}]}]}},
             "3": {"name":"Wi-Fi WAN on 2.4 GHz","enable":false,"statusLed":"gray",
                   "message":"Disabled","uptime":0,"type":"wifi"},
@@ -765,7 +766,7 @@ mod tests {
              "vlanId":10,"ip":"10.10.10.52","connectionType":"wifi"},
             {"mac":"99:88:77:66:55:44","name":"iPad","active":false,
              "vlanId":10,"ip":"10.10.10.53","connectionType":"wifi"},
-            {"mac":"F8:5E:3C:D0:13:0E","name":"OpenWrt","active":true,
+            {"mac":"02:00:00:00:13:0E","name":"OpenWrt","active":true,
              "ip":"192.168.50.30","connectionType":"ethernet"}
         ]})
     }
@@ -858,15 +859,15 @@ mod tests {
             "client IPs must not survive"
         );
         assert!(
-            !serialized.contains("302720713604621"),
+            !serialized.contains("001010000000001"),
             "IMSI must not survive"
         );
         assert!(
-            !serialized.contains("89302720554119789815"),
+            !serialized.contains("89000000000000000001"),
             "ICCID must not survive"
         );
         assert!(
-            !serialized.contains("868371053659609"),
+            !serialized.contains("860000000000001"),
             "IMEI must not survive"
         );
         assert_eq!(

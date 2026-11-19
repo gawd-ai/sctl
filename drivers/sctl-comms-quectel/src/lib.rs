@@ -1537,8 +1537,8 @@ mod tests {
             let response = match command.as_str() {
                 "AT+CGMM" => "EC25-AF\r\nOK\r\n",
                 "AT+CGMR" => "EC25AFFDR07A10M4G\r\nOK\r\n",
-                "AT+GSN" => "868748070457085\r\nOK\r\n",
-                "AT+QCCID" => "+QCCID: 89014103211118510720\r\nOK\r\n",
+                "AT+GSN" => "860000000000002\r\nOK\r\n",
+                "AT+QCCID" => "+QCCID: 89000000000000000002\r\nOK\r\n",
                 "AT+CIMI" => "302720123456789\r\nOK\r\n",
                 "AT+CSQ" => "+CSQ: 15,99\r\nOK\r\n",
                 "AT+QENG=\"servingcell\"" => {
