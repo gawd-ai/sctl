@@ -37,13 +37,14 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
-use nix::fcntl::AtFlags;
-use nix::sys::stat::{fstatat, FileStat};
+use nix::errno::Errno;
+use nix::fcntl::{self, AtFlags, OFlag};
+use nix::sys::stat::{fstatat, FileStat, Mode};
 use nix::sys::statfs::{
     statfs, FsType, DEBUGFS_MAGIC, PROC_SUPER_MAGIC, SYSFS_MAGIC, TRACEFS_MAGIC,
 };
@@ -549,13 +550,21 @@ impl Facts {
 struct Handle(File);
 
 impl Handle {
+    /// `open(path, O_PATH | O_CLOEXEC)`, called directly. std's
+    /// `OpenOptions` keeps only the custom flags outside `O_ACCMODE`, and
+    /// musl's `O_ACCMODE` (`0o10000003`) holds `O_PATH`: through std, every
+    /// release target took a plain read-only open, which waited on a FIFO
+    /// and ran a device's open (0.6.12). With `O_PATH` the kernel ignores
+    /// the access mode. A signal during the lookup is retried, as std does.
     fn take(path: &Path) -> io::Result<Self> {
-        // std adds O_CLOEXEC; with O_PATH the kernel ignores the access mode.
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH)
-            .open(path)
-            .map(Self)
+        let fd = loop {
+            match fcntl::open(path, OFlag::O_PATH | OFlag::O_CLOEXEC, Mode::empty()) {
+                Err(Errno::EINTR) => {}
+                other => break other?,
+            }
+        };
+        // SAFETY: `fd` was just returned by open(2) and is owned by nobody else.
+        Ok(Self(File::from(unsafe { OwnedFd::from_raw_fd(fd) })))
     }
 
     /// `/proc/self/fd/<n>`: names the handle's file for `readlink`,
@@ -581,7 +590,8 @@ impl Handle {
         Ok(statfs(&self.fd_path())?.filesystem_type())
     }
 
-    /// The handle's own file, opened for reading.
+    /// The handle's own file, opened for reading. std keeps these flags:
+    /// neither lies in `O_ACCMODE` on any target (checked below).
     fn reopen(&self) -> io::Result<File> {
         OpenOptions::new()
             .read(true)
@@ -589,6 +599,13 @@ impl Handle {
             .open(self.fd_path())
     }
 }
+
+// std's `custom_flags` keeps only the flags outside `O_ACCMODE`, which on
+// musl holds `O_PATH` too. Every flag the agent passes through it (above,
+// and in `upgrade::cli_name`'s read of its wrapper) lies outside it on the
+// target being built.
+const _: () =
+    assert!((libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_NOFOLLOW) & libc::O_ACCMODE == 0);
 
 /// procfs and sysfs files are read only from the list; debugfs and tracefs
 /// files never.
@@ -692,6 +709,8 @@ fn absolute(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    use nix::fcntl::FcntlArg;
+    use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
     use std::os::unix::fs::{symlink, MetadataExt};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::mpsc::RecvTimeoutError;
@@ -1022,6 +1041,11 @@ mod tests {
             });
             assert_eq!(what, "a FIFO");
         }
+        let what = answers_at_once(Some(&fifo), {
+            let (gate, fifo) = (gate.clone(), fifo.clone());
+            move || expect_not_regular(gate.open(&fifo, Purpose::Move))
+        });
+        assert_eq!(what, "a FIFO");
         assert_eq!(
             expect_not_regular(gate.open(Path::new("/dev/null"), Purpose::Read)),
             "a character device"
@@ -1031,6 +1055,110 @@ mod tests {
             "a character device"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The handle is `O_PATH`, so taking it opens nothing. Through std's
+    /// `custom_flags` it was only on glibc: musl's `O_ACCMODE` holds
+    /// `O_PATH`, std drops the flags in it, and the handle was a plain
+    /// read-only open on every release target (0.6.12).
+    #[test]
+    fn the_handle_carries_o_path_and_only_the_reopen_reads() {
+        let dir = scratch("o-path");
+        let file = dir.join("plain.txt");
+        std::fs::write(&file, b"twelve bytes").unwrap();
+        let fifo = dir.join("pipe");
+        mkfifo(&fifo);
+        let link = dir.join("link");
+        symlink(&file, &link).unwrap();
+        let paths: [&Path; 5] = [&file, &fifo, &dir, &link, Path::new("/dev/null")];
+        for path in paths {
+            let owned = path.to_path_buf();
+            let (status, fd_flags) = answers_at_once(Some(&fifo), move || {
+                let h = Handle::take(&owned).unwrap();
+                let fd = h.0.as_raw_fd();
+                (
+                    fcntl::fcntl(fd, FcntlArg::F_GETFL).unwrap(),
+                    fcntl::fcntl(fd, FcntlArg::F_GETFD).unwrap(),
+                )
+            });
+            let shown = path.display();
+            assert_ne!(status & libc::O_PATH, 0, "{shown}: flags {status:#o}");
+            assert_ne!(fd_flags & libc::FD_CLOEXEC, 0, "{shown}");
+        }
+        // The file judged is then opened for reading, without waiting.
+        let mut reopened = Handle::take(&link).unwrap().reopen().unwrap();
+        let status = fcntl::fcntl(reopened.as_raw_fd(), FcntlArg::F_GETFL).unwrap();
+        assert_eq!(status & libc::O_PATH, 0, "flags {status:#o}");
+        assert_eq!(
+            status & libc::O_ACCMODE,
+            libc::O_RDONLY,
+            "flags {status:#o}"
+        );
+        assert_ne!(status & libc::O_NONBLOCK, 0, "flags {status:#o}");
+        let mut text = String::new();
+        reopened.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "twelve bytes");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A link outside the key directories to a file in one is refused by
+    /// its real path, and the refusal opens nothing: a FIFO there answers at
+    /// once, and a key file there sees no open.
+    #[test]
+    fn a_link_into_a_key_directory_is_refused_without_opening_its_file() {
+        let root = scratch("link-in");
+        let state_dir = root.join("state");
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let gate = Gate::new(
+            vec![(state_dir.clone(), "the agent's state directory")],
+            None,
+        );
+
+        // A FIFO in the key directory: an open would wait for a writer.
+        let fifo = state_dir.join("pipe");
+        mkfifo(&fifo);
+        let link = elsewhere.join("notes");
+        symlink(&fifo, &link).unwrap();
+        for purpose in [Purpose::Read, Purpose::Move] {
+            let (rule, stage) = answers_at_once(Some(&fifo), {
+                let (gate, link) = (gate.clone(), link.clone());
+                move || expect_protected(gate.open(&link, purpose))
+            });
+            assert_eq!(stage, Stage::File);
+            assert!(rule.starts_with("the agent's state directory"), "{rule}");
+        }
+
+        // A key file in it, watched for opens.
+        let key = state_dir.join("tls_pins.json");
+        std::fs::write(&key, "{}").unwrap();
+        let link = elsewhere.join("pins");
+        symlink(&key, &link).unwrap();
+        let inotify = Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC).unwrap();
+        inotify.add_watch(&key, AddWatchFlags::IN_OPEN).unwrap();
+        let opens = || match inotify.read_events() {
+            Ok(events) => events.len(),
+            Err(Errno::EAGAIN) => 0,
+            Err(e) => panic!("inotify: {e}"),
+        };
+        // Linux before 5.13 reports an O_PATH handle as an open too; there
+        // only the FIFO above shows the refusal opens nothing. The kernel
+        // is asked directly, never through the handle under test.
+        let fd = fcntl::open(&key, OFlag::O_PATH | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
+        nix::unistd::close(fd).unwrap();
+        if opens() == 0 {
+            let (rule, stage) = expect_protected(gate.open(&link, Purpose::Read));
+            assert_eq!(stage, Stage::File);
+            assert!(rule.starts_with("the agent's state directory"), "{rule}");
+            assert_eq!(opens(), 0, "the refusal opened the key file");
+        } else {
+            eprintln!("this kernel reports an O_PATH handle as an open: the watch is not checked");
+        }
+        // The watch sees a plain open.
+        drop(File::open(&key).unwrap());
+        assert!(opens() > 0, "the watch saw no open");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
