@@ -10,6 +10,17 @@ under per-component headings. `server/CHANGELOG.md` is frozen.
 
 ## [Unreleased]
 
+## [0.6.13] - 2026-11-19
+
+### File reads
+- **The file gate's handle opens nothing on the release builds, as 0.6.12 promised** (ADR-011, TRD-9). 0.6.12 took the handle through std's `OpenOptions` with `custom_flags(O_PATH)`. std keeps only the custom flags outside `O_ACCMODE`, and musl's `O_ACCMODE` holds `O_PATH`, so on every release target, all musl, the handle was a plain read-only open. A read of a FIFO with no writer waited for one, and 32 such reads held every one of the tunnel client's handler permits, so every relayed operation on the unit stopped until a writer came, the agent was killed with SIGKILL or the unit rebooted (a SIGTERM left the agent running while a read waited). A device's driver open ran before the `NOT_A_REGULAR_FILE` refusal. A refusal decided on the real path, as for a link outside the key directories to a file in one, opened the protected file read-only before refusing it, though nothing of it was read or returned. The handle now comes from `open(2)` called directly with `O_PATH | O_CLOEXEC`, so no FIFO waits, no driver's open runs and no refusal opens the file, on every target. A glibc build, the one CI tested, was not affected; 0.6.11 opened and read such files, so this is no regression against it. Found by a bench run of 0.6.12.303.
+
+### Network tools
+- **`sctl help net` says a destination the unit holds itself is refused** (`own_address`, on any of its interfaces, up or down), as the guard does and `docs/guide.md` says; 0.6.12's help said it passed. The loopback passes, except with `--expect-mac`.
+
+### Release pipeline
+- **CI runs the file gate's tests on `x86_64-unknown-linux-musl`**, the libc every release target uses, beside the workspace job on glibc: the gate's own tests with the file routes' and the transfers'. The gate's tests now check that its handle carries `O_PATH` (`fcntl`), that a FIFO behind a link into a key directory is refused at once, and that a key file there sees no open; under musl, 0.6.12's handle fails five of them.
+
 ## [0.6.12] - 2026-11-19
 
 ### devices
