@@ -47,6 +47,25 @@ jobs:
         run: test ! -e server/bindings || (echo "stray ts-rs output at server/bindings — the workspace .cargo/config.toml env should make this impossible; investigate" && exit 1)
       - run: cargo doc --workspace --no-deps
 
+  # Every release target is musl, and the job above tests on glibc. std's
+  # custom_flags drops the flags in O_ACCMODE, which on musl holds O_PATH:
+  # 0.6.12's file gate opened the files it judged on every release binary
+  # while its tests passed here. This runs the gate's tests, and the
+  # routes' and transfers' that read through it, on the libc the units run.
+  test-musl:
+    name: File gate tests (x86_64 musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.1" # keep in sync with rust-toolchain.toml
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      # ring's C code builds with musl-gcc.
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: 'cargo test -p sctl --lib --target x86_64-unknown-linux-musl -- file_access gawdxfer:: routes::files:: --skip export_bindings'
+
   check-web:
     name: Check & Package (sctlin)
     runs-on: ubuntu-latest
