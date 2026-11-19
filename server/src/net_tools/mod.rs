@@ -76,7 +76,9 @@ They send only on this unit's LAN side: a destination the kernel routes
 with no gateway, by an interface that is up, takes ARP, is not
 point-to-point, is not the LTE bearer and holds an IPv4 address. The socket
 is bound to that interface and its address. A destination the unit holds
-itself passes. Broadcast, multicast and IPv6 destinations are refused.
+on one of its interfaces, up or down, is refused (own_address); the
+loopback passes without --expect-mac, since nothing leaves the unit.
+Broadcast, multicast and IPv6 destinations are refused.
 
 Options for every tool:
       --dev <IFACE>        Send by this LAN-side interface holding an address
@@ -667,6 +669,10 @@ mod cli {
             let help = crate::net_tools::help();
             assert!(!help.contains("--community"));
             assert!(!help.contains("-c,"));
+            // The guard refuses the unit's own addresses (0.6.12's help
+            // said they passed).
+            assert!(!help.contains("itself passes"));
+            assert!(help.contains("up or down, is refused (own_address)"));
             for word in [
                 "--dev",
                 "--expect-mac",
