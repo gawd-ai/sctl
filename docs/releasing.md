@@ -269,11 +269,12 @@ Release checklist additions:
    reconnect once (ADR-003). The previous binary stays in
    `/var/lib/sctl/rollback/`.
 
-Before the bundle is signed, the `Assemble` step proves every `server`
-artifact (`sctl-<target>`, the gunzipped `sctl-server-<target>.gz`) embeds
-the manifest's four-part version (`strings -n 5`, the version bounded by
-non-version characters: it sits inside a longer merged string in the
-binary). The plugins, `libc` and `libgcc` embed no version and are not
-checked. One failure refuses the release, so a bundle on a relay is trusted
-to upgrade every target it names (ADR-001). The step's log reads
-`proof ok <name>` per artifact.
+Once the bundle is signed (`scripts/release-bundle.sh` signs `release.json`
+as it writes it) and before it is published, the `Assemble` step proves every
+`server` artifact (`sctl-<target>`, the gunzipped `sctl-server-<target>.gz`)
+embeds the manifest's four-part version (`strings -n 5`, the version
+bounded by non-version characters: it sits inside a longer merged string in
+the binary). The plugins, `libc` and `libgcc` embed no version and are not
+checked. One failure fails the step, so nothing is published, and a bundle
+on a relay is trusted to upgrade every target it names (ADR-001). The step's
+log reads `proof ok <name>` per artifact.
