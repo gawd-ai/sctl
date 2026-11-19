@@ -108,7 +108,9 @@ copy_and_gzip() {
     local gz=$3
 
     install -m 0755 "$src" "$dst"
-    gzip -9 -c "$dst" > "$gz"
+    # -n: no name and no time in the header, so a file whose bytes did not
+    # change gzips to the same bytes, and a unit does not fetch it again.
+    gzip -9 -n -c "$dst" > "$gz"
 }
 
 print_artifact_sizes() {
