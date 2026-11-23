@@ -199,12 +199,17 @@ impl ActivityLog {
         request_id: Option<String>,
         refusal: bool,
     ) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
 
+        // The id is taken under the ring's lock, so the ring is always in
+        // id order whatever the order two tasks reach it in: `since` reads
+        // by id, and the refusals' share finds its oldest by id. Taken
+        // before the lock, a later id could land first.
+        let mut ring = self.entries.write().await;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let entry = ActivityEntry {
             id,
             timestamp,
@@ -215,7 +220,8 @@ impl ActivityLog {
             request_id,
         };
 
-        // Broadcast before acquiring the write lock (non-blocking for readers)
+        // Sent under the lock, which costs a reader nothing (a send never
+        // waits) and keeps the broadcasts in id order too.
         let _ = self.broadcast_tx.send(
             crate::ws::messages::WsServerMsg::ActivityNew {
                 entry: entry.clone(),
@@ -223,7 +229,6 @@ impl ActivityLog {
             .to_value(),
         );
 
-        let mut ring = self.entries.write().await;
         if refusal {
             // The oldest refusal makes room for this one: ids only grow, so
             // the entries are in id order.
@@ -487,5 +492,53 @@ mod ring_tests {
             2
         );
         assert_eq!(kept.len(), 8);
+    }
+
+    /// Two tasks append at once. An id taken before the ring's lock could
+    /// reach the ring after a later one: the ring was then out of id order,
+    /// the search for the oldest refusal missed, and each miss let one
+    /// refusal past the share and, on a full ring, pushed an old entry
+    /// out. The id is taken under the lock: the ring is always in id
+    /// order, and a flood from several tasks takes a quarter and no more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn appends_from_several_tasks_keep_the_ring_in_order_and_the_share_whole() {
+        for _ in 0..20 {
+            let log = std::sync::Arc::new(log_of(200));
+            for n in 0..200 {
+                exec(&log, n).await;
+            }
+            let tasks: Vec<_> = (0..4)
+                .map(|t| {
+                    let log = log.clone();
+                    tokio::spawn(async move {
+                        for n in 0..400 {
+                            refused(&log, t * 1000 + n).await;
+                        }
+                    })
+                })
+                .collect();
+            for task in tasks {
+                task.await.unwrap();
+            }
+            let entries = log.read_since(0, 1000).await;
+            assert!(
+                entries.windows(2).all(|w| w[0].id < w[1].id),
+                "the ring is in id order"
+            );
+            let refusals = entries
+                .iter()
+                .filter(|e| e.activity_type == ActivityType::FileRead)
+                .count();
+            assert_eq!(refusals, 50, "the share, and no more");
+            assert_eq!(entries.len(), 200);
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|e| e.activity_type == ActivityType::Exec)
+                    .count(),
+                150,
+                "a parallel flood takes a quarter of the ring, no more"
+            );
+        }
     }
 }
