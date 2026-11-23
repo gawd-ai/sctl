@@ -1462,8 +1462,10 @@ mod tests {
     }
 
     /// An owner on a WE826 that prefers the wire: the route lands there,
-    /// LTE's metric 0 notwithstanding, and the tunnel follows it.
-    #[tokio::test]
+    /// LTE's metric 0 notwithstanding, and the tunnel follows it. On the
+    /// paused clock, as its siblings that wait for a round are: `next_round`
+    /// sleeps to the schedule's next point, which is minutes on a real one.
+    #[tokio::test(start_paused = true)]
     async fn a_preferred_wire_holds_the_route_over_a_lower_metric_lte() {
         let fake = Fake::new(we826());
         let mut owner = Owner::new(fake.clone(), schedule(), prefer(&["eth0", "usb0"]));
