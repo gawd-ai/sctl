@@ -839,10 +839,20 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         },
     );
     if restart_helper_working {
-        tokio::spawn(sctl::upgrade::restart::watch_until_done(
+        // The helper reads this process's health; it is given its own time
+        // and a margin, and settled if it leaves no outcome.
+        let timing = sctl::upgrade::restart::Timing::production();
+        let bound = timing.bound(
+            install
+                .as_ref()
+                .map_or(sctl::upgrade::install::Layout::GzTmp, |i| i.layout),
+        );
+        tokio::spawn(sctl::upgrade::restart::supervise(
             restart.clone(),
             instance.to_string(),
             boot_unix_ms,
+            timing,
+            bound,
         ));
     } else {
         sctl::upgrade::restart::note_outcome(&restart.current());

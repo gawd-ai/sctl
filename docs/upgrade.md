@@ -479,8 +479,8 @@ a log, the loader words, `systemd-run --collect` on `systemd`); the 2 s the
 helper waits so the answer leaves; the restart command through `sh -c`; two
 healthy answers 5 s apart within 180 s; one in-flight rule, so that while
 either an upgrade or a restart is in flight the other is refused; the
-helper's lock, the reconcile at start and the watch of the record; and the
-`upgrade.state` push, which carries the restart's record as `restart`.
+helper's lock and the reconcile at start; and the `upgrade.state` push,
+which carries the restart's record as `restart`.
 
 What it does not share: the helper is the running binary started again as
 `sctl restart-apply --dir <state_dir>/upgrade/restart`, not a copy, since
@@ -512,6 +512,13 @@ What the agent does:
    window) or `not_healthy`, and exits. It never reboots the unit.
 6. **The new agent** reads the record at start, as it reads an upgrade's
    state, and writes its own `boot` into it as `boot_after`.
+7. **Neither process waits on the helper for ever.** While the helper
+   works the agent looks at the record once a second. A helper found gone
+   without an outcome (its lock free 15 s or more after its start), or
+   silent past its own time and a minute, is given up: the process that
+   accepted the request and is still running writes `not_restarted` with a
+   detail that begins `helper lost`, opens the gate on recovery runs and
+   takes requests again. The in-flight lock is held for the hand-off only.
 
 What the restart command does per layout, and what starts the agent again
 if the new process exits:

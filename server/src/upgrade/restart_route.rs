@@ -69,6 +69,8 @@ pub struct Deps {
     pub free_kb: Arc<FreeKb>,
     /// Start the detached helper.
     pub start_helper: Arc<StartHelper>,
+    /// How long the agent waits on its helper.
+    pub timing: restart::Timing,
 }
 
 impl Deps {
@@ -80,6 +82,7 @@ impl Deps {
             wrapper: PathBuf::from(install::RAMBOOT_WRAPPER_PATH),
             free_kb: Arc::new(|path| super::stage::free_bytes(path).map(|bytes| bytes / 1024)),
             start_helper: Arc::new(start_helper),
+            timing: restart::Timing::production(),
         }
     }
 }
@@ -301,56 +304,56 @@ pub async fn accept(state: &AppState, body: &[u8], deps: Deps) -> Result<Accepte
 }
 
 /// After the answer: end every session and job, write the helper's plan,
-/// move the record to `restarting` and start the helper. Then watch the
-/// record: a process that is still here when the helper ends it was not
-/// restarted, and opens the gate on recovery runs again.
+/// move the record to `restarting` and start the helper. Then wait on the
+/// helper, with a bound: a process that is still here when the record ends
+/// was not restarted, and opens the gate on recovery runs again.
 async fn hand_off(state: AppState, deps: Deps, install: Arc<InstallInfo>, accepted_unix_secs: u64) {
-    // Held for the hand-off and the helper's run: the route's guard dropped
-    // when it answered, and the record already refuses the next request.
-    let _guard = state.upgrade.in_flight.lock().await;
     let runs = state.infra_digest.runs();
-    // The agent ends them itself, so none is left to a supervisor's kill
-    // timeout. The answer said so.
-    state.session_manager.kill_all().await;
+    {
+        // Held for the hand-off only, as the upgrade holds it for its
+        // staging: once the helper is started the record refuses the next
+        // request, and a helper that dies must not leave the lock held.
+        let _guard = state.upgrade.in_flight.lock().await;
+        // The agent ends them itself, so none is left to a supervisor's
+        // kill timeout. The answer said so.
+        state.session_manager.kill_all().await;
 
-    let dir = state.restart.helper_dir().to_path_buf();
-    let plan = Plan {
-        v: 1,
-        restart: install.restart.clone(),
-        health_url: install.health_url(&state.config.server.listen),
-        layout: install.layout,
-        record_path: state.restart.path().to_path_buf(),
-        instance_before: state.instance.to_string(),
-    };
-    let started = restart_apply::save_plan(&dir, &plan).and_then(|()| {
-        state.restart.set(state.restart.current().restarting());
-        (deps.start_helper)(&dir, &install, accepted_unix_secs)
-    });
-    if let Err(e) = started {
-        warn!("restart: the helper could not be started: {e}");
-        state.restart.set(state.restart.current().finished(
-            Outcome::NotStarted,
-            Some(format!("the helper could not be started: {e}")),
-        ));
-        runs.reopen();
-        return;
+        let dir = state.restart.helper_dir().to_path_buf();
+        let plan = Plan {
+            v: 1,
+            restart: install.restart.clone(),
+            health_url: install.health_url(&state.config.server.listen),
+            layout: install.layout,
+            record_path: state.restart.path().to_path_buf(),
+            instance_before: state.instance.to_string(),
+        };
+        let started = restart_apply::save_plan(&dir, &plan).and_then(|()| {
+            state.restart.set(state.restart.current().restarting());
+            state.restart.helper_started(deps.timing.grace);
+            (deps.start_helper)(&dir, &install, accepted_unix_secs)
+        });
+        if let Err(e) = started {
+            warn!("restart: the helper could not be started: {e}");
+            state.restart.set(state.restart.current().finished(
+                Outcome::NotStarted,
+                Some(format!("the helper could not be started: {e}")),
+            ));
+            runs.reopen();
+            return;
+        }
+        info!("restart: handed off to the helper");
     }
-    info!("restart: handed off to the helper");
 
-    let ended = restart::watch_until_done(
+    // A helper that dies, or hangs, is given up: found gone without an
+    // outcome, or past its own time and a margin.
+    restart::supervise(
         state.restart.clone(),
         state.instance.to_string(),
         state.boot_unix_ms,
+        deps.timing,
+        deps.timing.bound(install.layout),
     )
     .await;
-    if ended.is_none() {
-        // The record could not be watched. A helper that ends it while this
-        // process still runs is read once both of its windows have passed.
-        tokio::time::sleep(2 * HEALTH_WINDOW + Duration::from_mins(1)).await;
-        if !restart_in_flight(&state) {
-            restart::note_outcome(&state.restart.current());
-        }
-    }
     // Still here: this process was not restarted. Recoveries may run again.
     runs.reopen();
 }
@@ -403,6 +406,15 @@ mod tests {
                 recorded.lock().unwrap().push(record.current().phase);
                 Ok(())
             }),
+            // A look every 10 ms; a helper's stand-in is given 5 s to
+            // write, so a loaded machine does not read it as lost.
+            timing: restart::Timing {
+                poll: Duration::from_millis(10),
+                grace: Duration::from_secs(5),
+                settle: Duration::ZERO,
+                window: Duration::from_secs(30),
+                margin: Duration::from_secs(5),
+            },
         };
         Bench {
             dir,
@@ -661,6 +673,113 @@ mod tests {
         let accepted = ask(&b, r#"{"request_id": "new"}"#).await.unwrap();
         assert_eq!(accepted.body["restart"]["request_id"], "new");
         helper_ends(&b, accepted, Outcome::NotRestarted).await;
+    }
+
+    /// The in-flight lock is held for the hand-off only. While the helper
+    /// works it is free, as it is while an upgrade's helper works, and the
+    /// record is what refuses the next request.
+    #[tokio::test]
+    async fn the_lock_is_released_once_the_helper_is_started() {
+        let mut b = bench("released");
+        // The stand-in is a live helper: it holds the helper's lock.
+        let held = Arc::new(Mutex::new(None));
+        let (holder, record) = (held.clone(), b.state.restart.clone());
+        b.deps.start_helper = Arc::new(move |dir, _, _| {
+            *holder.lock().unwrap() = crate::upgrade::apply::take_lock(dir);
+            assert_eq!(record.current().phase, Phase::Restarting);
+            Ok(())
+        });
+        let accepted = ask(&b, r#"{"request_id": "r-1"}"#).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while held.lock().unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the helper is started");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            b.state.upgrade.in_flight.try_lock().is_ok(),
+            "the lock is not held while the helper works"
+        );
+        assert!(
+            !accepted.hand_off.is_finished(),
+            "the agent still waits on it"
+        );
+        // The record refuses, at once, with no wait for a lock.
+        let at = std::time::Instant::now();
+        let (status, error) = ask(&b, "").await.err().unwrap();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error["code"], "RESTART_IN_FLIGHT");
+        assert!(at.elapsed() < LOCK_WAIT, "refused by the record");
+        assert!(
+            b.state.infra_digest.runs().is_closed(),
+            "the gate stays closed"
+        );
+        helper_ends(&b, accepted, Outcome::NotRestarted).await;
+    }
+
+    /// A helper that dies after it was started (out of memory, an exec that
+    /// fails inside its unit) writes no outcome. The agent does not wait on
+    /// it for ever: the record is settled, recoveries may run again, and
+    /// the next request is taken.
+    #[tokio::test]
+    async fn a_helper_that_dies_after_its_start_does_not_hold_the_unit() {
+        let mut b = bench("dies");
+        b.deps.timing.grace = Duration::from_millis(60);
+        // The stand-in starts and is gone: no lock, no outcome.
+        let accepted = ask(&b, r#"{"request_id": "r-7"}"#).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), accepted.hand_off)
+            .await
+            .expect("the hand-off ends without the helper")
+            .unwrap();
+        let record = b.state.restart.current();
+        assert_eq!(record.outcome, Some(Outcome::NotRestarted));
+        assert_eq!(record.detail.as_deref(), Some(restart::HELPER_LOST));
+        assert_eq!(record.request_id.as_deref(), Some("r-7"));
+        assert!(
+            !b.state.infra_digest.runs().is_closed(),
+            "recoveries may run"
+        );
+        assert!(b.state.upgrade.in_flight.try_lock().is_ok());
+        b.deps.timing.grace = Duration::from_secs(5);
+        let again = ask(&b, r#"{"request_id": "r-8"}"#).await.unwrap();
+        assert_eq!(again.body["restart"]["request_id"], "r-8");
+        helper_ends(&b, again, Outcome::NotRestarted).await;
+    }
+
+    /// A helper that hangs holds its lock and writes nothing: past its own
+    /// time and the margin the agent gives it up.
+    #[tokio::test]
+    async fn a_helper_that_hangs_is_given_up_past_its_time() {
+        let mut b = bench("hangs");
+        b.deps.timing.window = Duration::from_millis(150);
+        b.deps.timing.margin = Duration::from_millis(50);
+        let held = Arc::new(Mutex::new(None));
+        let holder = held.clone();
+        b.deps.start_helper = Arc::new(move |dir, _, _| {
+            *holder.lock().unwrap() = crate::upgrade::apply::take_lock(dir);
+            Ok(())
+        });
+        let at = std::time::Instant::now();
+        let accepted = ask(&b, "").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), accepted.hand_off)
+            .await
+            .expect("the hand-off ends at the bound")
+            .unwrap();
+        assert!(
+            at.elapsed() >= Duration::from_millis(200),
+            "not before the bound"
+        );
+        assert!(
+            held.lock().unwrap().is_some(),
+            "its lock was held throughout"
+        );
+        assert_eq!(
+            b.state.restart.current().outcome,
+            Some(Outcome::NotRestarted)
+        );
+        assert!(!b.state.infra_digest.runs().is_closed());
     }
 
     #[tokio::test]

@@ -350,6 +350,9 @@ pub struct Handle {
     path: PathBuf,
     helper_dir: PathBuf,
     tx: tokio::sync::watch::Sender<RestartState>,
+    /// Until when a helper this process started is given to take its lock:
+    /// before that, a free lock does not mean the helper is gone.
+    helper_grace_until: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl Handle {
@@ -371,6 +374,7 @@ impl Handle {
             path,
             helper_dir: helper_dir(state_dir),
             tx,
+            helper_grace_until: std::sync::Mutex::new(None),
         }
     }
 
@@ -412,12 +416,73 @@ impl Handle {
         Some(state)
     }
 
+    /// This process has just started a helper: for `grace` a free lock
+    /// does not mean it is gone, since it has yet to take it.
+    pub fn helper_started(&self, grace: std::time::Duration) {
+        let until = std::time::Instant::now() + grace;
+        *self
+            .helper_grace_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(until);
+    }
+
     /// Whether the helper is gone: its lock is free, or it never had a
-    /// directory to hold one in.
+    /// directory to hold one in. Never true in the grace a helper this
+    /// process started is given to take its lock.
     pub fn helper_gone(&self) -> bool {
-        !self.helper_dir.is_dir() || lock_is_free(&self.helper_dir)
+        let in_grace = self
+            .helper_grace_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|until| std::time::Instant::now() < until);
+        !in_grace && (!self.helper_dir.is_dir() || lock_is_free(&self.helper_dir))
     }
 }
+
+/// How long the agent waits on its helper, and how often it looks.
+#[derive(Clone, Copy, Debug)]
+pub struct Timing {
+    /// How often the record and the helper's lock are looked at.
+    pub poll: std::time::Duration,
+    /// How long a helper just started is given to take its lock.
+    pub grace: std::time::Duration,
+    /// The helper's settle time before it runs the command.
+    pub settle: std::time::Duration,
+    /// One of the helper's windows.
+    pub window: std::time::Duration,
+    /// What is allowed beyond the helper's own time before it is given up.
+    pub margin: std::time::Duration,
+}
+
+impl Timing {
+    /// The helper's real times.
+    pub fn production() -> Self {
+        Self {
+            poll: std::time::Duration::from_secs(1),
+            grace: std::time::Duration::from_secs(15),
+            settle: super::apply::SETTLE,
+            window: super::apply::HEALTH_WINDOW,
+            margin: std::time::Duration::from_mins(1),
+        }
+    }
+
+    /// The longest a helper may take on `layout` before the agent gives it
+    /// up: its settle time, its window, twice on `gz-tmp` where it may run
+    /// the command a second time, and the margin.
+    pub fn bound(&self, layout: super::install::Layout) -> std::time::Duration {
+        let windows = if layout == super::install::Layout::GzTmp {
+            2
+        } else {
+            1
+        };
+        self.settle + self.window * windows + self.margin
+    }
+}
+
+/// What a record says when its helper is gone, or overdue, without an
+/// outcome while the process that accepted the request still runs.
+pub const HELPER_LOST: &str =
+    "helper lost: it ended, or ran out of time, without an outcome; this process was not restarted";
 
 /// Settle a record whose helper is gone without an outcome, as the process
 /// `me` reads it. `None` when there is nothing to settle: no restart in
@@ -429,26 +494,24 @@ fn settled(handle: &Handle, me: &Process<'_>) -> Option<RestartState> {
             Outcome::NotStarted,
             Some("the agent stopped before it handed off to its helper".to_string()),
         )),
-        Phase::Restarting if handle.helper_gone() => {
-            if state.instance_before.as_deref() == Some(me.instance) {
-                Some(state.finished(
-                    Outcome::NotStarted,
-                    Some(
-                        "the helper is gone without an outcome, and the same process is running"
-                            .to_string(),
-                    ),
-                ))
-            } else {
-                let mut ok = state.finished(
-                    Outcome::Ok,
-                    Some("the helper did not report; a new process is running".to_string()),
-                );
-                ok.instance_after = Some(me.instance.to_string());
-                ok.boot_after = Some(me.boot);
-                Some(ok)
-            }
-        }
+        Phase::Restarting if handle.helper_gone() => Some(settled_now(state, me)),
         Phase::Restarting | Phase::Idle | Phase::Done => None,
+    }
+}
+
+/// End a `restarting` record that no helper will end, as the process `me`
+/// reads it.
+fn settled_now(state: RestartState, me: &Process<'_>) -> RestartState {
+    if state.instance_before.as_deref() == Some(me.instance) {
+        state.finished(Outcome::NotRestarted, Some(HELPER_LOST.to_string()))
+    } else {
+        let mut ok = state.finished(
+            Outcome::Ok,
+            Some("the helper did not report; a new process is running".to_string()),
+        );
+        ok.instance_after = Some(me.instance.to_string());
+        ok.boot_after = Some(me.boot);
+        ok
     }
 }
 
@@ -519,35 +582,55 @@ pub fn note_outcome(state: &RestartState) {
     }
 }
 
-/// Watch the record until the helper ends it, publishing every write; then
-/// stamp it and say how it ended. Returns the record as it ended, or `None`
-/// when the directory cannot be watched (the outcome is then read at the
-/// next start).
-pub async fn watch_until_done(
+/// Wait on the helper, with a bound: look at the record every
+/// `timing.poll` until the helper ends it, the helper is found gone without
+/// an outcome, or `bound` passes. A helper that is gone or overdue is
+/// settled as this process reads it, so a helper that died (or hangs) never
+/// leaves a restart in flight for good. Returns the record as it ended.
+///
+/// Both processes run it: the one that started the helper, which is still
+/// here only if the restart did not stop it, and the one the restart
+/// started, while the helper reads its health.
+pub async fn supervise(
     handle: std::sync::Arc<Handle>,
     instance: String,
     boot: u64,
-) -> Option<RestartState> {
-    let dir = handle.path().parent().map(Path::to_path_buf)?;
-    let watched = handle.clone();
-    super::watch::watch_file(dir, FILE_NAME, move |_| {
-        watched.reload().is_some_and(|s| s.phase == Phase::Done)
-    })
-    .await;
-    let state = handle.current();
-    if state.phase != Phase::Done {
-        return None;
+    timing: Timing,
+    bound: std::time::Duration,
+) -> RestartState {
+    let me = Process {
+        instance: &instance,
+        boot,
+    };
+    let started = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(timing.poll).await;
+        // The outcome first: a helper that has written it and gone is done,
+        // not lost.
+        handle.reload();
+        if handle.current().phase != Phase::Restarting {
+            break;
+        }
+        let overdue = started.elapsed() >= bound;
+        if overdue || handle.helper_gone() {
+            handle.reload();
+            let state = handle.current();
+            if state.phase == Phase::Restarting {
+                let lost = settled_now(state, &me);
+                warn!(
+                    overdue,
+                    "restart: the helper left no outcome: {}",
+                    lost.detail.as_deref().unwrap_or("")
+                );
+                handle.set(lost);
+            }
+            break;
+        }
     }
-    stamp(
-        &handle,
-        &Process {
-            instance: &instance,
-            boot,
-        },
-    );
+    stamp(&handle, &me);
     let state = handle.current();
     note_outcome(&state);
-    Some(state)
+    state
 }
 
 #[cfg(test)]
@@ -647,11 +730,12 @@ mod tests {
         assert_eq!(state.boot_after, Some(NEW.boot));
         assert!(state.detail.unwrap().contains("did not report"));
 
-        // The same process: nothing restarted it.
+        // The same process: nothing restarted it, and its helper is lost.
         handle.set(RestartState::accepted(None, &OLD).restarting());
         std::fs::create_dir_all(handle.helper_dir()).unwrap();
         assert!(!reconcile(&handle, &OLD));
-        assert_eq!(handle.current().outcome, Some(Outcome::NotStarted));
+        assert_eq!(handle.current().outcome, Some(Outcome::NotRestarted));
+        assert_eq!(handle.current().detail.as_deref(), Some(HELPER_LOST));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -700,16 +784,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Times small enough for a test: a look every 10 ms, 80 ms for the
+    /// helper to take its lock, and a helper given up after 400 ms.
+    const QUICK: Timing = Timing {
+        poll: std::time::Duration::from_millis(10),
+        grace: std::time::Duration::from_millis(80),
+        settle: std::time::Duration::ZERO,
+        window: std::time::Duration::from_millis(300),
+        margin: std::time::Duration::from_millis(100),
+    };
+
+    #[test]
+    fn the_bound_is_the_helpers_own_time_and_a_margin() {
+        use crate::upgrade::install::Layout;
+        let real = Timing::production();
+        // 2 s, one window of 180 s, a minute.
+        assert_eq!(real.bound(Layout::UsrBin).as_secs(), 2 + 180 + 60);
+        assert_eq!(real.bound(Layout::Ramboot), real.bound(Layout::Systemd));
+        // gz-tmp may run the command a second time: two windows.
+        assert_eq!(real.bound(Layout::GzTmp).as_secs(), 2 + 360 + 60);
+    }
+
     #[tokio::test]
-    async fn the_watcher_publishes_what_the_helper_writes_and_stamps_it() {
-        let (dir, handle) = bench("watch");
+    async fn the_supervisor_publishes_what_the_helper_writes_and_stamps_it() {
+        let (dir, handle) = bench("supervise");
         let handle = std::sync::Arc::new(handle);
         handle.set(RestartState::accepted(Some("r-3".into()), &OLD).restarting());
+        std::fs::create_dir_all(handle.helper_dir()).unwrap();
+        let lock = crate::upgrade::apply::take_lock(handle.helper_dir()).unwrap();
         let path = handle.path().to_path_buf();
-        let watcher = tokio::spawn(watch_until_done(
+        let supervisor = tokio::spawn(supervise(
             handle.clone(),
             NEW.instance.to_string(),
             NEW.boot,
+            QUICK,
+            std::time::Duration::from_secs(30),
         ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let mut done = RestartState::accepted(Some("r-3".into()), &OLD)
@@ -718,14 +827,78 @@ mod tests {
         done.instance_after = Some(NEW.instance.to_string());
         done.attempts = 1;
         save(&path, &done).unwrap();
-        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), watcher)
+        drop(lock);
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), supervisor)
             .await
-            .expect("the watcher returns on done")
-            .unwrap()
-            .expect("the record as it ended");
+            .expect("the supervisor returns on done")
+            .unwrap();
         assert_eq!(ended.outcome, Some(Outcome::Ok));
         assert_eq!(ended.boot_after, Some(NEW.boot));
         assert_eq!(handle.current(), ended);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A helper that died after it was started leaves no outcome. The
+    /// process that started it does not wait for ever: once the helper's
+    /// grace has passed and its lock is free, the record is settled.
+    #[tokio::test]
+    async fn a_helper_that_died_is_settled_once_its_lock_is_found_free() {
+        let (dir, handle) = bench("died");
+        let handle = std::sync::Arc::new(handle);
+        handle.set(RestartState::accepted(Some("r-4".into()), &OLD).restarting());
+        std::fs::create_dir_all(handle.helper_dir()).unwrap();
+        handle.helper_started(QUICK.grace);
+        // Just started: a free lock is not yet a lost helper.
+        assert!(!handle.helper_gone());
+        settle_lost_helper(&handle, &OLD);
+        assert_eq!(handle.current().phase, Phase::Restarting);
+        let at = std::time::Instant::now();
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            supervise(
+                handle.clone(),
+                OLD.instance.to_string(),
+                OLD.boot,
+                QUICK,
+                std::time::Duration::from_secs(30),
+            ),
+        )
+        .await
+        .expect("bounded by the helper's lock, not by the bound");
+        assert!(at.elapsed() >= QUICK.grace, "not before its grace");
+        assert_eq!(ended.outcome, Some(Outcome::NotRestarted));
+        assert_eq!(ended.detail.as_deref(), Some(HELPER_LOST));
+        assert_eq!(load(handle.path()).unwrap(), ended);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A helper that hangs holds its lock and writes nothing. Past its own
+    /// time and the margin it is given up, lock held or not.
+    #[tokio::test]
+    async fn a_helper_that_hangs_is_given_up_at_the_bound() {
+        use crate::upgrade::install::Layout;
+        let (dir, handle) = bench("hung");
+        let handle = std::sync::Arc::new(handle);
+        handle.set(RestartState::accepted(None, &OLD).restarting());
+        std::fs::create_dir_all(handle.helper_dir()).unwrap();
+        let _held = crate::upgrade::apply::take_lock(handle.helper_dir()).unwrap();
+        let bound = QUICK.bound(Layout::UsrBin);
+        let at = std::time::Instant::now();
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            supervise(
+                handle.clone(),
+                OLD.instance.to_string(),
+                OLD.boot,
+                QUICK,
+                bound,
+            ),
+        )
+        .await
+        .expect("bounded");
+        assert!(at.elapsed() >= bound);
+        assert_eq!(ended.outcome, Some(Outcome::NotRestarted));
+        assert_eq!(ended.detail.as_deref(), Some(HELPER_LOST));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

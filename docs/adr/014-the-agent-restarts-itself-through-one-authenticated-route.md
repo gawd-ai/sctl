@@ -43,7 +43,7 @@ Code paths are under `server/src/`; `devices/`, `docs/` and `server/files/` are 
    - the 2 s the helper waits before it touches anything, so the answer and the state push leave;
    - the restart command run through `sh -c`, and the health check's reader, interval, passes and window: two answers 5 s apart within 180 s;
    - one mutex and one in-flight rule across both: while either an upgrade or a restart is in flight, the other is refused;
-   - the helper's lock file, the reconcile at start and the inotify watch;
+   - the helper's lock file and the reconcile at start (the restart's record is looked at once a second while its helper works, where the upgrade's state is watched: a restart's wait has to be bounded, decision 6);
    - the `upgrade.state` push and the relay's keeping of it.
 
    Not shared: no manifest, no fetch, no stage, no swap, no rollback set, and no copy of the binary. Nothing is replaced, so the helper is the running binary started again (`InstallInfo::running`), as `sctl restart-apply`. A caller sends no shell text and needs no knowledge of the layout.
@@ -120,7 +120,8 @@ Code paths are under `server/src/`; `devices/`, `docs/` and `server/files/` are 
      | `not_healthy` | No new process answered twice within the window, or the two on `gz-tmp`. What starts it later, if anything, is the table above. |
      | `not_started` | The helper never ran: the agent could not start it and kept running, the gate on recovery runs open again, or the agent stopped some other way before the hand-off. |
 
-   - The agent that starts reads the record. `restarting` with the helper's lock held is watched; `restarting` with the lock free, read by a process whose `instance` is not `instance_before`, is settled as `ok` with a detail saying the helper did not report. The process the helper proved (`instance_after` is its own) writes its `boot` into the record as `boot_after`.
+   - A process that is still running when its helper ends the record was not restarted, and opens the gate on recovery runs again. It does not wait on its helper for ever: a helper found gone without an outcome, or silent past its own time and a margin, is settled `not_restarted` (the detail says the helper was lost), and requests are taken again. The in-flight mutex is held for the hand-off only, as the upgrade holds it for its staging.
+   - The agent that starts reads the record. `restarting` with the helper's lock held is waited on, with the same bound; `restarting` with the lock free, read by a process whose `instance` is not `instance_before`, is settled as `ok` with a detail saying the helper did not report. The process the helper proved (`instance_after` is its own) writes its `boot` into the record as `boot_after`.
    - The caller's proof is the next start, which the agent already reports: a `net.state` or `infra.state` whose `boot` is not `boot_before`. The record ties that start to the request: `request_id`, `boot_before`, and `boot_after` equal to the new `boot`.
 
 7. **Where the record is read, and how a caller knows the route is there.** The record lives beside the upgrade's state (`<state_dir>/upgrade/restart.json`).
