@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { parsePlaybookFrontmatter, renderPlaybookScript, validatePlaybookName } from './playbook-parser';
+import {
+	formParams,
+	isServerReference,
+	parsePlaybookFrontmatter,
+	renderPlaybookScript,
+	validatePlaybookName
+} from './playbook-parser';
 
 const SAMPLE_PLAYBOOK = `---
 name: restart-wifi
@@ -128,6 +134,53 @@ describe('renderPlaybookScript', () => {
 		expect(() => renderPlaybookScript('echo {{unknown}}', {}, {})).toThrow(
 			'undeclared parameter'
 		);
+	});
+
+	it('leaves {{agent}} as written: the server that sends the script fills it', () => {
+		const withAgent = '{{agent}} net tcp {{radio}} 80\n{{agent}} install-info';
+		expect(renderPlaybookScript(withAgent, { radio: '192.168.1.1' }, params)).toBe(
+			'{{agent}} net tcp 192.168.1.1 80\n{{agent}} install-info'
+		);
+		// With no parameter at all, too.
+		expect(renderPlaybookScript('{{agent}} net state', {}, {})).toBe('{{agent}} net state');
+	});
+
+	it('still refuses every other undeclared placeholder, beside {{agent}} or after it', () => {
+		expect(() => renderPlaybookScript('{{agent}} net tcp {{host}} 80', {}, {})).toThrow(
+			'Script references undeclared parameter: {{host}}'
+		);
+		expect(() => renderPlaybookScript('echo {{agents}}', {}, {})).toThrow(
+			'undeclared parameter: {{agents}}'
+		);
+	});
+
+	it('never fills {{agent}} from the form, even when a playbook declares it', () => {
+		const declared = {
+			agent: { type: 'string', description: 'A path', default: '/bin/false' },
+			radio: { type: 'string', description: 'Which radio', default: 'all' }
+		};
+		expect(
+			renderPlaybookScript('{{agent}} net wifi {{radio}}', { agent: '/tmp/evil' }, declared)
+		).toBe('{{agent}} net wifi all');
+		// A declared agent with no default is not a missing parameter.
+		const noDefault = { agent: { type: 'string', description: 'A path' } };
+		expect(renderPlaybookScript('{{agent}} net state', {}, noDefault)).toBe(
+			'{{agent}} net state'
+		);
+	});
+});
+
+describe('formParams', () => {
+	it('asks for every declared parameter but a server reference, sorted', () => {
+		const params = {
+			radio: { type: 'string', description: 'Which radio', default: 'all' },
+			agent: { type: 'string', description: 'A path' },
+			delay: { type: 'number', description: 'Delay', default: 5 }
+		};
+		expect(formParams(params).map(([name]) => name)).toEqual(['delay', 'radio']);
+		expect(formParams({})).toEqual([]);
+		expect(isServerReference('agent')).toBe(true);
+		expect(isServerReference('radio')).toBe(false);
 	});
 });
 

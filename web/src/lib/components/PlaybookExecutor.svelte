@@ -2,7 +2,7 @@
 	import type { PlaybookDetail, PlaybookRunState, ExecResult, ViewerTab, WsSessionOutputMsg } from '../types/terminal.types';
 	import type { SctlRestClient } from '../utils/rest-client';
 	import type { SctlWsClient } from '../utils/ws-client';
-	import { renderPlaybookScript } from '../utils/playbook-parser';
+	import { formParams, renderPlaybookScript } from '../utils/playbook-parser';
 	import { uuid } from '../utils/index';
 	import { onDestroy } from 'svelte';
 
@@ -73,7 +73,9 @@
 	$effect(() => {
 		if (playbook) {
 			const values: Record<string, string> = {};
-			for (const [name, param] of Object.entries(playbook.params)) {
+			// A server reference ({{agent}}) is not a form field: the sending
+			// server fills it.
+			for (const [name, param] of formParams(playbook.params)) {
 				values[name] = param.default !== undefined ? String(param.default) : '';
 			}
 			paramValues = values;
@@ -228,9 +230,7 @@
 		onOpenViewer(tab);
 	}
 
-	let paramEntries = $derived(
-		playbook ? Object.entries(playbook.params).sort(([a], [b]) => a.localeCompare(b)) : []
-	);
+	let paramEntries = $derived(playbook ? formParams(playbook.params) : []);
 </script>
 
 <!--

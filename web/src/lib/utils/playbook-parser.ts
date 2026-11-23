@@ -168,8 +168,35 @@ function extractScriptBlock(body: string): string {
 }
 
 /**
+ * References a playbook's script may hold that are not parameters: the
+ * server that sends the script to the unit fills them, from what it knows
+ * of the unit. `{{agent}}` is the path that runs the agent's tools there.
+ * The form never asks for one, and the renderer leaves it as written, even
+ * when a playbook declares a parameter of that name.
+ */
+export const SERVER_REFERENCES: readonly string[] = ['agent'];
+
+/** Whether `name` is a reference the sending server fills, not a parameter. */
+export function isServerReference(name: string): boolean {
+	return SERVER_REFERENCES.includes(name);
+}
+
+/**
+ * The parameters a form asks for, sorted by name: every declared parameter
+ * but a server reference.
+ */
+export function formParams(
+	params: Record<string, PlaybookParam>
+): [string, PlaybookParam][] {
+	return Object.entries(params)
+		.filter(([name]) => !isServerReference(name))
+		.sort(([a], [b]) => a.localeCompare(b));
+}
+
+/**
  * Render a playbook script by substituting {{param}} placeholders with values.
- * Falls back to param defaults if no value provided.
+ * Falls back to param defaults if no value provided. A server reference
+ * (`{{agent}}`) is left as written: the server that sends the script fills it.
  */
 export function renderPlaybookScript(
 	script: string,
@@ -179,6 +206,7 @@ export function renderPlaybookScript(
 	let result = script;
 
 	for (const [name, def] of Object.entries(params)) {
+		if (isServerReference(name)) continue;
 		const placeholder = `{{${name}}}`;
 		if (!result.includes(placeholder)) continue;
 
@@ -190,9 +218,10 @@ export function renderPlaybookScript(
 		result = result.replaceAll(placeholder, String(value));
 	}
 
-	// Check for remaining unreplaced placeholders
-	const remaining = result.match(/\{\{(\w+)\}\}/);
-	if (remaining) {
+	// Check for remaining unreplaced placeholders. A server reference is
+	// not one: it is not this renderer's to fill.
+	for (const remaining of result.matchAll(/\{\{(\w+)\}\}/g)) {
+		if (isServerReference(remaining[1])) continue;
 		throw new Error(`Script references undeclared parameter: {{${remaining[1]}}}`);
 	}
 

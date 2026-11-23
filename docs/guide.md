@@ -431,6 +431,8 @@ df -h
 
 **Template substitution:** `{{param_name}}` in the script body is replaced with the parameter value at execution time.
 
+`{{agent}}` is not a parameter. It stands for the path that runs the agent's tools on the unit (`GET /api/health`'s `cli`), and a server that sends a playbook's script to the unit fills it from what it knows of that unit. sctlin leaves `{{agent}}` in the script as written and never asks for it in its form, a playbook that declares a parameter of that name included; every other placeholder with no declared parameter is still refused before anything is sent. A client with no such server behind it, the MCP among them, has nothing to fill it with and refuses it like any undeclared placeholder.
+
 ### Auto-discovery
 
 sctl watches the `playbooks_dir` directory (default `/etc/sctl/playbooks`). Any `.md` file with valid frontmatter is automatically exposed as:
