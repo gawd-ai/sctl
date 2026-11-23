@@ -206,7 +206,7 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
     let mut resp = json!({
         "status": "ok",
         "uptime_secs": uptime,
-        // Opaque, random, made at start (ADR-014): two answers that carry
+        // Opaque, made at start and never waited for (ADR-014): two answers that carry
         // the same value came from one process.
         "instance": &*state.instance,
         "version": crate::VERSION,

@@ -109,10 +109,11 @@ Response `200`:
 }
 ```
 
-- `instance` (ADR-014): an opaque random value made when this process
-  started. It is not a time and not a counter, and it is derived from
-  nothing on the unit: two answers that carry the same value came from one
-  process, and that is all it says. The helper of a
+- `instance` (ADR-014): an opaque value made when this process started.
+  It is an identifier, not a secret: random where the kernel gives
+  randomness without waiting, mixed with the pid and the clocks, and never
+  waited for. It is not a time and not a counter: two answers that carry
+  the same value came from one process, and that is all it says. The helper of a
   [restart on request](#post-apirestart) tells the new process from the old
   one by it. It is not the `boot` that `net.state` and `infra.state` carry,
   which is the start time and stays behind the key.

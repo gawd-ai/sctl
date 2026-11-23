@@ -86,7 +86,7 @@ pub struct AppState {
     /// When this process started, unix ms: the `boot` of `net.state` and of
     /// the Infra digest.
     pub boot_unix_ms: u64,
-    /// An opaque random value made when this process started: `GET
+    /// An opaque value made when this process started, never waited for: `GET
     /// /api/health`'s `instance`, by which the restart's helper tells two
     /// processes apart on the route that needs no key.
     pub instance: Arc<str>,

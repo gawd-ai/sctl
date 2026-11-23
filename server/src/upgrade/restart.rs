@@ -9,7 +9,7 @@
 //!
 //! Two values name a process. `boot` is when it started, in unix ms: what
 //! `net.state` and `infra.state` carry, and what a caller matches its
-//! reports against. `instance` is opaque and random, made at start: what
+//! reports against. `instance` is opaque, made at start without a wait: what
 //! `GET /api/health` carries, the route that needs no key, and what the
 //! helper tells two processes apart by.
 
@@ -229,16 +229,91 @@ impl Ends {
 /// The process that reads or writes the record.
 #[derive(Clone, Copy, Debug)]
 pub struct Process<'a> {
-    /// Opaque, random, made at start (`GET /api/health`'s `instance`).
+    /// Opaque, made at start (`GET /api/health`'s `instance`).
     pub instance: &'a str,
     /// When it started, unix ms (`net.state`'s `boot`).
     pub boot: u64,
 }
 
-/// An opaque value for a process that starts now: random, not a time, not
-/// a counter, derived from nothing on the unit.
+/// The clocks and the pid a process is told apart by when the kernel gives
+/// nothing random without a wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Moment {
+    pid: u32,
+    /// The monotonic clock, in nanoseconds.
+    monotonic_ns: u128,
+    /// The wall clock, in nanoseconds since the epoch.
+    wall_ns: u128,
+}
+
+impl Moment {
+    fn now() -> Self {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid timespec, and CLOCK_MONOTONIC is always
+        // there on Linux. A failed call leaves the zeroes.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
+        #[allow(clippy::cast_sign_loss)] // The monotonic clock is not negative.
+        let monotonic_ns = (ts.tv_sec as u128) * 1_000_000_000 + ts.tv_nsec as u128;
+        Self {
+            pid: std::process::id(),
+            monotonic_ns,
+            wall_ns: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        }
+    }
+}
+
+/// Two hashers keyed by the kernel without a wait: std's hash keys come
+/// from getrandom(2) asked not to wait, and from `/dev/urandom` where the
+/// call is missing (`net_tools/snmp.rs`, `first_request_id`, draws the same
+/// way for the same reason). `None` when even that cannot be read.
+fn kernel_keyed() -> Option<[std::collections::hash_map::DefaultHasher; 2]> {
+    use std::hash::BuildHasher;
+    std::panic::catch_unwind(|| {
+        [(); 2].map(|()| std::collections::hash_map::RandomState::new().build_hasher())
+    })
+    .ok()
+}
+
+/// The instance for `moment`, from `keyed` hashers when the kernel gave
+/// some, else from the moment alone.
+fn instance_from(
+    keyed: Option<[std::collections::hash_map::DefaultHasher; 2]>,
+    moment: Moment,
+) -> String {
+    use std::hash::Hasher;
+    let hashers = keyed.unwrap_or_else(|| {
+        // Nothing random without a wait: the pid and the two clocks. An
+        // instance only has to differ from the last start's, and no two
+        // starts share all three.
+        [(); 2].map(|()| std::collections::hash_map::DefaultHasher::new())
+    });
+    let mut halves = [0_u64; 2];
+    for (lane, (mut hasher, half)) in (0_u64..).zip(hashers.into_iter().zip(&mut halves)) {
+        hasher.write_u64(lane);
+        hasher.write_u32(moment.pid);
+        hasher.write_u128(moment.monotonic_ns);
+        hasher.write_u128(moment.wall_ns);
+        *half = hasher.finish();
+    }
+    format!("{:016x}{:016x}", halves[0], halves[1])
+}
+
+/// An opaque value for a process that starts now (`GET /api/health`'s
+/// `instance`). It is an identifier, not a secret, and it is drawn on the
+/// start path, before the listener binds: it must never wait for the
+/// kernel's entropy pool. A generator that waits (getrandom(2) as a UUID
+/// draws it, which on a kernel without the call polls `/dev/random` with no
+/// limit) would leave a unit with a thin pool silent on health, on the API
+/// and on the tunnel while it only waits. So: random where the kernel gives
+/// it without waiting, mixed with the pid and the clocks, and from those
+/// alone where it gives nothing.
 pub fn new_instance() -> String {
-    uuid::Uuid::new_v4().simple().to_string()
+    instance_from(kernel_keyed(), Moment::now())
 }
 
 /// The record's path.
@@ -749,5 +824,76 @@ mod tests {
         assert_eq!(a.len(), 32);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
+    }
+
+    /// Nothing on the start path may wait for entropy. The draw goes
+    /// through std's hash keys, which the kernel gives without a wait, and
+    /// through no generator that can block: not a UUID, not getrandom, not
+    /// ring's.
+    #[test]
+    fn the_instance_is_drawn_without_a_generator_that_can_wait() {
+        let source = include_str!("restart.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the code before the tests");
+        for waits in [
+            "Uuid",
+            "uuid::",
+            "getrandom",
+            "ring::",
+            "OsRng",
+            "/dev/random",
+        ] {
+            let used = production
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.contains(waits));
+            assert!(!used, "{waits} can wait for the kernel's pool");
+        }
+        assert!(production.contains("RandomState::new()"));
+    }
+
+    /// Where the kernel gives nothing, the instance is the pid and the two
+    /// clocks: it still differs from the last start's, and it never waits.
+    #[test]
+    fn with_nothing_random_the_instance_is_the_pid_and_the_clocks() {
+        let moment = Moment {
+            pid: 4242,
+            monotonic_ns: 61_000_000_000,
+            wall_ns: 1_790_000_000_000_000_000,
+        };
+        let instance = instance_from(None, moment);
+        assert_eq!(instance.len(), 32);
+        assert!(instance.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(instance, instance_from(None, moment), "nothing else in it");
+        // Its two halves are not one value twice.
+        assert_ne!(instance[..16], instance[16..]);
+        // Another pid, a later monotonic clock or a later wall clock: another.
+        for other in [
+            Moment {
+                pid: 4243,
+                ..moment
+            },
+            Moment {
+                monotonic_ns: moment.monotonic_ns + 1,
+                ..moment
+            },
+            Moment {
+                wall_ns: moment.wall_ns + 1,
+                ..moment
+            },
+        ] {
+            assert_ne!(instance_from(None, other), instance, "{other:?}");
+        }
+        // With the kernel's keys, the same moment gives another value each
+        // time: the keys are in it.
+        let keyed = || instance_from(kernel_keyed(), moment);
+        assert_ne!(keyed(), keyed());
+        assert_ne!(keyed(), instance);
+        // The clocks are read.
+        let now = Moment::now();
+        assert_eq!(now.pid, std::process::id());
+        assert!(now.monotonic_ns > 0 && now.wall_ns > 0);
     }
 }
