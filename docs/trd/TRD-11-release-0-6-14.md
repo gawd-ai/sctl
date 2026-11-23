@@ -69,11 +69,11 @@ These files are the agent's own, in the agent's own directories, which the gate'
 
 The MCP's renderer is left refusing `{{agent}}`: nothing stands between the MCP and the unit to fill it (section 9, question 5).
 
-### 4.4 Open: the upgrade's helper is not bounded
+### 4.4 The upgrade's helper: the health read is bounded, the command's deadline is open
 
 TRD-10's review bounded every step of the restart's helper and left the upgrade's alone. As it stands (`upgrade/apply.rs`): `Shell::run` waits for the restart command with no deadline, and `http_get` bounds each read of health, not the whole exchange. A restart command that hangs, or a process that takes the health connection and never ends its answer, leaves the upgrade's helper holding its lock, and every later upgrade and restart answers in flight until a reboot.
 
-**Recommendation: bound both steps in this release, and nothing else.** The upgrade's helper gets the restart helper's two step bounds, the health read's total deadline (5 s) and the command's deadline, and no hard limit of its own: between its swap and its rollback it must never be ended from outside.
+**Ruled (section 9, ruling 1): the read's deadline in this release; the command's once the bench has timed it.** As recommended: The upgrade's helper gets the restart helper's two step bounds, the health read's total deadline (5 s) and the command's deadline, and no hard limit of its own: between its swap and its rollback it must never be ended from outside.
 
 - The read's deadline carries no risk: a health answer that takes over 5 s on loopback is not a healthy agent.
 - The command's deadline is the one a bench has to earn. A command killed between its `stop` and its `start` leaves no agent; the upgrade then waits its window and rolls back, which runs the command again, so a kill is recovered, but only if the deadline is not the cause. What the bench must show, on each layout and under load: how long the restart command takes at its slowest (a `gz-tmp` init expands about 9 MB from flash inside it), and that the deadline is at least three times that. TRD-10's bench times the same command on every layout for the restart's helper, so the number costs nothing more.
@@ -81,7 +81,7 @@ TRD-10's review bounded every step of the restart's helper and left the upgrade'
 
 To leave it instead: nothing has to be proven, and the weakness stays as TRD-10 section 4 records it.
 
-### 4.5 Open: an installed unit keeps the record and the init it has
+### 4.5 An installed unit keeps the record and the init it has
 
 A managed upgrade places the files `install.json` names and runs no install script. So after 0.6.14 rolls out:
 
@@ -91,7 +91,7 @@ A managed upgrade places the files `install.json` names and runs no install scri
 
 How such a record is rewritten without a reinstall, proposed and not built:
 
-1. **The agent reads its init's own threshold.** Where a `gz-tmp` record gives no `restart_tmp_kb`, the agent reads the line `MIN_TMP_KB=<digits>` from `/etc/init.d/sctl`, as text, through `read_own`, and takes that; 16384 only when there is no such line. No record is rewritten, every installed unit is right at its next start, and the number is the init's by construction. It is one line of a shell script read by its shape; a line the agent cannot read as digits leaves the default. **Recommended**, as a slice of this release.
+1. **The agent reads its init's own threshold.** Where a `gz-tmp` record gives no `restart_tmp_kb`, the agent reads the line `MIN_TMP_KB=<digits>` from `/etc/init.d/sctl`, as text, through `read_own`, and takes that; 16384 only when there is no such line. No record is rewritten, every installed unit is right at its next start, and the number is the init's by construction. It is one line of a shell script read by its shape; a line the agent cannot read as digits leaves the default. **Ruled in** (section 9, ruling 2), as a slice of this release.
 2. **An operator rewrites one unit's record** with `PUT /api/files` to `/etc/sctl/install.json` (writes there keep their rules; the record is read at start, so it counts from the next start). It works today on any agent with the route, one unit at a time, and a wrong byte leaves a unit with no install record until it is put right. For a unit that matters before option 1 ships.
 3. **The upgrade's helper patches the record** as it swaps files. It reaches every unit, and it gives the helper a write it never had, to a file the next upgrade depends on. Not recommended.
 
@@ -139,8 +139,8 @@ Build order. Each is accepted as said; the TRD's status flips in the change that
 
 1. **Rider A** (4.2): Planned. Built (2026-11-23, `3e558e3`, `b46c719`, `871e19e`): 8 new tests in the library. Accepted when the release bench (6.2) reads the same on the released binary.
 2. **Rider B** (4.3): Planned. Built (2026-11-23, `d695344`): 4 new tests, 84 in sctlin. Accepted when a playbook holding `{{agent}}` runs from sctlin against the bench.
-3. **The upgrade helper's two bounds** (4.4): open, for the lead to rule. If ruled in: the read's deadline at once; the command's once slice 5 has timed the command on every layout. Accepted when the upgrade's own tests pass unchanged and a stand-in command that never returns ends as a rollback, not as a held lock.
-4. **An installed `gz-tmp` unit's threshold** (4.5, option 1): open, for the lead to rule. Accepted when a staged `gz-tmp` unit with no `restart_tmp_kb` in its record and an init that says 8192 is judged at 8192.
+3. **The upgrade helper's health read** (4.4): Planned. The read's total deadline of 5 s. Accepted when the upgrade's own tests pass unchanged, its judgment is shown unchanged (the answers, their spacing, the window), and a health answer that never ends is one failed read, not a held helper. **Open, not built:** the command's deadline, until slice 7 has timed the restart command on every layout; it is then at least three times the slowest measured, and accepted when a stand-in command that never returns ends as a rollback, not as a held lock.
+4. **An installed `gz-tmp` unit's threshold** (4.5, option 1): Planned. Accepted when a staged `gz-tmp` unit with no `restart_tmp_kb` in its record and an init that says 8192 is judged at 8192, and `GET /api/upgrade` says the value came from the init.
 5. **The release commit.** The five version carriers, `Cargo.lock` and `web/package-lock.json`, each edit byte-safe; `CHANGELOG.md` `[0.6.14]` with `[Unreleased]`'s four groups; the index rows of ADR-014, TRD-10 and this TRD. Before it: `main` fetched; a sweep of what this release added for anything a public tree must not name. Accepted when the workspace, clippy, fmt, both docs gates, the bindings diff, `cargo doc` and sctlin's check, test and package are green on the pinned toolchain, as CI runs them, `test-musl` among them.
 6. **The tag and its measures.** `v0.6.14` on the release commit; the `Release` workflow signs, proves every server artifact's version (TRD-1) and publishes. Every target measured against 0.6.13 (section 5) and recorded here. Accepted when the proof is `ok` for the six server artifacts and the sizes are written.
 7. **The benches** (section 6): 6.2 on the released binary, then 6.1 on the units the owner names. Accepted when every line of both is recorded here, and each `gz-tmp` model's threshold is confirmed. A line that fails holds the rollout, as 0.6.12.303 was held.
@@ -148,11 +148,13 @@ Build order. Each is accepted as said; the TRD's status flips in the change that
 
 **What ran with the riders (2026-11-23, at `d695344`, on the pinned 1.97.1).** `cargo test --workspace`, nothing skipped: 672 passed in the library, 11 in the binary, 51 in the MCP, 17 in `relay_events.rs`, 9 in `cli_name.rs` (1 ignored, root), 4 in `restart.rs`, 5 in `restart_inits.rs`, 3 in `xe300_relay_route_sh.rs`, 1 and 4 in the two comms crates; the two netns tests ignored, as without root. `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` clean; both docs gates pass; `cargo doc` has the five warnings it had; no stray ts-rs output. sctlin: `npm run test`, 84 passed, and `npm run check`, no error; `npm run package` was not run.
 
-## 9. For the lead
+## 9. Ruled by the lead (2026-11-23)
 
-1. **The upgrade helper's bounds** (4.4). Recommended: both step bounds in this release, the command's only once the bench has timed it; no hard limit.
-2. **An installed `gz-tmp` unit's threshold** (4.5). Recommended: option 1, the agent reads its init's `MIN_TMP_KB`, as a slice of this release.
-3. **The sizes exist only after the tag.** Recommended: accept that, as for the last two releases, with slice 7 holding the rollout. The other way is a run of the `Release` workflow's build jobs with no publish, which is a change to the workflow.
-4. **The watchdog's append to its history** (4.2, left). Recommended: judge the name with `writable_own` in `append_rotating`, in this release, since the mechanism is there; it was not on TRD-9's list.
-5. **The MCP and `{{agent}}`** (4.3). Recommended: leave it refusing. The MCP sends a playbook's script straight to the unit; it could fill `{{agent}}` from the unit's health itself, which is a feature, not this rider.
-6. **The safe-mode flag's reads** (4.2) were not on TRD-9's list. They are built and committed on their own (`871e19e`), so they can be dropped without touching the rest. Recommended: keep them; `/api/info` is the route a collector polls.
+The six questions this TRD left open, each with its ruling. The version, 0.6.14, stands.
+
+1. **The upgrade helper's bounds** (4.4). As recommended. The health read's total deadline of 5 s ships in this release, with a test that the upgrade's judgment is otherwise unchanged: the same number of answers, the same spacing, the same window. The command's deadline is not built until the bench has timed the restart command on every layout; it stays an open item here, with the rule that the deadline is at least three times the slowest command measured.
+2. **An installed `gz-tmp` unit's threshold** (4.5). Built as a slice. When the install record gives no `restart_tmp_kb`, the agent reads one line of the form `MIN_TMP_KB=<digits>` from the init script its record names, through the same no-wait regular-file handle as rider A, size-bounded, the first match only, digits only. Anything else (no such line, not a regular file, unreadable, a value of 0 or absurdly large) gives the default, and `GET /api/upgrade` says where the value came from (record, init or default), so a bench can see it. Nothing in the init is executed or sourced.
+3. **Sizes per target only after the tag.** Accepted. The benches hold the rollout. No workflow change.
+4. **The watchdog's append to its history.** The name is judged the same way before the open, in this release: a FIFO or a device at that name costs one refusal and no thread.
+5. **The MCP's renderer keeps refusing `{{agent}}`.** Agreed.
+6. **The safe-mode flag's reads stay**, with one change: something at the flag's name that is not a regular file, or that cannot be read, must not read as "no flag". The answer says so in a field of its own, and `/api/info` does the same. A unit in safe mode whose flag cannot be read must never look like a unit out of safe mode.
