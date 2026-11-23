@@ -786,9 +786,9 @@ does not parse, or is not UTF-8 text), `422` `PLAYBOOK_TOO_LARGE` (the file
 is over the 1 MiB bound: none of it is returned, and the message gives its
 size), `500` `IO_ERROR`.
 
-A playbook is returned whole or not at all. Before 0.6.14 a file over the
-bound was returned cut at 1 MiB with no mark, so a client could run a part
-of a script as the script, and a cut inside a character of several bytes
+A playbook is returned whole or not at all: a file over the bound is not
+cut to fit, since a part of a script is not the script. Before 0.6.14 the
+read had no bound (only `PUT` had one), and a file that is not UTF-8 text
 was a `500`.
 
 ### `PUT /api/playbooks/{name}`
@@ -1304,8 +1304,8 @@ it) to bring the optional subsystems back. **Auth: API key Bearer.**
 
 It removes what is at the flag's name, which is what `GET` and the agent's
 start read as the flag: a file, a FIFO, a link (the link itself, never what
-it names), an empty directory. Before 0.6.14 a link to nothing was answered
-"flag not present" while `GET` said active, and a directory could not be
+it names), an empty directory. Before 0.6.14 every reader followed a
+link, so a link to nothing was no flag, and a directory could not be
 cleared.
 
 Response `200`: `{cleared: true}` or `{cleared: false, reason: "flag not

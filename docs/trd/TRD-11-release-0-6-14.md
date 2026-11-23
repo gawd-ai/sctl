@@ -32,7 +32,11 @@ The repository keeps Semantic Versioning (`CHANGELOG.md:5-6`) below 1.0, and its
 This release asks nothing of a consumer. It adds one route and three keys (`instance` in health, `restart` in `GET /api/upgrade` and `upgrade.state`, `restart_tmp_kb` in `install.json`), each additive; the relay is unchanged; an agent of this release and one of 0.6.13 are told apart by the presence of `restart`, never by a version. What changes for a caller that did nothing:
 
 - `GET /api/playbooks/{name}`, `PUT /api/playbooks/{name}` and `GET /api/lte/watchdog/history` answer 400 `NOT_A_REGULAR_FILE` where a FIFO or a device sits at the file's name, where they waited before;
-- `GET /api/safe_mode/flag` answers `flag: null` for a flag it cannot read, where it answered 500;
+- `GET /api/safe_mode/flag` answers `flag: null` for a flag it cannot read, where it answered 500, and a link to nothing at the flag's name is the flag, for the agent's start too, where it was no flag;
+- `DELETE /api/safe_mode/flag` can answer 409 `IS_DIRECTORY`, and its failures carry a body;
+- `GET /api/playbooks/{name}` answers 422 `PLAYBOOK_TOO_LARGE` for a stored file over 1 MiB, which it read whole, and `GET /api/playbooks` lists such a file with `too_large: true`;
+- `GET /api/lte/watchdog/history` answers the events it answered none of;
+- in sctlin, "Run in terminal" sends nothing when a script cannot be rendered, where it sent the script unrendered;
 - `POST /api/upgrade` can answer 409 `RESTART_IN_FLIGHT`, which means busy.
 
 None of those is a contract a caller could have relied on.
