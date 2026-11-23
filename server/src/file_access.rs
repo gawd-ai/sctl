@@ -1188,6 +1188,90 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The modules whose code calls the handle's own-file functions, or
+    /// the append built on them: `routes::playbooks`, `util`, ...
+    fn callers_of_the_handle() -> Vec<String> {
+        const CALLS: [&str; 5] = [
+            "read_own(",
+            "open_own(",
+            "writable_own(",
+            "append_own(",
+            "append_rotating(",
+        ];
+        fn walk(dir: &Path, src: &Path, found: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, src, found);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                if !CALLS.iter().any(|call| text.contains(call)) {
+                    continue;
+                }
+                let module = path
+                    .strip_prefix(src)
+                    .unwrap()
+                    .with_extension("")
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                    .filter(|part| part != "mod")
+                    .collect::<Vec<_>>()
+                    .join("::");
+                found.push(module);
+            }
+        }
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = Vec::new();
+        walk(&src, &src, &mut found);
+        found.sort();
+        found
+    }
+
+    /// The handle behaves differently on musl (std drops `O_PATH` from the
+    /// custom flags there, 0.6.12), and every release target is musl. The
+    /// CI job that tests on musl names the modules it runs: each module
+    /// that calls the handle must be among them, or a break on musl in
+    /// that caller is seen only on a unit.
+    #[test]
+    fn the_musl_job_runs_every_caller_of_the_handle() {
+        let ci = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows/ci.yml");
+        let ci = std::fs::read_to_string(ci).expect("the CI workflow");
+        let run = ci
+            .lines()
+            .find(|line| line.contains("--target x86_64-unknown-linux-musl --"))
+            .expect("the musl job's test run");
+        let filters: Vec<&str> = run
+            .split(" -- ")
+            .nth(1)
+            .expect("its filters")
+            .split_whitespace()
+            .take_while(|word| !word.starts_with("--"))
+            .collect();
+        let callers = callers_of_the_handle();
+        // What this test is for: the callers it must find.
+        for known in ["routes::playbooks", "upgrade::install", "util"] {
+            assert!(callers.iter().any(|c| c == known), "{known} in {callers:?}");
+        }
+        // A filter is a substring of a test's path, `<module>::tests::..`.
+        let missed: Vec<&String> = callers
+            .iter()
+            .filter(|module| {
+                let prefix = format!("{module}::");
+                !filters
+                    .iter()
+                    .any(|filter| prefix.contains(filter) || filter.starts_with(&prefix))
+            })
+            .collect();
+        assert!(
+            missed.is_empty(),
+            "the musl job does not run {missed:?}; its filters are {filters:?}"
+        );
+    }
+
     /// Run `append_own_then` on a thread of its own, with `swap` as what
     /// happens between the judgment and the open. An append that waited on
     /// a FIFO would hang the run for good: on a timeout the FIFO at `path`
