@@ -147,6 +147,114 @@ Two benches, both before any unit in service takes the release.
 - From sctlin against that bench, with `serverReferences` naming `agent` on the job and exec paths: a playbook holding `{{agent}}` leaves sctlin with `{{agent}}` in it, and its form shows no field for it. With no option, and from "Run in terminal" with it, the same playbook is refused before anything is sent.
 - Two reviewers on benches of their own, as for 0.6.13, told only what the release claims.
 
+**Bench 6.2 on 0.6.14.354 (2026-11-23).** Every line that needs no root and no unit passed. Four parts were not run: the `ramboot` and `systemd` restarts, which need root; three refusal codes the bench cannot reach; and the reviewers. None failed. The rollout is held for nothing found here.
+
+- **The binary.** `gh release download v0.6.14` into a fresh scratch directory. `release.json.sig` verifies against the key embedded in `server/src/upgrade/keys.rs` (id `7e744b7b`) with `openssl pkeyutl -verify -rawin`, and the same `release.json` with one byte changed fails. `sctl-x86_64` matches `release.json` in size (8,450,576 bytes) and sha256 (beginning `4d291a96f38f17ef`), and `--version` says `sctl 0.6.14.354`. No binary built here was used.
+- **The bench.**
+  - A bench relay on `127.0.0.1:18370` (`[tunnel] relay = true`) and a bench agent on `127.0.0.1:18371` tunnelled to it, serial `BENCH-AGENT-1`. Each runs from that binary as the bench account, with its config, its data, state and playbooks directories, and keys generated for the bench, all in the scratch directory.
+  - The agent is staged as each layout through `SCTL_INSTALL_JSON`, `SCTL_CLI_PATH` and `SCTL_DISABLED_PATH`, all pointing into the scratch directory. Its `restart` is a script that stops the bench agent by its pidfile and starts it again.
+  - Requests come from a Node 24.12 harness (fetch, and WebSocket with an `Authorization` header). The host is Linux 6.17 with strace 5.16 and nftables 1.0.2.
+- **40 FIFOs named `*.md` (pass).**
+  - Done: `mkfifo` 40 `fifo<i>.md` in `playbooks_dir`. Then, all at once: each `GET /api/playbooks/{name}` directly and through `/d/BENCH-AGENT-1`, both `GET /api/playbooks`, and meanwhile relayed health, an exec and a session start.
+  - Seen:
+    - Every read answered `400` `NOT_A_REGULAR_FILE`: directly within 70 ms (median 54), through the relay within 75 ms (median 58).
+    - Both lists answered `200` within 75 ms, naming only the regular `hello.md`.
+    - Health answered `200` in 74 ms, the exec `200` with its output in 74 ms, and the session started in 76 ms. Everything was done in 113 ms.
+  - With 200 at once:
+    - Direct reads within 184 ms (median 177), relayed within 205 ms (median 177).
+    - The lists within 205 ms.
+    - Health in 204 ms, exec in 203 ms, the session in 208 ms. Everything was done in 285 ms.
+- **The watchdog's history and the safe-mode flag (pass).**
+  - Done: FIFOs at `data_dir/watchdog_history.jsonl` and `data_dir/safe_mode.flag`. Then 8 `GET /api/lte/watchdog/history`, 8 `GET /api/safe_mode/flag` and 8 `GET /api/info`, all at once, directly and then through the relay.
+  - Seen:
+    - The history answered `400` `NOT_A_REGULAR_FILE`: within 42 ms directly, within 15 ms through the relay.
+    - The flag answered `200` `{active: true, flag: null, reason: "the flag cannot be read: Not a regular file: a FIFO"}` within 23 ms and 14 ms. A flag that cannot be read reads as safe mode on.
+    - `GET /api/info` answered `200` within 29 ms and 21 ms, with the same `safe_mode`.
+- **`PUT` onto a FIFO (pass).**
+  - Done: `PUT /api/playbooks/pfifo` with a valid playbook onto a FIFO `pfifo.md`, directly and through the relay.
+  - Seen: `400` `NOT_A_REGULAR_FILE` in 25 ms and 2 ms. The FIFO was still a FIFO, and nothing else was left in the directory.
+- **Under strace (pass).**
+  - Done: the agent restarted under `strace -f -tt -e trace=open,openat,openat2`. No root was needed, since the bench account traces its own child. The three lines above were run again with 40 FIFOs.
+  - Seen, every open an `O_PATH` open:
+    - the 40 FIFOs: 160 of 160;
+    - `pfifo.md`: 2 of 2;
+    - the history: 16 of 16;
+    - the flag: 32 of 32;
+    - the regular `hello.md`: 2 of 2.
+  - Two reopens went through `/proc/self/fd/<n>`. Both were `hello.md`, matched to their `O_PATH` descriptor by thread and fd.
+- **The activity ring (pass).**
+  - Done: 200 execs (10 rounds of 20 at once), then 300 `GET /api/files?path=<a FIFO>` (15 rounds of 20).
+  - Seen: all 300 answered `400` `NOT_A_REGULAR_FILE`. `GET /api/activity?activity_type=exec&limit=200` held 150 exec entries, and the newest 200 entries were 150 `exec` and 50 `file_read`.
+- **A SIGTERM after the FIFO reads (pass).**
+  - Done: 40 new FIFOs, read 80 times (directly and relayed, every one `NOT_A_REGULAR_FILE`), with the FIFOs left in place. Then a SIGTERM to the agent's pid.
+  - Seen: the agent was gone 13 ms later, its log ending "Goodbye".
+- **A restart by the route (pass on `usr-bin` and `gz-tmp`; not run on `ramboot` and `systemd`, which need root).**
+  - **`usr-bin`.** `POST /d/BENCH-AGENT-1/api/restart` answered `202` in 9 ms: `window_secs` 180, `second_run` false, `ends` all zero. On `/api/tunnel/events`, with times counted from the request:
+    - `upgrade.state` `accepted` (+7 ms);
+    - `restarting` (+1,008);
+    - `device.disconnected` `ws_close` (+2,012);
+    - `device.connected` (+2,121);
+    - in the same millisecond `infra.state`, `upgrade.state` `restarting`, and `net.state` with `boot` 1795454538440 (it was 1795454506377);
+    - `upgrade.state` `done`, `outcome` `ok`, `boot_after` 1795454538440, `attempts` 1 (+8,132).
+  - **The relay's own agent.** `POST /api/restart` on the relay answered `422` `RESTART_REFUSED` `relay`.
+  - **`gz-tmp`, with a gzipped server and plugin staged.**
+    - `202` in 9 ms, `second_run` true;
+    - `device.disconnected` (+2,010);
+    - `device.connected` and `net.state` with a new `boot` (+2,118);
+    - `done` `ok` with that `boot` (+8,127).
+    - Staged first with the server alone, it was refused `start_unreadable`: `sctl install-info` fills in the default plugin path, `/usr/local/lib/sctl/sctl-comms-quectel-x86_64.so.gz`, and nothing is there.
+  - **`ramboot`.** Not run: the check reads `/etc/sctl/ramboot.sh`, a fixed path in 0.6.14, and the bench may not write there.
+    - With a `ramboot.conf` in the scratch directory, the route answered `422` `start_unreadable`, naming that path.
+    - With none, it answered `loader_unknown`.
+  - **`systemd`.** Not run as a restart: the helper starts through `systemd-run` on the system manager, which the bench account may not use. Seen: `202` in 7 ms. Then `systemd-run exited Some(1)` 25 s later, and `done` `not_started`. The agent was left running.
+- **The bytes of the reconnect (run without root, though not as `relay_route_netns` runs).**
+  - Done:
+    - Relay and agent both on `127.0.0.1`, inside an unprivileged user and network namespace (`unshare -rn`) whose only link is `lo`, in place of the test's root-made namespaces and veths.
+    - nftables counted every packet to and from port 18370 (the tunnel) on the output hook, by IP length.
+    - The restart was asked of the agent's own port, so the request is not in the count.
+  - Seen:
+    - Idle, the tunnel cost 20 packets and 1,352 bytes in 20 s (pings).
+    - The old tunnel's close: 3 packets, 156 bytes.
+    - The new tunnel, from its connect to its registration and replay: 17 packets, 2,923 bytes (2,058 to the relay in 10 packets, 865 from it in 7), within 120 ms of the bench agent's start.
+    - The reconnect, close included: 20 packets, 3,079 bytes.
+    - The restart's own `upgrade.state` frames were 532 (`accepted`), 534 (`restarting`) and 1,250 (`done`) bytes, each with a 52-byte acknowledgement.
+    - The whole 21 s window, pings included: 6,539 bytes.
+- **The refusals by their codes (pass for every code the bench reaches; three not reached).**
+  - Done: each through `POST /d/BENCH-AGENT-1/api/restart`. Seen, as `422` `RESTART_REFUSED` with its reason:
+    - `no_install_json`: no install.json;
+    - `disabled`: the file at `SCTL_DISABLED_PATH`;
+    - `loader_unknown`: a `ramboot.conf` naming a `LOADER`, and no `helper_prefix`;
+    - `start_unreadable`: as above;
+    - `no_space`: `restart_tmp_kb` 999999999, so the message names the free and the needed KB;
+    - `sessions_open`: `unless: ["sessions"]` with a session open, `ends.sessions` 1;
+    - `jobs_running`: a job `sleep 20` named `bench-job`, `ends.jobs ["bench-job"]`;
+    - `transfers_running`: an STP download left open, `ends.transfers` 1;
+    - `relay`: as above.
+  - Also seen:
+    - `409` `RESTART_IN_FLIGHT`, for a second request at once, and for one sent while the helper watched the new process (`phase` `restarting`).
+    - `400` `RESTART_BAD_REQUEST`, for `unless: ["bogus"]` and for a `request_id` of 129 bytes.
+  - Not reached:
+    - `cache_invalid`: on `ramboot`, the `/etc/sctl/ramboot.sh` check comes first.
+    - `recovery_running`: no Infra recovery run was set up.
+    - `UPGRADE_IN_FLIGHT`: it would take a real upgrade of the bench agent.
+  - A helper killed after its start:
+    - The `restart-apply` helper was found by its executable and command line 33 ms after the `202` and sent SIGKILL.
+    - It settled `not_restarted`, "helper lost: it ended, or ran out of time, without an outcome; this process was not restarted".
+    - The next request was answered `202` and ended `ok`.
+  - `sctl upgrade 0.6.14.354`, run from a shell with the bench's config and environment 2.2 s into a restart, exited 1: "refused: a restart is in flight (request bench-flight): its helper is at work. Ask again when it has ended." That restart then ended `ok`.
+- **sctlin (pass).**
+  - Done:
+    - sctlin's own vitest (4.0.18, jsdom, with its Svelte and testing-library plugins) from `web/` at `4b63cbb`, whose `web/src` is the tag's.
+    - One test file in the scratch directory, using the real `SctlRestClient` and `SctlWsClient` on `ws://127.0.0.1:18370/d/BENCH-AGENT-1/api/ws`, and a `reach.md` holding `{{agent}} net tcp {{host}} 18371 || echo fallback`.
+    - The harness put Node's own `Event` back as the global, because undici fires its `open` with the global that jsdom replaces. This is a harness matter, not sctlin's.
+  - Seen, 5 tests of 5 passing:
+    - The playbook read through the relay holds `{{agent}}`.
+    - With `serverReferences` naming `agent` on `job` and `exec`, the form shows `host` and no `agent` field. The job sent `{{agent}} net tcp 127.0.0.1 18371 || echo fallback`, and the agent's replay of that job reads `/bin/sh: 1: {{agent}}: not found`, then `fallback`: no server fills it on this bench.
+    - The exec left the same command in the agent's activity.
+    - With no option, the job and the exec were each refused "Script references undeclared parameter: {{agent}}", with nothing sent: no call to `startJob` or `exec`, and no activity entry.
+    - From "Run in terminal" with the option, the playbook was refused the same way, with nothing sent.
+- **Two reviewers.** Not run here: this bench is one agent's own.
+
 ## 7. Rollout notes for an operator
 
 - **Order.** Units before relays (`docs/releasing.md`), the relay last through the managed path. A unit of 0.6.14 behind a relay of 0.6.13 holds: the route is forwarded like any other, and the relay keeps `upgrade.state` whole.
