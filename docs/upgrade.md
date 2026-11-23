@@ -492,8 +492,8 @@ What the agent does:
 1. **Refuses early**, before anything stops (`docs/http-api.md` lists the
    codes): an upgrade or a restart in flight; a relay; no `install.json`;
    the kill switch; a start its init would refuse (a file it needs, free
-   `/tmp` below `restart_tmp_kb` or below the helper's own image plus
-   `min_free_kb`); a `ramboot` start that would fetch a payload; and, when
+   `/tmp` below `restart_tmp_kb` plus the size of the running binary,
+   which the helper pins while the init writes the new copy); a `ramboot` start that would fetch a payload; and, when
    the request asks, an attached terminal, a running job or a transfer.
 2. **Closes the gate on recovery runs** in the step that finds none in
    progress, or refuses (`recovery_running`). From then to the stop no run
@@ -529,7 +529,7 @@ if the new process exits:
 | Layout | The command | The init's kill switch | Started again by |
 |---|---|---|---|
 | `usr-bin` | `/etc/init.d/sctl restart`: procd stops the instance and registers it again | none | procd, 5 s later; procd stops trying after ten quick exits, each within an hour of its start, and after that nothing does |
-| `gz-tmp` | the same; the init checks the kill switch where it has one, the config, the payloads and free `/tmp`, removes `/tmp/sctl`, expands the payloads and registers the instance | the XE300's reads it; the RUT241's has none | procd, 10 s later, without limit. If the init returns before it registers an instance, nothing does until the next boot |
+| `gz-tmp` | the same; the init checks the kill switch where it has one, the config, the payloads and free `/tmp`, removes `/tmp/sctl`, expands the payloads and registers the instance. The helper runs from the old binary, so the route asks for `restart_tmp_kb` plus that binary's size before it accepts | the XE300's reads it; the RUT241's has none | procd, 10 s later, without limit. If the init returns before it registers an instance, nothing does until the next boot |
 | `ramboot` under procd | the same; the wrapper expands the cached payloads and runs the agent, through the loader where there is one | read | procd, 30 s later, without limit, each time through the wrapper |
 | `ramboot` with no procd | the init's own `stop` and `start` of its supervisor loop | read, at start and at every respawn | the init's loop, 10 s later, until the kill switch exists |
 | `systemd` | `systemctl restart <unit>`, from a transient unit | none | systemd, 5 s later, on a failed exit only; a unit with a start limit stays failed once it is reached |

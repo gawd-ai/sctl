@@ -1493,7 +1493,7 @@ in `unless`), `422` `RESTART_REFUSED` with `detail.reason` one of:
 | `loader_unknown` | A `ramboot` unit runs its agent under a loader `install.json` does not name (`helper_prefix`): the helper cannot be started. |
 | `start_unreadable` | A file the init needs to start is missing or unreadable: the agent's config, a `gz-tmp` payload, the ramboot wrapper or `ramboot.conf`. |
 | `cache_invalid` | `ramboot`: a payload is not in the cache as `ramboot.conf` names it, so the start would download it over the uplink. |
-| `no_space` | A layout that runs from `/tmp`: less free space there than the install record's `restart_tmp_kb`, or than the helper's own image plus `min_free_kb`. |
+| `no_space` | A layout that runs from `/tmp`: less free space there than the install record's `restart_tmp_kb` plus the size of the running binary, which the helper pins while the init writes the new copy. |
 | `relay` | The agent is a relay. |
 | `recovery_running` | An Infra recovery run is in progress. The route does not wait for it. From the accept to the stop no run starts: a Down is still recorded and pushed, and its run is left to the next process. |
 | `sessions_open`, `jobs_running`, `transfers_running` | `unless` named that kind and it is running; `detail.ends` says what. |

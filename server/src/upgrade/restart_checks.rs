@@ -235,7 +235,11 @@ pub fn judge(install: Option<&InstallInfo>, site: &Site<'_>) -> Result<(), Refus
         let running = site.running.as_ref().map_err(|e| unreadable(e.clone()))?;
         let dir = running.binary.parent().unwrap_or(Path::new("/"));
         // The helper runs from the old binary, through its loader where
-        // there is one: their blocks stay held while the new set is written.
+        // there is one, so it pins their room while the init writes the new
+        // copy, on the first run and on a second. The init's own threshold
+        // is measured while the old copy is still there and counts none of
+        // that, so the room demanded is the device's threshold (never less
+        // than the upgrade's margin) plus what the helper pins.
         let held_kb = file_kb(&running.binary)
             + running
                 .loader
@@ -243,7 +247,8 @@ pub fn judge(install: Option<&InstallInfo>, site: &Site<'_>) -> Result<(), Refus
                 .map_or(0, |loader| file_kb(Path::new(loader)));
         let need_kb = install
             .restart_tmp_kb
-            .max(held_kb.saturating_add(install.min_free_kb));
+            .max(install.min_free_kb)
+            .saturating_add(held_kb);
         match (site.free_kb)(dir) {
             Some(free) if free >= need_kb => {}
             Some(free) => {
@@ -577,25 +582,58 @@ mod tests {
 
     #[test]
     fn free_space_is_judged_where_the_agent_runs_from_tmp_and_nowhere_else() {
-        // gz-tmp: the record's threshold, the init's own.
+        // gz-tmp: the record's threshold, the init's own, plus the room the
+        // helper pins: it runs from the old binary (3 MiB here), which
+        // stays in /tmp while the init extracts the new copy beside it.
         let mut unit = Unit::new("space", Layout::GzTmp);
         assert_eq!(unit.install.restart_tmp_kb, 16384);
-        unit.free_kb = Some(16383);
+        // The init's threshold alone is not room enough.
+        unit.free_kb = Some(16384);
         let refusal = unit.judge().unwrap_err();
         assert_eq!(refusal.reason, Reason::NoSpace);
-        assert!(refusal.detail.contains("16383 KB free") && refusal.detail.contains("16384 KB"));
-        unit.free_kb = Some(16384);
+        assert!(
+            refusal.detail.contains("16384 KB free") && refusal.detail.contains("19456 KB"),
+            "{}",
+            refusal.detail
+        );
+        unit.free_kb = Some(16384 + 3072 - 1);
+        assert_eq!(unit.reason(), Some(Reason::NoSpace));
+        unit.free_kb = Some(16384 + 3072);
         assert_eq!(unit.judge(), Ok(()));
         // A device whose init asks for less: its record says so.
         unit.install.restart_tmp_kb = 8192;
-        unit.free_kb = Some(8192);
-        assert_eq!(unit.judge(), Ok(()));
-        // Never under what the helper keeps mapped plus the margin: a 3 MiB
-        // binary and gz-tmp's 4096 KB.
-        unit.install.restart_tmp_kb = 0;
-        unit.free_kb = Some(3072 + 4096 - 1);
+        unit.free_kb = Some(8192 + 3072 - 1);
         assert_eq!(unit.reason(), Some(Reason::NoSpace));
-        unit.free_kb = Some(3072 + 4096);
+        unit.free_kb = Some(8192 + 3072);
+        assert_eq!(unit.judge(), Ok(()));
+        // A loader the helper runs through is pinned too.
+        let loader = unit.root.join("run/libc.so");
+        std::fs::write(&loader, vec![0_u8; 1024 * 1024]).unwrap();
+        let through_a_loader = |free| {
+            judge(
+                Some(&unit.install),
+                &Site {
+                    config: Some(&unit.config),
+                    disabled: &unit.disabled,
+                    wrapper: &unit.wrapper,
+                    running: Ok(Running {
+                        binary: unit.binary.clone(),
+                        loader: vec![loader.display().to_string(), "--library-path".into()],
+                    }),
+                    free_kb: &move |_| Some(free),
+                },
+            )
+            .err()
+            .map(|r| r.reason)
+        };
+        assert_eq!(through_a_loader(8192 + 3072 + 1023), Some(Reason::NoSpace));
+        assert_eq!(through_a_loader(8192 + 3072 + 1024), None);
+        // Never under the upgrade's margin plus what the helper pins:
+        // gz-tmp's 4096 KB.
+        unit.install.restart_tmp_kb = 0;
+        unit.free_kb = Some(4096 + 3072 - 1);
+        assert_eq!(unit.reason(), Some(Reason::NoSpace));
+        unit.free_kb = Some(4096 + 3072);
         assert_eq!(unit.judge(), Ok(()));
         // Space that cannot be read is not room.
         unit.free_kb = None;

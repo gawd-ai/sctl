@@ -593,7 +593,9 @@ mod tests {
             install.files.insert(role.to_string(), path);
         }
         b.state.install = Some(Arc::new(install));
-        b.deps.free_kb = Arc::new(|_| Some(16383));
+        // The init's own threshold is not room enough: the helper pins the
+        // binary it runs from.
+        b.deps.free_kb = Arc::new(|_| Some(16384));
         assert_eq!(
             refusal(&b, "").await,
             (422, "RESTART_REFUSED".into(), json!("no_space"))
