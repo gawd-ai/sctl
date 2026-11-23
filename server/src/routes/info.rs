@@ -134,20 +134,9 @@ pub(crate) async fn info_with_groups(
         let (mem_total, mem_available) = parse_meminfo(&meminfo);
         let load = parse_loadavg(&loadavg);
         let cpu_model = parse_cpu_model(&cpuinfo);
-        // Inspect safe_mode.flag — best-effort read.
-        let safe_mode_flag_path =
-            std::path::Path::new(&state.config.server.data_dir).join("safe_mode.flag");
-        let safe_mode_block = if safe_mode_flag_path.exists() {
-            std::fs::read_to_string(&safe_mode_flag_path)
-                .ok()
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .map_or_else(
-                    || json!({ "active": true }),
-                    |flag| json!({ "active": true, "flag": flag }),
-                )
-        } else {
-            json!({ "active": false })
-        };
+        // Inspect safe_mode.flag: a best-effort read that never waits.
+        let safe_mode_block =
+            super::safe_mode::block(std::path::Path::new(&state.config.server.data_dir));
         response = json!({
             "serial": state.config.device.serial,
             "hostname": hostname.trim(),
