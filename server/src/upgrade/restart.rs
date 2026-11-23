@@ -161,6 +161,71 @@ impl RestartState {
     }
 }
 
+/// At most this many job names in [`Ends::jobs`].
+pub const ENDS_JOB_NAMES: usize = 16;
+/// Each job name is cut to this many bytes, on a character boundary.
+pub const ENDS_JOB_NAME_BYTES: usize = 64;
+
+/// What a restart ends on the unit, as the agent holds it when it is asked
+/// (ADR-014 decision 4): the answer says so before anything stops.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Ends {
+    /// Running terminals.
+    pub sessions: usize,
+    /// Running terminals with a client attached now.
+    pub attached: usize,
+    /// The running jobs' names, at most [`ENDS_JOB_NAMES`]; a job with no
+    /// name is named by its session id.
+    pub jobs: Vec<String>,
+    /// File transfers in flight.
+    pub transfers: usize,
+}
+
+impl Ends {
+    /// Build it from the session list and the phase of each transfer held.
+    pub fn of<'a>(
+        sessions: &[crate::sessions::SessionListItem],
+        transfer_phases: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let running = || sessions.iter().filter(|s| s.status == "running");
+        let terminals = || running().filter(|s| s.kind == "terminal");
+        let jobs = running()
+            .filter(|s| s.kind == "job")
+            .take(ENDS_JOB_NAMES)
+            .map(|s| {
+                let name = s.name.as_deref().unwrap_or(&s.session_id);
+                let mut end = name.len().min(ENDS_JOB_NAME_BYTES);
+                while !name.is_char_boundary(end) {
+                    end -= 1;
+                }
+                name[..end].to_string()
+            })
+            .collect();
+        Self {
+            sessions: terminals().count(),
+            attached: terminals().filter(|s| s.attached).count(),
+            jobs,
+            transfers: transfer_phases
+                .into_iter()
+                .filter(|phase| matches!(*phase, "init" | "transferring" | "paused" | "verifying"))
+                .count(),
+        }
+    }
+
+    /// Read it from the agent's sessions and transfers.
+    pub async fn read(
+        sessions: &crate::sessions::SessionManager,
+        transfers: &crate::gawdxfer::manager::TransferManager,
+    ) -> Self {
+        let sessions = sessions.list_sessions().await;
+        let transfers = transfers.list().await;
+        Self::of(
+            &sessions,
+            transfers.transfers.iter().map(|t| t.phase.as_str()),
+        )
+    }
+}
+
 /// The process that reads or writes the record.
 #[derive(Clone, Copy, Debug)]
 pub struct Process<'a> {
@@ -587,6 +652,95 @@ mod tests {
         assert_eq!(ended.boot_after, Some(NEW.boot));
         assert_eq!(handle.current(), ended);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn session(
+        id: &str,
+        kind: &str,
+        status: &str,
+        attached: bool,
+        name: Option<&str>,
+    ) -> crate::sessions::SessionListItem {
+        crate::sessions::SessionListItem {
+            session_id: id.to_string(),
+            pid: 1,
+            persistent: true,
+            pty: kind == "terminal",
+            kind: kind.to_string(),
+            attached,
+            status: status.to_string(),
+            exit_code: None,
+            idle: false,
+            idle_timeout: 0,
+            name: name.map(ToString::to_string),
+            created_at: 0,
+            user_allows_ai: false,
+            ai_is_working: false,
+            ai_activity: None,
+            ai_status_message: None,
+        }
+    }
+
+    #[test]
+    fn ends_counts_what_runs_and_names_the_jobs() {
+        assert_eq!(Ends::of(&[], []), Ends::default());
+        let sessions = [
+            session("s1", "terminal", "running", false, None),
+            session("s2", "terminal", "running", true, Some("console")),
+            session("s3", "terminal", "exited", true, None),
+            session("j1", "job", "running", true, Some("pb:outlet-cycle")),
+            session("j2", "job", "running", false, None),
+            session("j3", "job", "exited", false, Some("pb:done")),
+        ];
+        let ends = Ends::of(
+            &sessions,
+            [
+                "init",
+                "transferring",
+                "paused",
+                "verifying",
+                "complete",
+                "failed",
+                "aborted",
+            ],
+        );
+        assert_eq!(
+            ends,
+            Ends {
+                sessions: 2,
+                attached: 1,
+                jobs: vec!["pb:outlet-cycle".into(), "j2".into()],
+                transfers: 4,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&ends).unwrap(),
+            json!({"sessions": 2, "attached": 1, "jobs": ["pb:outlet-cycle", "j2"], "transfers": 4})
+        );
+    }
+
+    #[test]
+    fn ends_names_at_most_sixteen_jobs_each_cut_on_a_character_boundary() {
+        let many: Vec<_> = (0..20)
+            .map(|i| session(&format!("j{i}"), "job", "running", false, None))
+            .collect();
+        assert_eq!(Ends::of(&many, []).jobs.len(), ENDS_JOB_NAMES);
+        // 63 bytes, then a two-byte character across the cut.
+        let long = format!("{}é-and-more", "x".repeat(63));
+        let ends = Ends::of(&[session("j", "job", "running", false, Some(&long))], []);
+        assert_eq!(ends.jobs, ["x".repeat(63)]);
+        let exact = "y".repeat(64);
+        let ends = Ends::of(
+            &[session(
+                "j",
+                "job",
+                "running",
+                false,
+                Some(&format!("{exact}z")),
+            )],
+            [],
+        );
+        assert_eq!(ends.jobs, [exact]);
     }
 
     #[test]

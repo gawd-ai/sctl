@@ -526,8 +526,20 @@ pub fn picture_hash(text: &str) -> String {
 /// target has at most one at a time, and a managed upgrade waits for every
 /// one to end before it hands off to its helper. Read without the Infra
 /// lock.
+///
+/// The set has a gate (ADR-014 decision 3): a restart on request closes it
+/// in the step that finds no run in progress, and while it is closed no run
+/// starts, so the restart never cuts one. A Down is still recorded and
+/// pushed; its run is left to the next process.
 #[derive(Debug, Clone)]
-pub struct Runs(Arc<watch::Sender<BTreeSet<String>>>);
+pub struct Runs(Arc<watch::Sender<RunSet>>);
+
+/// The targets with a run in progress, and whether a run may start.
+#[derive(Debug, Default)]
+struct RunSet {
+    ids: BTreeSet<String>,
+    closed: bool,
+}
 
 /// A run in progress: it ends when this drops, however its task ends.
 #[derive(Debug)]
@@ -538,16 +550,17 @@ pub struct RunGuard {
 
 impl Default for Runs {
     fn default() -> Self {
-        Self(Arc::new(watch::channel(BTreeSet::new()).0))
+        Self(Arc::new(watch::channel(RunSet::default()).0))
     }
 }
 
 impl Runs {
-    /// Mark a run of `target_id` in progress; `None` while one is.
+    /// Mark a run of `target_id` in progress; `None` while one is, and
+    /// while the gate is closed.
     pub fn start(&self, target_id: &str) -> Option<RunGuard> {
         let mut started = false;
         self.0.send_if_modified(|runs| {
-            started = runs.insert(target_id.to_string());
+            started = !runs.closed && runs.ids.insert(target_id.to_string());
             started
         });
         started.then(|| RunGuard {
@@ -558,20 +571,46 @@ impl Runs {
 
     /// Whether a run of `target_id` is in progress.
     pub fn contains(&self, target_id: &str) -> bool {
-        self.0.borrow().contains(target_id)
+        self.0.borrow().ids.contains(target_id)
     }
 
     /// How many runs are in progress.
     pub fn in_progress(&self) -> usize {
-        self.0.borrow().len()
+        self.0.borrow().ids.len()
     }
 
     /// Wait until no run is in progress, at most `limit`. True when none
     /// is.
     pub async fn wait_idle(&self, limit: Duration) -> bool {
         let mut runs = self.0.subscribe();
-        let idle = tokio::time::timeout(limit, runs.wait_for(BTreeSet::is_empty)).await;
+        let idle = tokio::time::timeout(limit, runs.wait_for(|set| set.ids.is_empty())).await;
         matches!(idle, Ok(Ok(_)))
+    }
+
+    /// Close the gate if no run is in progress, in one step: no run can
+    /// start between the look and the close. True when the gate is closed
+    /// with no run in progress, false when a run is.
+    pub fn close_if_idle(&self) -> bool {
+        let mut closed = false;
+        self.0.send_if_modified(|runs| {
+            closed = runs.ids.is_empty();
+            let changed = closed && !runs.closed;
+            runs.closed = runs.closed || closed;
+            changed
+        });
+        closed
+    }
+
+    /// Open the gate: the next failed check that leaves a target Down may
+    /// start its run.
+    pub fn reopen(&self) {
+        self.0
+            .send_if_modified(|runs| std::mem::take(&mut runs.closed));
+    }
+
+    /// Whether the gate is closed.
+    pub fn is_closed(&self) -> bool {
+        self.0.borrow().closed
     }
 }
 
@@ -579,7 +618,7 @@ impl Drop for RunGuard {
     fn drop(&mut self) {
         self.runs
             .0
-            .send_if_modified(|runs| runs.remove(&self.target_id));
+            .send_if_modified(|runs| runs.ids.remove(&self.target_id));
     }
 }
 
@@ -1961,5 +2000,72 @@ mod tests {
         assert_eq!(at.elapsed(), Duration::from_mins(5));
         drop(stuck);
         assert!(runs.wait_idle(Duration::ZERO).await, "none in progress");
+    }
+
+    /// The gate a restart on request closes (ADR-014 decision 3).
+    #[test]
+    fn the_gate_closes_only_with_no_run_in_progress_and_holds_every_start() {
+        let runs = Runs::default();
+        let pdu = runs.start("pdu").expect("free");
+        assert!(!runs.close_if_idle(), "a run is in progress");
+        assert!(!runs.is_closed());
+        assert!(runs.start("cam").is_some(), "the gate stayed open");
+        drop(pdu);
+        // `cam`'s guard was dropped where it was made: none in progress.
+        assert!(runs.close_if_idle());
+        assert!(runs.is_closed());
+        assert!(
+            runs.close_if_idle(),
+            "closed already, still none in progress"
+        );
+        assert!(
+            runs.start("pdu").is_none(),
+            "no run starts while it is closed"
+        );
+        assert!(!runs.contains("pdu"));
+        assert_eq!(runs.in_progress(), 0);
+        runs.reopen();
+        assert!(!runs.is_closed());
+        assert!(runs.start("pdu").is_some());
+    }
+
+    /// Looking and closing are one step: of a thread that starts runs and
+    /// one that closes the gate, no run starts after the close answered
+    /// true, and none is in progress when it did.
+    #[test]
+    fn no_run_starts_after_the_gate_answered_closed() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        for _ in 0..200 {
+            let runs = Runs::default();
+            let gate_shut = Arc::new(AtomicBool::new(false));
+            let starter = {
+                let (runs, gate_shut) = (runs.clone(), gate_shut.clone());
+                std::thread::spawn(move || {
+                    for i in 0..50 {
+                        let was_shut = gate_shut.load(SeqCst);
+                        let run = runs.start(&format!("t{i}"));
+                        assert!(
+                            !(was_shut && run.is_some()),
+                            "a run started after the gate answered closed"
+                        );
+                        drop(run);
+                    }
+                })
+            };
+            let closer = {
+                let (runs, gate_shut) = (runs.clone(), gate_shut.clone());
+                std::thread::spawn(move || loop {
+                    if runs.close_if_idle() {
+                        assert_eq!(runs.in_progress(), 0);
+                        gate_shut.store(true, SeqCst);
+                        return;
+                    }
+                    std::thread::yield_now();
+                })
+            };
+            starter.join().unwrap();
+            closer.join().unwrap();
+            assert!(runs.is_closed());
+        }
     }
 }

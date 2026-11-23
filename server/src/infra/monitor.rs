@@ -2284,6 +2284,45 @@ mod tests {
         assert_eq!(state.results.recovery_log.len(), 2);
     }
 
+    /// A restart on request closes the gate on recovery runs (ADR-014
+    /// decision 3). While it is closed a Down is still recorded and
+    /// signalled, and its run does not start: neither the cooldown nor the
+    /// count moves, so the run is the next process's, or this one's once
+    /// the gate is open again.
+    #[tokio::test]
+    async fn a_closed_gate_starts_no_run_and_moves_no_count() {
+        let scratch = Scratch::new("gate");
+        let t = pdu(60);
+        let mut state = holding(&scratch, vec![t.clone()]);
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let fold = |state: &mut InfraState, secs: u64| {
+            apply_result(state, &t, answer(false, 300), 1, at(secs), Reading::Monitor)
+        };
+        let runs = state.runs();
+        assert!(runs.close_if_idle(), "no run in progress: closed");
+        let seq = state.digest().group().seq;
+
+        assert!(fold(&mut state, 0).is_none());
+        assert!(fold(&mut state, 10).is_none());
+        assert!(fold(&mut state, 20).is_none(), "Down, and no run");
+        assert_eq!(state.results.targets["pdu"].status, TargetStatus::Down);
+        assert!(state.digest().group().seq > seq, "the Down is a change");
+        assert!(!state.recovery_tracker.contains_key("pdu"), "no count");
+        assert!(state.results.recovery_log.is_empty());
+        assert_eq!(runs.in_progress(), 0);
+        // Still closed at the next failed check.
+        assert!(fold(&mut state, 30).is_none());
+        assert!(!state.recovery_tracker.contains_key("pdu"));
+
+        // Open again: the next failed check starts the run, as a first run.
+        runs.reopen();
+        let first = fold(&mut state, 40).expect("the run the gate held back");
+        assert_eq!(state.recovery_tracker["pdu"], (at(40), 1));
+        run_inline(&mut state, first).await;
+        assert_eq!(state.results.recovery_log.len(), 1);
+    }
+
     /// One run per target at a time: a Down check while its run is in
     /// progress starts no second run, even with no cooldown.
     #[tokio::test]
