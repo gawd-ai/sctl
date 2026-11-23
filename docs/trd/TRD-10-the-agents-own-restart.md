@@ -212,7 +212,7 @@ Each change says what changes, in which files, how it is tested and when it is a
 
 ## 5. What the release that carries this must also carry
 
-These ride the same release. They are not slices of this TRD: the release and its riders get a TRD of their own (ADR-014 section 7, ruling 10), which is not written here.
+These ride the same release. They are not slices of this TRD: the release and its riders have a TRD of their own, [TRD-11](TRD-11-release-0-6-14.md) (ADR-014 section 7, ruling 10), which also takes this TRD's bench (3.8) as one of its slices.
 
 1. **The FIFO reads outside the file gate.** TRD-9 slice 10's bench (2026-11-20) found the failure 0.6.13 fixed in the gate still open on routes the gate does not cover, each older than 0.6.12 and each needing exec or local access to set up, "owed by the next release":
    - a FIFO named `*.md` in `playbooks_dir` makes `GET /api/playbooks` and `GET /api/playbooks/{name}` open it plainly (`server/src/routes/playbooks.rs:182`, `:224`); 32 such reads take every one of the tunnel client's handler permits, and a SIGTERM then leaves the agent alive;
@@ -260,3 +260,5 @@ Build order. Each slice is one commit. The TRD's status flips in the change that
 8. Not part of this TRD: `netwatch::owner::tests::a_preferred_wire_holds_the_route_over_a_lower_metric_lte` waits on the paused clock, as its siblings do (`7b0b793`). It was the test the first run could not end: on the real clock its `next_round` slept the schedule's minutes.
 
 **What ran after the review (2026-11-23, at `7b0b793`, on the pinned 1.97.1).** `cargo test --workspace`, nothing skipped: 664 passed in the library, 11 in the binary, 51 in the MCP, 17 in `relay_events.rs`, 9 in `cli_name.rs` (1 ignored, root), 4 in `restart.rs`, 5 in `restart_inits.rs`, 3 in `xe300_relay_route_sh.rs`, 1 and 4 in the two comms crates; the two netns tests ignored, as without root. `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` clean; both docs gates pass.
+
+One run on the build machine failed once outside this TRD's code and is left as it is: `infra::monitor::tests::a_run_whose_record_did_not_reach_the_disk_does_not_run` stopped at "at 10s: the command started" in a run of the suite that took 74 s where it takes half a second, then passed alone 12 times of 12 and in the next full run. The test gives a recovery's record 2 s to fail its write; the machine's disk stalled past that, as it did for three recovery tests in TRD-9 slice 9's record. The gate of slice 3 is not in that path: `Runs::start` answers at once and waits for nothing, a closed gate starts no run at all, and `run_recovery` never reads the gate.

@@ -64,7 +64,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # ring's C code builds with musl-gcc.
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: 'cargo test -p sctl --lib --target x86_64-unknown-linux-musl -- file_access gawdxfer:: routes::files:: --skip export_bindings'
+      # With them, every route that reads one of the agent's own files
+      # through the gate's handle (playbooks, the watchdog history, the
+      # safe-mode flag) and the restart's checks, which judge files the
+      # same way.
+      - run: 'cargo test -p sctl --lib --target x86_64-unknown-linux-musl -- file_access gawdxfer:: routes::files:: routes::playbooks:: routes::lte:: routes::safe_mode:: upgrade::restart --skip export_bindings'
 
   check-web:
     name: Check & Package (sctlin)
