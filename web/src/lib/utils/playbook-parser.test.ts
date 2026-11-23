@@ -161,8 +161,8 @@ describe('renderPlaybookScript', () => {
 
 	it('leaves a reference the host names as written, and fills it from no form value', () => {
 		const withAgent = '{{agent}} net tcp {{radio}} 80\n{{agent}} install-info';
-		expect(renderPlaybookScript(withAgent, { radio: '192.168.1.1' }, params, ['agent'])).toBe(
-			'{{agent}} net tcp 192.168.1.1 80\n{{agent}} install-info'
+		expect(renderPlaybookScript(withAgent, { radio: '192.0.2.1' }, params, ['agent'])).toBe(
+			'{{agent}} net tcp 192.0.2.1 80\n{{agent}} install-info'
 		);
 		expect(renderPlaybookScript('{{agent}} net state', {}, {}, ['agent'])).toBe(
 			'{{agent}} net state'

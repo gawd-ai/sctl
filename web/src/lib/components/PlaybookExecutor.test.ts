@@ -14,7 +14,7 @@ function playbook(params: PlaybookDetail['params'] = {}): PlaybookDetail {
 	} as PlaybookDetail;
 }
 
-const host = { host: { type: 'string', description: 'Where', default: '192.168.1.1' } };
+const host = { host: { type: 'string', description: 'Where', default: '192.0.2.1' } };
 
 /** A WebSocket client that records the job it is asked to start. */
 function wsStub() {
@@ -68,7 +68,7 @@ describe('PlaybookExecutor and a reference the host server fills', () => {
 		await component.run();
 		expect(ws.startJob).toHaveBeenCalledTimes(1);
 		expect(ws.startJob.mock.calls[0][0].command).toBe(
-			'/usr/bin/sctl net tcp 192.168.1.1 80 || echo fallback'
+			'/usr/bin/sctl net tcp 192.0.2.1 80 || echo fallback'
 		);
 	});
 
@@ -87,7 +87,7 @@ describe('PlaybookExecutor and a reference the host server fills', () => {
 		expect(screen.getByLabelText('host')).toBeTruthy();
 		await component.run();
 		expect(ws.startJob.mock.calls[0][0].command).toBe(
-			'{{agent}} net tcp 192.168.1.1 80 || echo fallback'
+			'{{agent}} net tcp 192.0.2.1 80 || echo fallback'
 		);
 	});
 
@@ -113,7 +113,7 @@ describe('PlaybookExecutor and a reference the host server fills', () => {
 			}
 		});
 		await filled.component.run();
-		expect(named.exec).toHaveBeenCalledWith('{{agent}} net tcp 192.168.1.1 80 || echo fallback');
+		expect(named.exec).toHaveBeenCalledWith('{{agent}} net tcp 192.0.2.1 80 || echo fallback');
 	});
 
 	it('never sends a script to the terminal with a reference left in it: no server fills that path', async () => {
@@ -140,6 +140,6 @@ describe('PlaybookExecutor and a reference the host server fills', () => {
 			props: { playbook: plain, restClient: null, onRunInTerminal }
 		});
 		await fireEvent.click(screen.getByTitle('Send script to active terminal session'));
-		expect(onRunInTerminal).toHaveBeenCalledWith('ping -c 1 192.168.1.1');
+		expect(onRunInTerminal).toHaveBeenCalledWith('ping -c 1 192.0.2.1');
 	});
 });
