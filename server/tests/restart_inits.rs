@@ -173,6 +173,36 @@ fn each_install_record_names_the_threshold_its_init_demands() {
     assert_eq!(sctl::upgrade::install::GZ_TMP_RESTART_TMP_KB, 16384);
 }
 
+/// A unit installed before its record carried the threshold takes it from
+/// its own init (TRD-11 4.5). The agent reads this repository's inits as
+/// it would read a unit's: each gives the number it checks, read as text.
+#[test]
+fn the_agent_reads_each_gz_tmp_inits_own_threshold() {
+    use sctl::upgrade::install::{InstallInfo, ThresholdFrom};
+    let scratch = std::env::temp_dir().join(format!("sctl-restart-inits-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    for (init, _) in GZ_TMP {
+        let script = repo().join(init);
+        let demanded: u64 = assigned(&read(init), "MIN_TMP_KB")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let record = scratch.join("install.json");
+        std::fs::write(
+            &record,
+            format!(
+                r#"{{"v":1,"layout":"gz-tmp","target":"mips_24kc","restart":"{} restart"}}"#,
+                script.display()
+            ),
+        )
+        .unwrap();
+        let info = InstallInfo::load(&record, "mips_24kc").unwrap().unwrap();
+        assert_eq!(info.restart_tmp_kb, demanded, "{init}");
+        assert_eq!(info.restart_tmp_kb_from, ThresholdFrom::Init, "{init}");
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 /// One kill switch: the path every init that has one reads is the path
 /// the agent refuses a restart by.
 #[test]

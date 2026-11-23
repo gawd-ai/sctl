@@ -36,6 +36,44 @@ pub const RAMBOOT_WRAPPER_PATH: &str = "/etc/sctl/ramboot.sh";
 /// install record gives none: the XE300's own threshold.
 pub const GZ_TMP_RESTART_TMP_KB: u64 = 16384;
 
+/// The most of an init script that is read for its `/tmp` threshold.
+pub const INIT_READ_CAP: usize = 64 * 1024;
+/// The largest `/tmp` threshold an init is believed to ask for, in KB
+/// (1 GiB). A larger number is not a threshold.
+pub const INIT_TMP_KB_MAX: u64 = 1024 * 1024;
+
+/// Where `restart_tmp_kb` came from, so a bench can see it in `GET
+/// /api/upgrade`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThresholdFrom {
+    /// The install record's own `restart_tmp_kb`.
+    Record,
+    /// The line `MIN_TMP_KB=<digits>` of the init script the record names.
+    Init,
+    /// The layout's default: nothing better was there.
+    Default,
+}
+
+/// The `/tmp` threshold an init script asks for: the number of its first
+/// line of the form `MIN_TMP_KB=<digits>`, read as text. `None` when the
+/// script has no such line, when its first one holds anything but digits
+/// (an expression, a variable, a trailing command), or when the number is
+/// 0 or past [`INIT_TMP_KB_MAX`]. Nothing of the script is run.
+pub fn init_tmp_kb(script: &str) -> Option<u64> {
+    let value = script
+        .lines()
+        .find_map(|line| line.strip_prefix("MIN_TMP_KB="))?
+        .trim_end();
+    if value.is_empty() || value.len() > 9 || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value
+        .parse()
+        .ok()
+        .filter(|kb| (1..=INIT_TMP_KB_MAX).contains(kb))
+}
+
 /// Where the kill switch is: [`DISABLED_PATH_ENV`] for a bench, else
 /// [`DISABLED_PATH`].
 pub fn disabled_path() -> PathBuf {
@@ -148,6 +186,9 @@ pub struct InstallInfo {
     /// device's install script writes it beside the restart command; where
     /// it gives none, [`GZ_TMP_RESTART_TMP_KB`] on `gz-tmp` and 0 elsewhere.
     pub restart_tmp_kb: u64,
+    /// Where `restart_tmp_kb` came from: the record, the unit's own init,
+    /// or the layout's default.
+    pub restart_tmp_kb_from: ThresholdFrom,
     /// The systemd unit (systemd layout).
     pub unit: Option<String>,
     /// The boot fetcher's config (ramboot layout).
@@ -169,9 +210,41 @@ impl InstallInfo {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("{}: {e}", path.display())),
         };
-        Self::parse(&bytes, binary_target)
-            .map(Some)
-            .map_err(|e| format!("{}: {e}", path.display()))
+        let mut info =
+            Self::parse(&bytes, binary_target).map_err(|e| format!("{}: {e}", path.display()))?;
+        info.read_init_threshold();
+        Ok(Some(info))
+    }
+
+    /// A `gz-tmp` unit installed before its record carried
+    /// `restart_tmp_kb` (a managed upgrade writes no install record): take
+    /// the threshold its own init demands, where the init says it on one
+    /// line (TRD-11 4.5). The init is the first word of the record's
+    /// restart command, read as text through the file gate's handle: only a
+    /// regular file is opened, without waiting, and at most
+    /// [`INIT_READ_CAP`] of it is read. Anything else leaves the default.
+    /// Nothing in the init is run or sourced.
+    pub fn read_init_threshold(&mut self) {
+        if self.layout != Layout::GzTmp || self.restart_tmp_kb_from == ThresholdFrom::Record {
+            return;
+        }
+        let Some(init) = self
+            .restart
+            .split_whitespace()
+            .next()
+            .map(Path::new)
+            .filter(|p| p.is_absolute())
+        else {
+            return;
+        };
+        let read = crate::file_access::read_own(init, INIT_READ_CAP)
+            .ok()
+            .flatten()
+            .and_then(|bytes| init_tmp_kb(&String::from_utf8_lossy(&bytes)));
+        if let Some(kb) = read {
+            self.restart_tmp_kb = kb;
+            self.restart_tmp_kb_from = ThresholdFrom::Init;
+        }
     }
 
     /// Parse the file's bytes and fill the defaults.
@@ -216,6 +289,7 @@ impl InstallInfo {
         }
         if let Some(kb) = raw.restart_tmp_kb {
             info.restart_tmp_kb = kb;
+            info.restart_tmp_kb_from = ThresholdFrom::Record;
         }
         if let Some(unit) = raw.unit {
             info.restart = format!("systemctl restart {unit}");
@@ -329,6 +403,7 @@ impl InstallInfo {
             } else {
                 0
             },
+            restart_tmp_kb_from: ThresholdFrom::Default,
             unit,
             ramboot_conf,
             cache_dir,
@@ -415,6 +490,7 @@ impl InstallInfo {
             "health_url": self.health_url(listen),
             "min_free_kb": self.min_free_kb,
             "restart_tmp_kb": self.restart_tmp_kb,
+            "restart_tmp_kb_from": self.restart_tmp_kb_from,
             "unit": self.unit,
             "ramboot_conf": self.ramboot_conf.as_ref().map(|p| p.display().to_string()),
             "cache_dir": self.cache_dir.as_ref().map(|p| p.display().to_string()),
@@ -494,6 +570,169 @@ mod tests {
                 .restart_tmp_kb,
             4096
         );
+    }
+
+    /// One line of an init, read by its shape and by nothing else.
+    #[test]
+    fn an_inits_threshold_is_its_first_min_tmp_kb_line_of_digits() {
+        assert_eq!(init_tmp_kb("START=95\nMIN_TMP_KB=8192\n"), Some(8192));
+        assert_eq!(init_tmp_kb("MIN_TMP_KB=16384\r\nfoo\r\n"), Some(16384));
+        assert_eq!(init_tmp_kb("MIN_TMP_KB=8192   \n"), Some(8192));
+        // No such line; an indented or commented one is not it.
+        assert_eq!(init_tmp_kb("START=95\n"), None);
+        assert_eq!(
+            init_tmp_kb("# MIN_TMP_KB=8192\n    MIN_TMP_KB=8192\n"),
+            None
+        );
+        assert_eq!(init_tmp_kb("XMIN_TMP_KB=8192\n"), None);
+        // Anything but digits: a variable, an expression, a second command,
+        // quotes, a sign, a space.
+        for value in [
+            "${OTHER:-8192}",
+            "$((8 * 1024))",
+            "8192; rm -rf /tmp/x",
+            "'8192'",
+            "\"8192\"",
+            "-1",
+            "+8192",
+            "81 92",
+            "8192kb",
+            "0x2000",
+            "",
+        ] {
+            assert_eq!(
+                init_tmp_kb(&format!("MIN_TMP_KB={value}\n")),
+                None,
+                "{value}"
+            );
+        }
+        // 0, and a number no init asks for.
+        assert_eq!(init_tmp_kb("MIN_TMP_KB=0\n"), None);
+        assert_eq!(init_tmp_kb("MIN_TMP_KB=000\n"), None);
+        assert_eq!(init_tmp_kb("MIN_TMP_KB=1048576\n"), Some(1_048_576));
+        assert_eq!(init_tmp_kb("MIN_TMP_KB=1048577\n"), None);
+        assert_eq!(init_tmp_kb("MIN_TMP_KB=99999999999999999999\n"), None);
+        // The first match only: a later line does not mend a first one
+        // that is not digits, nor change a first one that is.
+        assert_eq!(init_tmp_kb("MIN_TMP_KB=$X\nMIN_TMP_KB=4096\n"), None);
+        assert_eq!(
+            init_tmp_kb("MIN_TMP_KB=4096\nMIN_TMP_KB=8192\n"),
+            Some(4096)
+        );
+    }
+
+    /// An installed `gz-tmp` unit whose record gives no threshold takes the
+    /// one its own init demands, and the report says where it came from.
+    #[test]
+    fn a_gz_tmp_record_with_no_threshold_takes_its_inits() {
+        let dir = std::env::temp_dir().join(format!("sctl-init-threshold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let init = dir.join("sctl.init");
+        let record = dir.join("install.json");
+        let load = |extra: &str| {
+            std::fs::write(
+                &record,
+                format!(
+                    r#"{{"v":1,"layout":"gz-tmp","target":"mipsel_24kc","restart":"{} restart"{extra}}}"#,
+                    init.display()
+                ),
+            )
+            .unwrap();
+            InstallInfo::load(&record, "mipsel_24kc").unwrap().unwrap()
+        };
+        let read = |info: &InstallInfo| {
+            let report = info.report("127.0.0.1:1337");
+            (
+                report["restart_tmp_kb"].as_u64().unwrap(),
+                report["restart_tmp_kb_from"].as_str().unwrap().to_string(),
+            )
+        };
+
+        // No init there: the default, said so.
+        assert_eq!(read(&load("")), (16384, "default".to_string()));
+        // The init's own line.
+        std::fs::write(
+            &init,
+            "#!/bin/sh /etc/rc.common\nSTART=95\nMIN_TMP_KB=8192\n",
+        )
+        .unwrap();
+        assert_eq!(read(&load("")), (8192, "init".to_string()));
+        // The record's own number wins, whatever the init says.
+        assert_eq!(
+            read(&load(r#","restart_tmp_kb":12000"#)),
+            (12000, "record".to_string())
+        );
+        // An init that says nothing usable: the default.
+        std::fs::write(&init, "MIN_TMP_KB=$(expr 8 \\* 1024)\n").unwrap();
+        assert_eq!(read(&load("")), (16384, "default".to_string()));
+        // The line past what is read of the file is not read.
+        let mut long = "#".repeat(INIT_READ_CAP);
+        long.push_str("\nMIN_TMP_KB=8192\n");
+        std::fs::write(&init, long).unwrap();
+        assert_eq!(read(&load("")), (16384, "default".to_string()));
+        // Another layout asks its init nothing.
+        std::fs::write(&init, "MIN_TMP_KB=8192\n").unwrap();
+        std::fs::write(
+            &record,
+            format!(
+                r#"{{"layout":"usr-bin","target":"mipsel_24kc","restart":"{} restart"}}"#,
+                init.display()
+            ),
+        )
+        .unwrap();
+        let other = InstallInfo::load(&record, "mipsel_24kc").unwrap().unwrap();
+        assert_eq!(read(&other), (0, "default".to_string()));
+        // A restart command that names no file by its path: the default.
+        std::fs::write(
+            &record,
+            r#"{"layout":"gz-tmp","target":"mipsel_24kc","restart":"service sctl restart"}"#,
+        )
+        .unwrap();
+        let named = InstallInfo::load(&record, "mipsel_24kc").unwrap().unwrap();
+        assert_eq!(read(&named), (16384, "default".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A FIFO or a device where the init should be is never opened: the
+    /// load answers at once with the default.
+    #[test]
+    fn an_init_that_is_not_a_regular_file_is_never_opened() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("sctl-init-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("sctl.init");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let record = dir.join("install.json");
+        for init in [fifo.as_path(), Path::new("/dev/zero")] {
+            std::fs::write(
+                &record,
+                format!(
+                    r#"{{"layout":"gz-tmp","target":"mipsel_24kc","restart":"{} restart"}}"#,
+                    init.display()
+                ),
+            )
+            .unwrap();
+            // On its own thread: a read that waited on the FIFO would hang
+            // the run, so on a timeout the FIFO gets a writer first.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let path = record.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(InstallInfo::load(&path, "mipsel_24kc"));
+            });
+            let Ok(loaded) = rx.recv_timeout(std::time::Duration::from_secs(5)) else {
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&fifo);
+                panic!("the load waited on {}", init.display());
+            };
+            let info = loaded.unwrap().unwrap();
+            assert_eq!(info.restart_tmp_kb, GZ_TMP_RESTART_TMP_KB);
+            assert_eq!(info.restart_tmp_kb_from, ThresholdFrom::Default);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

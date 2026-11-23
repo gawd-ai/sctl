@@ -92,9 +92,16 @@ copy of the binary `ramboot.conf` names as `BIN`. Empty everywhere else.
 init asks for before it starts the agent: what a restart on request needs
 there ([restarting the agent](#restarting-the-agent)). It belongs to the
 device's install record: the install script writes the number its init
-checks (16384 on the XE300, 8192 on a RUT241 installed as `gz-tmp`). Where a
-`gz-tmp` record gives none the agent takes 16384, and 0 on the layouts whose
-init asks for no room.
+checks (16384 on the XE300, 8192 on a RUT241 installed as `gz-tmp`). A unit
+installed before its record carried the key keeps that record, since a
+managed upgrade writes none: there the agent reads its init's own line,
+`MIN_TMP_KB=<digits>`, from the init script the record's restart command
+names. It reads it as text, the first such line only, digits only, from a
+regular file opened without waiting, and runs nothing of it; no such line,
+a number of 0 or one past 1 GiB leaves the default, 16384. The layouts
+whose init asks for no room take 0. `GET /api/upgrade`'s `install` says
+where the number came from, as `restart_tmp_kb_from`: `record`, `init` or
+`default`.
 
 The agent also reads the kill switch, `/etc/sctl/disabled`, the file an init
 that has a kill switch checks before it starts the agent (the XE300's and
