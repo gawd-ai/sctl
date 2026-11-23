@@ -352,7 +352,10 @@ Errors: `400` `INVALID_REQUEST` (empty `commands`), `400` `BATCH_TOO_LARGE`
 Every exec, file operation, session event, and playbook operation is
 journaled to an in-memory activity log (ring buffer,
 `server.activity_log_max_entries`). Full exec outputs are additionally kept
-in a bounded result cache.
+in a bounded result cache. A refused read is one entry (ADR-011), and
+refused reads hold at most a quarter of the ring: past that share a new
+refusal takes the oldest refusal's place, so a flood of them does not push
+the rest out.
 
 ### `GET /api/activity`
 

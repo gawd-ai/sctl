@@ -221,7 +221,7 @@ pub async fn record(
         }),
         _ => return,
     };
-    log.log(
+    log.log_refusal(
         ActivityType::FileRead,
         source,
         format!("read refused: {}", activity::truncate_str(path, 80)),

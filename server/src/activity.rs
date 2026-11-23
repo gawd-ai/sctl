@@ -123,9 +123,17 @@ impl ActivitySource {
     }
 }
 
+/// The ring: its entries, oldest first, and which of them are refused
+/// reads.
+struct Ring {
+    entries: VecDeque<ActivityEntry>,
+    /// The ids of the refused-read entries still in the ring, oldest first.
+    refused: VecDeque<u64>,
+}
+
 /// In-memory ring buffer of activity entries with broadcast support.
 pub struct ActivityLog {
-    entries: RwLock<VecDeque<ActivityEntry>>,
+    entries: RwLock<Ring>,
     next_id: AtomicU64,
     max_entries: usize,
     broadcast_tx: broadcast::Sender<Value>,
@@ -135,11 +143,24 @@ impl ActivityLog {
     /// Create a new activity log that broadcasts via the given channel.
     pub fn new(max_entries: usize, broadcast_tx: broadcast::Sender<Value>) -> Self {
         Self {
-            entries: RwLock::new(VecDeque::with_capacity(max_entries)),
+            entries: RwLock::new(Ring {
+                entries: VecDeque::with_capacity(max_entries),
+                refused: VecDeque::new(),
+            }),
             next_id: AtomicU64::new(1),
             max_entries,
             broadcast_tx,
         }
+    }
+
+    /// How many refused reads the ring keeps: a quarter of it. A refused
+    /// read is one entry (ADR-011 decision 7), and refusals cost a caller
+    /// nothing, so a flood of them must not push everything else out: 300
+    /// refused reads once evicted all 200 entries, exec history included.
+    /// Past this share, a new refusal takes the place of the oldest
+    /// refusal, not of the oldest entry.
+    pub fn max_refused(&self) -> usize {
+        (self.max_entries / 4).max(1)
     }
 
     /// Append an entry, broadcast it, and return the assigned ID.
@@ -150,6 +171,33 @@ impl ActivityLog {
         summary: String,
         detail: Option<Value>,
         request_id: Option<String>,
+    ) -> u64 {
+        self.append(activity_type, source, summary, detail, request_id, false)
+            .await
+    }
+
+    /// Append a refused read ([`crate::file_access::record`]): an entry
+    /// like any other to a reader, kept within [`Self::max_refused`].
+    pub async fn log_refusal(
+        &self,
+        activity_type: ActivityType,
+        source: ActivitySource,
+        summary: String,
+        detail: Option<Value>,
+        request_id: Option<String>,
+    ) -> u64 {
+        self.append(activity_type, source, summary, detail, request_id, true)
+            .await
+    }
+
+    async fn append(
+        &self,
+        activity_type: ActivityType,
+        source: ActivitySource,
+        summary: String,
+        detail: Option<Value>,
+        request_id: Option<String>,
+        refusal: bool,
     ) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let timestamp = std::time::SystemTime::now()
@@ -175,19 +223,35 @@ impl ActivityLog {
             .to_value(),
         );
 
-        let mut entries = self.entries.write().await;
-        if entries.len() >= self.max_entries {
-            entries.pop_front();
+        let mut ring = self.entries.write().await;
+        if refusal {
+            // The oldest refusal makes room for this one: ids only grow, so
+            // the entries are in id order.
+            if ring.refused.len() >= self.max_refused() {
+                if let Some(oldest) = ring.refused.pop_front() {
+                    if let Ok(at) = ring.entries.binary_search_by_key(&oldest, |e| e.id) {
+                        ring.entries.remove(at);
+                    }
+                }
+            }
+            ring.refused.push_back(id);
         }
-        entries.push_back(entry);
+        if ring.entries.len() >= self.max_entries {
+            if let Some(dropped) = ring.entries.pop_front() {
+                if ring.refused.front() == Some(&dropped.id) {
+                    ring.refused.pop_front();
+                }
+            }
+        }
+        ring.entries.push_back(entry);
 
         id
     }
 
     /// Read entries with `id > since_id`, up to `limit`.
     pub async fn read_since(&self, since_id: u64, limit: usize) -> Vec<ActivityEntry> {
-        let entries = self.entries.read().await;
-        entries
+        let ring = self.entries.read().await;
+        ring.entries
             .iter()
             .filter(|e| e.id > since_id)
             .take(limit)
@@ -204,8 +268,8 @@ impl ActivityLog {
         source: Option<ActivitySource>,
         session_id: Option<&str>,
     ) -> Vec<ActivityEntry> {
-        let entries = self.entries.read().await;
-        entries
+        let ring = self.entries.read().await;
+        ring.entries
             .iter()
             .filter(|e| e.id > since_id)
             .filter(|e| activity_type.is_none_or(|t| e.activity_type == t))
@@ -320,5 +384,108 @@ pub fn truncate_str(s: &str, max: usize) -> String {
             .collect::<String>();
         result.push_str("...");
         result
+    }
+}
+
+#[cfg(test)]
+mod ring_tests {
+    use super::*;
+
+    fn log_of(max_entries: usize) -> ActivityLog {
+        let (tx, _) = broadcast::channel(16);
+        ActivityLog::new(max_entries, tx)
+    }
+
+    async fn exec(log: &ActivityLog, n: usize) {
+        log.log(
+            ActivityType::Exec,
+            ActivitySource::Rest,
+            format!("exec {n}"),
+            None,
+            None,
+        )
+        .await;
+    }
+
+    async fn refused(log: &ActivityLog, n: usize) -> u64 {
+        log.log_refusal(
+            ActivityType::FileRead,
+            ActivitySource::Rest,
+            format!("read refused: /tmp/fifo-{n}"),
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// A flood of refused reads costs a caller nothing, and once evicted
+    /// the whole ring, exec history included. Refusals hold at most a
+    /// quarter of it: past that share a new refusal takes the oldest
+    /// refusal's place.
+    #[tokio::test]
+    async fn a_flood_of_refused_reads_does_not_evict_the_rest_of_the_ring() {
+        let log = log_of(200);
+        assert_eq!(log.max_refused(), 50);
+        for n in 0..200 {
+            exec(&log, n).await;
+        }
+        let mut last = 0;
+        for n in 0..300 {
+            last = refused(&log, n).await;
+        }
+        let entries = log.read_since(0, 1000).await;
+        assert_eq!(entries.len(), 200, "the ring is full, and no fuller");
+        let execs: Vec<_> = entries
+            .iter()
+            .filter(|e| e.activity_type == ActivityType::Exec)
+            .collect();
+        let refusals: Vec<_> = entries
+            .iter()
+            .filter(|e| e.activity_type == ActivityType::FileRead)
+            .collect();
+        assert_eq!(execs.len(), 150, "the flood took a quarter, no more");
+        assert_eq!(refusals.len(), 50);
+        // The newest of each are what is kept.
+        assert_eq!(execs.first().unwrap().summary, "exec 50");
+        assert_eq!(execs.last().unwrap().summary, "exec 199");
+        assert_eq!(
+            refusals.first().unwrap().summary,
+            "read refused: /tmp/fifo-250"
+        );
+        assert_eq!(refusals.last().unwrap().id, last);
+        // Ids still only grow along the ring, so `since` reads as before.
+        assert!(entries.windows(2).all(|w| w[0].id < w[1].id));
+        assert_eq!(log.read_since(last - 1, 10).await.len(), 1);
+    }
+
+    /// Other entries still push refusals out in their turn: the share is a
+    /// ceiling, not a reservation.
+    #[tokio::test]
+    async fn refused_reads_age_out_like_any_entry() {
+        let log = log_of(8);
+        assert_eq!(log.max_refused(), 2);
+        for n in 0..3 {
+            refused(&log, n).await;
+        }
+        let kept = log.read_since(0, 100).await;
+        assert_eq!(kept.len(), 2, "two refusals at most");
+        assert_eq!(kept[0].summary, "read refused: /tmp/fifo-1");
+        for n in 0..8 {
+            exec(&log, n).await;
+        }
+        let kept = log.read_since(0, 100).await;
+        assert_eq!(kept.len(), 8);
+        assert!(kept.iter().all(|e| e.activity_type == ActivityType::Exec));
+        // The share starts afresh once they are gone.
+        refused(&log, 9).await;
+        refused(&log, 10).await;
+        let kept = log.read_since(0, 100).await;
+        assert_eq!(
+            kept.iter()
+                .filter(|e| e.activity_type == ActivityType::FileRead)
+                .count(),
+            2
+        );
+        assert_eq!(kept.len(), 8);
     }
 }
