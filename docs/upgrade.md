@@ -503,7 +503,10 @@ What the agent does:
 3. **Writes the record and answers 202**, with what the restart ends.
 4. **Ends every session and job** itself, writes the helper's plan, moves
    the record to `restarting` and starts the helper.
-5. **The helper** waits 2 s, runs the restart command, and reads
+5. **The helper**, every step of it bounded (the command by 60 s, at which
+   its shell is killed; each health read by 5 s; the whole by a hard limit
+   of 277 s, 522 s on `gz-tmp`, at which it writes `not_healthy` and
+   exits), waits 2 s, runs the restart command, and reads
    `GET health_url` until a process whose `instance` is not the one that
    accepted the request has answered twice, 5 s apart, within 180 s. The
    tunnel is not required: the helper proves the process, and the caller
@@ -515,7 +518,7 @@ What the agent does:
 7. **Neither process waits on the helper for ever.** While the helper
    works the agent looks at the record once a second. A helper found gone
    without an outcome (its lock free 15 s or more after its start), or
-   silent past its own time and a minute, is given up: the process that
+   silent 30 s past its hard limit, is given up: the process that
    accepted the request and is still running writes `not_restarted` with a
    detail that begins `helper lost`, opens the gate on recovery runs and
    takes requests again. The in-flight lock is held for the hand-off only.

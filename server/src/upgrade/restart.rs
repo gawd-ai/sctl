@@ -448,9 +448,16 @@ pub struct Timing {
     pub grace: std::time::Duration,
     /// The helper's settle time before it runs the command.
     pub settle: std::time::Duration,
+    /// The restart command's deadline.
+    pub command: std::time::Duration,
     /// One of the helper's windows.
     pub window: std::time::Duration,
-    /// What is allowed beyond the helper's own time before it is given up.
+    /// One health read's deadline.
+    pub read: std::time::Duration,
+    /// What the helper allows itself beyond its steps.
+    pub helper_margin: std::time::Duration,
+    /// What is allowed beyond the helper's hard limit before it is given
+    /// up.
     pub margin: std::time::Duration,
 }
 
@@ -461,21 +468,30 @@ impl Timing {
             poll: std::time::Duration::from_secs(1),
             grace: std::time::Duration::from_secs(15),
             settle: super::apply::SETTLE,
+            command: super::restart_apply::COMMAND_LIMIT,
             window: super::apply::HEALTH_WINDOW,
-            margin: std::time::Duration::from_mins(1),
+            read: super::restart_apply::READ_LIMIT,
+            helper_margin: super::restart_apply::HARD_MARGIN,
+            margin: std::time::Duration::from_secs(30),
         }
     }
 
     /// The longest a helper may take on `layout` before the agent gives it
-    /// up: its settle time, its window, twice on `gz-tmp` where it may run
-    /// the command a second time, and the margin.
+    /// up: the helper's own hard limit (`restart_apply::Limits`), which is
+    /// derived from its bounded steps, and a margin. The agent never calls
+    /// a helper lost that is still inside its own time.
     pub fn bound(&self, layout: super::install::Layout) -> std::time::Duration {
-        let windows = if layout == super::install::Layout::GzTmp {
-            2
-        } else {
-            1
-        };
-        self.settle + self.window * windows + self.margin
+        super::restart_apply::Limits::with(
+            layout,
+            self.settle,
+            self.command,
+            self.window,
+            super::apply::HEALTH_INTERVAL,
+            self.read,
+            self.helper_margin,
+        )
+        .hard
+            + self.margin
     }
 }
 
@@ -790,7 +806,10 @@ mod tests {
         poll: std::time::Duration::from_millis(10),
         grace: std::time::Duration::from_millis(80),
         settle: std::time::Duration::ZERO,
+        command: std::time::Duration::ZERO,
         window: std::time::Duration::from_millis(300),
+        read: std::time::Duration::ZERO,
+        helper_margin: std::time::Duration::ZERO,
         margin: std::time::Duration::from_millis(100),
     };
 
@@ -798,11 +817,12 @@ mod tests {
     fn the_bound_is_the_helpers_own_time_and_a_margin() {
         use crate::upgrade::install::Layout;
         let real = Timing::production();
-        // 2 s, one window of 180 s, a minute.
-        assert_eq!(real.bound(Layout::UsrBin).as_secs(), 2 + 180 + 60);
+        // The helper's hard limit (2 s; a minute for the command, the 180 s
+        // window and a 5 s read; 30 s), and 30 s more.
+        assert_eq!(real.bound(Layout::UsrBin).as_secs(), 2 + 245 + 30 + 30);
         assert_eq!(real.bound(Layout::Ramboot), real.bound(Layout::Systemd));
-        // gz-tmp may run the command a second time: two windows.
-        assert_eq!(real.bound(Layout::GzTmp).as_secs(), 2 + 360 + 60);
+        // gz-tmp may run the command a second time.
+        assert_eq!(real.bound(Layout::GzTmp).as_secs(), 2 + 490 + 30 + 30);
     }
 
     #[tokio::test]

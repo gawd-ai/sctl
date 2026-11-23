@@ -412,7 +412,10 @@ mod tests {
                 poll: Duration::from_millis(10),
                 grace: Duration::from_secs(5),
                 settle: Duration::ZERO,
+                command: Duration::ZERO,
                 window: Duration::from_secs(30),
+                read: Duration::ZERO,
+                helper_margin: Duration::ZERO,
                 margin: Duration::from_secs(5),
             },
         };

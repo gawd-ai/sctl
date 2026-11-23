@@ -4,18 +4,26 @@
 //! answers, writes the record's outcome and exits. It replaces nothing, so
 //! it restores nothing, and it never reboots the unit.
 //!
-//! Shared with the upgrade's helper (`apply.rs`): the shell that runs the
-//! command, the HTTP reader, the log, the lock, and the settle time, the
-//! interval, the passes and the window. Its wait is its own: it has to
-//! remember whether the old process still answers, which the upgrade's
-//! wait has no use for.
+//! Shared with the upgrade's helper (`apply.rs`): the HTTP reader, the log,
+//! the lock, and the settle time, the interval, the passes and the window.
+//! Its wait is its own: it has to remember whether the old process still
+//! answers, which the upgrade's wait has no use for.
+//!
+//! Every step is bounded, because this helper holds the lock that keeps
+//! every later restart and upgrade out: the restart command runs under a
+//! deadline and the helper's own child is killed at it, each health read
+//! ends by a total deadline, and the helper as a whole ends by a hard
+//! limit derived from its windows, writing its outcome first.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::apply::{self, Log, Runner, Shell, HEALTH_INTERVAL, HEALTH_PASSES, HEALTH_WINDOW};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
+
+use super::apply::{self, Log, Runner, HEALTH_INTERVAL, HEALTH_PASSES, HEALTH_WINDOW};
 use super::install::Layout;
 use super::restart::{self, Outcome, RestartState};
 
@@ -48,14 +56,17 @@ pub trait Probe {
     fn instance(&mut self) -> Result<String, String>;
 }
 
-/// `GET health_url` on loopback, 5 s budget: the answer's `instance`.
+/// `GET health_url` on loopback: the answer's `instance`. The whole read
+/// ends by `total`: a process that takes the connection and never answers
+/// does not hold the helper.
 pub struct HttpProbe {
     pub url: String,
+    pub total: Duration,
 }
 
 impl Probe for HttpProbe {
     fn instance(&mut self) -> Result<String, String> {
-        let body = apply::http_get(&self.url, Duration::from_secs(5))?;
+        let body = apply::http_get_within(&self.url, self.total, Some(self.total))?;
         let json: serde_json::Value =
             serde_json::from_str(&body).map_err(|e| format!("health is not JSON: {e}"))?;
         json["instance"]
@@ -140,17 +151,187 @@ fn second_run_allowed(layout: Layout) -> bool {
     layout == Layout::GzTmp
 }
 
+/// How long the restart command may run before its child is killed.
+pub const COMMAND_LIMIT: Duration = Duration::from_mins(1);
+/// How long one health read may take, connect to last byte.
+pub const READ_LIMIT: Duration = Duration::from_secs(5);
+/// What the helper is allowed beyond its bounded steps before it ends
+/// itself.
+pub const HARD_MARGIN: Duration = Duration::from_secs(30);
+
+/// The bounds of the helper's steps. Each step ends by its own; `hard`
+/// ends the helper whatever a step does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Before the command runs: the answer and the state push leave first.
+    pub settle: Duration,
+    /// The restart command's deadline.
+    pub command: Duration,
+    /// How long a new process is waited for after the command.
+    pub window: Duration,
+    /// Between two health reads.
+    pub interval: Duration,
+    /// One health read's total deadline.
+    pub read: Duration,
+    /// The helper's hard limit.
+    pub hard: Duration,
+}
+
+impl Limits {
+    /// The helper's real bounds on `layout`. The hard limit is derived
+    /// from the bounded steps: the settle time, then for each run of the
+    /// command (two on `gz-tmp`) its deadline, the window and one read
+    /// that began as the window ended, and a margin.
+    pub fn production(layout: Layout) -> Self {
+        Self::with(
+            layout,
+            apply::SETTLE,
+            COMMAND_LIMIT,
+            HEALTH_WINDOW,
+            HEALTH_INTERVAL,
+            READ_LIMIT,
+            HARD_MARGIN,
+        )
+    }
+
+    /// Bounds built from the given steps, the hard limit derived as
+    /// [`Limits::production`] derives it.
+    pub fn with(
+        layout: Layout,
+        settle: Duration,
+        command: Duration,
+        window: Duration,
+        interval: Duration,
+        read: Duration,
+        margin: Duration,
+    ) -> Self {
+        let runs = if second_run_allowed(layout) { 2 } else { 1 };
+        Self {
+            settle,
+            command,
+            window,
+            interval,
+            read,
+            hard: settle + (command + window + read) * runs + margin,
+        }
+    }
+}
+
+/// `sh -c <command>` under a deadline. A command still running at it is
+/// killed: the child this helper spawned, and nothing else.
+pub struct BoundedShell {
+    pub limit: Duration,
+}
+
+impl Runner for BoundedShell {
+    fn run(&mut self, command: &str) -> Result<i32, String> {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let deadline = Instant::now() + self.limit;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(status.code().unwrap_or(-1)),
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "still running after {}s: its shell was killed",
+                        self.limit.as_secs()
+                    ));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
+}
+
+/// The one write that ends the record. The helper's run and its hard
+/// limit both reach for it, and the first to do so writes: an outcome is
+/// never written over by a later one.
+pub struct Ending {
+    record_path: PathBuf,
+    log_path: PathBuf,
+    done: Mutex<bool>,
+    /// How many times the restart command has been run so far.
+    attempts: AtomicU32,
+}
+
+impl Ending {
+    pub fn new(record_path: &Path, log_path: &Path) -> Self {
+        Self {
+            record_path: record_path.to_path_buf(),
+            log_path: log_path.to_path_buf(),
+            done: Mutex::new(false),
+            attempts: AtomicU32::new(0),
+        }
+    }
+
+    /// End the record with `state`, unless it is ended already. Returns
+    /// the record as it stands on disk either way.
+    fn end(&self, state: RestartState, log: &mut Log) -> RestartState {
+        let mut done = self
+            .done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *done {
+            return restart::load(&self.record_path).unwrap_or(state);
+        }
+        *done = true;
+        let state = state.with_log_tail(super::state::log_tail(&self.log_path));
+        if let Err(e) = restart::save(&self.record_path, &state) {
+            log.line(&format!(
+                "could not write {}: {e}",
+                self.record_path.display()
+            ));
+        }
+        state
+    }
+
+    /// The hard limit was reached: a step did not return. End the record
+    /// as it stands, so that the helper can exit with an outcome written.
+    /// `None` when the run ended it first.
+    pub fn expire(&self, hard: Duration) -> Option<RestartState> {
+        if *self
+            .done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return None;
+        }
+        let mut log = Log::open(&self.log_path);
+        log.line(&format!(
+            "WARNING: the helper reached its hard limit of {}s: a step did not return. Ending with what is known.",
+            hard.as_secs()
+        ));
+        let mut state = restart::load(&self.record_path)
+            .unwrap_or_else(RestartState::idle)
+            .restarting();
+        state.attempts = self.attempts.load(Ordering::SeqCst);
+        let state = state.finished(
+            Outcome::NotHealthy,
+            Some(format!(
+                "the helper reached its hard limit of {}s before it could judge: a step did not return",
+                hard.as_secs()
+            )),
+        );
+        Some(self.end(state, &mut log))
+    }
+}
+
 /// The helper's whole run, with its collaborators injected. Returns the
-/// record it wrote. `settle` is the upgrade's 2 s in production and zero in
-/// tests.
+/// record as it ended.
 pub fn apply(
     plan: &Plan,
     log_path: &Path,
     runner: &mut dyn Runner,
     probe: &mut dyn Probe,
-    window: Duration,
-    interval: Duration,
-    settle: Duration,
+    limits: &Limits,
+    ending: &Ending,
 ) -> RestartState {
     let mut log = Log::open(log_path);
     let mut state = restart::load(&plan.record_path).unwrap_or_else(|| {
@@ -165,10 +346,12 @@ pub fn apply(
         plan.restart
     ));
     // The answer and the state push leave first.
-    std::thread::sleep(settle);
+    std::thread::sleep(limits.settle);
+    let window = limits.window;
 
     let mut run = |attempt: u32, log: &mut Log| {
         log.line(&format!("restart (run {attempt}): {}", plan.restart));
+        ending.attempts.store(attempt, Ordering::SeqCst);
         match runner.run(&plan.restart) {
             Ok(code) => log.line(&format!("restart exited {code}")),
             Err(e) => log.line(&format!("restart: {e}")),
@@ -176,7 +359,13 @@ pub fn apply(
     };
     run(1, &mut log);
     state.attempts = 1;
-    let mut waited = wait_new(probe, &plan.instance_before, window, interval, &mut log);
+    let mut waited = wait_new(
+        probe,
+        &plan.instance_before,
+        window,
+        limits.interval,
+        &mut log,
+    );
     let mut second_run = false;
     if waited == (Waited::Silence { new_seen: false }) && second_run_allowed(plan.layout) {
         // Never quiet: the first run started nothing, which is a defect.
@@ -187,7 +376,13 @@ pub fn apply(
         second_run = true;
         run(2, &mut log);
         state.attempts = 2;
-        waited = wait_new(probe, &plan.instance_before, window, interval, &mut log);
+        waited = wait_new(
+            probe,
+            &plan.instance_before,
+            window,
+            limits.interval,
+            &mut log,
+        );
     }
     let first_run_started_nothing = format!(
         "the first run of the restart command started nothing within {}s; it was run a second time",
@@ -227,15 +422,7 @@ pub fn apply(
         serde_json::to_string(&outcome).unwrap_or_default(),
         state.attempts
     ));
-    let tail = super::state::log_tail(log_path);
-    let state = state.finished(outcome, detail).with_log_tail(tail);
-    if let Err(e) = restart::save(&plan.record_path, &state) {
-        log.line(&format!(
-            "could not write {}: {e}",
-            plan.record_path.display()
-        ));
-    }
-    state
+    ending.end(state.finished(outcome, detail), &mut log)
 }
 
 /// The restart's words for its helper: `restart-apply --dir <dir>`.
@@ -267,8 +454,8 @@ pub fn save_plan(dir: &Path, plan: &Plan) -> Result<(), String> {
 }
 
 /// `sctl restart-apply --dir <dir>`: the process entry. Exit 0 on `ok`, 1
-/// on `not_restarted`, 2 on `not_healthy`, 4 when the plan cannot be read
-/// or the directory is locked.
+/// on `not_restarted`, 2 on `not_healthy`, 3 when the hard limit ended
+/// it, 4 when the plan cannot be read or the directory is locked.
 pub fn main(dir: &str) -> i32 {
     let dir = PathBuf::from(dir);
     let plan = match load_plan(&dir) {
@@ -285,19 +472,28 @@ pub fn main(dir: &str) -> i32 {
         );
         return 4;
     };
-    let mut runner = Shell;
+    let limits = Limits::production(plan.layout);
+    let log_path = dir.join(LOG_FILE);
+    let ending = std::sync::Arc::new(Ending::new(&plan.record_path, &log_path));
+    // The hard limit: whatever a step does, the helper ends, its outcome
+    // written first. Its lock goes with the process.
+    {
+        let ending = ending.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(limits.hard);
+            if ending.expire(limits.hard).is_some() {
+                std::process::exit(3);
+            }
+        });
+    }
+    let mut runner = BoundedShell {
+        limit: limits.command,
+    };
     let mut probe = HttpProbe {
         url: plan.health_url.clone(),
+        total: limits.read,
     };
-    let state = apply(
-        &plan,
-        &dir.join(LOG_FILE),
-        &mut runner,
-        &mut probe,
-        HEALTH_WINDOW,
-        HEALTH_INTERVAL,
-        apply::SETTLE,
-    );
+    let state = apply(&plan, &log_path, &mut runner, &mut probe, &limits, &ending);
     match state.outcome {
         Some(Outcome::Ok) => 0,
         Some(Outcome::NotRestarted) => 1,
@@ -409,17 +605,31 @@ mod tests {
         Bench { dir, plan }
     }
 
+    /// Bounds small enough for a test: a window of `checks` health reads
+    /// 20 ms apart, no settle time.
+    fn quick(layout: Layout, checks: u64) -> Limits {
+        Limits::with(
+            layout,
+            Duration::ZERO,
+            Duration::from_millis(200),
+            Duration::from_millis(20 * checks),
+            Duration::from_millis(20),
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        )
+    }
+
     /// Run the helper over `fake` with a window of `checks` health reads.
     fn run(bench: &Bench, fake: Fake, checks: u64) -> (RestartState, Fake) {
         let fake = std::cell::RefCell::new(fake);
+        let log = bench.dir.join("upgrade").join("restart").join(LOG_FILE);
         let state = apply(
             &bench.plan,
-            &bench.dir.join("upgrade").join("restart").join(LOG_FILE),
+            &log,
             &mut Split(&fake),
             &mut Split(&fake),
-            Duration::from_millis(20 * checks),
-            Duration::from_millis(20),
-            Duration::ZERO,
+            &quick(bench.plan.layout, checks),
+            &Ending::new(&bench.plan.record_path, &log),
         );
         // What the helper answered is what it left on disk.
         assert_eq!(
@@ -594,10 +804,206 @@ mod tests {
         });
         let mut probe = HttpProbe {
             url: format!("http://127.0.0.1:{port}/api/health"),
+            total: READ_LIMIT,
         };
         assert_eq!(probe.instance().as_deref(), Ok("abc"));
         // An agent from before the route carries none: not an answer.
         assert_eq!(probe.instance().unwrap_err(), "health has no instance");
         server.join().unwrap();
+    }
+
+    /// The hard limit is derived from the bounded steps, and the agent
+    /// that waits on the helper gives it longer than that: it never calls
+    /// a helper lost that is still inside its own time.
+    #[test]
+    fn the_hard_limit_is_derived_from_the_steps_and_the_agent_waits_longer() {
+        // 2 s, then a minute for the command, the 180 s window and one 5 s
+        // read, and 30 s.
+        assert_eq!(
+            Limits::production(Layout::UsrBin).hard.as_secs(),
+            2 + 245 + 30
+        );
+        assert_eq!(
+            Limits::production(Layout::Ramboot),
+            Limits::production(Layout::Systemd)
+        );
+        // Two runs of the command on gz-tmp.
+        assert_eq!(
+            Limits::production(Layout::GzTmp).hard.as_secs(),
+            2 + 490 + 30
+        );
+        let agent = restart::Timing::production();
+        for layout in [
+            Layout::UsrBin,
+            Layout::GzTmp,
+            Layout::Ramboot,
+            Layout::Systemd,
+        ] {
+            assert!(
+                agent.bound(layout) > Limits::production(layout).hard,
+                "{}",
+                layout.as_str()
+            );
+        }
+    }
+
+    /// The restart command runs under a deadline. One still running at it
+    /// is killed: the helper's own child. The test's commands are harmless
+    /// stand-ins, and the child killed is the one this test started.
+    #[test]
+    fn a_restart_command_that_does_not_return_is_killed_at_its_deadline() {
+        let mut shell = BoundedShell {
+            limit: Duration::from_millis(300),
+        };
+        let at = Instant::now();
+        let hung = shell.run("sleep 30").unwrap_err();
+        assert!(at.elapsed() < Duration::from_secs(5), "{:?}", at.elapsed());
+        assert!(hung.contains("killed"), "{hung}");
+        // One that ends in time answers its exit code.
+        assert_eq!(shell.run("true"), Ok(0));
+        assert_eq!(shell.run("exit 3"), Ok(3));
+    }
+
+    /// A command that hit its deadline is logged, and the helper still
+    /// reads health: the restart may have happened before the command
+    /// hung.
+    #[test]
+    fn a_killed_command_does_not_end_the_helper_which_still_judges_by_health() {
+        struct Hung;
+        impl Runner for Hung {
+            fn run(&mut self, _: &str) -> Result<i32, String> {
+                Err("still running after 60s: its shell was killed".into())
+            }
+        }
+        struct NewAtOnce;
+        impl Probe for NewAtOnce {
+            fn instance(&mut self) -> Result<String, String> {
+                Ok("new".into())
+            }
+        }
+        let bench = bench("killed", Layout::UsrBin);
+        let log = bench.dir.join("upgrade").join("restart").join(LOG_FILE);
+        let state = apply(
+            &bench.plan,
+            &log,
+            &mut Hung,
+            &mut NewAtOnce,
+            &quick(Layout::UsrBin, 8),
+            &Ending::new(&bench.plan.record_path, &log),
+        );
+        assert_eq!(state.outcome, Some(Outcome::Ok));
+        assert!(state.log_tail.unwrap().contains("its shell was killed"));
+    }
+
+    /// A health read ends by its total deadline, whatever the peer does: a
+    /// process that takes the connection and sends a byte now and then
+    /// does not hold the helper.
+    #[test]
+    fn a_health_read_ends_by_its_total_deadline() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request);
+            // A byte every 100 ms for 3 s: each read succeeds in time, and
+            // the answer never ends.
+            for byte in b"HTTP/1.0 200 OK\r\n\r\n{\"sta".iter().cycle().take(30) {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let mut probe = HttpProbe {
+            url: format!("http://127.0.0.1:{port}/api/health"),
+            total: Duration::from_millis(400),
+        };
+        let at = Instant::now();
+        let error = probe.instance().unwrap_err();
+        assert!(
+            at.elapsed() < Duration::from_millis(1500),
+            "ended by the total, not by the peer: {:?}",
+            at.elapsed()
+        );
+        assert!(error.contains("no answer within 400 ms"), "{error}");
+        server.join().unwrap();
+    }
+
+    /// The helper as a whole ends by its hard limit, with an outcome
+    /// written first, and that outcome is not written over by a step that
+    /// returns later.
+    #[test]
+    fn the_hard_limit_ends_the_record_and_a_late_step_does_not_write_over_it() {
+        /// A step that does not return in time, whatever its own bound.
+        struct Stuck;
+        impl Runner for Stuck {
+            fn run(&mut self, _: &str) -> Result<i32, String> {
+                std::thread::sleep(Duration::from_millis(500));
+                Ok(0)
+            }
+        }
+        struct NewAtOnce;
+        impl Probe for NewAtOnce {
+            fn instance(&mut self) -> Result<String, String> {
+                Ok("new".into())
+            }
+        }
+        let bench = bench("hard", Layout::GzTmp);
+        let log = bench.dir.join("upgrade").join("restart").join(LOG_FILE);
+        let ending = Ending::new(&bench.plan.record_path, &log);
+        let limits = quick(Layout::GzTmp, 4);
+        let state = std::thread::scope(|scope| {
+            let run = scope.spawn(|| {
+                apply(
+                    &bench.plan,
+                    &log,
+                    &mut Stuck,
+                    &mut NewAtOnce,
+                    &limits,
+                    &ending,
+                )
+            });
+            // The hard limit passes while the command is still stuck.
+            std::thread::sleep(Duration::from_millis(100));
+            let expired = ending
+                .expire(limits.hard)
+                .expect("the limit ends the record");
+            assert_eq!(expired.phase, crate::upgrade::restart::Phase::Done);
+            assert_eq!(expired.outcome, Some(Outcome::NotHealthy));
+            assert_eq!(expired.attempts, 1, "the command was run once so far");
+            assert!(expired.detail.as_deref().unwrap().contains("hard limit"));
+            assert!(expired
+                .log_tail
+                .as_deref()
+                .unwrap()
+                .contains("WARNING: the helper reached its hard limit"));
+            assert_eq!(
+                restart::load(&bench.plan.record_path),
+                Some(expired.clone())
+            );
+            // In the helper the process exits here. The run that returns
+            // late finds the record ended and leaves it.
+            let late = run.join().unwrap();
+            assert_eq!(late, expired);
+            late
+        });
+        assert_eq!(restart::load(&bench.plan.record_path), Some(state));
+        // Once the run ended the record, the limit has nothing to end.
+        let bench = self::bench("hard-late", Layout::UsrBin);
+        let log = bench.dir.join("upgrade").join("restart").join(LOG_FILE);
+        let ending = Ending::new(&bench.plan.record_path, &log);
+        let ended = apply(
+            &bench.plan,
+            &log,
+            &mut Stuck,
+            &mut NewAtOnce,
+            &quick(Layout::UsrBin, 4),
+            &ending,
+        );
+        assert_eq!(ended.outcome, Some(Outcome::Ok));
+        assert_eq!(ending.expire(Duration::from_secs(1)), None);
+        assert_eq!(restart::load(&bench.plan.record_path), Some(ended));
     }
 }

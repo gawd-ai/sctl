@@ -47,9 +47,32 @@ impl Health for HttpHealth {
     }
 }
 
-/// A minimal HTTP/1.0 GET: the body of a 200, or the error.
+/// A minimal HTTP/1.0 GET: the body of a 200, or the error. `budget`
+/// bounds the connect and each read, not the whole exchange.
 pub(crate) fn http_get(url: &str, budget: Duration) -> Result<String, String> {
+    http_get_within(url, budget, None)
+}
+
+/// [`http_get`], and when `total` is given the whole exchange ends by it:
+/// a peer that keeps a connection open, or sends a byte now and then,
+/// cannot hold the caller past it. The upgrade's helper passes none and
+/// reads as it always did; the restart's helper passes one (ADR-014).
+pub(crate) fn http_get_within(
+    url: &str,
+    budget: Duration,
+    total: Option<Duration>,
+) -> Result<String, String> {
     use std::io::Read;
+    let started = Instant::now();
+    // What is left of the total, capped by the per-step budget.
+    let left = || match total {
+        None => Ok(budget),
+        Some(total) => total
+            .checked_sub(started.elapsed())
+            .filter(|left| !left.is_zero())
+            .map(|left| left.min(budget))
+            .ok_or_else(|| format!("no answer within {} ms", total.as_millis())),
+    };
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| format!("{url} is not http://"))?;
@@ -63,17 +86,31 @@ pub(crate) fn http_get(url: &str, budget: Duration) -> Result<String, String> {
         .parse()
         .map_err(|_| format!("{addr} is not an address"))?;
     let mut stream =
-        std::net::TcpStream::connect_timeout(&socket, budget).map_err(|e| e.to_string())?;
-    stream.set_read_timeout(Some(budget)).ok();
-    stream.set_write_timeout(Some(budget)).ok();
+        std::net::TcpStream::connect_timeout(&socket, left()?).map_err(|e| e.to_string())?;
+    stream.set_read_timeout(Some(left()?)).ok();
+    stream.set_write_timeout(Some(left()?)).ok();
     let request = format!("GET /{path} HTTP/1.0\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .map_err(|e| e.to_string())?;
     let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|e| e.to_string())?;
+    if total.is_none() {
+        stream
+            .read_to_end(&mut response)
+            .map_err(|e| e.to_string())?;
+    } else {
+        // Each read is given only what is left of the total.
+        let mut chunk = [0_u8; 4096];
+        loop {
+            stream.set_read_timeout(Some(left()?)).ok();
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => response.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
     let text = String::from_utf8_lossy(&response);
     let (head, body) = text.split_once("\r\n\r\n").ok_or("no HTTP response")?;
     let status: u16 = head
