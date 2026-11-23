@@ -38,12 +38,13 @@ pub fn expand_tilde(path: &str) -> Cow<'_, str> {
 /// on slower filesystems (caught by CI). `std::fs` with an explicit
 /// `flush` + drop is synchronous and avoids the race.
 ///
-/// What is at the name is judged before the open, through the file gate's
-/// handle and its type judgment (ADR-011): nothing, or a regular file, is
-/// appended to. An open for appending waits on a FIFO with no reader and
-/// runs a device's open; each append then held one thread of the blocking
-/// pool for good. A FIFO, a socket or a device at the name is one error
-/// to the caller and no thread.
+/// The file is opened through the file gate's handle and its type
+/// judgment (ADR-011, `file_access::append_own`): the file that was judged
+/// is the file that is opened, and a new one is made exclusive. An open for
+/// appending waits on a FIFO with no reader and runs a device's open; each
+/// append then held one thread of the blocking pool for good. A FIFO, a
+/// socket or a device at the name, or one put there after the judgment, is
+/// one error to the caller at most, and no thread.
 pub async fn append_rotating(path: &Path, line: &str, max_bytes: u64) -> std::io::Result<bool> {
     let path = path.to_path_buf();
     let line = line.to_string();
@@ -62,16 +63,13 @@ pub async fn append_rotating(path: &Path, line: &str, max_bytes: u64) -> std::io
                 }
             }
         }
-        crate::file_access::writable_own(&path).map_err(|refusal| {
-            std::io::Error::new(
+        let mut f = crate::file_access::append_own(&path).map_err(|refusal| match refusal {
+            crate::file_access::Refusal::Io(e) => e,
+            refusal => std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("{}: {}", path.display(), refusal.message()),
-            )
+            ),
         })?;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
         f.write_all(line.as_bytes())?;
         f.flush()?;
         Ok(rotated)

@@ -550,6 +550,62 @@ pub fn writable_own(path: &Path) -> Result<(), Refusal> {
     }
 }
 
+/// How often [`append_own`] judges a name that something keeps taking
+/// between its judgment and its making of the file.
+const APPEND_TRIES: usize = 4;
+
+/// One of the agent's own files, opened to append to: the file that was
+/// judged, never the name a second time (ADR-011 decision 6).
+///
+/// - Something is at the name: it is taken by a handle that opens nothing,
+///   judged by its type, and that handle's own file is opened to append
+///   to. A FIFO, a socket or a device is `NOT_A_REGULAR_FILE` and is never
+///   opened; a FIFO put at the name after the judgment is not the file
+///   that is opened.
+/// - Nothing is at the name: the file is made new and exclusive
+///   (`O_EXCL`), which opens nothing that is already there. When something
+///   took the name in between, that is judged in its turn.
+///
+/// The name was judged and then opened plainly, so a FIFO swapped in
+/// between the two still held a thread in its open. A link to nothing is
+/// refused: nothing is made through a link.
+pub fn append_own(path: &Path) -> Result<File, Refusal> {
+    append_own_then(path, || {})
+}
+
+/// [`append_own`], calling `judged` once the name has been judged and
+/// before anything is opened: where a test changes what is at the name.
+fn append_own_then(path: &Path, judged: impl Fn()) -> Result<File, Refusal> {
+    for _ in 0..APPEND_TRIES {
+        let handle = match Handle::take(path) {
+            Ok(handle) => handle,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                judged();
+                match OpenOptions::new().append(true).create_new(true).open(path) {
+                    Ok(file) => return Ok(file),
+                    // Something took the name: judge it.
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(Refusal::opening(e)),
+                }
+            }
+            Err(e) => return Err(Refusal::opening(e)),
+        };
+        let facts = handle.facts().map_err(|e| Refusal::judging(&e))?;
+        if facts.kind == libc::S_IFDIR {
+            return Err(Refusal::IsDirectory);
+        }
+        if let Some(what) = not_regular(facts.kind) {
+            return Err(Refusal::NotRegular(what.to_string()));
+        }
+        judged();
+        return handle.reopen_to_append().map_err(Refusal::opening);
+    }
+    Err(Refusal::Io(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "the name is taken by something that leads to no file (a link to nothing)",
+    )))
+}
+
 /// Open `path` again for a later read of a file the gate judged, only while
 /// it is still that file: the same device and inode, still a regular file.
 /// Returns the file and its last change (seconds since the epoch).
@@ -661,6 +717,15 @@ impl Handle {
     fn reopen(&self) -> io::Result<File> {
         OpenOptions::new()
             .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(self.fd_path())
+    }
+
+    /// The handle's own file, opened to append to: the file that was
+    /// judged, whatever is at its name by now.
+    fn reopen_to_append(&self) -> io::Result<File> {
+        OpenOptions::new()
+            .append(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
             .open(self.fd_path())
     }
@@ -1119,6 +1184,96 @@ mod tests {
         assert_eq!(
             expect_not_regular(gate.open(Path::new("/dev/zero"), Purpose::Move)),
             "a character device"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Run `append_own_then` on a thread of its own, with `swap` as what
+    /// happens between the judgment and the open. An append that waited on
+    /// a FIFO would hang the run for good: on a timeout the FIFO at `path`
+    /// gets a reader, opened without waiting, before the test fails.
+    fn append_at_once(path: &Path, swap: impl Fn() + Send + 'static) -> Result<File, Refusal> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let name = path.to_path_buf();
+        std::thread::spawn(move || {
+            let once = std::sync::atomic::AtomicBool::new(false);
+            let _ = tx.send(append_own_then(&name, || {
+                if !once.swap(true, Ordering::SeqCst) {
+                    swap();
+                }
+            }));
+        });
+        let Ok(answer) = rx.recv_timeout(Duration::from_secs(5)) else {
+            let _ = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path);
+            panic!("the append waited on what took the name after the judgment");
+        };
+        answer
+    }
+
+    /// An append opens the file that was judged, not the name again. The
+    /// name was judged and then opened plainly, so a FIFO put there in
+    /// between still held a thread in its open.
+    #[test]
+    fn an_append_opens_the_file_it_judged_whatever_takes_the_name_after() {
+        use std::io::Write;
+        use std::os::unix::fs::FileTypeExt;
+        let dir = scratch("append");
+        let is_fifo = |p: &Path| std::fs::symlink_metadata(p).unwrap().file_type().is_fifo();
+
+        // A regular file is judged; a FIFO takes its name before the open.
+        let log = dir.join("history.jsonl");
+        std::fs::write(&log, b"one\n").unwrap();
+        let kept = dir.join("kept");
+        std::fs::hard_link(&log, &kept).unwrap();
+        let name = log.clone();
+        let mut file = append_at_once(&log, move || {
+            std::fs::remove_file(&name).unwrap();
+            mkfifo(&name);
+        })
+        .expect("the file that was judged");
+        file.write_all(b"two\n").unwrap();
+        drop(file);
+        assert!(is_fifo(&log), "the FIFO is left, never opened");
+        // The write went to the file that was judged.
+        assert_eq!(std::fs::read(&kept).unwrap(), b"one\ntwo\n");
+
+        // Nothing is at the name when it is judged; a FIFO appears before
+        // the file is made. It is not opened: it is judged, and refused.
+        let fresh = dir.join("fresh.jsonl");
+        let name = fresh.clone();
+        let refused = append_at_once(&fresh, move || mkfifo(&name));
+        assert!(
+            matches!(&refused, Err(Refusal::NotRegular(what)) if what == "a FIFO"),
+            "{refused:?}"
+        );
+        assert!(is_fifo(&fresh));
+
+        // With nothing in between: a new file is made, one that is there is
+        // appended to, and a FIFO, a device and a directory are refused.
+        let plain = dir.join("plain.jsonl");
+        for line in [&b"a\n"[..], b"b\n"] {
+            append_own(&plain).unwrap().write_all(line).unwrap();
+        }
+        assert_eq!(std::fs::read(&plain).unwrap(), b"a\nb\n");
+        assert!(matches!(
+            append_at_once(&fresh, || {}),
+            Err(Refusal::NotRegular(_))
+        ));
+        assert!(matches!(
+            append_own(Path::new("/dev/null")),
+            Err(Refusal::NotRegular(_))
+        ));
+        assert!(matches!(append_own(&dir), Err(Refusal::IsDirectory)));
+        // A link to nothing: nothing is made through it.
+        let link = dir.join("link.jsonl");
+        symlink(dir.join("nowhere"), &link).unwrap();
+        assert!(append_own(&link).is_err());
+        assert!(
+            !dir.join("nowhere").exists(),
+            "nothing is made through a link"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
