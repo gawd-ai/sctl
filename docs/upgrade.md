@@ -87,6 +87,20 @@ started through (`["/tmp/sctl/lib/libc.so", "--library-path", "/tmp/sctl/lib"]`)
 Under a loader `current_exe()` is the loader, so with a prefix the helper is a
 copy of the binary `ramboot.conf` names as `BIN`. Empty everywhere else.
 
+`restart_tmp_kb` (ADR-014) is the free `/tmp`, in KB, that this device's own
+init asks for before it starts the agent: what a restart on request needs
+there ([restarting the agent](#restarting-the-agent)). It belongs to the
+device's install record: the install script writes the number its init
+checks (16384 on the XE300, 8192 on a RUT241 installed as `gz-tmp`). Where a
+`gz-tmp` record gives none the agent takes 16384, and 0 on the layouts whose
+init asks for no room.
+
+The agent also reads the kill switch, `/etc/sctl/disabled`, the file an init
+that has a kill switch checks before it starts the agent (the XE300's and
+the shared ramboot init; the RUT241's `gz-tmp` init and the `usr-bin` init
+have none). While it exists the agent refuses to be restarted, on every
+layout: stopped, it would not start again.
+
 **The tools' name** (0.6.12, TRD-9). Every unit runs the agent's tools
 (`sctl net`, `sctl install-info`, `sctl upgrade`) as `/usr/bin/sctl`, whatever
 its layout, so a command stored for any unit carries no layout's path. It is a

@@ -17,6 +17,8 @@
 //! - [`state`]: the one state file both halves write and the tunnel pushes.
 //! - [`restart`]: the record of the agent's own restart (ADR-014), beside
 //!   the upgrade's state.
+//! - [`restart_checks`]: whether a start of the agent would be refused,
+//!   judged before a restart is accepted.
 //! - [`routes`]: `POST/GET/DELETE /api/upgrade`.
 
 pub mod apply;
@@ -26,6 +28,7 @@ pub mod install;
 pub mod keys;
 pub mod manifest;
 pub mod restart;
+pub mod restart_checks;
 pub mod routes;
 pub mod stage;
 pub mod state;

@@ -22,6 +22,25 @@ pub const DEFAULT_PATH: &str = "/etc/sctl/install.json";
 pub const HOLD_PATH: &str = "/etc/sctl/upgrade-hold";
 /// The boot fetcher's config when `install.json` names none.
 pub const RAMBOOT_CONF_PATH: &str = "/etc/sctl/ramboot.conf";
+/// The kill switch: while this file exists, an init that has a kill switch
+/// starts no agent (`devices/xe300/sctl.init`,
+/// `devices/common/sctl-ramboot.init`). The agent refuses to be restarted
+/// while it exists, on every layout (ADR-014).
+pub const DISABLED_PATH: &str = "/etc/sctl/disabled";
+/// Moves the kill switch for tests and benches, as `SCTL_INSTALL_JSON`
+/// moves `install.json`.
+pub const DISABLED_PATH_ENV: &str = "SCTL_DISABLED_PATH";
+/// The wrapper the ramboot init runs (`devices/common/sctl-ramboot.init`).
+pub const RAMBOOT_WRAPPER_PATH: &str = "/etc/sctl/ramboot.sh";
+/// The free `/tmp` a `gz-tmp` init asks for before it starts, where the
+/// install record gives none: the XE300's own threshold.
+pub const GZ_TMP_RESTART_TMP_KB: u64 = 16384;
+
+/// Where the kill switch is: [`DISABLED_PATH_ENV`] for a bench, else
+/// [`DISABLED_PATH`].
+pub fn disabled_path() -> PathBuf {
+    std::env::var_os(DISABLED_PATH_ENV).map_or_else(|| PathBuf::from(DISABLED_PATH), PathBuf::from)
+}
 
 /// How the agent is installed. Every layout runs the agent's tools as
 /// `/usr/bin/sctl`, or `/usr/local/bin/sctl` on the relay
@@ -83,6 +102,8 @@ struct Raw {
     #[serde(default)]
     min_free_kb: Option<u64>,
     #[serde(default)]
+    restart_tmp_kb: Option<u64>,
+    #[serde(default)]
     unit: Option<String>,
     #[serde(default)]
     ramboot_conf: Option<String>,
@@ -122,6 +143,11 @@ pub struct InstallInfo {
     pub health_url: Option<String>,
     /// Free space to keep on the target filesystem after a stage.
     pub min_free_kb: u64,
+    /// The free `/tmp` this device's init asks for before it starts the
+    /// agent, in KB: what a restart on request needs there (ADR-014). The
+    /// device's install script writes it beside the restart command; where
+    /// it gives none, [`GZ_TMP_RESTART_TMP_KB`] on `gz-tmp` and 0 elsewhere.
+    pub restart_tmp_kb: u64,
     /// The systemd unit (systemd layout).
     pub unit: Option<String>,
     /// The boot fetcher's config (ramboot layout).
@@ -187,6 +213,9 @@ impl InstallInfo {
         }
         if let Some(kb) = raw.min_free_kb {
             info.min_free_kb = kb;
+        }
+        if let Some(kb) = raw.restart_tmp_kb {
+            info.restart_tmp_kb = kb;
         }
         if let Some(unit) = raw.unit {
             info.restart = format!("systemctl restart {unit}");
@@ -295,6 +324,11 @@ impl InstallInfo {
             rollback_dir,
             health_url: None,
             min_free_kb,
+            restart_tmp_kb: if layout == Layout::GzTmp {
+                GZ_TMP_RESTART_TMP_KB
+            } else {
+                0
+            },
             unit,
             ramboot_conf,
             cache_dir,
@@ -380,6 +414,7 @@ impl InstallInfo {
             "rollback_dir": self.rollback_dir.display().to_string(),
             "health_url": self.health_url(listen),
             "min_free_kb": self.min_free_kb,
+            "restart_tmp_kb": self.restart_tmp_kb,
             "unit": self.unit,
             "ramboot_conf": self.ramboot_conf.as_ref().map(|p| p.display().to_string()),
             "cache_dir": self.cache_dir.as_ref().map(|p| p.display().to_string()),
@@ -434,6 +469,31 @@ mod tests {
             "http://127.0.0.1:1337/api/health"
         );
         assert_eq!(info.min_free_kb, 4096);
+    }
+
+    /// `restart_tmp_kb` belongs to the device's install record (ADR-014,
+    /// ruling 9): what the record says, and only where it says nothing the
+    /// `gz-tmp` default, 0 on the layouts whose init asks for no room.
+    #[test]
+    fn the_restart_threshold_is_the_records_and_defaults_per_layout() {
+        let parse = |json: &str| InstallInfo::parse(json.as_bytes(), "mipsel_24kc").unwrap();
+        let rut241 =
+            parse(r#"{"v":1,"layout":"gz-tmp","target":"mipsel_24kc","restart_tmp_kb":8192}"#);
+        assert_eq!(rut241.restart_tmp_kb, 8192);
+        assert_eq!(rut241.report("127.0.0.1:1337")["restart_tmp_kb"], 8192);
+        assert_eq!(
+            parse(r#"{"layout":"gz-tmp","target":"mipsel_24kc"}"#).restart_tmp_kb,
+            GZ_TMP_RESTART_TMP_KB
+        );
+        for layout in ["usr-bin", "ramboot", "systemd"] {
+            let json = format!(r#"{{"layout":"{layout}","target":"mipsel_24kc"}}"#);
+            assert_eq!(parse(&json).restart_tmp_kb, 0, "{layout}");
+        }
+        assert_eq!(
+            parse(r#"{"layout":"ramboot","target":"mipsel_24kc","restart_tmp_kb":4096}"#)
+                .restart_tmp_kb,
+            4096
+        );
     }
 
     #[test]
