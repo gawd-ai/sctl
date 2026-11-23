@@ -77,7 +77,7 @@ const AT_FAIL_TO_USB: u32 = 3;
 /// modem fault. Index 99 = "unknown" (no service). Index 5 ≈ −103 dBm.
 const RSSI_USABLE_MIN: u8 = 5;
 
-const HISTORY_MAX_BYTES: u64 = 5 * 1024 * 1024;
+pub(crate) const HISTORY_MAX_BYTES: u64 = 5 * 1024 * 1024;
 const SNAPSHOT_EVENTS: usize = 20;
 const REGRESSION_WINDOW: Duration = Duration::from_hours(1);
 const REGRESSION_THRESHOLD: usize = 3;

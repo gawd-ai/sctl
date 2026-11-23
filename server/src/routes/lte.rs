@@ -201,16 +201,41 @@ pub async fn manual_usb_cycle(State(state): State<AppState>) -> ApiResult<Value>
     Ok(Json(result))
 }
 
+/// The most of the watchdog's history one read returns: the size it
+/// rotates at, and one more entry's room. A file that is not the
+/// watchdog's own is cut here.
+const WATCHDOG_HISTORY_READ_CAP: usize =
+    crate::lte_watchdog::HISTORY_MAX_BYTES as usize + 64 * 1024;
+
 /// `GET /api/lte/watchdog/history` — return the rolling watchdog history file.
 pub async fn watchdog_history(State(state): State<AppState>) -> ApiResult<Value> {
     let path = std::path::Path::new(&state.config.server.data_dir).join("watchdog_history.jsonl");
-    if !path.exists() {
-        return Ok(Json(json!([])));
-    }
-    let contents = std::fs::read_to_string(&path).map_err(|e| {
-        ApiError::new(codes::IO_ERROR, format!("read watchdog_history.jsonl: {e}"))
-            .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
+    // Through the file gate's handle and its type judgment (ADR-011), on
+    // the blocking pool: a regular file is read, and a FIFO or a device at
+    // the name is refused without an open. A plain read here ran on a
+    // runtime worker, and four of them waiting on a FIFO stopped the agent.
+    let read = tokio::task::spawn_blocking(move || {
+        crate::file_access::read_own(&path, WATCHDOG_HISTORY_READ_CAP)
+    })
+    .await
+    .map_err(|e| crate::file_access::Refusal::Io(std::io::Error::other(e)))
+    .and_then(|read| read)
+    .map_err(|refusal| {
+        let status = match refusal {
+            crate::file_access::Refusal::NotRegular(_)
+            | crate::file_access::Refusal::IsDirectory => StatusCode::BAD_REQUEST,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        ApiError::new(
+            refusal.code(),
+            format!("read watchdog_history.jsonl: {}", refusal.message()),
+        )
+        .into_response_with(status)
     })?;
+    let Some(bytes) = read else {
+        return Ok(Json(json!([])));
+    };
+    let contents = String::from_utf8_lossy(&bytes);
     let entries: Vec<Value> = contents
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -311,4 +336,83 @@ fn default_lte_bands() -> Vec<u16> {
     vec![
         1, 2, 3, 4, 5, 7, 8, 12, 13, 14, 17, 20, 25, 26, 28, 29, 30, 66, 71,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::config::Config;
+    use crate::file_access::Gate;
+
+    /// The history as the route reads it, asked on a thread of its own: a
+    /// plain read ran on the runtime's worker, where no timeout of that
+    /// runtime could end it. On a timeout the FIFO gets a writer, opened
+    /// without waiting, before the test fails.
+    fn history(state: &AppState, fifo: Option<&std::path::Path>) -> ApiResult<Value> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let state = state.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _ = tx.send(runtime.block_on(watchdog_history(State(state))));
+        });
+        let Ok(answer) = rx.recv_timeout(Duration::from_secs(5)) else {
+            if let Some(fifo) = fifo {
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(fifo);
+            }
+            panic!("the history read waited");
+        };
+        answer
+    }
+
+    /// A FIFO at the history's name held a runtime worker for good, and
+    /// four of them stopped the agent. It is judged by its type and never
+    /// opened; the watchdog's own file is read as before.
+    #[test]
+    fn the_watchdog_history_refuses_a_fifo_at_once_and_reads_its_own_file() {
+        let dir = std::env::temp_dir().join(format!("sctl-lte-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let mut config: Config = toml::from_str("").unwrap();
+        config.server.data_dir = dir.join("data").display().to_string();
+        let gate = Arc::new(Gate::for_agent(&config, None, None));
+        let state = AppState::for_tests(config, gate);
+        let path = dir.join("data/watchdog_history.jsonl");
+
+        // No file yet: an empty history.
+        let Json(none) = history(&state, None).expect("no history yet");
+        assert_eq!(none, json!([]));
+
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        for _ in 0..8 {
+            let (status, Json(error)) =
+                history(&state, Some(&path)).expect_err("a FIFO is not the history");
+            assert_eq!(
+                (status, error.code.as_str()),
+                (StatusCode::BAD_REQUEST, "NOT_A_REGULAR_FILE")
+            );
+        }
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(
+            &path,
+            "{\"action\":\"soft_reset\"}\n\nnot json\n{\"action\":\"none\"}\n",
+        )
+        .unwrap();
+        let Json(entries) = history(&state, None).expect("the watchdog's own file");
+        assert_eq!(
+            entries,
+            json!([{"action": "soft_reset"}, {"action": "none"}])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -16,12 +16,45 @@ use serde_json::{json, Value};
 
 use crate::activity::{request_id_from_headers, source_from_headers, ActivityType};
 use crate::error::{codes, ApiError};
+use crate::file_access::{self, Refusal};
 use crate::AppState;
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
 /// Maximum playbook content size (1 MB).
 const MAX_PLAYBOOK_SIZE: usize = 1024 * 1024;
+
+/// A playbook's file, read through the file gate's handle and its type
+/// judgment (ADR-011): a regular file is read, at most
+/// [`MAX_PLAYBOOK_SIZE`] bytes, and a FIFO, a socket or a device named
+/// `*.md` in the playbooks directory is `NOT_A_REGULAR_FILE` and is never
+/// opened. A plain read waited on a FIFO for good, and 32 such reads took
+/// every handler the tunnel runs. `Ok(None)` when no file is there.
+async fn read_playbook_file(path: std::path::PathBuf) -> Result<Option<String>, Refusal> {
+    let read = tokio::task::spawn_blocking(move || file_access::read_own(&path, MAX_PLAYBOOK_SIZE))
+        .await
+        .map_err(|e| Refusal::Io(std::io::Error::other(e)))??;
+    read.map(|bytes| {
+        String::from_utf8(bytes)
+            .map_err(|e| Refusal::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+    })
+    .transpose()
+}
+
+/// A refusal of a playbook's file, as the file routes answer the gate's.
+fn playbook_refused(refusal: &Refusal, doing: &str) -> (StatusCode, Json<ApiError>) {
+    let status = match refusal {
+        Refusal::NotRegular(_) | Refusal::IsDirectory => StatusCode::BAD_REQUEST,
+        Refusal::Protected { .. } | Refusal::PermissionDenied => StatusCode::FORBIDDEN,
+        Refusal::NotFound => StatusCode::NOT_FOUND,
+        Refusal::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    ApiError::new(
+        refusal.code(),
+        format!("Failed to {doing} playbook: {}", refusal.message()),
+    )
+    .into_response_with(status)
+}
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -179,7 +212,14 @@ pub async fn list_playbooks(State(state): State<AppState>, headers: HeaderMap) -
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "md") {
-            if let Ok(content) = tokio::fs::read_to_string(&path).await {
+            let content = match read_playbook_file(path.clone()).await {
+                Ok(content) => content,
+                Err(refusal) => {
+                    tracing::warn!(path = %path.display(), "Skipping a playbook that cannot be read: {}", refusal.message());
+                    None
+                }
+            };
+            if let Some(content) = content {
                 match parse_playbook(&content) {
                     Ok((fm, _script)) => {
                         playbooks.push(PlaybookSummary {
@@ -221,15 +261,13 @@ pub async fn get_playbook(
     let req_id = request_id_from_headers(&headers);
     let file_path = format!("{}/{}.md", state.config.server.playbooks_dir, name);
 
-    let content = tokio::fs::read_to_string(&file_path).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
+    let content = read_playbook_file(std::path::PathBuf::from(&file_path))
+        .await
+        .map_err(|refusal| playbook_refused(&refusal, "read"))?
+        .ok_or_else(|| {
             ApiError::new(codes::NOT_FOUND, format!("Playbook '{name}' not found"))
                 .into_response_with(StatusCode::NOT_FOUND)
-        } else {
-            ApiError::new(codes::IO_ERROR, format!("Failed to read playbook: {e}"))
-                .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    })?;
+        })?;
 
     let (fm, script) = parse_playbook(&content).map_err(|e| {
         ApiError::new(codes::INVALID_CONTENT, format!("Invalid playbook: {e}"))
@@ -311,10 +349,29 @@ pub async fn put_playbook(
     }
 
     let file_path = format!("{dir}/{name}.md");
-    tokio::fs::write(&file_path, &body).await.map_err(|e| {
-        ApiError::new(codes::IO_ERROR, format!("Failed to write playbook: {e}"))
-            .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
-    })?;
+    // An open for writing waits on a FIFO with no reader. What is at the
+    // name is judged first, through the gate's handle (ADR-011): only
+    // nothing, or a regular file, is written.
+    let target = std::path::PathBuf::from(&file_path);
+    tokio::task::spawn_blocking(move || file_access::writable_own(&target))
+        .await
+        .map_err(|e| Refusal::Io(std::io::Error::other(e)))
+        .and_then(|judged| judged)
+        .map_err(|refusal| playbook_refused(&refusal, "write"))?;
+    // Written beside the name and renamed over it: the name itself is never
+    // opened, so whatever takes its place after the judgment holds nothing.
+    let beside = format!("{dir}/.{name}.md.tmp");
+    let written = match tokio::fs::write(&beside, &body).await {
+        Ok(()) => tokio::fs::rename(&beside, &file_path).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = written {
+        let _ = tokio::fs::remove_file(&beside).await;
+        return Err(
+            ApiError::new(codes::IO_ERROR, format!("Failed to write playbook: {e}"))
+                .into_response_with(StatusCode::INTERNAL_SERVER_ERROR),
+        );
+    }
 
     state
         .activity_log
@@ -363,4 +420,160 @@ pub async fn delete_playbook(
         .await;
 
     Ok(Json(json!({"ok": true, "name": name})))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+    use std::path::{Path as FsPath, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::config::Config;
+    use crate::file_access::Gate;
+
+    const PLAYBOOK: &str =
+        "---\nname: outlet-cycle\ndescription: Cycle an outlet\n---\n```sh\necho cycle\n```\n";
+
+    /// A state whose playbooks directory is `<scratch>/playbooks`.
+    fn bench(tag: &str) -> (PathBuf, AppState) {
+        let dir = std::env::temp_dir().join(format!("sctl-playbooks-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("playbooks")).unwrap();
+        let mut config: Config = toml::from_str("").unwrap();
+        config.server.data_dir = dir.join("data").display().to_string();
+        config.server.playbooks_dir = dir.join("playbooks").display().to_string();
+        let gate = Arc::new(Gate::for_agent(&config, None, None));
+        (dir, AppState::for_tests(config, gate))
+    }
+
+    fn mkfifo(path: &FsPath) {
+        nix::unistd::mkfifo(path, nix::sys::stat::Mode::S_IRWXU).unwrap();
+    }
+
+    /// Wait for `answer` at most 5 s. A read or a write that waited on the
+    /// FIFO would hang the run for good: on a timeout the FIFO gets its
+    /// other end, opened without waiting, before the test fails.
+    async fn at_once<T>(fifo: &FsPath, answer: impl std::future::Future<Output = T>) -> T {
+        let Ok(answer) = tokio::time::timeout(Duration::from_secs(5), answer).await else {
+            for write in [true, false] {
+                let _ = std::fs::OpenOptions::new()
+                    .read(!write)
+                    .write(write)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(fifo);
+            }
+            panic!("the route waited on a FIFO");
+        };
+        answer
+    }
+
+    /// A FIFO named `*.md` in the playbooks directory held `GET
+    /// /api/playbooks` for good, and 32 such reads took every handler the
+    /// tunnel runs. It is judged by its type and never opened: the list
+    /// answers at once without it.
+    #[tokio::test]
+    async fn the_list_skips_a_fifo_named_as_a_playbook_and_answers_at_once() {
+        let (dir, state) = bench("list");
+        std::fs::write(dir.join("playbooks/outlet-cycle.md"), PLAYBOOK).unwrap();
+        let fifo = dir.join("playbooks/stuck.md");
+        mkfifo(&fifo);
+        for _ in 0..40 {
+            let Json(body) = at_once(
+                &fifo,
+                list_playbooks(State(state.clone()), HeaderMap::new()),
+            )
+            .await
+            .expect("the list answers");
+            assert_eq!(body["playbooks"].as_array().unwrap().len(), 1, "{body}");
+            assert_eq!(body["playbooks"][0]["name"], "outlet-cycle");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reading_a_fifo_named_as_a_playbook_is_refused_at_once() {
+        let (dir, state) = bench("get");
+        std::fs::write(dir.join("playbooks/outlet-cycle.md"), PLAYBOOK).unwrap();
+        let fifo = dir.join("playbooks/stuck.md");
+        mkfifo(&fifo);
+        for _ in 0..40 {
+            let (status, Json(error)) = at_once(
+                &fifo,
+                get_playbook(State(state.clone()), Path("stuck".into()), HeaderMap::new()),
+            )
+            .await
+            .expect_err("a FIFO is not a playbook");
+            assert_eq!(
+                (status, error.code.as_str()),
+                (StatusCode::BAD_REQUEST, "NOT_A_REGULAR_FILE")
+            );
+            assert!(error.message.contains("a FIFO"), "{}", error.message);
+        }
+        // A playbook beside it is read as before, and a missing one is 404.
+        let Json(body) = get_playbook(
+            State(state.clone()),
+            Path("outlet-cycle".into()),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("a regular playbook");
+        assert_eq!(body["script"], "echo cycle");
+        assert_eq!(body["raw_content"], PLAYBOOK);
+        let (status, _) = get_playbook(State(state), Path("none".into()), HeaderMap::new())
+            .await
+            .expect_err("no such playbook");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A write onto a FIFO with no reader waited in its open. What is at
+    /// the name is judged first, and a write never opens the name itself.
+    #[tokio::test]
+    async fn a_write_onto_a_fifo_is_refused_at_once_and_a_playbook_is_replaced_whole() {
+        let (dir, state) = bench("put");
+        let fifo = dir.join("playbooks/stuck.md");
+        mkfifo(&fifo);
+        let put = |name: &str, body: &str| {
+            put_playbook(
+                State(state.clone()),
+                Path(name.to_string()),
+                HeaderMap::new(),
+                body.to_string(),
+            )
+        };
+        let stuck = PLAYBOOK.replace("outlet-cycle", "stuck");
+        let (status, Json(error)) = at_once(&fifo, put("stuck", &stuck))
+            .await
+            .expect_err("a FIFO is not written");
+        assert_eq!(
+            (status, error.code.as_str()),
+            (StatusCode::BAD_REQUEST, "NOT_A_REGULAR_FILE")
+        );
+        assert!(
+            std::fs::symlink_metadata(&fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "the FIFO is left as it was"
+        );
+
+        // A new playbook, then the same name again: written, then replaced.
+        let file = dir.join("playbooks/outlet-cycle.md");
+        let Json(written) = put("outlet-cycle", PLAYBOOK).await.expect("written");
+        assert_eq!(written["ok"], true);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), PLAYBOOK);
+        let again = PLAYBOOK.replace("echo cycle", "echo again");
+        let Json(replaced) = put("outlet-cycle", &again).await.expect("replaced");
+        assert_eq!(replaced["name"], "outlet-cycle");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), again);
+        // Nothing is left beside it.
+        let left: Vec<_> = std::fs::read_dir(dir.join("playbooks"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left.len(), 2, "{left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

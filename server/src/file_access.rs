@@ -484,6 +484,72 @@ impl Gate {
     }
 }
 
+/// Open one of the agent's own files for one of its own routes: a
+/// playbook, the watchdog's history, the safe-mode flag. These live in the
+/// agent's directories, which [`Gate::open`] refuses to a caller's read, so
+/// its path rules do not apply; its handle and its type judgment do (ADR-011
+/// decisions 2 and 6). A handle that opens nothing is taken (`O_PATH`), the
+/// type is read from it, and only a regular file is opened, through that
+/// handle and without waiting. A FIFO, a socket or a device placed at the
+/// path is `NOT_A_REGULAR_FILE` and is never opened, so it holds no
+/// handler. Blocking: async callers run it on the blocking pool.
+pub fn open_own(path: &Path) -> Result<Opened, Refusal> {
+    let handle = Handle::take(path).map_err(Refusal::opening)?;
+    let facts = handle.facts().map_err(|e| Refusal::judging(&e))?;
+    if facts.nlink == 0 {
+        return Err(Refusal::NotFound);
+    }
+    if facts.kind == libc::S_IFDIR {
+        return Err(Refusal::IsDirectory);
+    }
+    if let Some(what) = not_regular(facts.kind) {
+        return Err(Refusal::NotRegular(what.to_string()));
+    }
+    let file = handle.reopen().map_err(Refusal::opening)?;
+    Ok(Opened {
+        file,
+        size: facts.size,
+        modified: facts.modified,
+        id: facts.id,
+        pseudo: None,
+    })
+}
+
+/// Read one of the agent's own files whole, at most `cap` bytes
+/// ([`open_own`]). `Ok(None)` when no file is there; a file longer than
+/// `cap` is cut there.
+pub fn read_own(path: &Path, cap: usize) -> Result<Option<Vec<u8>>, Refusal> {
+    match open_own(path) {
+        Ok(mut opened) => opened
+            .read(0, cap)
+            .map(|out| Some(out.bytes))
+            .map_err(Refusal::Io),
+        Err(Refusal::NotFound) => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Whether one of the agent's own routes may write `path`: nothing is
+/// there, or a regular file is. An open for writing waits on a FIFO with no
+/// reader and runs a device's open, so anything else is
+/// `NOT_A_REGULAR_FILE` before any open (ADR-011 decision 6). The judgment
+/// is the read's: a handle that opens nothing, and the type read from it.
+pub fn writable_own(path: &Path) -> Result<(), Refusal> {
+    let handle = match Handle::take(path) {
+        Ok(handle) => handle,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(Refusal::opening(e)),
+    };
+    let facts = handle.facts().map_err(|e| Refusal::judging(&e))?;
+    if facts.kind == libc::S_IFDIR {
+        return Err(Refusal::IsDirectory);
+    }
+    match not_regular(facts.kind) {
+        Some(what) => Err(Refusal::NotRegular(what.to_string())),
+        None => Ok(()),
+    }
+}
+
 /// Open `path` again for a later read of a file the gate judged, only while
 /// it is still that file: the same device and inode, still a regular file.
 /// Returns the file and its last change (seconds since the epoch).
@@ -1054,6 +1120,63 @@ mod tests {
             expect_not_regular(gate.open(Path::new("/dev/zero"), Purpose::Move)),
             "a character device"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The agent's own routes read the agent's own files through the same
+    /// handle and the same type judgment: a regular file is read, and a
+    /// FIFO, a socket or a device placed at its path is refused at once and
+    /// never opened, for a read and for a write.
+    #[test]
+    fn the_agents_own_files_are_judged_by_the_same_handle() {
+        let dir = scratch("own");
+        let file = dir.join("playbook.md");
+        std::fs::write(&file, b"twelve bytes").unwrap();
+        assert_eq!(read_own(&file, 1024).unwrap().unwrap(), b"twelve bytes");
+        assert_eq!(
+            read_own(&file, 6).unwrap().unwrap(),
+            b"twelve",
+            "cut at the cap"
+        );
+        assert!(read_own(&dir.join("none"), 1024).unwrap().is_none());
+        assert!(matches!(open_own(&dir), Err(Refusal::IsDirectory)));
+        assert!(writable_own(&file).is_ok());
+        assert!(writable_own(&dir.join("none")).is_ok(), "nothing there yet");
+        assert!(matches!(writable_own(&dir), Err(Refusal::IsDirectory)));
+
+        let fifo = dir.join("pipe.md");
+        mkfifo(&fifo);
+        for _ in 0..40 {
+            let what = answers_at_once(Some(&fifo), {
+                let fifo = fifo.clone();
+                move || expect_not_regular(open_own(&fifo))
+            });
+            assert_eq!(what, "a FIFO");
+        }
+        let what = answers_at_once(Some(&fifo), {
+            let fifo = fifo.clone();
+            move || match writable_own(&fifo) {
+                Err(Refusal::NotRegular(what)) => what,
+                other => panic!("a FIFO was judged writable: {other:?}"),
+            }
+        });
+        assert_eq!(what, "a FIFO");
+        assert_eq!(
+            expect_not_regular(open_own(Path::new("/dev/null"))),
+            "a character device"
+        );
+        assert!(matches!(
+            writable_own(Path::new("/dev/zero")),
+            Err(Refusal::NotRegular(_))
+        ));
+        // A link to a FIFO is the FIFO.
+        let link = dir.join("link.md");
+        symlink(&fifo, &link).unwrap();
+        let what = answers_at_once(Some(&fifo), {
+            let link = link.clone();
+            move || expect_not_regular(open_own(&link))
+        });
+        assert_eq!(what, "a FIFO");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

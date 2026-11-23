@@ -747,10 +747,15 @@ typed `params`) and a fenced `sh`/`bash` code block, stored in
 `server.playbooks_dir`. Names must be non-empty, ≤ alphanumeric/`-`/`_`
 only (`400` `INVALID_REQUEST` otherwise).
 
+A playbook's file is read through the file gate's handle and its type
+judgment (ADR-011): only a regular file is opened, without waiting, and at
+most 1 MB of it is read. A FIFO, a socket or a device named `*.md` in the
+directory is never opened.
+
 ### `GET /api/playbooks`
 
-List playbooks with summary info. Unparsable files are skipped with a
-warning, not an error. **Auth: API key Bearer.**
+List playbooks with summary info. Unparsable files, and entries that are
+not regular files, are skipped with a warning, not an error. **Auth: API key Bearer.**
 
 Response `200`: `{playbooks: [{name, description, params: [names...]}]}`.
 
@@ -764,8 +769,9 @@ Full playbook detail. **Auth: API key Bearer.**
 Response `200`: `{name, description, params: {name: {type, description,
 default?, enum?}}, script, raw_content}`.
 
-Errors: `404` `NOT_FOUND`, `422` `INVALID_CONTENT` (file exists but does not
-parse), `500` `IO_ERROR`.
+Errors: `404` `NOT_FOUND`, `400` `NOT_A_REGULAR_FILE` (a FIFO, a socket or a
+device is at the playbook's name), `422` `INVALID_CONTENT` (file exists but
+does not parse), `500` `IO_ERROR`.
 
 ### `PUT /api/playbooks/{name}`
 
@@ -775,8 +781,13 @@ API key Bearer.**
 
 Response `200`: `{ok: true, name, path}`.
 
-Errors: `400` `INVALID_CONTENT` (does not parse), `413` `FILE_TOO_LARGE`
-(over 1 MB), `500` `IO_ERROR`.
+The document is written beside the playbook's name and renamed over it, so
+a reader never sees half of one and the name itself is never opened.
+
+Errors: `400` `INVALID_CONTENT` (does not parse), `400`
+`NOT_A_REGULAR_FILE` (a FIFO, a socket or a device is at the playbook's
+name: nothing is written), `413` `FILE_TOO_LARGE` (over 1 MB), `500`
+`IO_ERROR`.
 
 ### `DELETE /api/playbooks/{name}`
 
@@ -879,9 +890,11 @@ Rolling LTE-watchdog history (`watchdog_history.jsonl`). **Auth: API key
 Bearer.**
 
 Response `200`: JSON array of watchdog event entries; `[]` when the file
-does not exist.
+does not exist. The file is read as a playbook's is: only a regular file
+is opened, without waiting.
 
-Errors: `500` `IO_ERROR`.
+Errors: `400` `NOT_A_REGULAR_FILE` (a FIFO, a socket or a device is at the
+history's name), `500` `IO_ERROR`.
 
 ---
 
