@@ -78,7 +78,7 @@ Each change says what changes, in which files, how it is tested and when it is a
 - `Runs` gains a gate: `close_if_idle` closes the set in the step that finds it empty and answers whether it is closed; while it is closed, `start` answers none; `reopen` opens it. A monitor check that finds the gate closed records and signals its Down as today and starts no run, and neither the cooldown nor the count moves: the run is the next process's.
 - `ends` is built from what the agent holds: the running terminals, those with a client attached, the running jobs' names (at most 16, each cut to 64 bytes on a character boundary; a job with no name is named by its session id), the transfers in flight (`init`, `transferring`, `paused`, `verifying`).
 
-**Files.** `server/src/infra/mod.rs`, `server/src/sessions/mod.rs`, `server/src/upgrade/restart.rs`.
+**Files.** `server/src/infra/mod.rs`, `server/src/infra/monitor.rs` (its test), `server/src/upgrade/restart.rs`.
 
 **Tests.**
 
@@ -114,12 +114,12 @@ Each change says what changes, in which files, how it is tested and when it is a
 **Change.** `POST /api/restart`, behind the key, in this order:
 
 1. The body: `request_id` at most 128 bytes, `unless` a list of `sessions`, `jobs`, `transfers`; otherwise 400 `RESTART_BAD_REQUEST`. An empty body is a request with neither.
-2. The in-flight mutex the upgrade takes, tried and not waited for; an upgrade's state in flight is 409 `UPGRADE_IN_FLIGHT`, a record `accepted` or `restarting` is 409 `RESTART_IN_FLIGHT` with the record. A `restarting` record whose lock is free is settled first, as the upgrade clears a lost helper. `POST /api/upgrade` refuses in the same way while a restart is in flight.
+2. The in-flight mutex the upgrade takes, waited for 250 ms at most (a hand-off that has just ended holds it for an instant after its record reads done); an upgrade's state in flight is 409 `UPGRADE_IN_FLIGHT`, a record `accepted` or `restarting` is 409 `RESTART_IN_FLIGHT` with the record. A `restarting` record whose lock is free is settled first, as the upgrade clears a lost helper. `POST /api/upgrade` refuses in the same way while a restart is in flight.
 3. A relay is refused (`relay`).
 4. The start's judgment (3.2).
 5. `unless`, against `ends`.
 6. The gate: `close_if_idle`, or `recovery_running`.
-7. The record `accepted`, written and pushed; the answer, 202.
+7. The record `accepted`, written and pushed; the answer, 202, with `window_secs`, `second_run` (true on `gz-tmp`, where the helper may wait a second window), `safe_mode` and `ends`.
 8. In a task that holds the mutex: every session and job ended (`kill_all`); the plan written; the record `restarting`; the helper started; the record watched until the helper ends it. A helper that cannot be started ends the record as `not_started`, reopens the gate, and the agent keeps running. A record the helper ends while this process still runs (`not_restarted`, `not_healthy`) reopens the gate too.
 
 **Files.** `server/src/upgrade/restart_route.rs` (new), `server/src/upgrade/routes.rs` (`POST /api/upgrade`'s refusal), `server/src/main.rs` (the route), `docs/http-api.md` (the route under "Managed upgrades", `instance` in `GET /api/health`, `restart` in `GET /api/upgrade` and in `upgrade.state`), `docs/upgrade.md` (a section "Restarting the agent" beside the hand-off, and the per-layout table), `docs/safe-mode.md` (lines 117 to 119 name the route), `docs/errors.md` (the codes and the reasons), `CHANGELOG.md` `[Unreleased]`.
@@ -168,10 +168,10 @@ Each change says what changes, in which files, how it is tested and when it is a
 
 **Tests.**
 
-- The request is answered 202 with `instance_before` equal to health's; the marker appears; `GET /api/upgrade` then reads `restart` `done`, `ok`, `attempts` 1, `instance_after` the stand-in's value; a second request during the first is 409 `RESTART_IN_FLIGHT`.
-- With the kill switch's stand-in present: 422 `disabled`, no marker.
-- With no `install.json`: 422 `no_install_json`.
-- A session open before the request is gone after it.
+- The request is answered 202 with `instance_before` equal to health's, before the marker exists; a second request during the first is 409 `RESTART_IN_FLIGHT`; the marker appears; `GET /api/upgrade` then reads `restart` `done`, `ok`, `attempts` 1, `instance_after` the stand-in's value, no `boot_after`, and the helper's log tail; the agent the test started still answers with its own `instance`.
+- With the kill switch's stand-in present: 422 `disabled`, no marker and no plan.
+- With no `install.json`: 422 `no_install_json`; a bad body is 400; without the key, 401.
+- Sessions are not opened here: that takes a WebSocket client. 3.5's test ends real sessions and a real job, the test's own children, before its stand-in helper is started.
 
 **Accepted when.** `restart.rs` is green on the pinned toolchain with no root.
 
@@ -229,13 +229,17 @@ These ride the same release. They are not slices of this TRD: the release and it
 
 ## 7. Slices and status
 
-Build order. Each slice is one commit, reviewed before the release; the status flips in the change that ships it, with the verification it ran.
+Build order. Each slice is one commit. The TRD's status flips in the change that ships it; until then every slice reads Planned, and a slice that is built says so, with its commit and what it ran. Nothing here is released, no payload was built, and nothing was sent to a unit.
 
-1. The record, and `instance` in health (3.1): Planned.
-2. What the agent knows of its own start (3.2): Planned.
-3. What a restart ends, and the gate on recovery runs (3.3): Planned.
-4. The helper (3.4): Planned.
-5. The route and the docs (3.5): Planned.
-6. The device tree (3.6): Planned.
-7. A real agent and a real helper on loopback (3.7): Planned.
+1. The record, and `instance` in health (3.1): Planned. Built (2026-11-22, `61265d3`): 12 new tests in the library, 1 in `relay_events.rs`.
+2. What the agent knows of its own start (3.2): Planned. Built (2026-11-22, `13ba2c4`): 11 new tests in the library.
+3. What a restart ends, and the gate on recovery runs (3.3): Planned. Built (2026-11-22, `5007648`): 5 new tests in the library. Reading what the stop does to a `POST /api/exec` in flight and to a session whose process ignores SIGTERM is left to the bench (3.8).
+4. The helper (3.4): Planned. Built (2026-11-22, `2bc444d`): 10 new tests in the library, 1 in the binary. The words an upgrade's helper is started by are pinned in the same commit that widens the start, not in one before it: each slice is one commit.
+5. The route and the docs (3.5): Planned. Built (2026-11-22, `3d8176f`): 7 new tests in the library; both docs gates pass, the HTTP API gate with one new heading (69 routes, 68 sections).
+6. The device tree (3.6): Planned. Built (2026-11-22, `d071965`): 5 tests in `server/tests/restart_inits.rs`.
+7. A real agent and a real helper on loopback (3.7): Planned. Built (2026-11-22, `effcfaf`): 3 tests in `server/tests/restart.rs`, about 7 s. It found that a hand-off that has just ended still holds the in-flight lock for an instant after its record reads done; the route now waits up to 250 ms for the lock (3.5).
 8. The bench (3.8): Planned. It needs a relay, units and the release's payloads.
+
+**What slices 1 to 7 ran (2026-11-22, at `effcfaf`, on the pinned 1.97.1).** `cargo test --workspace`: 644 passed in the library and 1 not run (below), 11 in the binary, 51 in the MCP, 17 in `relay_events.rs`, 9 in `cli_name.rs` (1 ignored, root), 3 in `restart.rs`, 5 in `restart_inits.rs`, 3 in `xe300_relay_route_sh.rs`, 1 and 4 in the two comms crates; the two netns tests ignored, as without root. `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` clean. `cargo doc --workspace --no-deps`: the five warnings it had before, none from these files. `scripts/check-http-api-docs.py` and `scripts/check-config-docs.py` pass. No stray ts-rs output.
+
+One test of the library was not run: `netwatch::owner::tests::a_preferred_wire_holds_the_route_over_a_lower_metric_lte` did not end on the build machine, at `a222339` before any of this as well (a run of the unchanged tree stood on it for eight minutes). It is not touched by this TRD and is left for whoever owns the relay route's tests.
