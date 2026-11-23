@@ -617,7 +617,9 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
     // keep only the management plane (HTTP + tunnel + sessions) live so an
     // operator can reach the box, inspect logs, and clear the flag.
     let safe_mode_flag_path = std::path::Path::new(&config.server.data_dir).join("safe_mode.flag");
-    let safe_mode_active = safe_mode_flag_path.exists();
+    // One judgment for boot and the routes: anything at the flag's name is
+    // the flag, a link to nothing and a directory included.
+    let safe_mode_active = routes::safe_mode::active(std::path::Path::new(&config.server.data_dir));
     if safe_mode_active {
         warn!(
             "==== SAFE MODE ACTIVE ==== modem/GPS/LTE/watchdog/infra subsystems will be skipped. \

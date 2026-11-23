@@ -23,6 +23,16 @@ box, read logs, and clear the flag. The startup log banner is unmissable:
 ==== SAFE MODE ACTIVE ==== modem/GPS/LTE/watchdog/infra subsystems will be skipped. ...
 ```
 
+The flag is whatever is at that name, looked at without following a link:
+the supervisor's file, and also a link (even one to nothing), a directory,
+a FIFO, or a name that cannot be looked at. The agent's start, `GET
+/api/info`, `GET /api/safe_mode/flag` and `POST /api/restart`'s answer read
+that one judgment, so they never disagree, and something at the name that
+cannot be read never reads as "no flag". `DELETE /api/safe_mode/flag`
+removes what is there (a link itself, never what it names; an empty
+directory), so the flag can always be cleared over the API; only a
+directory that holds something is refused, with a message naming it.
+
 While the flag exists, the supervisor also stretches its restart backoff to
 a fixed 300 s (instead of the normal exponential ramp capped at
 `[supervisor] max_backoff`) so it does not spin on a flag nobody has

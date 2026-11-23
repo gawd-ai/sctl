@@ -1274,9 +1274,11 @@ Inspect the flag. **Auth: API key Bearer.**
 Response `200`: `{active: false}` when nothing is at the flag's name;
 `{active: true, flag: {since_unix, reason, consecutive_crashes}}` for the
 supervisor's flag; and `{active: true, flag: null, reason: "..."}` for
-anything else at the name: a FIFO or a device (never opened), content that
-is not JSON, a link to nothing, a name that cannot be looked at. `reason`
-says which. A unit in safe mode whose flag cannot be read never reads as a
+anything else at the name: a FIFO or a device (never opened), a directory,
+content that is not JSON, a link to nothing, a name that cannot be looked
+at. `reason` says which. Anything at the flag's name, looked at without
+following a link, is the flag: the agent's start, this route, `DELETE` and
+`POST /api/restart`'s answer read that one judgment. A unit in safe mode whose flag cannot be read never reads as a
 unit out of safe mode; before 0.6.14 an unreadable flag was a `500`.
 `GET /api/info`'s `safe_mode` is the same object.
 
@@ -1286,10 +1288,19 @@ Clear the flag. Idempotent — clearing an absent flag succeeds. Does **not**
 restart the daemon; the operator restarts it (or lets the supervisor recycle
 it) to bring the optional subsystems back. **Auth: API key Bearer.**
 
+It removes what is at the flag's name, which is what `GET` and the agent's
+start read as the flag: a file, a FIFO, a link (the link itself, never what
+it names), an empty directory. Before 0.6.14 a link to nothing was answered
+"flag not present" while `GET` said active, and a directory could not be
+cleared.
+
 Response `200`: `{cleared: true}` or `{cleared: false, reason: "flag not
 present"}`.
 
-Errors: `500` (plain status) on filesystem failure.
+Errors: `409` `IS_DIRECTORY` (a directory at the flag's name that holds
+something: it is not removed, the message names it, and the flag stays
+set until it is emptied or removed on the unit), `500` `IO_ERROR` (what is
+there could not be removed; a plain status before 0.6.14).
 
 ---
 

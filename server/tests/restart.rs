@@ -498,3 +498,45 @@ fn sctl_upgrade_from_a_shell_refuses_while_a_restarts_helper_is_at_work() {
     );
     drop(lock);
 }
+
+/// Boot and the routes read the flag with one function. A link to nothing
+/// at the flag's name: the route said active while boot ran normal, and
+/// `DELETE` said there was no flag. A directory there was active for the
+/// route and could not be cleared. Whatever is at the name is the flag,
+/// for all of them, and `DELETE` removes it.
+#[test]
+fn boot_and_the_routes_agree_on_what_the_safe_mode_flag_is() {
+    type Place = fn(&Path, &Path);
+    let cases: [(&str, Place); 2] = [
+        ("flag-link", |flag, nowhere| {
+            std::os::unix::fs::symlink(nowhere, flag).unwrap();
+        }),
+        ("flag-dir", |flag, _| std::fs::create_dir(flag).unwrap()),
+    ];
+    for (name, place) in cases {
+        let bench = Bench::new(name, false);
+        let flag = bench.path("data/safe_mode.flag");
+        place(&flag, &bench.path("nowhere"));
+        let agent = Agent::start(&bench);
+
+        let (status, info) = bench.request("GET", "/api/info?groups=core,infra", "");
+        assert_eq!(status, 200, "{info}");
+        assert_eq!(info["safe_mode"]["active"], true, "{name}: the route");
+        assert_eq!(
+            info["infra"]["off"],
+            "safe_mode",
+            "{name}: boot read the flag the route reads: {}",
+            agent.said()
+        );
+
+        let (status, cleared) = bench.request("DELETE", "/api/safe_mode/flag", "");
+        assert_eq!(
+            (status, &cleared),
+            (200, &json!({"cleared": true})),
+            "{name}"
+        );
+        assert!(std::fs::symlink_metadata(&flag).is_err(), "{name}: gone");
+        let (_, after) = bench.request("GET", "/api/safe_mode/flag", "");
+        assert_eq!(after, json!({"active": false}), "{name}");
+    }
+}

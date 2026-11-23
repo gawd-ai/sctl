@@ -284,14 +284,17 @@ mod tests {
 
     #[test]
     fn safe_mode_flag_is_a_real_file_for_child_to_read() {
-        // The child reads this on startup via path.exists(). This test
-        // confirms the flag is a regular file (not a directory or symlink)
-        // and is parsable JSON — both expected by the child.
+        // The child reads this at its start with the routes' one judgment
+        // (`routes::safe_mode::active`). This test confirms the flag is a
+        // regular file (not a directory or symlink) and is parsable JSON,
+        // which is what `GET /api/safe_mode/flag` answers whole.
         let dir = temp_data_dir("flag-shape");
         let dd = dir.to_string_lossy().into_owned();
         write_safe_mode_flag(&dd, "test_reason", 5);
         let flag = dir.join("safe_mode.flag");
         assert!(flag.exists(), "flag file must exist");
+        assert!(sctl::routes::safe_mode::active(&dir), "the child's reading");
+        assert!(std::fs::symlink_metadata(&flag).unwrap().is_file());
         let raw = std::fs::read_to_string(&flag).expect("read flag");
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("flag is JSON");
         assert_eq!(parsed["reason"], "test_reason");
