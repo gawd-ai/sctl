@@ -15,5 +15,6 @@ A decision that shapes the agent, the relay or the way they are built and releas
 | [011](011-file-reads-read-what-is-there-and-refuse-secrets-and-devices.md) | File reads read what is there, and refuse secrets and devices | Accepted (2026-10-21) | [TRD-9](../trd/TRD-9-release-0-6-12.md) (release 0.6.12) |
 | [012](012-net-tools-send-only-on-the-lan-to-the-device-expected.md) | Net tools send only on the LAN, to the device expected | Accepted (2026-10-21) | [TRD-9](../trd/TRD-9-release-0-6-12.md) (release 0.6.12). Departs from decision 1: the unit's own addresses do not pass, they are refused as `own_address` (TRD-9 3.4, the lead's ruling of 2026-10-25); only the loopback passes |
 | [013](013-a-session-starts-closed-to-ai-clients.md) | A session starts closed to AI clients | Accepted (2026-10-25) | [TRD-9](../trd/TRD-9-release-0-6-12.md) (release 0.6.12) |
+| [014](014-the-agent-restarts-itself-through-one-authenticated-route.md) | The agent restarts itself through one authenticated route | Proposed (2026-11-22) | [TRD-10](../trd/TRD-10-the-agents-own-restart.md) |
 
 ADR-008 and ADR-009 are reserved: ADR-008 for a router's WAN digest (fleet TRD-28, appendix A), ADR-009 for an uplink's throughput (fleet TRD-29). Each ships later with a TRD of its own, so 010 follows 007.
