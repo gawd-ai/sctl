@@ -248,4 +248,15 @@ Build order. Each slice is one commit. The TRD's status flips in the change that
 
 **What slices 1 to 7 ran (2026-11-22, at `effcfaf`, on the pinned 1.97.1).** `cargo test --workspace`: 644 passed in the library and 1 not run (below), 11 in the binary, 51 in the MCP, 17 in `relay_events.rs`, 9 in `cli_name.rs` (1 ignored, root), 3 in `restart.rs`, 5 in `restart_inits.rs`, 3 in `xe300_relay_route_sh.rs`, 1 and 4 in the two comms crates; the two netns tests ignored, as without root. `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` clean. `cargo doc --workspace --no-deps`: the five warnings it had before, none from these files. `scripts/check-http-api-docs.py` and `scripts/check-config-docs.py` pass. No stray ts-rs output.
 
-One test of the library was not run: `netwatch::owner::tests::a_preferred_wire_holds_the_route_over_a_lower_metric_lte` did not end on the build machine, at `a222339` before any of this as well (a run of the unchanged tree stood on it for eight minutes). It is not touched by this TRD and is left for whoever owns the relay route's tests.
+**The review of slices 1 to 7 (2026-11-22 and 23).** Eight findings, one commit each, each with a test that fails without it:
+
+1. The instance is drawn without a wait for entropy (`7220473`). ADR-014 ruling 6 is amended.
+2. The agent does not wait on its helper for ever: the lock is released once the helper is started, and the wait is bounded (`548c69b`).
+3. Every step of the restart's helper is bounded: the command, each health read, and the helper as a whole (`8c6639c`). The upgrade's helper is left as it is; its unbounded run is in section 4.
+4. The start's room counts the binary the helper pins (`84d2273`).
+5. A window is judged by its last answered read, and silence by its tail (`5849258`).
+6. `sctl upgrade` from a shell and a restart read each other's lock on disk (`af4f57f`).
+7. `ok` is written only by the helper; a new process writes `interrupted` (`464aacf`).
+8. Not part of this TRD: `netwatch::owner::tests::a_preferred_wire_holds_the_route_over_a_lower_metric_lte` waits on the paused clock, as its siblings do (`7b0b793`). It was the test the first run could not end: on the real clock its `next_round` slept the schedule's minutes.
+
+**What ran after the review (2026-11-23, at `7b0b793`, on the pinned 1.97.1).** `cargo test --workspace`, nothing skipped: 664 passed in the library, 11 in the binary, 51 in the MCP, 17 in `relay_events.rs`, 9 in `cli_name.rs` (1 ignored, root), 4 in `restart.rs`, 5 in `restart_inits.rs`, 3 in `xe300_relay_route_sh.rs`, 1 and 4 in the two comms crates; the two netns tests ignored, as without root. `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` clean; both docs gates pass.
