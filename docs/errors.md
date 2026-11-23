@@ -97,7 +97,8 @@ one status depending on the route.
 | `INVALID_REQUEST` | 400 | Bad parameter or body field (empty command list, bad band mode, missing required header, …) |
 | `INVALID_PATH` | 400 | Path not absolute, contains `..` or NUL |
 | `INVALID_MODE` | 400 | Bad octal mode string on file write |
-| `INVALID_CONTENT` | 400 / 422 | base64 decode failed (400) / unparsable playbook (422) |
+| `INVALID_CONTENT` | 400 / 422 | base64 decode failed (400) / unparsable playbook, or one that is not UTF-8 text (422) |
+| `PLAYBOOK_TOO_LARGE` | 422 | `GET /api/playbooks/{name}`: the stored file is over the 1 MiB playbook bound. None of it is returned; `GET /api/playbooks` names it with `too_large: true` |
 | `FILE_NOT_FOUND` | 404 | File or directory does not exist |
 | `FILE_TOO_LARGE` | 400 / 413 | Exceeds `max_file_size` (or the 1 MB playbook cap). Through the relay `GET /api/files` reads at most 4 MiB (`max_file_size` when smaller): a larger file asked with no range is refused before it is read (ask a range), and so is an answer that would not fit the tunnel's 8 MiB body (ask a smaller `limit`) |
 | `IS_DIRECTORY` | 400 | Path is a directory where a file was expected |

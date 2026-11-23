@@ -75,6 +75,9 @@ pub mod codes {
     pub const INVALID_CONTENT: &str = "INVALID_CONTENT";
     pub const FILE_NOT_FOUND: &str = "FILE_NOT_FOUND";
     pub const FILE_TOO_LARGE: &str = "FILE_TOO_LARGE";
+    /// A stored playbook longer than the 1 MiB bound: none of it is
+    /// returned, since a part of a script is not the script.
+    pub const PLAYBOOK_TOO_LARGE: &str = "PLAYBOOK_TOO_LARGE";
     pub const IS_DIRECTORY: &str = "IS_DIRECTORY";
     pub const NOT_A_DIRECTORY: &str = "NOT_A_DIRECTORY";
     /// A file read the agent refuses (ADR-011): its own keys, a process's

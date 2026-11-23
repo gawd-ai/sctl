@@ -24,21 +24,85 @@ type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 /// Maximum playbook content size (1 MB).
 const MAX_PLAYBOOK_SIZE: usize = 1024 * 1024;
 
-/// A playbook's file, read through the file gate's handle and its type
-/// judgment (ADR-011): a regular file is read, at most
-/// [`MAX_PLAYBOOK_SIZE`] bytes, and a FIFO, a socket or a device named
-/// `*.md` in the playbooks directory is `NOT_A_REGULAR_FILE` and is never
-/// opened. A plain read waited on a FIFO for good, and 32 such reads took
-/// every handler the tunnel runs. `Ok(None)` when no file is there.
-async fn read_playbook_file(path: std::path::PathBuf) -> Result<Option<String>, Refusal> {
-    let read = tokio::task::spawn_blocking(move || file_access::read_own(&path, MAX_PLAYBOOK_SIZE))
-        .await
-        .map_err(|e| Refusal::Io(std::io::Error::other(e)))??;
-    read.map(|bytes| {
+/// Why a playbook's file was not read.
+enum Unread {
+    /// The gate's refusal: not a regular file, not readable.
+    Refused(Refusal),
+    /// Longer than [`MAX_PLAYBOOK_SIZE`]: its size in bytes. Never read in
+    /// part: a part of a script must not be run as if it were the script.
+    TooLarge(u64),
+    /// Not UTF-8 text.
+    NotText,
+}
+
+/// A playbook's file, read whole through the file gate's handle and its
+/// type judgment (ADR-011): a regular file of at most
+/// [`MAX_PLAYBOOK_SIZE`] bytes is read, and a FIFO, a socket or a device
+/// named `*.md` in the playbooks directory is `NOT_A_REGULAR_FILE` and is
+/// never opened. A plain read waited on a FIFO for good, and 32 such reads
+/// took every handler the tunnel runs. `Ok(None)` when no file is there.
+///
+/// A longer file is [`Unread::TooLarge`], never its first megabyte: it
+/// was returned cut, with no mark, and a cut inside a character of several
+/// bytes failed as a `500`.
+async fn read_playbook_file(path: std::path::PathBuf) -> Result<Option<String>, Unread> {
+    let io = |e: std::io::Error| Unread::Refused(Refusal::Io(e));
+    tokio::task::spawn_blocking(move || {
+        let mut opened = match file_access::open_own(&path) {
+            Ok(opened) => opened,
+            Err(Refusal::NotFound) => return Ok(None),
+            Err(refusal) => return Err(Unread::Refused(refusal)),
+        };
+        if opened.size > MAX_PLAYBOOK_SIZE as u64 {
+            return Err(Unread::TooLarge(opened.size));
+        }
+        // To its end, one byte past the bound at most: a file that grew
+        // since its size was read is judged by what is there now.
+        #[allow(clippy::cast_possible_truncation)]
+        let bytes = file_access::read_up_to(
+            &mut opened.file,
+            MAX_PLAYBOOK_SIZE + 1,
+            opened.size as usize,
+        )
+        .map_err(io)?;
+        if bytes.len() > MAX_PLAYBOOK_SIZE {
+            let size = opened
+                .file
+                .metadata()
+                .map_or(bytes.len() as u64, |m| m.len());
+            return Err(Unread::TooLarge(size));
+        }
         String::from_utf8(bytes)
-            .map_err(|e| Refusal::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+            .map(Some)
+            .map_err(|_| Unread::NotText)
     })
-    .transpose()
+    .await
+    .map_err(|e| io(std::io::Error::other(e)))?
+}
+
+/// The refusal of a playbook longer than the bound.
+fn too_large_message(name: &str, size: u64) -> String {
+    format!(
+        "Playbook '{name}' is {size} bytes, over the {MAX_PLAYBOOK_SIZE} byte bound: none of \
+         it is returned, since a part of a script is not the script."
+    )
+}
+
+/// Why a playbook's file was not read, as `GET /api/playbooks/:name`
+/// answers it.
+fn playbook_unread(unread: &Unread, name: &str) -> (StatusCode, Json<ApiError>) {
+    match unread {
+        Unread::Refused(refusal) => playbook_refused(refusal, "read"),
+        Unread::TooLarge(size) => {
+            ApiError::new(codes::PLAYBOOK_TOO_LARGE, too_large_message(name, *size))
+                .into_response_with(StatusCode::UNPROCESSABLE_ENTITY)
+        }
+        Unread::NotText => ApiError::new(
+            codes::INVALID_CONTENT,
+            "Invalid playbook: the file is not UTF-8 text",
+        )
+        .into_response_with(StatusCode::UNPROCESSABLE_ENTITY),
+    }
 }
 
 /// A refusal of a playbook's file, as the file routes answer the gate's.
@@ -86,6 +150,13 @@ struct PlaybookSummary {
     name: String,
     description: String,
     params: Vec<String>,
+    /// `true` for a file over [`MAX_PLAYBOOK_SIZE`], which is named in the
+    /// list by its file name and is not read. Absent otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    too_large: bool,
+    /// That file's size in bytes. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -214,8 +285,36 @@ pub async fn list_playbooks(State(state): State<AppState>, headers: HeaderMap) -
         if path.extension().is_some_and(|ext| ext == "md") {
             let content = match read_playbook_file(path.clone()).await {
                 Ok(content) => content,
-                Err(refusal) => {
+                // Named, by its file name: neither hidden nor cut. A file
+                // whose name is not a playbook's cannot be asked for, and
+                // is skipped like any other file that is not one.
+                Err(Unread::TooLarge(size)) => {
+                    let name = path
+                        .file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    if validate_playbook_name(&name).is_ok() {
+                        playbooks.push(PlaybookSummary {
+                            description: format!(
+                                "Too large to read: {size} bytes, over the \
+                                 {MAX_PLAYBOOK_SIZE} byte bound"
+                            ),
+                            name,
+                            params: Vec::new(),
+                            too_large: true,
+                            size: Some(size),
+                        });
+                    } else {
+                        tracing::warn!(path = %path.display(), size, "Skipping a file over the playbook bound");
+                    }
+                    None
+                }
+                Err(Unread::Refused(refusal)) => {
                     tracing::warn!(path = %path.display(), "Skipping a playbook that cannot be read: {}", refusal.message());
+                    None
+                }
+                Err(Unread::NotText) => {
+                    tracing::warn!(path = %path.display(), "Skipping a playbook that is not UTF-8 text");
                     None
                 }
             };
@@ -226,6 +325,8 @@ pub async fn list_playbooks(State(state): State<AppState>, headers: HeaderMap) -
                             name: fm.name,
                             description: fm.description,
                             params: fm.params.keys().cloned().collect(),
+                            too_large: false,
+                            size: None,
                         });
                     }
                     Err(e) => {
@@ -263,7 +364,7 @@ pub async fn get_playbook(
 
     let content = read_playbook_file(std::path::PathBuf::from(&file_path))
         .await
-        .map_err(|refusal| playbook_refused(&refusal, "read"))?
+        .map_err(|unread| playbook_unread(&unread, &name))?
         .ok_or_else(|| {
             ApiError::new(codes::NOT_FOUND, format!("Playbook '{name}' not found"))
                 .into_response_with(StatusCode::NOT_FOUND)
@@ -774,6 +875,123 @@ mod tests {
                 "nothing beside it"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A playbook's document of exactly `len` bytes whose script is whole
+    /// near its start: the rest is prose after the script block, of
+    /// `filler` repeated.
+    fn document(name: &str, len: usize, filler: &str) -> String {
+        let mut doc = PLAYBOOK.replace("outlet-cycle", name);
+        while doc.len() + filler.len() <= len {
+            doc.push_str(filler);
+        }
+        while doc.len() < len {
+            doc.push('.');
+        }
+        assert_eq!(doc.len(), len);
+        doc
+    }
+
+    /// A playbook over the bound was returned cut, with no mark, and a
+    /// client would run the cut script; a cut inside a character of
+    /// several bytes was a 500. Over the bound is a refusal with its own
+    /// code, never a part of a script, and the list names such a file as
+    /// too large, neither hidden nor cut.
+    #[tokio::test]
+    async fn a_playbook_over_the_bound_is_refused_whole_and_the_list_names_it() {
+        let (dir, state) = bench("large");
+        let playbooks = dir.join("playbooks");
+        let get = |name: &str| {
+            get_playbook(
+                State(state.clone()),
+                Path(name.to_string()),
+                HeaderMap::new(),
+            )
+        };
+
+        // At the bound: read whole.
+        let at_bound = document("at-bound", MAX_PLAYBOOK_SIZE, "prose\n");
+        std::fs::write(playbooks.join("at-bound.md"), &at_bound).unwrap();
+        let Json(read) = get("at-bound").await.expect("a playbook at the bound");
+        assert_eq!(
+            read["raw_content"].as_str().unwrap().len(),
+            MAX_PLAYBOOK_SIZE
+        );
+        assert_eq!(read["script"], "echo cycle");
+
+        // One byte over, and one whose bound falls inside a character of
+        // three bytes.
+        let over = document("over", MAX_PLAYBOOK_SIZE + 1, "prose\n");
+        std::fs::write(playbooks.join("over.md"), &over).unwrap();
+        let mut split = document("split", MAX_PLAYBOOK_SIZE - 1, "prose\n");
+        split.push_str("\u{20ac}\u{20ac}\n");
+        std::fs::write(playbooks.join("split.md"), &split).unwrap();
+        for (name, size) in [("over", over.len()), ("split", split.len())] {
+            let (status, Json(refusal)) = get(name).await.expect_err("over the bound");
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{name}");
+            assert_eq!(
+                refusal.code,
+                codes::PLAYBOOK_TOO_LARGE,
+                "{name}: {}",
+                refusal.message
+            );
+            assert!(
+                refusal.message.contains(&format!("{size} bytes"))
+                    && refusal.message.contains("1048576"),
+                "{}",
+                refusal.message
+            );
+        }
+
+        // The list: the playbook that fits as before, the two that do not
+        // named as too large, with their sizes.
+        let Json(list) = list_playbooks(State(state.clone()), HeaderMap::new())
+            .await
+            .expect("the list");
+        let mut listed: Vec<Value> = list["playbooks"].as_array().unwrap().clone();
+        listed.sort_by_key(|p| p["name"].as_str().unwrap().to_string());
+        assert_eq!(listed.len(), 3, "{list}");
+        assert_eq!(
+            listed[0],
+            json!({"name": "at-bound", "description": "Cycle an outlet", "params": []})
+        );
+        for (entry, name, size) in [
+            (&listed[1], "over", over.len()),
+            (&listed[2], "split", split.len()),
+        ] {
+            assert_eq!(entry["name"], name);
+            assert_eq!(entry["too_large"], true, "{entry}");
+            assert_eq!(entry["size"], size);
+            assert_eq!(entry["params"], json!([]));
+            assert!(
+                entry["description"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Too large to read"),
+                "{entry}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A playbook that is not UTF-8 text is a file that does not parse,
+    /// not a failure of the agent.
+    #[tokio::test]
+    async fn a_playbook_that_is_not_text_does_not_parse() {
+        let (dir, state) = bench("not-text");
+        let mut bytes = PLAYBOOK.as_bytes().to_vec();
+        bytes.extend_from_slice(&[0xff, 0xfe, b'\n']);
+        std::fs::write(dir.join("playbooks/outlet-cycle.md"), bytes).unwrap();
+        let (status, Json(refusal)) = get_playbook(
+            State(state.clone()),
+            Path("outlet-cycle".to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .expect_err("not text");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(refusal.code, codes::INVALID_CONTENT);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

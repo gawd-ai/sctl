@@ -763,6 +763,13 @@ not regular files, are skipped with a warning, not an error. **Auth: API key Bea
 
 Response `200`: `{playbooks: [{name, description, params: [names...]}]}`.
 
+A file over the 1 MiB playbook bound is not read and is named in the list
+as too large, neither hidden nor cut: `{name, description, params: [],
+too_large: true, size}`, where `name` is its file name without `.md`,
+`description` says "Too large to read: ..." and `size` is its size in
+bytes. `too_large` and `size` are absent from every other entry. Asking for
+it by name is `PLAYBOOK_TOO_LARGE`.
+
 Errors: `500` `IO_ERROR`. A missing playbooks directory yields an empty
 list, not an error.
 
@@ -775,7 +782,14 @@ default?, enum?}}, script, raw_content}`.
 
 Errors: `404` `NOT_FOUND`, `400` `NOT_A_REGULAR_FILE` (a FIFO, a socket or a
 device is at the playbook's name), `422` `INVALID_CONTENT` (file exists but
-does not parse), `500` `IO_ERROR`.
+does not parse, or is not UTF-8 text), `422` `PLAYBOOK_TOO_LARGE` (the file
+is over the 1 MiB bound: none of it is returned, and the message gives its
+size), `500` `IO_ERROR`.
+
+A playbook is returned whole or not at all. Before 0.6.14 a file over the
+bound was returned cut at 1 MiB with no mark, so a client could run a part
+of a script as the script, and a cut inside a character of several bytes
+was a `500`.
 
 ### `PUT /api/playbooks/{name}`
 

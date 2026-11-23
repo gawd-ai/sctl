@@ -865,6 +865,14 @@ export interface PlaybookSummary {
 	name: string;
 	description: string;
 	params: string[];
+	/**
+	 * `true` for a file over the agent's 1 MiB playbook bound: it is named
+	 * (by its file name) and not read, and asking for it is refused with
+	 * `PLAYBOOK_TOO_LARGE`. Absent otherwise.
+	 */
+	too_large?: boolean;
+	/** That file's size in bytes. Absent otherwise. */
+	size?: number;
 }
 
 export interface PlaybookDetail {
