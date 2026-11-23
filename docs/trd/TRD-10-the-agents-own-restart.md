@@ -1,6 +1,6 @@
 # TRD-10: The agent's own restart
 
-Implements [ADR-014](../adr/014-the-agent-restarts-itself-through-one-authenticated-route.md). Status: Planned. It rides sctl's next release, the first after 0.6.13, and never a release of its own; section 5 lists what that release also carries. (TRD-7 is held for ADR-007's option B, and TRD-8 and TRD-9 are taken, so this is TRD-10.)
+Implements [ADR-014](../adr/014-the-agent-restarts-itself-through-one-authenticated-route.md), as ruled in its section 7. Status: Planned. It rides sctl's next release, the first after 0.6.13, and never a release of its own; section 5 lists what that release also carries, in a TRD of its own. (TRD-7 is held for ADR-007's option B, and TRD-8 and TRD-9 are taken, so this is TRD-10.)
 
 ## 1. Objective
 
@@ -9,8 +9,9 @@ After the release that carries this:
 - a caller restarts a unit's agent with `POST /api/restart`, on every layout, sending no shell text and knowing nothing of the layout;
 - the agent refuses, before anything stops, a restart that would strand it or cut something that must not be cut: an upgrade or another restart in flight, a recovery run, the kill switch, a start its init would refuse, a `ramboot` start that would fetch;
 - the answer leaves before the agent stops and says what the restart ends;
-- the next start is tied to the request: `boot` differs, and a record names the request, the `boot` before and the `boot` after;
+- the next start is tied to the request: a record names the request, the process before and the process after;
 - a caller knows the route is there by one key in an answer the agent already gives, so an older agent is never asked;
+- a `gz-tmp` init no longer stops the agent before its own checks have passed;
 - the unit never reboots for it, its modem and its routes are not touched, and what a reconnect costs in bytes is a measured number.
 
 No relay change is needed.
@@ -21,52 +22,52 @@ ADR-014's section 2 holds what the decision found. This section holds what the b
 
 - **Main.** `main` is 3 commits past `v0.6.13`, at `a222339`: a payload build fix (`5d3c4fb`) and two commits of TRD-9's records. `server/src` is as 0.6.13 released it.
 - **The upgrade's two halves.** `upgrade/stage.rs` is the running agent's half and ends in `hand_off` and `spawn_helper` (`:778-788`, `:822-896`); `upgrade/apply.rs` is the helper's, plain synchronous code with its runner and its health check behind two traits (`Runner`, `:90-106`; `Health`, `:26-48`), which its tests replace with a scripted service (`:464`). `spawn_helper` builds the `upgrade-apply --stage` arguments and the unit name `sctl-upgrade-<version>` inside itself.
-- **The state.** `upgrade/state.rs` holds the one upgrade state, its file under `<state_dir>/upgrade/` (`:211`) and its handle with the in-flight mutex (`:155-160`). `tunnel/upgrade_state.rs` flattens that state into the pushed message (`:29-40`) and trims the log tail when the message passes 8 KiB (`:87-104`).
-- **Recovery runs.** `Runs` is a watch over the set of target ids with a run in progress (`infra/mod.rs:530-575`); `start` is one `send_if_modified`, so finding the set empty and closing it can be one step of the same kind. The upgrade's context takes the runs of the agent's own Infra state (`upgrade/routes.rs:69`), and a test holds that it is that set and no other (`:165-225`).
-- **Sessions and transfers.** `SessionManager::list_sessions` gives each session's kind, status and attached count (`sessions/mod.rs:58-75`, `:727`), `kill_all` ends them (`:484`), and the transfer manager lists the transfers it holds (`gawdxfer/manager.rs:1007`).
-- **Tests.** The library's tests run with no root. `server/tests/cli_name.rs` starts a real agent on a staged layout through `SCTL_INSTALL_JSON` and `SCTL_CLI_PATH`, and runs shell text under the system `sh` and BusyBox's only on files in its own scratch directory, every path an argument. `server/tests/relay_events.rs` runs fake devices against the real relay router. Root-only network tests follow `server/tests/relay_route_netns.rs`: `#[ignore]`, root and `SCTL_NETNS_TEST=1`, built with `--no-run` and run as the test binary under sudo, every command an argument vector. `devices/we826-qwd/tests/` holds the shell tests of that device's scripts.
+- **The state.** `upgrade/state.rs` holds the one upgrade state, its file under `<state_dir>/upgrade/` (`:211`) and its handle with the in-flight mutex (`:155-160`). `tunnel/upgrade_state.rs` flattens that state into the pushed message (`:29-40`) and trims the log tail when the message passes 8 KiB (`:87-104`). `upgrade/watch.rs` watches the state file by name in that directory (`:78`).
+- **Recovery runs.** `Runs` is a watch over the set of target ids with a run in progress (`infra/mod.rs:530-575`); `start` is one `send_if_modified`, so finding the set empty and closing it can be one step of the same kind. A run's cooldown and count move only after `start` answers (`infra/monitor.rs:1209-1216`). The upgrade's context takes the runs of the agent's own Infra state (`upgrade/routes.rs:69`), and a test holds that it is that set and no other (`:165-225`).
+- **Sessions and transfers.** `SessionManager::list_sessions` gives each session's kind, status, name and whether a client is attached (`sessions/mod.rs:58-75`, `:727`), `kill_all` ends them (`:484`), and the transfer manager lists the transfers it holds with their phase (`gawdxfer/manager.rs:1007`).
+- **The install records.** Three scripts write `install.json` for a `gz-tmp` unit, each as one `printf`: `devices/xe300/install.sh:235`, `devices/xe300/upgrade.sh:129` and `devices/rut241/install.sh:96`.
+- **The shared ramboot init is pinned by its bytes.** `devices/we826-qwd/ramboot-refresh.sh` keeps a table of the SHA-256 of every released shared init and wrapper (`:178-183`), and its test holds that the current files are in it (`devices/we826-qwd/tests/ramboot-refresh-test.sh:383`). That suite runs the init under a stand-in `rc.common` in a scratch tree.
+- **Tests.** The library's tests run with no root. `server/tests/cli_name.rs` starts a real agent on a staged layout through `SCTL_INSTALL_JSON` and `SCTL_CLI_PATH`, and runs shell text under the system `sh` and BusyBox's only on files in its own scratch directory, every path an argument. `server/tests/relay_events.rs` runs fake devices against the real relay router. Root-only network tests follow `server/tests/relay_route_netns.rs`.
 - **CI and the gates.** As TRD-9 section 2 lists them. This build adds one route, so the HTTP API docs gate (`scripts/check-http-api-docs.py`) needs a heading for it; it adds no `pub` config field.
-- **Line ends.** `CHANGELOG.md` is CRLF, and so is `web/src/lib/utils/playbook-parser.ts`, which a rider edits (section 5). Every edit to them is byte-safe and keeps each line's ending. Every other file named here is LF.
+- **Line ends.** `CHANGELOG.md` is CRLF. Every edit to it is byte-safe and keeps each line's ending. Every other file this TRD edits is LF.
 
 ## 3. Deliverables
 
 Each change says what changes, in which files, how it is tested and when it is accepted. Section 6 runs the checks that cover them all.
 
-### 3.1 The record, and `boot` where the helper reads
+### 3.1 The record, and `instance` where the helper reads
 
 **Change.**
 
-- `GET /api/health` gains `boot`: when this process started, unix ms, the value `net.state` and the Infra digest already take (`main.rs:742-747`). It joins the app's state so the route and the record read one number.
-- The restart's record: `v`, `phase` (`idle`, `accepted`, `restarting`, `done`), `request_id`, `boot_before`, `boot_after`, `outcome` (`ok`, `not_restarted`, `not_healthy`, `not_started`), `reason`, `detail`, `attempts`, `accepted_at`, `ended_at`, `log_tail` (the last 1 KiB of the helper's log, cut on a character boundary). It lives at `<state_dir>/upgrade/restart.json`, written through a temporary file and a rename, and is read at start.
-- `GET /api/upgrade` gains `restart`, the record, `{"v": 1, "phase": "idle"}` on an agent never asked. The pushed `upgrade.state` gains the same key; the forwarder sends when either the upgrade's state or the record changes, still at most once a second, and drops the record's log tail before the upgrade's when the message passes 8 KiB.
-- At start: a record left `accepted` (the agent stopped before the hand-off) ends as `not_started`; `restarting` with the helper's lock held is watched as the upgrade's state is; `restarting` with the lock free, read by a process whose `boot` is not `boot_before`, ends as `ok` with `boot_after` its own `boot` and a detail saying the helper did not report; `restarting` with the lock free and the same `boot` ends as `not_started`.
+- `GET /api/health` gains `instance`: an opaque random value made once when the process starts (a version 4 UUID's 32 hex characters), derived from nothing on the unit. The app's state holds it beside `boot`, the start time `net.state` and the Infra digest already take (`main.rs:742-747`).
+- The restart's record: `v`, `phase` (`idle`, `accepted`, `restarting`, `done`), `request_id`, `boot_before`, `boot_after`, `instance_before`, `instance_after`, `outcome` (`ok`, `not_restarted`, `not_healthy`, `not_started`), `detail`, `attempts`, `accepted_at`, `ended_at`, `log_tail` (the last 1 KiB of the helper's log, cut on a character boundary). A key with nothing to say is left out, so an idle record is `{"v": 1, "phase": "idle"}`. It lives at `<state_dir>/upgrade/restart.json`, written through a temporary file and a rename, and is read at start.
+- `GET /api/upgrade` gains `restart`, the record. The pushed `upgrade.state` gains the same key; the forwarder sends when either the upgrade's state or the record changes, still at most once a second, and drops the record's log tail before the upgrade's when the message passes 8 KiB.
+- At start: a record left `accepted` (the agent stopped before the hand-off) ends as `not_started`; `restarting` with the helper's lock held is watched as the upgrade's state is; `restarting` with the lock free, read by a process whose `instance` is not `instance_before`, ends as `ok` with `instance_after` and `boot_after` its own and a detail saying the helper did not report; `restarting` with the lock free and the same `instance` ends as `not_started`. A record the helper ended as `ok` with this process's `instance` gains this process's `boot` as `boot_after`.
+- An outcome whose `attempts` is 2 is logged at warn by the agent that reads it.
 
-**Files.** `server/src/upgrade/restart.rs` (new: the record, its file, its handle), `server/src/upgrade/mod.rs`, `server/src/upgrade/routes.rs` (`report`), `server/src/upgrade/watch.rs`, `server/src/tunnel/upgrade_state.rs`, `server/src/routes/health.rs`, `server/src/state.rs`, `server/src/main.rs`.
+**Files.** `server/src/upgrade/restart.rs` (new: the record, its file, its handle, the settle at start), `server/src/upgrade/mod.rs`, `server/src/upgrade/routes.rs` (`report`), `server/src/upgrade/watch.rs` (the watch takes the file's name), `server/src/tunnel/upgrade_state.rs`, `server/src/tunnel/client.rs` (the forwarder's second channel), `server/src/routes/health.rs`, `server/src/state.rs`, `server/src/main.rs`.
 
 **Tests.**
 
-- The record round-trips, an unknown key in a stored record is ignored, and a file that is not a record reads as idle with a log line.
-- Each of the four starts above settles as written.
-- `report` carries `restart` on an agent never asked; health carries `boot`, equal to the `boot` its `net.state` is built with.
+- The record round-trips, an idle record is the two keys, an unknown key in a stored record is ignored, and a file that is not a record reads as idle.
+- Each start above settles as written, and the stamp of `boot_after` is written once.
+- `report` carries `restart` on an agent never asked; health carries `instance`, the app state's.
 - The pushed message carries `restart`; a change of the record alone sends one message; a message over 8 KiB loses the record's log tail first.
 - `server/tests/relay_events.rs`: the relay keeps an `upgrade.state` that carries `restart`, publishes it and replays it whole.
 
-**Accepted when.** An agent never asked shows `restart` idle in `GET /api/upgrade` and in its first `upgrade.state` on a relay's event stream, and its health shows the `boot` its `net.state` carries.
+**Accepted when.** An agent never asked shows `restart` idle in `GET /api/upgrade`, and two reads of its health show one `instance`.
 
 ### 3.2 What the agent knows of its own start
 
 **Change.**
 
-- `install.rs` names the kill switch (`/etc/sctl/disabled`) beside the hold file, and reads the optional `install.json` key `restart_tmp_kb`: 16384 by default on `gz-tmp`, 0 elsewhere. `sctl install-info` and `GET /api/upgrade`'s `install` report it.
-- One function judges whether a start would be refused, from the install and the unit's files, with no side effect, and answers the first reason in this order: `no_install_json`; `disabled`; `loader_unknown` (a `ramboot` unit whose `ramboot.conf` names a loader, or cannot be read, and whose `install.json` has no `helper_prefix`, as `cli_name` already judges it); `start_unreadable` (the agent's config; on `gz-tmp` each file `install.json`'s `files` names; on `ramboot` the wrapper, executable, and `ramboot.conf`); `cache_invalid` (`ramboot`: each payload `ramboot.conf` names with a SHA-256 must be in the cache with that hash; a payload named with none makes the start unjudgeable, and is refused as `cache_invalid` too); `no_space` (a layout that runs from `/tmp`: free space in the run directory's filesystem below `restart_tmp_kb`, or below the running binary's and plugin's size plus `min_free_kb`).
-- The files it reads are opened as regular files only, through the file gate's handle, so a FIFO placed at one of those paths cannot hold the request (section 5, rider 1).
+- `install.rs` names the kill switch (`/etc/sctl/disabled`) beside the hold file, and reads the optional `install.json` key `restart_tmp_kb`. Where a record gives none: 16384 on `gz-tmp`, 0 elsewhere. `sctl install-info` and `GET /api/upgrade`'s `install` report it. `SCTL_DISABLED_PATH` moves the kill switch for tests and benches, as `SCTL_INSTALL_JSON` moves `install.json`.
+- One function judges whether a start would be refused, from the install and the unit's files, with no side effect, and answers the first reason in this order: `no_install_json`; `disabled`; `loader_unknown` (a `ramboot` unit whose `ramboot.conf` names a loader, or cannot be read, and whose `install.json` has no `helper_prefix`, as `cli_name` already judges it); `start_unreadable` (the agent's config; on `gz-tmp` each file `install.json`'s `files` names; on `ramboot` the wrapper, executable, and `ramboot.conf`); `cache_invalid` (`ramboot`: the boot fetcher's own rule, `devices/common/sctl-ramboot.sh:120-131`: the server's payload and each other payload whose URL `ramboot.conf` names must be in the cache with its SHA-256, or, named with none, be there under `ALLOW_UNSIGNED=1`); `no_space` (a layout that runs from `/tmp`: free space in the run directory's filesystem below `restart_tmp_kb`, or below what the helper keeps mapped plus `min_free_kb`).
+- A path is judged by its metadata before anything is opened: one that is not a regular file is never opened, so a FIFO placed there cannot hold the request (section 5, rider 1).
 
-**Files.** `server/src/upgrade/install.rs`, `server/src/upgrade/restart.rs`, `docs/upgrade.md` (the key, and the kill switch as something the agent reads).
+**Files.** `server/src/upgrade/install.rs`, `server/src/upgrade/restart_checks.rs` (new), `server/src/main.rs` (`install-info`), `docs/upgrade.md` (the key, and the kill switch as something the agent reads).
 
-**Tests.**
-
-- In a scratch root, per layout: each reason above, alone and in order; a valid `ramboot` cache passes; a cached payload with one byte changed is `cache_invalid`; free space is injected, as the upgrade's stage tests inject it.
-- `server/tests/restart_inits.rs` (new) reads the init scripts as text, and never runs them, since they name fixed paths and remove a run directory: every `MIN_TMP_KB` in a `gz-tmp` init under `devices/` is at most the agent's default, and every `DISABLED=` there is the path the agent checks. A new init with a higher threshold fails the test.
+**Tests.** In a scratch root, per layout: each reason above, alone and in order; a valid `ramboot` cache passes; a cached payload with one byte changed is `cache_invalid`; an unsigned payload passes only under `ALLOW_UNSIGNED=1`; a FIFO at a payload's path is refused at once; free space is injected.
 
 **Accepted when.** On a unit staged as each layout, the function's answer matches what that layout's init would do with the same files, for every row of ADR-014's table.
 
@@ -74,16 +75,15 @@ Each change says what changes, in which files, how it is tested and when it is a
 
 **Change.**
 
-- `Runs` gains a gate: `close_if_idle` closes the set in the step that finds it empty and answers whether it did; while it is closed, `start` answers none; `reopen` opens it. A monitor check that finds the gate closed records and signals its Down as today and starts no run, and neither the cooldown nor the count moves: the run is the next process's.
-- `ends` is built from what the agent holds: the running terminals, those with a client attached, the running jobs' names (at most 16, each cut to 64 bytes on a character boundary), the transfers in flight.
-- Slice 3 also reads what the stop does to a `POST /api/exec` in flight and to a session whose process ignores SIGTERM, and records both here. ADR-014 lists neither in `ends`.
+- `Runs` gains a gate: `close_if_idle` closes the set in the step that finds it empty and answers whether it is closed; while it is closed, `start` answers none; `reopen` opens it. A monitor check that finds the gate closed records and signals its Down as today and starts no run, and neither the cooldown nor the count moves: the run is the next process's.
+- `ends` is built from what the agent holds: the running terminals, those with a client attached, the running jobs' names (at most 16, each cut to 64 bytes on a character boundary; a job with no name is named by its session id), the transfers in flight (`init`, `transferring`, `paused`, `verifying`).
 
-**Files.** `server/src/infra/mod.rs`, `server/src/infra/monitor.rs`, `server/src/sessions/mod.rs`, `server/src/gawdxfer/manager.rs`, `server/src/upgrade/restart.rs`.
+**Files.** `server/src/infra/mod.rs`, `server/src/sessions/mod.rs`, `server/src/upgrade/restart.rs`.
 
 **Tests.**
 
-- A run in progress keeps the gate open and `close_if_idle` answers false; with none it closes, and a Down then starts no run, moves `seq` and is pushed; `reopen` lets the next failed check start it, the count as it was.
-- Two tasks, one starting a run and one closing: never both.
+- A run in progress keeps the gate open and `close_if_idle` answers false; with none it closes, `start` then answers none and a recovery that is due starts no run and moves no count; `reopen` lets the next failed check start it.
+- Two threads, one starting runs and one closing: never a run started after the close answered true.
 - `ends` for no session, a detached terminal, an attached one, an exited one (not counted), a job, 20 jobs (16 names), a name over 64 bytes.
 
 **Accepted when.** With a recovery of about 30 s on a bench agent, a restart asked during the run is refused, and one accepted just before a target goes Down starts no run before the stop; the next process's first failed check starts it.
@@ -92,90 +92,121 @@ Each change says what changes, in which files, how it is tested and when it is a
 
 **Change.**
 
-- `sctl restart-apply --request <file>`: the helper. It takes the record's lock, waits the upgrade's 2 s, runs the install's restart command through the upgrade's `Shell`, and waits for health with the upgrade's interval, passes and window. An answer counts only when its `boot` is not the record's `boot_before`. It writes `ok` with `boot_after`, `not_restarted` when the last answer inside the window still carried `boot_before`, or `not_healthy`, then exits. It runs nothing else and restores nothing.
-- `Health::check` answers the `boot` beside the version and the tunnel, and `wait_healthy` takes the rule an answer must meet; the upgrade passes its version rule and behaves as before.
-- `spawn_helper` takes the helper's arguments and its unit name from its caller. The upgrade passes what it passes today; the restart passes `restart-apply --request <file>` and `sctl-restart-<accepted_at in unix seconds>`. The helper is `InstallInfo::running`'s binary through its loader words, not a copy.
-- The helper's log is `<state_dir>/upgrade/restart.log`, started afresh for each request.
-- If the lead rules for ADR-014's open question 4: on `gz-tmp` only, when no answer at all came inside the first window, the helper runs the restart command once more and waits one more window; `attempts` says which run was answered.
+- `sctl restart-apply --dir <state_dir>/upgrade/restart`: the helper. The directory holds its plan (`plan.json`: the restart command, the health URL, the layout, the record's path and `instance_before`), its lock and its log. It takes the lock, waits the upgrade's 2 s, runs the restart command through the upgrade's `Shell`, and reads health through the upgrade's reader, with the upgrade's interval, passes and window. An answer counts only when its `instance` is not the plan's. It writes `ok` with `instance_after`, `not_restarted` when the last answer inside the window still carried the old `instance`, or `not_healthy`, then exits. It restores nothing.
+- **The second run.** On `gz-tmp` only, when no answer at all came inside the first window, the helper logs that, runs the restart command once more and waits one more window. `attempts` is 2 from then on, and the outcome's `detail` says that the first run started nothing.
+- Its wait is its own loop: it has to remember whether the old process still answers, which the upgrade's wait does not. The upgrade's `wait_healthy` and its `Health` are unchanged.
+- `spawn_helper` takes the helper's arguments and its unit name from its caller. The upgrade passes what it passed before; the restart passes `restart-apply --dir <dir>` and `sctl-restart-<accepted_at in unix seconds>`. The helper is `InstallInfo::running`'s binary through its loader words, not a copy.
 
-**Files.** `server/src/upgrade/apply.rs`, `server/src/upgrade/stage.rs`, `server/src/upgrade/restart.rs`, `server/src/main.rs` (the subcommand, beside `upgrade-apply`).
+**Files.** `server/src/upgrade/restart_apply.rs` (new), `server/src/upgrade/apply.rs` (the reader, the log and the settle time shared), `server/src/upgrade/stage.rs`, `server/src/main.rs` (the subcommand, beside `upgrade-apply`).
 
 **Tests.** With a scripted runner and health, as `apply.rs`'s tests are built:
 
-- a new `boot` twice is `ok` with that `boot`; one new answer followed by silence is `not_healthy`;
-- the old `boot` to the end of the window is `not_restarted`; silence is `not_healthy`;
-- the same version before and after restarts and is `ok`: the version is not judged;
+- a new `instance` twice is `ok` with that `instance` and `attempts` 1; one new answer followed by silence is `not_healthy`;
+- the old `instance` to the end of the window is `not_restarted`, on every layout, with one run of the command;
+- silence on `usr-bin`, `ramboot` and `systemd` is `not_healthy` after one run; on `gz-tmp` the command runs a second time, and an answer then is `ok` with `attempts` 2 and the detail, silence again `not_healthy` with `attempts` 2;
 - a held lock ends a second helper at once, exit 4, the record untouched;
-- the upgrade's own tests pass unchanged through the widened `Health` and `wait_healthy`;
-- `spawn_helper` builds the same command line for an upgrade as before (a test that pins it first, in the commit before the change), and for a restart the loader words, the binary and the two arguments, on `systemd` inside `systemd-run --collect --unit=sctl-restart-<n>`.
+- the command line `spawn_helper` builds: for an upgrade the words it built before the change, pinned literally, on each layout and through a loader; for a restart the loader words, the binary and the two arguments, on `systemd` inside `systemd-run --collect --unit=sctl-restart-<n>`.
 
-**Accepted when.** On a loopback agent, a helper started by hand against a record restarts the agent through a scratch restart command and writes `ok` with the new process's `boot`.
+**Accepted when.** A helper started by hand against a plan runs a stand-in restart command and writes the outcome its health reads.
 
 ### 3.5 The route
 
-**Change.** `POST /api/restart`, behind the key, in the order ADR-014 decision 3 gives:
+**Change.** `POST /api/restart`, behind the key, in this order:
 
-1. The body: `request_id` at most 128 bytes, `unless` a list of `sessions`, `jobs`, `transfers`; otherwise 400 `RESTART_BAD_REQUEST`.
+1. The body: `request_id` at most 128 bytes, `unless` a list of `sessions`, `jobs`, `transfers`; otherwise 400 `RESTART_BAD_REQUEST`. An empty body is a request with neither.
 2. The in-flight mutex the upgrade takes, tried and not waited for; an upgrade's state in flight is 409 `UPGRADE_IN_FLIGHT`, a record `accepted` or `restarting` is 409 `RESTART_IN_FLIGHT` with the record. A `restarting` record whose lock is free is settled first, as the upgrade clears a lost helper. `POST /api/upgrade` refuses in the same way while a restart is in flight.
-3. A relay is refused (`relay`), if the lead rules so.
+3. A relay is refused (`relay`).
 4. The start's judgment (3.2).
 5. `unless`, against `ends`.
 6. The gate: `close_if_idle`, or `recovery_running`.
 7. The record `accepted`, written and pushed; the answer, 202.
-8. In a task that holds the mutex: every session and job ended (`kill_all`); the record `restarting`; the helper started. A helper that cannot be started ends the record as `not_started`, reopens the gate, and the agent keeps running.
+8. In a task that holds the mutex: every session and job ended (`kill_all`); the plan written; the record `restarting`; the helper started; the record watched until the helper ends it. A helper that cannot be started ends the record as `not_started`, reopens the gate, and the agent keeps running. A record the helper ends while this process still runs (`not_restarted`, `not_healthy`) reopens the gate too.
 
-**Files.** `server/src/upgrade/routes.rs` (or a `restart` module beside it), `server/src/main.rs` (the route), `server/src/error.rs` (the three codes), `docs/http-api.md` (the route under "Managed upgrades", `boot` in `GET /api/health`, `restart` in `GET /api/upgrade` and in `upgrade.state`), `docs/upgrade.md` (a section "Restarting the agent" beside the hand-off, and the per-layout table), `docs/safe-mode.md` (lines 117 to 119 name the route), `docs/errors.md` (the codes and the reasons), `CHANGELOG.md` `[Unreleased]`.
+**Files.** `server/src/upgrade/restart_route.rs` (new), `server/src/upgrade/routes.rs` (`POST /api/upgrade`'s refusal), `server/src/main.rs` (the route), `docs/http-api.md` (the route under "Managed upgrades", `instance` in `GET /api/health`, `restart` in `GET /api/upgrade` and in `upgrade.state`), `docs/upgrade.md` (a section "Restarting the agent" beside the hand-off, and the per-layout table), `docs/safe-mode.md` (lines 117 to 119 name the route), `docs/errors.md` (the codes and the reasons), `CHANGELOG.md` `[Unreleased]`.
 
 **Tests.**
 
 - Each refusal: its status, its code, its reason, and nothing stopped: the gate open, the sessions alive, the record as it was.
 - An upgrade staging refuses a restart; a restart accepted refuses an upgrade, and a second restart with the first's record in the detail.
 - `unless` with each kind refuses only when that kind is running, and `detail.ends` names it; without `unless` the same unit is accepted.
-- An accept writes the record before the answer; the task ends the sessions, then starts the helper, in that order (a helper stood in by a recorder).
-- A helper that cannot be started: `not_started`, the gate open again, a recovery able to run.
+- An accept writes the record before the answer and closes the gate; the task ends the sessions, then starts the helper, in that order (a helper stood in by a recorder).
+- A helper that cannot be started: `not_started`, the gate open again.
 - Both docs gates pass.
 
-**Accepted when.** Through a bench relay, each refusal reads as its code and reason, and an accepted request's 202 arrives before the device's connection drops.
+**Accepted when.** Each refusal reads as its code and reason, and an accepted request's 202 is answered before the helper is started.
 
-### 3.6 A real restart on loopback, and its bytes
+### 3.6 The device tree: a `gz-tmp` init checks before it stops, and each install record names its threshold
 
-**Change.** No product code: the harness that proves the whole path.
+**Change.**
 
-- `server/tests/restart.rs` (new), in the pattern of `cli_name.rs`: a real agent started by the test on a loopback port, staged as each layout in turn through `SCTL_INSTALL_JSON`, `SCTL_CLI_PATH` and a `state_dir` and `data_dir` in the test's scratch directory. Its `install.json` names a scratch restart command, a script the test writes, which signals the one process the test started, by the pid the test recorded, and starts the same binary again with the same arguments. On the `systemd` staging a stand-in `systemd-run`, first in `PATH`, runs its command detached. The test signals nothing it did not start and removes nothing outside its scratch directory.
-- `server/tests/restart_bytes_netns.rs` (new), in the pattern of `relay_route_netns.rs`: an agent in one namespace, a bench relay in another, one veth pair between them; the bytes each way on that link from the accept to the second healthy answer, read from the interface's counters.
+- `devices/xe300/sctl.init` and `devices/rut241/sctl.init`: the checks a start makes (the kill switch on the XE300, the config, the two payloads, free `/tmp`) move into one function, `start_checks`. `start_service` calls it, as before. A `restart` function, which `rc.common` leaves to the script, calls it first and stops the running agent only when it passes; otherwise it says why on stderr and exits 1, the agent left running.
+- The install scripts write the threshold their init demands: `"restart_tmp_kb":16384` in the XE300's two `printf` lines, `"restart_tmp_kb":8192` in the RUT241's.
+- Not changed, and why:
+  - `devices/common/sctl-ramboot.init`. Its checks (the kill switch, the wrapper, `ramboot.conf`) fail only when a person removed a file, and with a valid cache the wrapper asks for no room, so it has no check that can fail between a stop and a start by itself. Its bytes are pinned by the WE826 refresh's table, whose suite runs the init; changing it belongs with that suite, on a bench.
+  - `server/files/sctl.init` (`usr-bin`): it has no check before its start.
+  - No init gains a kill switch (ADR-014 section 7).
+- An init reaches a unit when its install script runs, never by a managed upgrade. A unit already installed keeps the init and the install record it has.
+
+**Files.** `devices/xe300/sctl.init`, `devices/rut241/sctl.init`, `devices/xe300/install.sh`, `devices/xe300/upgrade.sh`, `devices/rut241/install.sh`, `devices/xe300/README.md` and `devices/rut241/README.md` where they describe the init.
+
+**Tests.** `server/tests/restart_inits.rs` (new). It reads the scripts as text and parses them with `sh -n`; it never runs one, since they name fixed paths and remove a run directory.
+
+- In each `gz-tmp` init: `restart()` exists, and inside it `start_checks` comes before `stop`; `start_service` calls `start_checks` before it removes the run directory.
+- Each `gz-tmp` init's `MIN_TMP_KB` is the `restart_tmp_kb` its device's install script writes, in every `printf` that writes `install.json` there.
+- Every `DISABLED=` in an init under `devices/` is the path the agent checks.
+- `sh -n` passes on each init and each install script it read.
+
+**Accepted when.** The test is green, and on a bench unit of each `gz-tmp` model `/etc/init.d/sctl restart` with a failing check (a full `/tmp`, stood in on the bench) leaves the agent running (3.8).
+
+### 3.7 A real agent and a real helper on loopback
+
+**Change.** No product code: the harness that proves the path with real processes and no relay.
+
+- `server/tests/restart.rs` (new), in the pattern of `cli_name.rs`: an agent started by the test on a loopback port, with no `[tunnel]` section, staged through `SCTL_INSTALL_JSON`, `SCTL_CLI_PATH` and `SCTL_DISABLED_PATH`, its `state_dir` and `data_dir` in the test's scratch directory.
+- Its `install.json` names a restart command that only writes a marker file in the scratch directory, and a `health_url` on a loopback port where the test itself answers: the agent's own `instance` until the marker exists, another after.
+- The test stops only the agent it started, at its end. It runs no init script, no `systemctl`, and signals no process it did not start.
 
 **Tests.**
 
-- Per staged layout: the answer is 202 with `boot_before`; the process the test started is gone and another answers; health's `boot` differs; the record reads `ok` with `boot_after` equal to it; a session opened before the request is gone; `request_id` is echoed.
-- A restart command that does nothing: `not_restarted`, the first process still answering, its sessions ended, the gate open again.
-- A restart command that stops the agent and starts nothing: `not_healthy`.
-- The staged `ramboot` layout with one cached payload removed: refused `cache_invalid`, nothing stopped.
-- The netns test asserts only that the count is above zero and under 256 KiB, and prints it; the number is recorded in section 7.
+- The request is answered 202 with `instance_before` equal to health's; the marker appears; `GET /api/upgrade` then reads `restart` `done`, `ok`, `attempts` 1, `instance_after` the stand-in's value; a second request during the first is 409 `RESTART_IN_FLIGHT`.
+- With the kill switch's stand-in present: 422 `disabled`, no marker.
+- With no `install.json`: 422 `no_install_json`.
+- A session open before the request is gone after it.
 
-**Accepted when.** `restart.rs` is green on the pinned toolchain with no root, and the netns run is recorded here, since CI has no privileged job.
+**Accepted when.** `restart.rs` is green on the pinned toolchain with no root.
 
-### 3.7 One restart on a bench unit of each layout
+### 3.8 The bench: a relay, the bytes, and one restart on a unit of each layout
 
-**Change.** None. With the release's payloads on bench units the owner names, one of each layout: `usr-bin`, `gz-tmp`, `ramboot` under procd, `ramboot` with no procd and a loader, and `systemd` for an agent that is not a relay if one exists.
+**Change.** None. This slice needs a relay and units, and is run by a person. It needs the release's payloads, so it runs between the release's build and its rollout, on bench units the owner names: one of each layout, `usr-bin`, `gz-tmp` (each model), `ramboot` under procd, `ramboot` with no procd and a loader, and `systemd` for an agent that is not a relay if one exists.
 
-**Checks, per unit.** The request through the relay answers 202; the unit's system uptime keeps counting (no reboot); its `net.state` shows the same uplink before and after, and no interface dropped; the next `net.state` carries a new `boot` and the record reads `ok`; a console session open before is gone after; with the kill switch placed by hand the route refuses and the agent keeps running; the bytes of the reconnect, counted on the unit's uplink interface before the request and after the record reads `ok`. On the `ramboot` units, the wrapper's log shows every payload served from the cache.
+**Checks.**
 
-**Accepted when.** Every layout has one recorded restart, and the cost in bytes is written beside each.
+- Behind a bench relay, with the event stream open: an accepted request's 202 arrives before the device's connection drops; `device.disconnected`, `device.connected`, a `net.state` with a new `boot` and an `upgrade.state` whose `restart` reads `ok` with that `boot` as `boot_after` arrive in that order; a relay's own agent refuses (`relay`).
+- The bytes of one reconnect, counted on the link: in a network namespace as `server/tests/relay_route_netns.rs` is run, and on each unit's uplink interface before the request and after the record reads `ok`.
+- Per unit: the unit's system uptime keeps counting (no reboot); its `net.state` shows the same uplink before and after, and no interface dropped; a console session open before is gone after; with the kill switch placed by hand the route refuses and the agent keeps running; on the `ramboot` units the wrapper's log shows every payload served from the cache, and with one cached payload removed the route refuses `cache_invalid`.
+- A recovery of about 30 s: a restart asked during the run is refused; one accepted just before a target goes Down starts no run before the stop.
+- Each `gz-tmp` model: free `/tmp` against the init's threshold and the install record's `restart_tmp_kb`, the two equal; a restart with `/tmp` filled below it is refused `no_space`; with the new init installed, `/etc/init.d/sctl restart` with `/tmp` filled below it leaves the agent running.
+- **The shared ramboot init under procd.** On a `ramboot` unit that has procd, whether `/etc/init.d/sctl restart` stops the instance: the init defines a `stop` of its own for units with no procd, and if `rc.common` did not put procd's in its place, the restart would stop nothing and the route would report `not_restarted`.
+- What the stop does to a `POST /api/exec` in flight and to a session whose process ignores SIGTERM, read once and recorded here.
+
+**Accepted when.** Every layout has one recorded restart, the cost in bytes is written beside each, and each `gz-tmp` model's threshold is confirmed.
 
 ## 4. Decisions inside the build
 
 - **The helper is the running binary, not a copy.** Nothing is replaced, so nothing the helper runs from is replaced. On a layout that runs from `/tmp` the init removes or overwrites the file the helper runs from; a running process keeps its image, and the room for it is what 3.2's `no_space` counts.
-- **The record has its own file.** The upgrade's state file is written whole by two processes that expect its shape; a second writer for another purpose would have to be taught to both. One directory, two files, one lock each.
-- **The record and its log are under `state_dir`.** `data_dir` is in `/tmp` on the units whose init removes `/tmp/sctl` at every start; the outcome has to be there after the start. The log is a few hundred bytes and starts afresh for each request.
+- **The record has its own file.** The upgrade's state file is written whole by two processes that expect its shape. One directory, two records, one lock each.
+- **The record, the plan and the log are under `state_dir`.** `data_dir` is in `/tmp` on the units whose init removes `/tmp/sctl` at every start; the outcome has to be there after the start. The log is a few hundred bytes and starts afresh for each request.
+- **`instance`, not `boot`, on the route that needs no key.** The ruling asks for an opaque value there. `boot` already means the start time in `net.state`, `infra.state` and the Infra digest, so the opaque value takes another name, and the record carries both: `instance` for the helper, `boot` for a caller that matches reports.
 - **The gate is closed in the route, and the sessions are ended in the task.** The gate must be closed in the step that finds no run, before the answer. Ending the sessions takes up to 3 s and must not hold the answer.
 - **The accepted order is fixed.** A refusal that costs nothing comes before one that reads files, and the gate is closed last, so a refusal leaves nothing to undo.
-- **The version is not judged.** An upgrade proves its version; a restart proves a new process. On `gz-tmp` and `ramboot` the files that start are the ones on flash or in the cache, which the last upgrade left.
-- **Init scripts are read as text and never run in a test.** They name fixed paths under `/tmp` and `/etc`, and a `gz-tmp` init removes its run directory.
-- **Not in this build.** No MCP tool and no sctlin control for the restart; no `features` entry; no change to an init script or an install script; no WebSocket frame; no restart of a relay if the lead rules as recommended. The RUT241's `gz-tmp` init keeps its lower threshold and gains no kill switch here.
+- **The version is not judged.** An upgrade proves its version; a restart proves a new process.
+- **The helper's wait is its own.** Sharing the upgrade's loop would mean widening it for a rule it has no use for; the reader, the runner, the log, the lock and the three constants are shared.
+- **Scripts are read as text and never run in a test.** They name fixed paths under `/tmp` and `/etc`, and a `gz-tmp` init removes its run directory. The one test that starts processes starts an agent with no tunnel and a helper whose restart command writes a marker.
+- **Not in this build.** No MCP tool and no sctlin control for the restart; no `features` entry; no WebSocket frame; no restart of a relay; no change to the shared ramboot init or to the `usr-bin` init; no kill switch added to an init.
 
 ## 5. What the release that carries this must also carry
 
-These ride the same release. They are not slices of this TRD: each is built and reviewed on its own, and the release's own record lists them.
+These ride the same release. They are not slices of this TRD: the release and its riders get a TRD of their own (ADR-014 section 7, ruling 10), which is not written here.
 
 1. **The FIFO reads outside the file gate.** TRD-9 slice 10's bench (2026-11-20) found the failure 0.6.13 fixed in the gate still open on routes the gate does not cover, each older than 0.6.12 and each needing exec or local access to set up, "owed by the next release":
    - a FIFO named `*.md` in `playbooks_dir` makes `GET /api/playbooks` and `GET /api/playbooks/{name}` open it plainly (`server/src/routes/playbooks.rs:182`, `:224`); 32 such reads take every one of the tunnel client's handler permits, and a SIGTERM then leaves the agent alive;
@@ -185,26 +216,26 @@ These ride the same release. They are not slices of this TRD: each is built and 
 
    It belongs with this TRD for a second reason: an agent that a SIGTERM leaves alive is an agent whose restart ends as `not_restarted`.
 2. **sctlin passes `{{agent}}` through in a playbook's script.** TRD-9 section 4 kept it out of 0.6.12 ("no sctlin pass-through of `{{agent}}` in a runbook"), and 0.6.13's `web/` differs from 0.6.12's only in its version line. `renderPlaybookScript` (`web/src/lib/utils/playbook-parser.ts:174-200`, CRLF) refuses any `{{name}}` left after the declared parameters as an undeclared parameter. `{{agent}}` names the path that runs the agent's tools on the unit (TRD-9 3.6, `GET /api/health`'s `cli`) and is filled by the server that sends the job, so sctlin must leave it in the text; every other undeclared name stays refused. Its test is in `playbook-parser.test.ts`.
-3. **The release itself**, as `docs/releasing.md` and TRD-9 3.9 describe one: the five version carriers and the lock files, `CHANGELOG.md` (CRLF), the tag equal to `server/Cargo.toml`'s version, TRD-1's proof in the `Release` workflow, every target's artifacts measured against 0.6.13, the units before the relay. ADR-014 recommends that a TRD of its own record it (open question 10).
+3. **The release itself**, as `docs/releasing.md` and TRD-9 3.9 describe one: the five version carriers and the lock files, `CHANGELOG.md` (CRLF), the tag equal to `server/Cargo.toml`'s version, TRD-1's proof in the `Release` workflow, every target's artifacts measured against 0.6.13, the units before the relay.
 
 ## 6. Verification
 
-- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` on the pinned toolchain, as CI runs them; the `test-musl` job; the ts-rs bindings diff and `cargo doc`.
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` on the pinned toolchain, as CI runs them; the ts-rs bindings diff and `cargo doc`.
 - `scripts/check-http-api-docs.py` (one new heading) and `scripts/check-config-docs.py` (unchanged).
 - `server/tests/restart.rs` and `server/tests/restart_inits.rs` with no root; `server/tests/relay_events.rs` with its new case.
-- As root, built with `--no-run` and run with `sudo -n env SCTL_NETNS_TEST=1 <test binary> --ignored`: `restart_bytes_netns`, its number recorded in section 7; `relay_route_netns` and `net_tools_netns`, unchanged and still green.
-- A bench agent (x86) behind a bench relay on loopback, staged as each layout in turn as TRD-9 section 6 stages them: each refusal by its code through the relay; an accepted restart with the event stream open, where `device.disconnected`, `device.connected`, a `net.state` with a new `boot` and an `upgrade.state` whose `restart` reads `ok` arrive in that order; a recovery of about 30 s refusing a restart, and a restart accepted first starting no run before the stop.
-- 3.7's bench units, with the owner's go for each.
+- Device payloads are built only through `rundev.sh` and `devices/build.sh`, never with cargo or cross by hand; no payload is built for slices 1 to 7.
+- 3.8, on the bench, with the owner's go for each unit.
 - Nothing here runs on a unit in service. A unit in service is restarted by this route only after the release's rollout reaches it, by whoever operates it.
 
 ## 7. Slices and status
 
-Build order. Each slice is one or more commits, reviewed before the next begins; the status flips in the change that ships it, with the verification it ran.
+Build order. Each slice is one commit, reviewed before the release; the status flips in the change that ships it, with the verification it ran.
 
-1. The record, and `boot` in health (3.1): Planned.
+1. The record, and `instance` in health (3.1): Planned.
 2. What the agent knows of its own start (3.2): Planned.
 3. What a restart ends, and the gate on recovery runs (3.3): Planned.
-4. The helper (3.4): Planned. Its first commit pins `spawn_helper`'s command line for an upgrade, before the function is widened.
+4. The helper (3.4): Planned.
 5. The route and the docs (3.5): Planned.
-6. A real restart on loopback, and its bytes (3.6): Planned.
-7. One restart on a bench unit of each layout (3.7): Planned. It needs the release's payloads, so it runs between the release's build and its rollout.
+6. The device tree (3.6): Planned.
+7. A real agent and a real helper on loopback (3.7): Planned.
+8. The bench (3.8): Planned. It needs a relay, units and the release's payloads.
