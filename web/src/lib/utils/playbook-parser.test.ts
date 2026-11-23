@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
 	formParams,
-	isServerReference,
 	parsePlaybookFrontmatter,
+	referencesFilledOn,
 	renderPlaybookScript,
 	validatePlaybookName
 } from './playbook-parser';
@@ -136,51 +136,87 @@ describe('renderPlaybookScript', () => {
 		);
 	});
 
-	it('leaves {{agent}} as written: the server that sends the script fills it', () => {
+	it('refuses {{agent}} like any undeclared placeholder when the host names no reference', () => {
+		// As 0.6.13: nothing behind sctlin fills it, so it must not reach a shell.
+		expect(() => renderPlaybookScript('{{agent}} net state', {}, {})).toThrow(
+			'Script references undeclared parameter: {{agent}}'
+		);
+		expect(() => renderPlaybookScript('{{agent}} net tcp {{radio}} 80', {}, params)).toThrow(
+			'undeclared parameter: {{agent}}'
+		);
+	});
+
+	it('treats a declared agent parameter as any other when the host names no reference', () => {
+		const declared = {
+			agent: { type: 'string', description: 'A path', default: '/usr/bin/sctl' },
+			radio: { type: 'string', description: 'Which radio', default: 'all' }
+		};
+		expect(renderPlaybookScript('{{agent}} net wifi {{radio}}', {}, declared)).toBe(
+			'/usr/bin/sctl net wifi all'
+		);
+		expect(
+			renderPlaybookScript('{{agent}} net wifi {{radio}}', { agent: '/tmp/sctl' }, declared)
+		).toBe('/tmp/sctl net wifi all');
+	});
+
+	it('leaves a reference the host names as written, and fills it from no form value', () => {
 		const withAgent = '{{agent}} net tcp {{radio}} 80\n{{agent}} install-info';
-		expect(renderPlaybookScript(withAgent, { radio: '192.168.1.1' }, params)).toBe(
+		expect(renderPlaybookScript(withAgent, { radio: '192.168.1.1' }, params, ['agent'])).toBe(
 			'{{agent}} net tcp 192.168.1.1 80\n{{agent}} install-info'
 		);
-		// With no parameter at all, too.
-		expect(renderPlaybookScript('{{agent}} net state', {}, {})).toBe('{{agent}} net state');
-	});
-
-	it('still refuses every other undeclared placeholder, beside {{agent}} or after it', () => {
-		expect(() => renderPlaybookScript('{{agent}} net tcp {{host}} 80', {}, {})).toThrow(
-			'Script references undeclared parameter: {{host}}'
+		expect(renderPlaybookScript('{{agent}} net state', {}, {}, ['agent'])).toBe(
+			'{{agent}} net state'
 		);
-		expect(() => renderPlaybookScript('echo {{agents}}', {}, {})).toThrow(
-			'undeclared parameter: {{agents}}'
-		);
-	});
-
-	it('never fills {{agent}} from the form, even when a playbook declares it', () => {
+		// Even when a playbook declares a parameter of that name.
 		const declared = {
 			agent: { type: 'string', description: 'A path', default: '/bin/false' },
 			radio: { type: 'string', description: 'Which radio', default: 'all' }
 		};
 		expect(
-			renderPlaybookScript('{{agent}} net wifi {{radio}}', { agent: '/tmp/evil' }, declared)
+			renderPlaybookScript(
+				'{{agent}} net wifi {{radio}}',
+				{ agent: '/tmp/evil' },
+				declared,
+				['agent']
+			)
 		).toBe('{{agent}} net wifi all');
-		// A declared agent with no default is not a missing parameter.
-		const noDefault = { agent: { type: 'string', description: 'A path' } };
-		expect(renderPlaybookScript('{{agent}} net state', {}, noDefault)).toBe(
-			'{{agent}} net state'
+	});
+
+	it('still refuses every other undeclared placeholder beside a named reference', () => {
+		expect(() =>
+			renderPlaybookScript('{{agent}} net tcp {{host}} 80', {}, {}, ['agent'])
+		).toThrow('Script references undeclared parameter: {{host}}');
+		expect(() => renderPlaybookScript('echo {{agents}}', {}, {}, ['agent'])).toThrow(
+			'undeclared parameter: {{agents}}'
 		);
 	});
 });
 
 describe('formParams', () => {
-	it('asks for every declared parameter but a server reference, sorted', () => {
-		const params = {
-			radio: { type: 'string', description: 'Which radio', default: 'all' },
-			agent: { type: 'string', description: 'A path' },
-			delay: { type: 'number', description: 'Delay', default: 5 }
-		};
-		expect(formParams(params).map(([name]) => name)).toEqual(['delay', 'radio']);
+	const params = {
+		radio: { type: 'string', description: 'Which radio', default: 'all' },
+		agent: { type: 'string', description: 'A path' },
+		delay: { type: 'number', description: 'Delay', default: 5 }
+	};
+
+	it('asks for every declared parameter, sorted, when the host names no reference', () => {
+		expect(formParams(params).map(([name]) => name)).toEqual(['agent', 'delay', 'radio']);
 		expect(formParams({})).toEqual([]);
-		expect(isServerReference('agent')).toBe(true);
-		expect(isServerReference('radio')).toBe(false);
+	});
+
+	it('drops the field of a reference the host names', () => {
+		expect(formParams(params, ['agent']).map(([name]) => name)).toEqual(['delay', 'radio']);
+	});
+});
+
+describe('referencesFilledOn', () => {
+	it('names the references only on the paths the host says its server fills', () => {
+		const host = { names: ['agent'], paths: ['job', 'exec'] as const };
+		expect(referencesFilledOn(host, 'job')).toEqual(['agent']);
+		expect(referencesFilledOn(host, 'exec')).toEqual(['agent']);
+		expect(referencesFilledOn(host, 'terminal')).toEqual([]);
+		expect(referencesFilledOn({ names: ['agent'], paths: ['job'] }, 'exec')).toEqual([]);
+		expect(referencesFilledOn(undefined, 'job')).toEqual([]);
 	});
 });
 

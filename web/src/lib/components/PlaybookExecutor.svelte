@@ -1,8 +1,8 @@
 <script lang="ts">
-	import type { PlaybookDetail, PlaybookRunState, ExecResult, ViewerTab, WsSessionOutputMsg } from '../types/terminal.types';
+	import type { PlaybookDetail, PlaybookRunPath, PlaybookRunState, ExecResult, ServerReferences, ViewerTab, WsSessionOutputMsg } from '../types/terminal.types';
 	import type { SctlRestClient } from '../utils/rest-client';
 	import type { SctlWsClient } from '../utils/ws-client';
-	import { formParams, renderPlaybookScript } from '../utils/playbook-parser';
+	import { formParams, referencesFilledOn, renderPlaybookScript } from '../utils/playbook-parser';
 	import { uuid } from '../utils/index';
 	import { onDestroy } from 'svelte';
 
@@ -30,6 +30,14 @@
 		description?: boolean;
 		/** Fires whenever the run state changes, for host-rendered controls. */
 		onstatechange?: (state: PlaybookRunState) => void;
+		/**
+		 * The references the host's server fills in a script, and on which
+		 * paths (`job`, `exec`). Off by default: with none, `{{agent}}` is a
+		 * placeholder like any other. A host passes it only when its own
+		 * server fills the reference on the path before the script reaches
+		 * the unit. "Run in terminal" is never such a path.
+		 */
+		serverReferences?: ServerReferences;
 	}
 
 
@@ -43,8 +51,14 @@
 		onclose,
 		actions = true,
 		description = true,
-		onstatechange
+		onstatechange,
+		serverReferences
 	}: Props = $props();
+
+	// The path Execute takes, and the references the host's server fills on
+	// it: left in the script as written, and not asked for in the form.
+	let runPath: PlaybookRunPath = $derived(wsClient ? 'job' : 'exec');
+	let filled = $derived(referencesFilledOn(serverReferences, runPath));
 
 	// Parameter values
 	let paramValues: Record<string, string> = $state({});
@@ -73,9 +87,9 @@
 	$effect(() => {
 		if (playbook) {
 			const values: Record<string, string> = {};
-			// A server reference ({{agent}}) is not a form field: the sending
-			// server fills it.
-			for (const [name, param] of formParams(playbook.params)) {
+			// A reference the host's server fills on this path is not a form
+			// field.
+			for (const [name, param] of formParams(playbook.params, filled)) {
 				values[name] = param.default !== undefined ? String(param.default) : '';
 			}
 			paramValues = values;
@@ -115,15 +129,37 @@
 	let previewScript = $derived((() => {
 		if (!playbook) return '';
 		try {
-			return renderPlaybookScript(playbook.script, paramValues, playbook.params);
+			return renderPlaybookScript(playbook.script, paramValues, playbook.params, filled);
 		} catch {
 			return playbook.script;
 		}
 	})());
 
+	/**
+	 * Send the script to the terminal session, rendered with no reference
+	 * left in it: nothing fills a script typed into a terminal, so a
+	 * reference the server fills elsewhere is refused here, with every
+	 * other placeholder that has no value. Nothing is sent on a refusal.
+	 */
+	function runInTerminal() {
+		if (!playbook) return;
+		try {
+			const script = renderPlaybookScript(
+				playbook.script,
+				paramValues,
+				playbook.params,
+				referencesFilledOn(serverReferences, 'terminal')
+			);
+			error = null;
+			onRunInTerminal?.(script);
+		} catch (e) {
+			error = e instanceof Error ? e.message : 'The script could not be rendered';
+		}
+	}
+
 	async function execute() {
 		if (!playbook) return;
-		const script = renderPlaybookScript(playbook.script, paramValues, playbook.params);
+		const script = renderPlaybookScript(playbook.script, paramValues, playbook.params, filled);
 
 		// ── Streaming path (preferred): run as a job, stream output live ──
 		if (wsClient) {
@@ -230,7 +266,7 @@
 		onOpenViewer(tab);
 	}
 
-	let paramEntries = $derived(playbook ? formParams(playbook.params) : []);
+	let paramEntries = $derived(playbook ? formParams(playbook.params, filled) : []);
 </script>
 
 <!--
@@ -292,7 +328,7 @@
 					{#if onRunInTerminal}
 						<button
 							class="pb-btn pb-btn-quiet flex items-center gap-1"
-							onclick={() => onRunInTerminal?.(previewScript)}
+							onclick={runInTerminal}
 							title="Send script to active terminal session"
 						>
 							<svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">

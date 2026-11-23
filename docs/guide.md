@@ -431,7 +431,7 @@ df -h
 
 **Template substitution:** `{{param_name}}` in the script body is replaced with the parameter value at execution time.
 
-`{{agent}}` is not a parameter. It stands for the path that runs the agent's tools on the unit (`GET /api/health`'s `cli`), and a server that sends a playbook's script to the unit fills it from what it knows of that unit. sctlin leaves `{{agent}}` in the script as written and never asks for it in its form, a playbook that declares a parameter of that name included; every other placeholder with no declared parameter is still refused before anything is sent. A client with no such server behind it, the MCP among them, has nothing to fill it with and refuses it like any undeclared placeholder.
+`{{agent}}` is not a parameter. It stands for the path that runs the agent's tools on the unit (`GET /api/health`'s `cli`), and a server that sends a playbook's script to the unit fills it from what it knows of that unit. sctlin leaves `{{agent}}` in the script as written only where its host says its server fills it: the host names the reference and the paths it fills it on (a job, an exec) with one option, `serverReferences` (`web/README.md`), and there the form does not ask for it. With no such option, and on any path the host did not name (a script sent to a terminal session is never one), `{{agent}}` is a placeholder like any other: a declared parameter of that name is a form field, and an undeclared one is refused before anything is sent. A client with no such server behind it, the MCP among them, has nothing to fill it with and refuses it.
 
 ### Auto-discovery
 

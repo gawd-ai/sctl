@@ -1,4 +1,9 @@
-import type { PlaybookDetail, PlaybookParam } from '../types/terminal.types';
+import type {
+	PlaybookDetail,
+	PlaybookParam,
+	PlaybookRunPath,
+	ServerReferences
+} from '../types/terminal.types';
 
 interface ParsedFrontmatter {
 	name: string;
@@ -168,45 +173,52 @@ function extractScriptBlock(body: string): string {
 }
 
 /**
- * References a playbook's script may hold that are not parameters: the
- * server that sends the script to the unit fills them, from what it knows
- * of the unit. `{{agent}}` is the path that runs the agent's tools there.
- * The form never asks for one, and the renderer leaves it as written, even
- * when a playbook declares a parameter of that name.
+ * The references the host's server fills on `path`: the names a script
+ * may hold as written there. None when the host gave no option, or did not
+ * name the path.
  */
-export const SERVER_REFERENCES: readonly string[] = ['agent'];
-
-/** Whether `name` is a reference the sending server fills, not a parameter. */
-export function isServerReference(name: string): boolean {
-	return SERVER_REFERENCES.includes(name);
+export function referencesFilledOn(
+	host: ServerReferences | undefined | null,
+	path: PlaybookRunPath
+): readonly string[] {
+	return host && host.paths.includes(path) ? host.names : [];
 }
 
 /**
  * The parameters a form asks for, sorted by name: every declared parameter
- * but a server reference.
+ * but those in `filled`, the references the host's server fills on the path
+ * the script takes. With none filled, every declared parameter is asked for.
  */
 export function formParams(
-	params: Record<string, PlaybookParam>
+	params: Record<string, PlaybookParam>,
+	filled: readonly string[] = []
 ): [string, PlaybookParam][] {
 	return Object.entries(params)
-		.filter(([name]) => !isServerReference(name))
+		.filter(([name]) => !filled.includes(name))
 		.sort(([a], [b]) => a.localeCompare(b));
 }
 
 /**
  * Render a playbook script by substituting {{param}} placeholders with values.
- * Falls back to param defaults if no value provided. A server reference
- * (`{{agent}}`) is left as written: the server that sends the script fills it.
+ * Falls back to param defaults if no value provided.
+ *
+ * `filled` names the references the host's server fills on the path this
+ * script takes (`referencesFilledOn`): each is left as written, and is
+ * filled from no form value, even when the playbook declares a parameter of
+ * that name. It is empty by default: then `{{agent}}` is a placeholder like
+ * any other, filled when declared and refused when not, so that it never
+ * reaches a shell that nothing filled it for.
  */
 export function renderPlaybookScript(
 	script: string,
 	args: Record<string, unknown>,
-	params: Record<string, PlaybookParam>
+	params: Record<string, PlaybookParam>,
+	filled: readonly string[] = []
 ): string {
 	let result = script;
 
 	for (const [name, def] of Object.entries(params)) {
-		if (isServerReference(name)) continue;
+		if (filled.includes(name)) continue;
 		const placeholder = `{{${name}}}`;
 		if (!result.includes(placeholder)) continue;
 
@@ -218,10 +230,10 @@ export function renderPlaybookScript(
 		result = result.replaceAll(placeholder, String(value));
 	}
 
-	// Check for remaining unreplaced placeholders. A server reference is
-	// not one: it is not this renderer's to fill.
+	// Check for remaining unreplaced placeholders. A reference the host's
+	// server fills on this path is not one.
 	for (const remaining of result.matchAll(/\{\{(\w+)\}\}/g)) {
-		if (isServerReference(remaining[1])) continue;
+		if (filled.includes(remaining[1])) continue;
 		throw new Error(`Script references undeclared parameter: {{${remaining[1]}}}`);
 	}
 

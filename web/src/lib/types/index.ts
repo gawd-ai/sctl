@@ -56,6 +56,8 @@ export type {
 	PlaybookSummary,
 	PlaybookDetail,
 	PlaybookRunState,
+	PlaybookRunPath,
+	ServerReferences,
 	SplitGroupInfo,
 	SidePanelTabDef,
 	ViewerTab,

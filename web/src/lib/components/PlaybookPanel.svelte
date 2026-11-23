@@ -1,7 +1,7 @@
 <script lang="ts">
 	import type { SctlRestClient } from '../utils/rest-client';
 	import type { SctlWsClient } from '../utils/ws-client';
-	import type { PlaybookSummary, PlaybookDetail, ViewerTab } from '../types/terminal.types';
+	import type { PlaybookSummary, PlaybookDetail, ServerReferences, ViewerTab } from '../types/terminal.types';
 	import PlaybookList from './PlaybookList.svelte';
 	import PlaybookViewer from './PlaybookViewer.svelte';
 	import PlaybookExecutor from './PlaybookExecutor.svelte';
@@ -12,6 +12,8 @@
 		wsClient?: SctlWsClient | null;
 		onRunInTerminal?: (script: string) => void;
 		onOpenViewer?: (tab: ViewerTab) => void;
+		/** The references the host's server fills, and on which paths; off by default (see PlaybookExecutor). */
+		serverReferences?: ServerReferences;
 	}
 
 	let {
@@ -19,7 +21,8 @@
 		restClient,
 		wsClient = null,
 		onRunInTerminal,
-		onOpenViewer
+		onOpenViewer,
+		serverReferences
 	}: Props = $props();
 
 	// ── State machine: list → detail → execute ───────────────────
@@ -155,6 +158,7 @@
 						{wsClient}
 						{onRunInTerminal}
 						{onOpenViewer}
+						{serverReferences}
 					/>
 				{/if}
 				{#if loading}

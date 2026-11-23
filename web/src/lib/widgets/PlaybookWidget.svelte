@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
 	import type { DeviceConnectionConfig } from '../types/widget.types';
-	import type { PlaybookSummary, PlaybookDetail, ExecResult } from '../types/terminal.types';
+	import type { PlaybookSummary, PlaybookDetail, ExecResult, ServerReferences } from '../types/terminal.types';
 	import { SctlRestClient } from '../utils/rest-client';
 	import PlaybookList from '../components/PlaybookList.svelte';
 	import PlaybookViewer from '../components/PlaybookViewer.svelte';
@@ -15,9 +15,11 @@
 		editable?: boolean;
 		/** Additional CSS classes on the wrapper div. */
 		class?: string;
+		/** The references the host's server fills, and on which paths; off by default (see PlaybookExecutor). This widget runs a playbook as an exec. */
+		serverReferences?: ServerReferences;
 	}
 
-	let { config, editable = false, class: className = '' }: Props = $props();
+	let { config, editable = false, class: className = '', serverReferences }: Props = $props();
 
 	let restClient: SctlRestClient | null = $state(null);
 	let playbooks: PlaybookSummary[] = $state([]);
@@ -152,6 +154,7 @@
 					{restClient}
 					onclose={goBack}
 					onresult={handleResult}
+					{serverReferences}
 				/>
 			</div>
 		</div>

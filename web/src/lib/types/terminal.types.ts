@@ -875,6 +875,34 @@ export interface PlaybookDetail {
 	raw_content: string;
 }
 
+/**
+ * How a rendered playbook script leaves sctlin: a streaming job over the
+ * WebSocket (`job`), a blocking exec over REST (`exec`), or typed into a
+ * terminal session (`terminal`).
+ */
+export type PlaybookRunPath = 'job' | 'exec' | 'terminal';
+
+/**
+ * References a host's server fills in a script before it reaches the unit,
+ * and the paths it fills them on. A reference is a `{{name}}` that is not a
+ * parameter: `{{agent}}`, the path that runs the agent's tools on the unit.
+ *
+ * The option is the host's, and off by default. With none, and on any path
+ * the host does not name, sctlin treats `{{agent}}` as any placeholder: a
+ * declared parameter of that name is a form field, and an undeclared one is
+ * refused before anything is sent. Only on a named path is the reference
+ * left in the script as written, and its form field dropped, since the
+ * server fills it there. A host names a path only when its own server
+ * fills the reference on it: left as written anywhere else, it would reach
+ * the unit's shell unfilled.
+ */
+export interface ServerReferences {
+	/** The reference names the server fills, without braces: `['agent']`. */
+	names: readonly string[];
+	/** The paths the server fills them on. */
+	paths: readonly PlaybookRunPath[];
+}
+
 /** PlaybookExecutor's run state, for host-rendered controls (`onstatechange`). */
 export interface PlaybookRunState {
 	executing: boolean;

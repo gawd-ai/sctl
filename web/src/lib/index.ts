@@ -80,6 +80,8 @@ export type {
 	PlaybookParam,
 	PlaybookSummary,
 	PlaybookDetail,
+	PlaybookRunPath,
+	ServerReferences,
 	SplitGroupInfo,
 	SidePanelTabDef,
 	ViewerTab,
@@ -113,7 +115,13 @@ export { createTerminal, applyTheme, DEFAULT_THEME, type XtermInstance } from '.
 export { SctlRestClient } from './utils/rest-client';
 export type { RestClientConfig } from './utils/rest-client';
 export { KeyboardManager, type Shortcut } from './utils/keyboard';
-export { parsePlaybookFrontmatter, renderPlaybookScript, validatePlaybookName } from './utils/playbook-parser';
+export {
+	formParams,
+	parsePlaybookFrontmatter,
+	referencesFilledOn,
+	renderPlaybookScript,
+	validatePlaybookName
+} from './utils/playbook-parser';
 export { TransferTracker, type ClientTransfer, type TransferProgress, type TransferState, type OnProgress, type OnComplete, type OnError } from './utils/transfer';
 export { ConnectionManager, type ConnectionManagerConfig, type ConnectionManagerEvents, type ServerConnection } from './utils/connection-manager';
 export { getRelayBaseUrl, getRelaySerial } from './utils/relay';

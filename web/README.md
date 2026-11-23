@@ -105,6 +105,24 @@ Widgets                (self-contained: each creates its own clients internally)
 | `SplitPane` | Resizable split pane layout |
 | `ToastContainer` | Toast notifications |
 
+### References a host's server fills
+
+A playbook's script may name the agent's tools as `{{agent}}`: the path that runs them on the unit, which differs by unit. sctlin does not know it. A host whose own server fills the reference before a script reaches the unit says so with one prop, `serverReferences`, on `PlaybookExecutor`, `PlaybookPanel` or `PlaybookWidget`:
+
+```svelte
+<PlaybookExecutor {playbook} {restClient} {wsClient}
+  serverReferences={{ names: ['agent'], paths: ['job', 'exec'] }} />
+```
+
+- `names`: the references the server fills, without braces. Today `agent`.
+- `paths`: where the server fills them. `job` is a script run as a streaming job over the WebSocket (what Execute does when a `wsClient` is given); `exec` is a blocking exec over REST (Execute with no `wsClient`, and `PlaybookWidget`). Name a path only if the server fills the reference on it.
+
+On a named path the reference is left in the script as written and its form field is dropped, a playbook that declares a parameter of that name included: the server fills it.
+
+The option is off by default, and with none sctlin behaves as it did before the option existed. `{{agent}}` is then a placeholder like any other: a declared parameter of that name is a form field, and an undeclared one is refused before anything is sent ("Script references undeclared parameter: {{agent}}"). The same holds on a path the host did not name. "Run in terminal" is never a path a server fills, since the script is typed into a session as it is: a script that still holds a reference is refused there, and nothing is sent. Left as written with nothing to fill it, `{{agent}}` would reach the unit's shell as text, and a script such as `{{agent}} net tcp ... || fallback` would fail on it and take its fallback.
+
+`referencesFilledOn(serverReferences, path)`, `formParams(params, filled)` and `renderPlaybookScript(script, args, params, filled)` are exported for a host that renders its own form.
+
 ### Theming the playbook components
 
 `PlaybookViewer` and `PlaybookExecutor` read their colours, fonts and sizes from `--sctl-*` custom properties. The defaults are the dark console look, so nothing changes until a host sets them on an ancestor:
