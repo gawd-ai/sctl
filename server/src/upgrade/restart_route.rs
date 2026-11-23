@@ -30,6 +30,10 @@ use super::restart_checks::{self, Reason, Site};
 use crate::error::ApiError;
 use crate::AppState;
 
+/// How long a request waits for the in-flight lock before it is answered
+/// 409.
+const LOCK_WAIT: Duration = Duration::from_millis(250);
+
 /// The longest `request_id` the route takes, in bytes.
 pub const MAX_REQUEST_ID_BYTES: usize = 128;
 
@@ -192,7 +196,11 @@ pub async fn accept(state: &AppState, body: &[u8], deps: Deps) -> Result<Accepte
     }
 
     // 2. One in flight at a time, across upgrades and restarts.
-    let Ok(guard) = state.upgrade.in_flight.try_lock() else {
+    // The lock is held through an upgrade's staging and through a restart's
+    // hand-off and its helper's run. A hand-off that has just ended still
+    // holds it for an instant after its record reads done: wait that out
+    // rather than answer "in flight" with nothing in flight.
+    let Ok(guard) = tokio::time::timeout(LOCK_WAIT, state.upgrade.in_flight.lock()).await else {
         return Err(in_flight(state));
     };
     if restart_in_flight(state) || state.upgrade.current().in_flight() {
