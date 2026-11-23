@@ -105,6 +105,28 @@ A unit fetches the whole set once, never a difference: what the rollout costs it
 
 No number is claimed before the tag (section 2). What is known: no dependency is added or moved (`Cargo.lock` is unchanged but for the version at the release), and the code added is the restart's modules and three small readers. Slice 6 measures every target from the tag's `release.json` against the figures of section 2, and records, for each: the server, the plugin, the set, and the difference in bytes and in percent. On a WE826, whether `libc` and `libgcc` keep their hashes, since 0.6.13 was the first release to gzip them with `-n`: if they do, that unit fetches 1,257,347 bytes less than it did for 0.6.13.
 
+### 5.1 Measured at the tag (2026-11-23)
+
+`v0.6.14` was tagged on `7092717` and the `Release` workflow published 0.6.14.354: every job passed, the version proof included, and the release is not a draft. The published files against 0.6.13.309's, in bytes:
+
+| File | 0.6.13 | 0.6.14 | Difference |
+|---|---|---|---|
+| `sctl-server-mips_24kc.gz` | 3,849,030 | 3,921,647 | +72,617 (+1.89%) |
+| `sctl-server-mipsel_24kc.gz` | 3,818,755 | 3,894,515 | +75,760 (+1.98%) |
+| `sctl-comms-quectel-mips_24kc.so.gz` | 226,990 | 226,883 | -107 |
+| `sctl-comms-quectel-mipsel_24kc.so.gz` | 227,005 | 226,974 | -31 |
+| `libc-mips_24kc.so.gz` | 1,132,822 | 1,132,804 | -18 |
+| `libgcc_s-mips_24kc.so.1.gz` | 124,525 | 124,501 | -24 |
+| `sctl-x86_64` | 8,290,544 | 8,450,576 | +160,032 (+1.93%) |
+| `sctl-aarch64` | 6,774,424 | 6,905,784 | +131,360 (+1.94%) |
+| `sctl-armv7` | 6,537,744 | 6,668,960 | +131,216 (+2.01%) |
+| `sctl-riscv64` | 7,426,264 | 7,565,816 | +139,552 (+1.88%) |
+| `libsctl_comms_quectel-riscv64.so` | 356,744 | 356,744 | 0 |
+
+- **What a unit pays at the rollout** is its whole set, as section 5 says: on a `gz-tmp` unit the server and the plugin, about 4.12 MB on `mipsel_24kc`.
+- **The WE826's libc and libgcc change once more, and for the last time.** Their contents did not change. 0.6.14 is the first release built with `gzip -n` (`5d3c4fb`, after the 0.6.13 tag), which stores neither the file's time nor its name in the header: the two files are exactly one name shorter, 18 bytes (`libc-mips_24kc.so` and its terminator) and 24 bytes (`libgcc_s-mips_24kc.so.1` and its terminator). So a `ramboot` WE826 fetches both again (1,257,305 bytes) once at its next boot under 0.6.14, and from the next release on they keep their hashes while their contents do.
+- **The servers grew about 2%** on every target, the restart's modules and the three readers; no dependency moved.
+
 ## 6. The bench
 
 Two benches, both before any unit in service takes the release.
@@ -146,7 +168,7 @@ Build order. Each is accepted as said; the TRD's status flips in the change that
 3. **The upgrade helper's health read** (4.4): Planned. Built (2026-11-23): `HttpHealth` reads through the reader the restart's helper uses, the whole exchange within 5 s (`HEALTH_READ_TOTAL`); 2 new tests, one that a health answer which never ends is one failed read, one that pins the judgment (2 answers in a row, 5 s apart, 180 s, a failed read starting the count again), and the upgrade's 8 own tests unchanged. The read's total deadline of 5 s. Accepted when the upgrade's own tests pass unchanged, its judgment is shown unchanged (the answers, their spacing, the window), and a health answer that never ends is one failed read, not a held helper. **Open, not built:** the command's deadline, until slice 7 has timed the restart command on every layout; it is then at least three times the slowest measured, and accepted when a stand-in command that never returns ends as a rollback, not as a held lock.
 4. **An installed `gz-tmp` unit's threshold** (4.5, option 1): Planned. Built (2026-11-23): `InstallInfo::load` reads the init the record's restart command names when a `gz-tmp` record gives no `restart_tmp_kb` (`install.rs`, `read_init_threshold`, `init_tmp_kb`), through `read_own`, 64 KiB at most; the report carries `restart_tmp_kb_from`. 3 new tests in the library (the line's shape, a staged unit through `record`, `init` and `default`, a FIFO and `/dev/zero` as the init answered at once) and 1 in `restart_inits.rs`: this repository's two `gz-tmp` inits read as 16384 and 8192. Accepted when a staged `gz-tmp` unit with no `restart_tmp_kb` in its record and an init that says 8192 is judged at 8192, and `GET /api/upgrade` says the value came from the init.
 5. **The release commit.** Planned. Built (2026-11-23, the commit that carries this line): the five version carriers, `Cargo.lock` and `web/package-lock.json` at 0.6.14, each edit byte-safe; `CHANGELOG.md` `[0.6.14]` (2026-11-23) with `[Unreleased]`'s five groups (Restart, Managed upgrades, File reads, sctlin, devices), its File reads entries said against 0.6.13, where the review's fixes had each described the commit before it; ADR-014's index row names the release. ADR-014 stays Proposed and TRD-10 and this TRD stay Planned, as 0.6.12's release commit left TRD-9 Planned: TRD-9 was marked Implemented in a commit of its own once its tag was made (`c9571d4`), before its rollout. Before it: `main` fetched; a sweep of what this release added for anything a public tree must not name. Accepted when the workspace, clippy, fmt, both docs gates, the bindings diff, `cargo doc` and sctlin's check, test and package are green on the pinned toolchain, as CI runs them, `test-musl` among them.
-6. **The tag and its measures.** `v0.6.14` on the release commit; the `Release` workflow signs, proves every server artifact's version (TRD-1) and publishes. Every target measured against 0.6.13 (section 5) and recorded here. Accepted when the proof is `ok` for the six server artifacts and the sizes are written.
+6. **The tag and its measures.** `v0.6.14` on the release commit; the `Release` workflow signs, proves every server artifact's version (TRD-1) and publishes. Every target measured against 0.6.13 (section 5) and recorded here. Accepted when the proof is `ok` for the six server artifacts and the sizes are written. Done (2026-11-23): 0.6.14.354 published, the proof `ok`, the sizes in 5.1.
 7. **The benches** (section 6): 6.2 on the released binary, then 6.1 on the units the owner names. Accepted when every line of both is recorded here, and each `gz-tmp` model's threshold is confirmed. A line that fails holds the rollout, as 0.6.12.303 was held.
 8. **The rollout**, under section 7's notes: the bundle on the relays, the previous one kept, the units, the relay last. Accepted as TRD-9 section 5 accepts one.
 
