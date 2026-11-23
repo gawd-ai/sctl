@@ -427,3 +427,74 @@ fn a_unit_with_no_install_record_refuses() {
     assert!(!Path::new(&bench.marker()).exists());
     drop(agent);
 }
+
+/// `sctl upgrade` from a shell is another process than the agent that
+/// accepted a restart. It reads the restart helper's lock on disk and
+/// refuses while it is held, before it stages or fetches anything.
+#[test]
+fn sctl_upgrade_from_a_shell_refuses_while_a_restarts_helper_is_at_work() {
+    use std::os::unix::io::AsRawFd;
+    let bench = Bench::new("cli", true);
+    // What an agent and its helper leave on disk mid-restart. No agent runs
+    // here: the files are the test's own.
+    let upgrade = bench.path("state/upgrade");
+    std::fs::create_dir_all(upgrade.join("restart")).unwrap();
+    std::fs::write(
+        upgrade.join("restart.json"),
+        json!({"v": 1, "phase": "restarting", "request_id": "bench-9",
+               "instance_before": "an-instance", "boot_before": 1_790_000_000_000_u64})
+        .to_string(),
+    )
+    .unwrap();
+    let lock = std::fs::File::create(upgrade.join("restart/lock")).unwrap();
+    // SAFETY: flock on a file descriptor this test owns.
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "the helper's lock, held by the test"
+    );
+
+    let mut child = Command::new(SCTL)
+        .env_clear()
+        .env("PATH", PATH)
+        .env("SCTL_INSTALL_JSON", bench.path("install.json"))
+        .env("SCTL_CLI_PATH", bench.path("bin/sctl"))
+        .env("SCTL_DISABLED_PATH", bench.path("disabled"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(bench.path("upgrade.err")).unwrap())
+        .arg("upgrade")
+        .arg("9.9.9.1")
+        .arg("--config")
+        .arg(bench.path("sctl.toml"))
+        // Were it not refused, it would ask the loopback, where nothing
+        // listens.
+        .arg("--manifest")
+        .arg("http://127.0.0.1:1/release.json")
+        .spawn()
+        .expect("sctl upgrade starts");
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > Duration::from_secs(20) {
+            // The test's own child.
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("sctl upgrade went on with a restart in flight");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let said = std::fs::read_to_string(bench.path("upgrade.err")).unwrap_or_default();
+    assert_eq!(status.code(), Some(1), "{said}");
+    assert!(
+        said.contains("a restart is in flight (request bench-9)"),
+        "{said}"
+    );
+    assert!(
+        !upgrade.join("state.json").exists(),
+        "nothing was staged: {said}"
+    );
+    drop(lock);
+}

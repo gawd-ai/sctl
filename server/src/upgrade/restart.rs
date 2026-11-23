@@ -316,6 +316,17 @@ pub fn new_instance() -> String {
     instance_from(kernel_keyed(), Moment::now())
 }
 
+/// The restart whose helper is at work on this unit, read from disk: the
+/// record says a restart is in flight, and its helper holds its lock.
+/// `sctl upgrade` from a shell is another process than the agent that
+/// accepted the restart; it reads the files. `None` when no helper holds
+/// the lock, a stale record included.
+pub fn helper_at_work(state_dir: &str) -> Option<RestartState> {
+    let on_disk = load(&record_path(state_dir))?;
+    let dir = helper_dir(state_dir);
+    (on_disk.in_flight() && dir.is_dir() && !lock_is_free(&dir)).then_some(on_disk)
+}
+
 /// The record's path.
 pub fn record_path(state_dir: &str) -> PathBuf {
     upgrade_dir(state_dir).join(FILE_NAME)
@@ -1009,6 +1020,31 @@ mod tests {
             [],
         );
         assert_eq!(ends.jobs, [exact]);
+    }
+
+    /// What `sctl upgrade` reads before it stages anything: a restart whose
+    /// helper holds its lock. A record alone, or a lock alone, is not one.
+    #[test]
+    fn a_restart_at_work_is_read_from_disk_by_its_record_and_its_lock() {
+        let (dir, handle) = bench("disk");
+        let state_dir = dir.to_str().unwrap();
+        assert_eq!(helper_at_work(state_dir), None, "nothing on disk");
+        let restarting = RestartState::accepted(Some("r-5".into()), &OLD).restarting();
+        handle.set(restarting.clone());
+        assert_eq!(helper_at_work(state_dir), None, "no helper's directory");
+        std::fs::create_dir_all(handle.helper_dir()).unwrap();
+        assert_eq!(
+            helper_at_work(state_dir),
+            None,
+            "a stale record: no lock held"
+        );
+        let lock = crate::upgrade::apply::take_lock(handle.helper_dir()).unwrap();
+        assert_eq!(helper_at_work(state_dir), Some(restarting.clone()));
+        // Ended: the lock alone says nothing.
+        handle.set(restarting.finished(Outcome::Ok, None));
+        assert_eq!(helper_at_work(state_dir), None);
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

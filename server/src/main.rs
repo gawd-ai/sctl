@@ -241,6 +241,15 @@ async fn run_upgrade_cli(
         eprintln!("refused: {refusal}");
         return 1;
     }
+    // A restart on request is the agent's, another process: its helper's
+    // lock on disk says it is at work (ADR-014). One at a time.
+    if let Some(restart) = sctl::upgrade::restart::helper_at_work(&ctx.state_dir) {
+        eprintln!(
+            "refused: a restart is in flight (request {}): its helper is at work. Ask again when it has ended.",
+            restart.request_id.as_deref().unwrap_or("with no id")
+        );
+        return 1;
+    }
     let handle = Arc::new(Handle::open(&ctx.state_dir));
     if handle.current().in_flight() {
         eprintln!("an upgrade is in flight: {:?}", handle.current());

@@ -1403,7 +1403,9 @@ arrives as [`upgrade.state`](#upgradestate-where-the-devices-upgrade-stands)),
 `200` `{accepted: false, state, running_version}` (already at that version).
 
 Errors: `409` `UPGRADE_IN_FLIGHT` (one is in progress; `detail.state` says
-which), `423` `UPGRADE_HELD` (`[upgrade] hold` or `/etc/sctl/upgrade-hold`),
+which), `409` `RESTART_IN_FLIGHT` (a [restart on request](#post-apirestart)
+is in flight; `detail.restart` is its record: the unit is busy, and the
+upgrade is asked again once that record has ended), `423` `UPGRADE_HELD` (`[upgrade] hold` or `/etc/sctl/upgrade-hold`),
 `422` `UPGRADE_REFUSED` with `detail.reason` one of `window_passed`,
 `no_clock`, `downgrade`, `no_install_json`, `no_mirror`, `manifest_invalid`
 (the version does not parse), `500` `UPGRADE_CONFIG` (a `trust_keys` entry
@@ -1481,7 +1483,8 @@ Response `202`, sent before anything stops:
   next process starts in safe mode again. The route does not clear it.
 
 Errors, each before anything stops. `409` `UPGRADE_IN_FLIGHT` (an upgrade
-is staging or its helper has the unit; `detail.state`), `409`
+is staging or its helper has the unit, one started by `sctl upgrade` from a
+shell included, by its helper's lock on disk; `detail.state`), `409`
 `RESTART_IN_FLIGHT` (a restart is accepted or its helper is still
 watching; `detail.restart` is its record), `400` `RESTART_BAD_REQUEST` (a
 body that is not a request, a `request_id` over 128 bytes, an unknown word

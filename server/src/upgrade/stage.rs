@@ -262,15 +262,38 @@ pub fn manifest_url(ctx: &Context, req: &Request) -> Result<String, Refusal> {
 /// earlier release under the same name is never mistaken for a partial
 /// download of this one.
 pub fn stage_dir(ctx: &Context, version: &str) -> PathBuf {
-    match ctx.install.as_ref() {
+    stage_dir_of(ctx.install.as_ref(), &ctx.state_dir, version)
+}
+
+/// [`stage_dir`] from the install and the state directory alone: where an
+/// upgrade to `version` is staged, and so where its helper holds its lock.
+pub fn stage_dir_of(install: Option<&InstallInfo>, state_dir: &str, version: &str) -> PathBuf {
+    match install {
         Some(i) if i.layout == Layout::Ramboot => i
             .cache_dir
             .clone()
             .unwrap_or_else(|| PathBuf::from("/tmp/sctl/cache")),
-        _ => super::state::upgrade_dir(&ctx.state_dir)
+        _ => super::state::upgrade_dir(state_dir)
             .join("stage")
             .join(version),
     }
+}
+
+/// The upgrade whose helper is at work on this unit, read from disk: the
+/// state file says an upgrade is in flight, and its helper holds the lock
+/// of its stage. An upgrade asked from a shell (`sctl upgrade`) is another
+/// process, which the agent's memory knows nothing of; the files say so.
+/// `None` when no helper holds a lock, a stale state included.
+pub fn helper_at_work(
+    install: Option<&InstallInfo>,
+    state_dir: &str,
+) -> Option<super::state::UpgradeState> {
+    let on_disk = super::state::load(&super::state::state_path(state_dir))?;
+    if !on_disk.in_flight() {
+        return None;
+    }
+    let stage = stage_dir_of(install, state_dir, on_disk.to_version.as_deref()?);
+    (stage.is_dir() && !super::apply::lock_is_free(&stage)).then_some(on_disk)
 }
 
 /// Remove every other version's stage directory (their downloads, helper

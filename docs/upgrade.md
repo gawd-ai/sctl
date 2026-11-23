@@ -478,7 +478,10 @@ systemd unit); the detached start of step 6 (its own session, its output in
 a log, the loader words, `systemd-run --collect` on `systemd`); the 2 s the
 helper waits so the answer leaves; the restart command through `sh -c`; two
 healthy answers 5 s apart within 180 s; one in-flight rule, so that while
-either an upgrade or a restart is in flight the other is refused; the
+either an upgrade or a restart is in flight the other is refused (an
+upgrade asked during a restart is answered 409 `RESTART_IN_FLIGHT`, which
+means busy, not failed; `sctl upgrade` from a shell and the route read each
+other's helper lock on disk); the
 helper's lock and the reconcile at start; and the `upgrade.state` push,
 which carries the restart's record as `restart`.
 

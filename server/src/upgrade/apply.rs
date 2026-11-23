@@ -107,6 +107,15 @@ pub(crate) fn http_get_within(
                 Ok(0) => break,
                 Ok(n) => response.extend_from_slice(&chunk[..n]),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                // The read's own timeout was what was left of the total.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    left()?;
+                }
                 Err(e) => return Err(e.to_string()),
             }
         }

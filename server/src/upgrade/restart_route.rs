@@ -209,6 +209,18 @@ pub async fn accept(state: &AppState, body: &[u8], deps: Deps) -> Result<Accepte
     if restart_in_flight(state) || state.upgrade.current().in_flight() {
         return Err(in_flight(state));
     }
+    // An upgrade asked from a shell (`sctl upgrade`) is another process:
+    // this one's memory knows nothing of it. Its helper's lock on disk
+    // does.
+    if let Some(on_disk) =
+        super::stage::helper_at_work(state.install.as_deref(), state.config.server.state_dir())
+    {
+        return Err(
+            ApiError::new("UPGRADE_IN_FLIGHT", "an upgrade's helper is at work")
+                .with_detail(json!({"state": on_disk}))
+                .into_response_with(StatusCode::CONFLICT),
+        );
+    }
 
     // 3. A relay's restart drops every unit's tunnel at once.
     if state.config.tunnel.as_ref().is_some_and(|tc| tc.relay) {
@@ -661,6 +673,42 @@ mod tests {
         );
         helper_ends(&b, first, Outcome::NotRestarted).await;
         assert_eq!(b.state.restart.current().request_id.as_deref(), Some("r-1"));
+    }
+
+    /// An upgrade asked from a shell is another process: the agent's memory
+    /// says nothing is in flight. The upgrade helper's lock on disk refuses
+    /// the restart; a stale state with no lock held does not.
+    #[tokio::test]
+    async fn an_upgrade_started_from_a_shell_refuses_a_restart_by_its_helpers_lock() {
+        let b = bench("shell");
+        let state_dir = b.state.config.server.state_dir().to_string();
+        // What `sctl upgrade` and its helper leave on disk, this process's
+        // memory untouched.
+        let applying = UpgradeState::staging(Some("cli-1".into()), "0.6.13.309", "0.6.14.1")
+            .with_phase(crate::upgrade::state::Phase::Applying);
+        crate::upgrade::state::save(&crate::upgrade::state::state_path(&state_dir), &applying)
+            .unwrap();
+        let stage =
+            crate::upgrade::stage::stage_dir_of(b.state.install.as_deref(), &state_dir, "0.6.14.1");
+        std::fs::create_dir_all(&stage).unwrap();
+        assert!(
+            !b.state.upgrade.current().in_flight(),
+            "memory knows nothing"
+        );
+        let lock = crate::upgrade::apply::take_lock(&stage).unwrap();
+
+        let (status, error) = ask(&b, "").await.err().unwrap();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error["code"], "UPGRADE_IN_FLIGHT");
+        assert_eq!(error["detail"]["state"]["request_id"], "cli-1");
+        assert_eq!(error["detail"]["state"]["phase"], "applying");
+        untouched(&b);
+
+        // The helper is gone: a state left on disk with no lock held does
+        // not refuse.
+        drop(lock);
+        let accepted = ask(&b, "").await.unwrap();
+        helper_ends(&b, accepted, Outcome::NotRestarted).await;
     }
 
     /// A helper that is gone without an outcome does not hold the unit: the
