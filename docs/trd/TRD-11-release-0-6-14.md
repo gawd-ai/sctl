@@ -148,6 +148,8 @@ Build order. Each is accepted as said; the TRD's status flips in the change that
 
 **What ran with the riders (2026-11-23, at `d695344`, on the pinned 1.97.1).** `cargo test --workspace`, nothing skipped: 672 passed in the library, 11 in the binary, 51 in the MCP, 17 in `relay_events.rs`, 9 in `cli_name.rs` (1 ignored, root), 4 in `restart.rs`, 5 in `restart_inits.rs`, 3 in `xe300_relay_route_sh.rs`, 1 and 4 in the two comms crates; the two netns tests ignored, as without root. `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` clean; both docs gates pass; `cargo doc` has the five warnings it had; no stray ts-rs output. sctlin: `npm run test`, 84 passed, and `npm run check`, no error; `npm run package` was not run.
 
+**What ran after the rulings' four builds (2026-11-23, at `4539048`, on the pinned 1.97.1).** `19f199b` (the upgrade helper's health read), `80155ed` (an installed `gz-tmp` unit's threshold), `4635bab` (the watchdog's append), `4539048` (a flag that cannot be read is active). `cargo test --workspace`, nothing skipped: 679 passed in the library, 11 in the binary, 51 in the MCP, 17 in `relay_events.rs`, 9 in `cli_name.rs` (1 ignored, root), 4 in `restart.rs`, 6 in `restart_inits.rs`, 3 in `xe300_relay_route_sh.rs`, 1 and 4 in the two comms crates; the two netns tests ignored, as without root. `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` clean; both docs gates pass; no stray ts-rs output. sctlin: 84 passed, `npm run check` with no error.
+
 ## 9. Ruled by the lead (2026-11-23)
 
 The six questions this TRD left open, each with its ruling. The version, 0.6.14, stands.
