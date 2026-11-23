@@ -59,7 +59,7 @@ These files are the agent's own, in the agent's own directories, which the gate'
 
 **Tests.** Each makes its own FIFO in a scratch directory, and a route that waited is given the FIFO's other end and failed within 5 s, so no run hangs. Against the plain reads and the plain write, the four route tests fail that way. 1 in `file_access` (40 reads of a FIFO, a link to one, `/dev/null`, a write's judgment), 3 in `routes/playbooks.rs`, 1 in `routes/lte.rs`, 1 in `routes/safe_mode.rs`, 2 in `activity.rs`. CI's `test-musl` job now runs the three routes' tests and the restart's with the gate's, on the libc the units run. That filter, run here on `x86_64-unknown-linux-musl`: 108 passed. It ran on the build machine's stable toolchain (1.98.1), which has the musl target; the pinned 1.97.1 has none installed here, as TRD-9 slice 10 records, and CI installs it.
 
-**Left, and named:** the watchdog's own append to its history opens the file for writing (`util.rs`, `append_rotating`); a FIFO at the name would hold one thread of the blocking pool per watchdog event. It takes local access, stops no route, and is not on TRD-9's list (section 9, question 4).
+**The watchdog's own append** (section 9, ruling 4; built 2026-11-23). It opened its history for appending (`util.rs`, `append_rotating`), and a FIFO at the name held one thread of the blocking pool per watchdog event. The name is judged with `writable_own` before the open: a FIFO or a device there is one error to the watchdog, which logs it, and no thread. 1 new test, with its own FIFO, released and failed within 5 s if an append waits.
 
 ### 4.3 Rider B: sctlin leaves `{{agent}}` as written
 

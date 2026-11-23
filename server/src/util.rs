@@ -37,6 +37,13 @@ pub fn expand_tilde(path: &str) -> Cow<'_, str> {
 /// blocking pool — readers racing the close occasionally see an empty file
 /// on slower filesystems (caught by CI). `std::fs` with an explicit
 /// `flush` + drop is synchronous and avoids the race.
+///
+/// What is at the name is judged before the open, through the file gate's
+/// handle and its type judgment (ADR-011): nothing, or a regular file, is
+/// appended to. An open for appending waits on a FIFO with no reader and
+/// runs a device's open; each append then held one thread of the blocking
+/// pool for good. A FIFO, a socket or a device at the name is one error
+/// to the caller and no thread.
 pub async fn append_rotating(path: &Path, line: &str, max_bytes: u64) -> std::io::Result<bool> {
     let path = path.to_path_buf();
     let line = line.to_string();
@@ -55,6 +62,12 @@ pub async fn append_rotating(path: &Path, line: &str, max_bytes: u64) -> std::io
                 }
             }
         }
+        crate::file_access::writable_own(&path).map_err(|refusal| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{}: {}", path.display(), refusal.message()),
+            )
+        })?;
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -108,5 +121,52 @@ mod tests {
 
     fn tempfile_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("sctl_test_{name}_{}.log", std::process::id()))
+    }
+
+    /// A FIFO at the log's name held each append in its open, one thread
+    /// of the blocking pool per line. It is judged first and never opened:
+    /// one error, at once, and the FIFO left as it was.
+    #[tokio::test]
+    async fn a_fifo_at_the_name_is_one_refusal_and_no_thread() {
+        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+        let dir = std::env::temp_dir().join(format!("sctl-append-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("watchdog_history.jsonl");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        for _ in 0..8 {
+            // An append that waited would hang the run: on a timeout the
+            // FIFO gets a reader, opened without waiting, before the test
+            // fails.
+            let appended = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                append_rotating(&fifo, "{}\n", 1024),
+            )
+            .await;
+            let Ok(appended) = appended else {
+                let _ = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&fifo);
+                panic!("the append waited on a FIFO");
+            };
+            let error = appended.expect_err("a FIFO is not appended to");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("a FIFO"), "{error}");
+        }
+        assert!(std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo());
+        // A device is refused the same way; a file that is not there yet is
+        // made, and one that is there is appended to.
+        assert!(append_rotating(Path::new("/dev/null"), "x\n", 1024)
+            .await
+            .is_err());
+        let log = dir.join("modem-state.log");
+        assert!(!append_rotating(&log, "one\n", 1024).await.unwrap());
+        assert!(!append_rotating(&log, "two\n", 1024).await.unwrap());
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "one\ntwo\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
