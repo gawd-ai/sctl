@@ -20,7 +20,7 @@ pub const HEALTH_WINDOW: Duration = Duration::from_mins(3);
 /// Consecutive healthy answers needed.
 pub const HEALTH_PASSES: u32 = 2;
 /// Before touching anything: the 202 and the state push must leave first.
-const SETTLE: Duration = Duration::from_secs(2);
+pub(crate) const SETTLE: Duration = Duration::from_secs(2);
 
 /// How the helper judges health: the real thing, or a stand-in for tests.
 pub trait Health {
@@ -48,7 +48,7 @@ impl Health for HttpHealth {
 }
 
 /// A minimal HTTP/1.0 GET: the body of a 200, or the error.
-fn http_get(url: &str, budget: Duration) -> Result<String, String> {
+pub(crate) fn http_get(url: &str, budget: Duration) -> Result<String, String> {
     use std::io::Read;
     let rest = url
         .strip_prefix("http://")
@@ -111,7 +111,7 @@ pub struct Log {
 }
 
 impl Log {
-    fn open(path: &Path) -> Self {
+    pub(crate) fn open(path: &Path) -> Self {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -120,7 +120,7 @@ impl Log {
         Self { file }
     }
 
-    fn line(&mut self, text: &str) {
+    pub(crate) fn line(&mut self, text: &str) {
         let line = format!("{} {text}\n", crate::infra::now_iso());
         // The helper's stderr is the same log file: write once.
         match &mut self.file {

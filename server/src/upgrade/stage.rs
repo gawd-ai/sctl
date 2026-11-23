@@ -3,6 +3,7 @@
 //! write the rollback set, write the helper's plan, hand off to the
 //! detached helper. Nothing here changes an installed file.
 
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -758,9 +759,9 @@ async fn stage(ctx: &Context, req: &Request, handle: &Handle) -> Result<(), Refu
     hand_off(ctx, handle, applying, || {
         spawn_helper(
             &helper,
-            &stage,
+            &upgrade_helper_args(&stage),
+            &upgrade_helper_unit(&manifest.version),
             install.layout,
-            &manifest.version,
             &plan.log_path,
             &running.loader,
         )
@@ -815,15 +816,67 @@ pub async fn wait_for_recovery_runs(ctx: &Context) {
     }
 }
 
-/// Start `helper upgrade-apply --stage <stage>` in its own session with
-/// its output in `log`; on the systemd layout as a transient unit so it
-/// lives outside the hardened service's cgroup; through `prefix` (the
+/// The upgrade's words for its helper: `upgrade-apply --stage <stage>`.
+pub fn upgrade_helper_args(stage: &Path) -> Vec<OsString> {
+    vec!["upgrade-apply".into(), "--stage".into(), stage.into()]
+}
+
+/// The transient unit an upgrade's helper runs as on the systemd layout.
+pub fn upgrade_helper_unit(version: &str) -> String {
+    format!(
+        "sctl-upgrade-{}",
+        version
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>()
+    )
+}
+
+/// The command line that starts a helper, `helper <args>`: on the systemd
+/// layout as the transient unit `unit`, so it lives outside the hardened
+/// service's cgroup, its output appended to `log`; through `prefix` (the
 /// unit's loader and its words) when the unit runs its agent that way.
-fn spawn_helper(
+pub fn helper_command(
     helper: &Path,
-    stage: &Path,
+    args: &[OsString],
+    unit: &str,
     layout: Layout,
-    version: &str,
+    log: &Path,
+    prefix: &[String],
+) -> std::process::Command {
+    if layout == Layout::Systemd {
+        let mut c = std::process::Command::new("systemd-run");
+        c.arg("--collect")
+            .arg(format!("--unit={unit}"))
+            .arg("--quiet")
+            .arg(format!(
+                "--property=StandardOutput=append:{}",
+                log.display()
+            ))
+            .arg(format!("--property=StandardError=append:{}", log.display()))
+            .arg(helper)
+            .args(args);
+        c
+    } else if let Some((first, rest)) = prefix.split_first() {
+        let mut c = std::process::Command::new(first);
+        c.args(rest).arg(helper).args(args);
+        c
+    } else {
+        let mut c = std::process::Command::new(helper);
+        c.args(args);
+        c
+    }
+}
+
+/// Start `helper <args>` in its own session with its output in `log`
+/// ([`helper_command`]). The upgrade starts `upgrade-apply --stage <stage>`
+/// this way, and a restart on request `restart-apply --dir <dir>`
+/// (ADR-014): one detached start for both.
+pub fn spawn_helper(
+    helper: &Path,
+    args: &[OsString],
+    unit: &str,
+    layout: Layout,
     log: &Path,
     prefix: &[String],
 ) -> Result<(), String> {
@@ -836,41 +889,7 @@ fn spawn_helper(
     let err_file = log_file
         .try_clone()
         .map_err(|e| format!("{}: {e}", log.display()))?;
-    let mut command = if layout == Layout::Systemd {
-        let unit = format!(
-            "sctl-upgrade-{}",
-            version
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-                .collect::<String>()
-        );
-        let mut c = std::process::Command::new("systemd-run");
-        c.arg("--collect")
-            .arg(format!("--unit={unit}"))
-            .arg("--quiet")
-            .arg(format!(
-                "--property=StandardOutput=append:{}",
-                log.display()
-            ))
-            .arg(format!("--property=StandardError=append:{}", log.display()))
-            .arg(helper)
-            .arg("upgrade-apply")
-            .arg("--stage")
-            .arg(stage);
-        c
-    } else if let Some((first, rest)) = prefix.split_first() {
-        let mut c = std::process::Command::new(first);
-        c.args(rest)
-            .arg(helper)
-            .arg("upgrade-apply")
-            .arg("--stage")
-            .arg(stage);
-        c
-    } else {
-        let mut c = std::process::Command::new(helper);
-        c.arg("upgrade-apply").arg("--stage").arg(stage);
-        c
-    };
+    let mut command = helper_command(helper, args, unit, layout, log, prefix);
     command
         .stdin(std::process::Stdio::null())
         .stdout(log_file)
@@ -919,6 +938,140 @@ mod tests {
         assert_eq!(parse_rfc3339("yesterday"), None);
         assert_eq!(parse_rfc3339("2026-13-02T06:00:00Z"), None);
         assert_eq!(parse_rfc3339("2026-10-02T06:00"), None);
+    }
+
+    /// The words a command was built with: its program, then its arguments.
+    fn words(command: &std::process::Command) -> Vec<String> {
+        std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .map(|w| w.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The upgrade's helper is started by the words it always was: the
+    /// start is shared with a restart on request now (ADR-014), and what
+    /// an upgrade runs did not change. Pinned word for word.
+    #[test]
+    fn the_upgrades_helper_is_started_by_the_words_it_always_was() {
+        let (helper, stage, log) = (
+            Path::new("/var/lib/sctl/upgrade/stage/0.6.8.440/helper"),
+            Path::new("/var/lib/sctl/upgrade/stage/0.6.8.440"),
+            Path::new("/var/lib/sctl/upgrade/stage/0.6.8.440/log"),
+        );
+        let build = |layout, prefix: &[String]| {
+            words(&helper_command(
+                helper,
+                &upgrade_helper_args(stage),
+                &upgrade_helper_unit("0.6.8.440"),
+                layout,
+                log,
+                prefix,
+            ))
+        };
+        for layout in [Layout::UsrBin, Layout::GzTmp, Layout::Ramboot] {
+            assert_eq!(
+                build(layout, &[]),
+                [
+                    "/var/lib/sctl/upgrade/stage/0.6.8.440/helper",
+                    "upgrade-apply",
+                    "--stage",
+                    "/var/lib/sctl/upgrade/stage/0.6.8.440"
+                ],
+                "{}",
+                layout.as_str()
+            );
+        }
+        // Under a loader: its words first, then the helper as its argument.
+        let loader = [
+            "/tmp/sctl/lib/libc.so".to_string(),
+            "--library-path".to_string(),
+            "/tmp/sctl/lib".to_string(),
+        ];
+        assert_eq!(
+            build(Layout::Ramboot, &loader),
+            [
+                "/tmp/sctl/lib/libc.so",
+                "--library-path",
+                "/tmp/sctl/lib",
+                "/var/lib/sctl/upgrade/stage/0.6.8.440/helper",
+                "upgrade-apply",
+                "--stage",
+                "/var/lib/sctl/upgrade/stage/0.6.8.440"
+            ]
+        );
+        // On systemd: a transient unit named by the version, outside the
+        // service's cgroup.
+        assert_eq!(
+            build(Layout::Systemd, &[]),
+            [
+                "systemd-run",
+                "--collect",
+                "--unit=sctl-upgrade-0-6-8-440",
+                "--quiet",
+                "--property=StandardOutput=append:/var/lib/sctl/upgrade/stage/0.6.8.440/log",
+                "--property=StandardError=append:/var/lib/sctl/upgrade/stage/0.6.8.440/log",
+                "/var/lib/sctl/upgrade/stage/0.6.8.440/helper",
+                "upgrade-apply",
+                "--stage",
+                "/var/lib/sctl/upgrade/stage/0.6.8.440"
+            ]
+        );
+    }
+
+    /// A restart's helper is the running binary, started through the same
+    /// words: its loader where there is one, a transient unit on systemd.
+    #[test]
+    fn a_restarts_helper_is_started_the_same_way_with_its_own_words() {
+        let dir = Path::new("/etc/sctl/state/upgrade/restart");
+        let log = dir.join("log");
+        let args = crate::upgrade::restart_apply::helper_args(dir);
+        let unit = crate::upgrade::restart_apply::helper_unit(1_795_000_000);
+        let loader = [
+            "/tmp/sctl/lib/libc.so".to_string(),
+            "--library-path".to_string(),
+            "/tmp/sctl/lib".to_string(),
+        ];
+        assert_eq!(
+            words(&helper_command(
+                Path::new("/tmp/sctl/sctl-server"),
+                &args,
+                &unit,
+                Layout::Ramboot,
+                &log,
+                &loader
+            )),
+            [
+                "/tmp/sctl/lib/libc.so",
+                "--library-path",
+                "/tmp/sctl/lib",
+                "/tmp/sctl/sctl-server",
+                "restart-apply",
+                "--dir",
+                "/etc/sctl/state/upgrade/restart"
+            ]
+        );
+        assert_eq!(
+            words(&helper_command(
+                Path::new("/usr/local/bin/sctl"),
+                &args,
+                &unit,
+                Layout::Systemd,
+                &log,
+                &[]
+            )),
+            [
+                "systemd-run",
+                "--collect",
+                "--unit=sctl-restart-1795000000",
+                "--quiet",
+                "--property=StandardOutput=append:/etc/sctl/state/upgrade/restart/log",
+                "--property=StandardError=append:/etc/sctl/state/upgrade/restart/log",
+                "/usr/local/bin/sctl",
+                "restart-apply",
+                "--dir",
+                "/etc/sctl/state/upgrade/restart"
+            ]
+        );
     }
 
     fn ctx(install: Option<InstallInfo>) -> Context {
@@ -1196,7 +1349,15 @@ mod tests {
         set_mode(&helper, 0o755).unwrap();
         let log = dir.join("log");
         let prefix = vec!["/bin/sh".to_string(), "-e".to_string()];
-        spawn_helper(&helper, &dir, Layout::Ramboot, "0.6.9.1", &log, &prefix).unwrap();
+        spawn_helper(
+            &helper,
+            &upgrade_helper_args(&dir),
+            &upgrade_helper_unit("0.6.9.1"),
+            Layout::Ramboot,
+            &log,
+            &prefix,
+        )
+        .unwrap();
         let mut recorded = String::new();
         for _ in 0..50 {
             if let Ok(s) = std::fs::read_to_string(&argv) {

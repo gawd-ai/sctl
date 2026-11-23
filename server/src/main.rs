@@ -71,6 +71,11 @@ enum Command {
     UpgradeApply {
         stage: String,
     },
+    /// `sctl restart-apply --dir <dir>`: the detached helper of a restart
+    /// on request (ADR-014).
+    RestartApply {
+        dir: String,
+    },
     /// `sctl net <tool> ...`: the network tools for runbooks (ADR-006).
     Net {
         args: Vec<String>,
@@ -121,6 +126,9 @@ async fn main() {
         }
         Command::UpgradeApply { stage } => {
             std::process::exit(sctl::upgrade::apply::main(&stage));
+        }
+        Command::RestartApply { dir } => {
+            std::process::exit(sctl::upgrade::restart_apply::main(&dir));
         }
         Command::Net { args } => {
             std::process::exit(sctl::net_tools::main(args).await);
@@ -339,6 +347,22 @@ where
                 .map(|stage| Command::UpgradeApply { stage })
                 .ok_or_else(|| "upgrade-apply needs --stage <dir>".to_string())
         }
+        "restart-apply" => {
+            args.remove(0);
+            let mut dir = None;
+            let mut iter = args.into_iter();
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "--dir" => dir = Some(next_arg(&mut iter, "--dir")?),
+                    other if other.starts_with("--dir=") => {
+                        dir = Some(other["--dir=".len()..].to_string());
+                    }
+                    other => return Err(format!("unknown restart-apply argument '{other}'")),
+                }
+            }
+            dir.map(|dir| Command::RestartApply { dir })
+                .ok_or_else(|| "restart-apply needs --dir <dir>".to_string())
+        }
         "target" => Ok(Command::PrintTarget),
         "install-info" => {
             args.remove(0);
@@ -403,7 +427,7 @@ fn upgrade_help() -> &'static str {
     "Upgrade this agent to a signed release its relay serves (docs/upgrade.md)\n\n\
 Usage: sctl upgrade <VERSION> [OPTIONS]\n\n\
 Options:\n      --config <PATH>     Path to TOML config file\n      --manifest <URL>    release.json to use instead of the relay's\n      --mirror <URL>      Where a ramboot device's boot fetcher gets the files\n      --allow-downgrade   Accept a version below the running one\n  -h, --help              Print help\n\n\
-Related:\n  sctl target          Print the compile target\n  sctl install-info    Print install.json with defaults applied\n  sctl upgrade-apply --stage <DIR>   The detached helper (never run by hand)"
+Related:\n  sctl target          Print the compile target\n  sctl install-info    Print install.json with defaults applied\n  sctl upgrade-apply --stage <DIR>   The detached helper (never run by hand)\n  sctl restart-apply --dir <DIR>     The detached helper of a restart on request (never run by hand)"
 }
 
 fn parse_serve_args(args: Vec<String>) -> Result<Command, String> {
@@ -1444,6 +1468,18 @@ mod cli_tests {
                 config: Some("/etc/sctl.toml".to_string()),
             })
         );
+    }
+
+    #[test]
+    fn restart_apply_takes_its_directory() {
+        let dir = "/etc/sctl/state/upgrade/restart";
+        let helper = Ok(Command::RestartApply {
+            dir: dir.to_string(),
+        });
+        assert_eq!(parse(&["restart-apply", "--dir", dir]), helper);
+        assert_eq!(parse(&["restart-apply", &format!("--dir={dir}")]), helper);
+        assert!(parse(&["restart-apply"]).is_err());
+        assert!(parse(&["restart-apply", "--stage", dir]).is_err());
     }
 
     #[test]

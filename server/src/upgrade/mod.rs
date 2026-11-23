@@ -19,6 +19,8 @@
 //!   the upgrade's state.
 //! - [`restart_checks`]: whether a start of the agent would be refused,
 //!   judged before a restart is accepted.
+//! - [`restart_apply`]: the restart's detached helper: run the install's
+//!   restart command, wait for a new process, write the outcome.
 //! - [`routes`]: `POST/GET/DELETE /api/upgrade`.
 
 pub mod apply;
@@ -28,6 +30,7 @@ pub mod install;
 pub mod keys;
 pub mod manifest;
 pub mod restart;
+pub mod restart_apply;
 pub mod restart_checks;
 pub mod routes;
 pub mod stage;
