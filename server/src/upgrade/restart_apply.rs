@@ -81,39 +81,79 @@ impl Probe for HttpProbe {
 enum Waited {
     /// A new process answered [`HEALTH_PASSES`] times in a row.
     New(String),
-    /// The window's last answer came from the process the restart was to
-    /// stop.
+    /// The last read that was answered in the window was answered by the
+    /// process the restart was to stop, and it is not established that
+    /// nothing answers.
     OldStillAnswers,
-    /// The window ended on no answer. `new_seen` when a new process did
-    /// answer at some point: something is starting it.
+    /// Nothing answers: every read in the window's last
+    /// [`Limits::silence`] failed, at least [`SILENT_READS`] of them.
+    /// `new_seen` when a new process did answer at some point: something
+    /// is starting it.
     Silence { new_seen: bool },
+    /// Neither: a new process answered, though never twice in a row, or
+    /// too few reads were made to say that nothing answers.
+    Unproven { new_seen: bool },
+}
+
+/// How many failed reads, at least, say that nothing answers.
+pub const SILENT_READS: usize = 3;
+/// The end of the window in which every read must have failed for the
+/// helper to say that nothing answers.
+pub const SILENCE_SPAN: Duration = Duration::from_secs(30);
+
+/// What one health read found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Read {
+    Old,
+    New,
+    Failed,
+}
+
+/// Judge a window that ended with no new process proven, from its reads
+/// and when each was made. One failed read at the end does not turn a
+/// process that still answers into silence: the judgment is the last read
+/// that was answered, unless every read of the window's last `silence`
+/// failed, [`SILENT_READS`] of them at least.
+fn judge_window(reads: &[(Duration, Read)], window: Duration, silence: Duration) -> Waited {
+    let new_seen = reads.iter().any(|(_, read)| *read == Read::New);
+    let tail_from = window.saturating_sub(silence);
+    let tail: Vec<Read> = reads
+        .iter()
+        .filter(|(at, _)| *at >= tail_from)
+        .map(|(_, read)| *read)
+        .collect();
+    if tail.len() >= SILENT_READS && tail.iter().all(|read| *read == Read::Failed) {
+        return Waited::Silence { new_seen };
+    }
+    let last_answered = reads
+        .iter()
+        .rev()
+        .map(|(_, read)| *read)
+        .find(|read| *read != Read::Failed);
+    match last_answered {
+        Some(Read::Old) => Waited::OldStillAnswers,
+        _ => Waited::Unproven { new_seen },
+    }
 }
 
 /// Read health until a process other than `before` has answered
 /// [`HEALTH_PASSES`] times in a row, at most `window`.
-fn wait_new(
-    probe: &mut dyn Probe,
-    before: &str,
-    window: Duration,
-    interval: Duration,
-    log: &mut Log,
-) -> Waited {
+fn wait_new(probe: &mut dyn Probe, before: &str, limits: &Limits, log: &mut Log) -> Waited {
     let start = Instant::now();
     let mut passes = 0;
     let mut candidate: Option<String> = None;
-    let mut new_seen = false;
-    let mut last_was_old = false;
-    while start.elapsed() < window {
+    let mut reads: Vec<(Duration, Read)> = Vec::new();
+    while start.elapsed() < limits.window {
+        let at = start.elapsed();
         match probe.instance() {
             Ok(instance) if instance == before => {
                 passes = 0;
                 candidate = None;
-                last_was_old = true;
+                reads.push((at, Read::Old));
                 log.line("health: the process that accepted the request still answers");
             }
             Ok(instance) => {
-                new_seen = true;
-                last_was_old = false;
+                reads.push((at, Read::New));
                 // Two answers count only when one process gave both.
                 if candidate.as_deref() == Some(instance.as_str()) {
                     passes += 1;
@@ -131,17 +171,13 @@ fn wait_new(
             Err(e) => {
                 passes = 0;
                 candidate = None;
-                last_was_old = false;
+                reads.push((at, Read::Failed));
                 log.line(&format!("health: {e}"));
             }
         }
-        std::thread::sleep(interval);
+        std::thread::sleep(limits.interval);
     }
-    if last_was_old {
-        Waited::OldStillAnswers
-    } else {
-        Waited::Silence { new_seen }
-    }
+    judge_window(&reads, limits.window, limits.silence)
 }
 
 /// Whether a second run of the restart command is tried: on `gz-tmp` only,
@@ -173,6 +209,9 @@ pub struct Limits {
     pub interval: Duration,
     /// One health read's total deadline.
     pub read: Duration,
+    /// The end of the window in which every read must have failed for the
+    /// helper to say that nothing answers.
+    pub silence: Duration,
     /// The helper's hard limit.
     pub hard: Duration,
 }
@@ -212,6 +251,7 @@ impl Limits {
             window,
             interval,
             read,
+            silence: SILENCE_SPAN,
             hard: settle + (command + window + read) * runs + margin,
         }
     }
@@ -359,13 +399,7 @@ pub fn apply(
     };
     run(1, &mut log);
     state.attempts = 1;
-    let mut waited = wait_new(
-        probe,
-        &plan.instance_before,
-        window,
-        limits.interval,
-        &mut log,
-    );
+    let mut waited = wait_new(probe, &plan.instance_before, limits, &mut log);
     let mut second_run = false;
     if waited == (Waited::Silence { new_seen: false }) && second_run_allowed(plan.layout) {
         // Never quiet: the first run started nothing, which is a defect.
@@ -376,18 +410,13 @@ pub fn apply(
         second_run = true;
         run(2, &mut log);
         state.attempts = 2;
-        waited = wait_new(
-            probe,
-            &plan.instance_before,
-            window,
-            limits.interval,
-            &mut log,
-        );
+        waited = wait_new(probe, &plan.instance_before, limits, &mut log);
     }
     let first_run_started_nothing = format!(
         "the first run of the restart command started nothing within {}s; it was run a second time",
         window.as_secs()
     );
+    let silent = matches!(waited, Waited::Silence { .. });
     let (outcome, detail) = match waited {
         Waited::New(instance) => {
             state.instance_after = Some(instance);
@@ -400,11 +429,12 @@ pub fn apply(
                     .to_string(),
             ),
         ),
-        Waited::Silence { new_seen } => {
-            let why = if new_seen {
-                "a new process answered and then stopped answering"
-            } else {
-                "no process answered"
+        Waited::Silence { new_seen } | Waited::Unproven { new_seen } => {
+            let why = match (silent, new_seen) {
+                (true, true) => "a new process answered and then stopped answering",
+                (true, false) => "no process answered",
+                (false, true) => "a new process answered, but never twice in a row,",
+                (false, false) => "too few health reads were made to say that nothing answers",
             };
             let detail = if second_run {
                 format!(
@@ -608,15 +638,20 @@ mod tests {
     /// Bounds small enough for a test: a window of `checks` health reads
     /// 20 ms apart, no settle time.
     fn quick(layout: Layout, checks: u64) -> Limits {
-        Limits::with(
-            layout,
-            Duration::ZERO,
-            Duration::from_millis(200),
-            Duration::from_millis(20 * checks),
-            Duration::from_millis(20),
-            Duration::from_millis(200),
-            Duration::from_millis(200),
-        )
+        Limits {
+            // The last 150 ms of the window: fifteen reads or so, three
+            // needed.
+            silence: Duration::from_millis(150),
+            ..Limits::with(
+                layout,
+                Duration::ZERO,
+                Duration::from_millis(200),
+                Duration::from_millis(20 * checks),
+                Duration::from_millis(10),
+                Duration::from_millis(200),
+                Duration::from_millis(200),
+            )
+        }
     }
 
     /// Run the helper over `fake` with a window of `checks` health reads.
@@ -764,7 +799,7 @@ mod tests {
     #[test]
     fn on_gz_tmp_a_new_process_that_went_quiet_brings_no_second_run() {
         let bench = bench("flap", Layout::GzTmp);
-        let (state, fake) = run(&bench, Fake::new(vec![vec![Some("new")]]), 6);
+        let (state, fake) = run(&bench, Fake::new(vec![vec![Some("new")]]), 20);
         assert_eq!(state.outcome, Some(Outcome::NotHealthy));
         assert_eq!(state.attempts, 1);
         assert_eq!(fake.commands.len(), 1);
@@ -1005,5 +1040,162 @@ mod tests {
         assert_eq!(ended.outcome, Some(Outcome::Ok));
         assert_eq!(ending.expire(Duration::from_secs(1)), None);
         assert_eq!(restart::load(&bench.plan.record_path), Some(ended));
+    }
+
+    /// A health that answers by the clock: `old` until `quiet_from`, then
+    /// nothing.
+    struct OldUntil {
+        started: Option<Instant>,
+        quiet_from: Duration,
+    }
+    impl Runner for OldUntil {
+        fn run(&mut self, _: &str) -> Result<i32, String> {
+            self.started.get_or_insert_with(Instant::now);
+            Ok(0)
+        }
+    }
+    impl Probe for OldUntil {
+        fn instance(&mut self) -> Result<String, String> {
+            if self.started.expect("the command ran").elapsed() < self.quiet_from {
+                Ok(OLD.to_string())
+            } else {
+                Err("connection refused".into())
+            }
+        }
+    }
+    struct SplitClock<'a>(&'a std::cell::RefCell<OldUntil>);
+    impl Runner for SplitClock<'_> {
+        fn run(&mut self, c: &str) -> Result<i32, String> {
+            self.0.borrow_mut().run(c)
+        }
+    }
+    impl Probe for SplitClock<'_> {
+        fn instance(&mut self) -> Result<String, String> {
+            self.0.borrow_mut().instance()
+        }
+    }
+
+    /// One failed read at the end of the window does not turn a process
+    /// that still answers into silence, and on `gz-tmp` it brings no
+    /// second run while the old process is alive.
+    #[test]
+    fn a_failed_read_at_the_end_does_not_make_the_old_process_silent() {
+        let bench = bench("lastread", Layout::GzTmp);
+        let log = bench.dir.join("upgrade").join("restart").join(LOG_FILE);
+        // A 600 ms window; the old process answers until its last 40 ms.
+        let limits = quick(Layout::GzTmp, 30);
+        let fake = std::cell::RefCell::new(OldUntil {
+            started: None,
+            quiet_from: limits.window.saturating_sub(Duration::from_millis(40)),
+        });
+        let state = apply(
+            &bench.plan,
+            &log,
+            &mut SplitClock(&fake),
+            &mut SplitClock(&fake),
+            &limits,
+            &Ending::new(&bench.plan.record_path, &log),
+        );
+        assert_eq!(state.outcome, Some(Outcome::NotRestarted), "{state:?}");
+        assert_eq!(
+            state.attempts, 1,
+            "no second run while the old process answers"
+        );
+    }
+
+    /// The judgment, from the reads and when each was made.
+    #[test]
+    fn a_window_is_judged_by_its_last_answered_read_and_silence_by_its_tail() {
+        use Read::{Failed, New, Old};
+        let window = Duration::from_mins(3);
+        let silence = Duration::from_secs(30);
+        let at = |secs: u64, read| (Duration::from_secs(secs), read);
+        let judge = |reads: &[(Duration, Read)]| judge_window(reads, window, silence);
+
+        // Old throughout, one failure at the very end: it still answers.
+        let mut reads: Vec<_> = (0..35).map(|i| at(i * 5, Old)).collect();
+        reads.push(at(178, Failed));
+        assert_eq!(judge(&reads), Waited::OldStillAnswers);
+        // Two failures at the end are not three.
+        reads.push(at(179, Failed));
+        assert_eq!(judge(&reads), Waited::OldStillAnswers);
+
+        // Old once, then every read failed, the last 30 s included: nothing
+        // answers, and nothing new was seen.
+        let mut reads = vec![at(0, Old)];
+        reads.extend((1..36).map(|i| at(i * 5, Failed)));
+        assert_eq!(judge(&reads), Waited::Silence { new_seen: false });
+
+        // Every read failed: the same.
+        let reads: Vec<_> = (0..36).map(|i| at(i * 5, Failed)).collect();
+        assert_eq!(judge(&reads), Waited::Silence { new_seen: false });
+
+        // A new process answered once, then silence to the end: something
+        // is starting it.
+        let mut reads = vec![at(0, Failed), at(5, New)];
+        reads.extend((2..36).map(|i| at(i * 5, Failed)));
+        assert_eq!(judge(&reads), Waited::Silence { new_seen: true });
+
+        // The last 30 s hold an answered read: not silence. The last read
+        // answered decides.
+        let mut reads: Vec<_> = (0..30).map(|i| at(i * 5, Failed)).collect();
+        reads.extend([
+            at(155, Old),
+            at(160, Failed),
+            at(165, Failed),
+            at(170, Failed),
+        ]);
+        assert_eq!(judge(&reads), Waited::OldStillAnswers);
+        let mut reads: Vec<_> = (0..30).map(|i| at(i * 5, Failed)).collect();
+        reads.extend([
+            at(155, New),
+            at(160, Failed),
+            at(165, Failed),
+            at(170, Failed),
+        ]);
+        assert_eq!(judge(&reads), Waited::Unproven { new_seen: true });
+
+        // Too few reads in the last 30 s to say that nothing answers: two
+        // slow failed reads are not silence, and bring no second run.
+        let reads = [
+            at(0, Failed),
+            at(100, Failed),
+            at(160, Failed),
+            at(175, Failed),
+        ];
+        assert_eq!(judge(&reads), Waited::Unproven { new_seen: false });
+        assert_eq!(judge(&[]), Waited::Unproven { new_seen: false });
+        // Three are.
+        let reads = [at(152, Failed), at(160, Failed), at(175, Failed)];
+        assert_eq!(judge(&reads), Waited::Silence { new_seen: false });
+        assert_eq!(SILENCE_SPAN, Duration::from_secs(30));
+        assert_eq!(Limits::production(Layout::GzTmp).silence, SILENCE_SPAN);
+    }
+
+    /// Too little evidence is not silence: on `gz-tmp` it brings no second
+    /// run, and the record says why.
+    #[test]
+    fn too_few_reads_bring_no_second_run() {
+        let bench = bench("thin", Layout::GzTmp);
+        let log = bench.dir.join("upgrade").join("restart").join(LOG_FILE);
+        // Two reads in the whole window.
+        let limits = Limits {
+            window: Duration::from_millis(70),
+            interval: Duration::from_millis(50),
+            ..quick(Layout::GzTmp, 1)
+        };
+        let fake = std::cell::RefCell::new(Fake::new(vec![vec![], vec![]]));
+        let state = apply(
+            &bench.plan,
+            &log,
+            &mut Split(&fake),
+            &mut Split(&fake),
+            &limits,
+            &Ending::new(&bench.plan.record_path, &log),
+        );
+        assert_eq!(state.outcome, Some(Outcome::NotHealthy));
+        assert_eq!(state.attempts, 1);
+        assert_eq!(fake.into_inner().commands.len(), 1);
+        assert!(state.detail.unwrap().starts_with("too few health reads"));
     }
 }

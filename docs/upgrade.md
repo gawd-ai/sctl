@@ -511,8 +511,9 @@ What the agent does:
    accepted the request has answered twice, 5 s apart, within 180 s. The
    tunnel is not required: the helper proves the process, and the caller
    proves its reach by the next `net.state`, whose `boot` is new. It writes
-   `ok`, `not_restarted` (the old process still answered at the end of the
-   window) or `not_healthy`, and exits. It never reboots the unit.
+   `ok`, `not_restarted` (the last read answered in the window was the old
+   process's, and it is not established that nothing answers) or
+   `not_healthy`, and exits. It never reboots the unit.
 6. **The new agent** reads the record at start, as it reads an upgrade's
    state, and writes its own `boot` into it as `boot_after`.
 7. **Neither process waits on the helper for ever.** While the helper
@@ -534,8 +535,9 @@ if the new process exits:
 | `ramboot` with no procd | the init's own `stop` and `start` of its supervisor loop | read, at start and at every respawn | the init's loop, 10 s later, until the kill switch exists |
 | `systemd` | `systemctl restart <unit>`, from a transient unit | none | systemd, 5 s later, on a failed exit only; a unit with a start limit stays failed once it is reached |
 
-**The second run on `gz-tmp`.** There, and only there, when nothing at all
-answers within the first window, the helper runs the restart command once
+**The second run on `gz-tmp`.** There, and only there, when nothing answers
+at the end of the first window (every health read of its last 30 s failed,
+at least three of them) and no new process answered in it, the helper runs the restart command once
 more and waits one more window. It is never quiet: the record's `attempts`
 is 2, its `detail` says the first run started nothing, the helper's log
 holds a warning, and the agent that reads the outcome logs it at warn. A
