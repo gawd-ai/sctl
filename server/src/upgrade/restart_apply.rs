@@ -66,7 +66,7 @@ pub struct HttpProbe {
 
 impl Probe for HttpProbe {
     fn instance(&mut self) -> Result<String, String> {
-        let body = apply::http_get_within(&self.url, self.total, Some(self.total))?;
+        let body = apply::http_get_within(&self.url, self.total)?;
         let json: serde_json::Value =
             serde_json::from_str(&body).map_err(|e| format!("health is not JSON: {e}"))?;
         json["instance"]

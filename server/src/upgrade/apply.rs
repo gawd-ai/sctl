@@ -28,14 +28,24 @@ pub trait Health {
     fn check(&mut self) -> Result<(String, bool), String>;
 }
 
-/// `GET health_url` over plain HTTP/1.0 on loopback, 5 s budget.
+/// How long one health read may take, connect to last byte. A health
+/// answer that takes longer on loopback is not a healthy agent, and a
+/// process that takes the connection and never ends its answer must not
+/// hold the helper, which holds the lock every later upgrade and restart
+/// waits on.
+pub const HEALTH_READ_TOTAL: Duration = Duration::from_secs(5);
+
+/// `GET health_url` over plain HTTP/1.0 on loopback: each step within
+/// `total`, and the whole read within it too.
 pub struct HttpHealth {
     pub url: String,
+    /// One read's total deadline: [`HEALTH_READ_TOTAL`] in the helper.
+    pub total: Duration,
 }
 
 impl Health for HttpHealth {
     fn check(&mut self) -> Result<(String, bool), String> {
-        let body = http_get(&self.url, Duration::from_secs(5))?;
+        let body = http_get_within(&self.url, self.total)?;
         let json: serde_json::Value =
             serde_json::from_str(&body).map_err(|e| format!("health is not JSON: {e}"))?;
         let version = json["version"]
@@ -47,31 +57,21 @@ impl Health for HttpHealth {
     }
 }
 
-/// A minimal HTTP/1.0 GET: the body of a 200, or the error. `budget`
-/// bounds the connect and each read, not the whole exchange.
-pub(crate) fn http_get(url: &str, budget: Duration) -> Result<String, String> {
-    http_get_within(url, budget, None)
-}
-
-/// [`http_get`], and when `total` is given the whole exchange ends by it:
-/// a peer that keeps a connection open, or sends a byte now and then,
-/// cannot hold the caller past it. The upgrade's helper passes none and
-/// reads as it always did; the restart's helper passes one (ADR-014).
-pub(crate) fn http_get_within(
-    url: &str,
-    budget: Duration,
-    total: Option<Duration>,
-) -> Result<String, String> {
+/// A minimal HTTP/1.0 GET: the body of a 200, or the error. The whole
+/// exchange ends by `total`, connect to last byte: a peer that keeps a
+/// connection open, or sends a byte now and then, cannot hold the caller
+/// past it. Both helpers read health through it: the restart's from the
+/// start (ADR-014), the upgrade's since 0.6.14 (TRD-11), where each read
+/// was bounded and the exchange was not.
+pub(crate) fn http_get_within(url: &str, total: Duration) -> Result<String, String> {
     use std::io::Read;
     let started = Instant::now();
-    // What is left of the total, capped by the per-step budget.
-    let left = || match total {
-        None => Ok(budget),
-        Some(total) => total
+    // What is left of the total.
+    let left = || {
+        total
             .checked_sub(started.elapsed())
             .filter(|left| !left.is_zero())
-            .map(|left| left.min(budget))
-            .ok_or_else(|| format!("no answer within {} ms", total.as_millis())),
+            .ok_or_else(|| format!("no answer within {} ms", total.as_millis()))
     };
     let rest = url
         .strip_prefix("http://")
@@ -87,37 +87,30 @@ pub(crate) fn http_get_within(
         .map_err(|_| format!("{addr} is not an address"))?;
     let mut stream =
         std::net::TcpStream::connect_timeout(&socket, left()?).map_err(|e| e.to_string())?;
-    stream.set_read_timeout(Some(left()?)).ok();
     stream.set_write_timeout(Some(left()?)).ok();
     let request = format!("GET /{path} HTTP/1.0\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .map_err(|e| e.to_string())?;
+    // Each read is given only what is left of the total.
     let mut response = Vec::new();
-    if total.is_none() {
-        stream
-            .read_to_end(&mut response)
-            .map_err(|e| e.to_string())?;
-    } else {
-        // Each read is given only what is left of the total.
-        let mut chunk = [0_u8; 4096];
-        loop {
-            stream.set_read_timeout(Some(left()?)).ok();
-            match stream.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => response.extend_from_slice(&chunk[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                // The read's own timeout was what was left of the total.
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    left()?;
-                }
-                Err(e) => return Err(e.to_string()),
+    let mut chunk = [0_u8; 4096];
+    loop {
+        stream.set_read_timeout(Some(left()?)).ok();
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            // The read's own timeout was what was left of the total.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                left()?;
             }
+            Err(e) => return Err(e.to_string()),
         }
     }
     let text = String::from_utf8_lossy(&response);
@@ -483,6 +476,7 @@ pub fn main(stage: &str) -> i32 {
     let mut runner = Shell;
     let mut health = HttpHealth {
         url: plan.health_url.clone(),
+        total: HEALTH_READ_TOTAL,
     };
     match apply(
         &plan,
@@ -741,7 +735,122 @@ mod tests {
         });
         let mut h = HttpHealth {
             url: format!("http://{addr}/api/health"),
+            total: HEALTH_READ_TOTAL,
         };
         assert_eq!(h.check().unwrap(), ("0.6.8.2".to_string(), true));
+    }
+
+    /// One health read ends by its total deadline. A process that takes
+    /// the connection and sends a byte now and then kept the read going
+    /// for as long as it liked, each byte inside its own 5 s, and the
+    /// helper with it, its lock held.
+    #[test]
+    fn a_health_answer_that_never_ends_is_one_failed_read() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 512];
+            let _ = s.read(&mut buf);
+            // A byte every 100 ms for 3 s: no read waits long, and the
+            // answer does not end.
+            for byte in b"HTTP/1.0 200 OK\r\n\r\n{\"ver".iter().cycle().take(30) {
+                if s.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let mut h = HttpHealth {
+            url: format!("http://{addr}/api/health"),
+            total: Duration::from_millis(400),
+        };
+        let at = Instant::now();
+        let error = h.check().unwrap_err();
+        assert!(
+            at.elapsed() < Duration::from_millis(1500),
+            "ended by the total, not by the peer: {:?}",
+            at.elapsed()
+        );
+        assert!(error.contains("no answer within 400 ms"), "{error}");
+        server.join().unwrap();
+        // The helper's own deadline.
+        assert_eq!(HEALTH_READ_TOTAL, Duration::from_secs(5));
+    }
+
+    /// A scripted health that records when it was asked.
+    struct Scripted {
+        answers: Vec<Result<(String, bool), String>>,
+        asked_at: Vec<Instant>,
+    }
+    impl Health for Scripted {
+        fn check(&mut self) -> Result<(String, bool), String> {
+            self.asked_at.push(Instant::now());
+            if self.answers.is_empty() {
+                Err("connection refused".into())
+            } else {
+                self.answers.remove(0)
+            }
+        }
+    }
+
+    /// The read's deadline changes nothing else of the upgrade's judgment:
+    /// the same number of answers in a row, the same spacing, the same
+    /// window, and a failed read still starts the count again.
+    #[test]
+    fn the_upgrades_judgment_is_what_it_was() {
+        assert_eq!(HEALTH_PASSES, 2);
+        assert_eq!(HEALTH_INTERVAL, Duration::from_secs(5));
+        assert_eq!(HEALTH_WINDOW, Duration::from_mins(3));
+
+        let good = || Ok(("0.6.8.2".to_string(), true));
+        let no_tunnel = || Ok(("0.6.8.2".to_string(), false));
+        let old = || Ok(("0.6.7.1".to_string(), true));
+        let dir = std::env::temp_dir().join(format!("sctl-apply-judgment-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut log = Log::open(&dir.join("log"));
+        let expected = Version::parse("0.6.8.2");
+        let interval = Duration::from_millis(30);
+
+        // Healthy once, a failed read, then twice in a row: four reads, the
+        // interval between each, and the count began again after the miss.
+        let mut health = Scripted {
+            answers: vec![good(), Err("timed out".into()), good(), good()],
+            asked_at: Vec::new(),
+        };
+        assert!(wait_healthy(
+            &mut health,
+            expected.as_ref(),
+            true,
+            Duration::from_secs(5),
+            interval,
+            &mut log
+        ));
+        assert_eq!(health.asked_at.len(), 4);
+        assert!(health
+            .asked_at
+            .windows(2)
+            .all(|w| w[1].duration_since(w[0]) >= interval));
+
+        // The wrong version or no tunnel is not a pass, and the window
+        // ends the wait: never healthy, asked to the window's end.
+        let mut health = Scripted {
+            answers: vec![old(), good(), no_tunnel(), good(), old()],
+            asked_at: Vec::new(),
+        };
+        let window = Duration::from_millis(300);
+        let at = Instant::now();
+        assert!(!wait_healthy(
+            &mut health,
+            expected.as_ref(),
+            true,
+            window,
+            interval,
+            &mut log
+        ));
+        assert!(at.elapsed() >= window);
+        assert!(health.asked_at.len() >= 6, "{}", health.asked_at.len());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

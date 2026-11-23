@@ -403,7 +403,10 @@ finished state (the fleet does not need it; it is for a person at the box).
    4. runs the layout's restart command;
    5. waits for **health**: `GET health_url` answers with `version` equal to
       the target **and**, when the device has a `[tunnel]` client section,
-      `tunnel.connected: true`, **twice, 5 s apart, within 180 s**;
+      `tunnel.connected: true`, **twice, 5 s apart, within 180 s**; each
+      read of health ends within 5 s, connect to last byte (0.6.14), so a
+      process that takes the connection and never ends its answer is one
+      failed read;
    6. on success writes `phase: done, outcome: ok` and exits;
    7. otherwise restores the rollback set, restarts, waits for health once
       more (any version) and writes `rolled_back` (with the log tail), or
