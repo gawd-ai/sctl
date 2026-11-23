@@ -255,6 +255,23 @@ Two benches, both before any unit in service takes the release.
     - From "Run in terminal" with the option, the playbook was refused the same way, with nothing sent.
 - **Two reviewers.** Not run here: this bench is one agent's own.
 
+**Note: "restart: ended" at every start (read from the code at `v0.6.14`, 2026-11-23).** In the bench above, every later start of the bench agent logged "restart: ended" again for the first restart (`bench-usrbin`). It is a log line and the record's standing state, not a restart announced again:
+
+- **Where the line comes from.** At start, `main.rs` calls `restart::reconcile`. When no helper is at work it then calls `note_outcome` on the record as stored. `note_outcome` logs any `done` record, however old.
+- **What the relay is sent.** The record is persisted in `state_dir` and is replaced only by the next accepted request. `tunnel/upgrade_state.rs` sends one `upgrade.state` right after each `tunnel.register.ack`, and every one carries the current record. So each reconnect, and each start, carries the last restart's `done` record.
+- **What the record holds.** It is the same record, unchanged, with its own `request_id`, `accepted_at`, `ended_at`, `boot_before`, `boot_after`, `instance_before` and `instance_after`.
+  - `reconcile` rewrites only a record still `accepted` (it becomes `not_started`) or `restarting` with its helper gone (`not_restarted` or `interrupted`).
+  - `stamp` writes `boot_after` once, only in the process whose `instance` the helper proved.
+  - A later process changes nothing in it, so its `boot_after` stays the proved process's boot, not the boot of the process sending it.
+- **What a caller must match.**
+  - Match on the `request_id` it sent, which should be unique per request.
+  - Take the record as that request's outcome once `phase` is `done`.
+  - Read the same record again as the same outcome, never as a new restart.
+  - A caller that reads every `done` `ok` as a fresh restart is fooled at each reconnect.
+  - A caller that ties a `done` record to the current `net.state` `boot` without the `request_id` ties it wrongly after any later start, because `boot_after` is then an older boot.
+  - A request sent with no `request_id` can be told from the one before only by `accepted_at` and `ended_at`.
+- **Owed by 0.6.15, in the docs only.** `docs/http-api.md`'s record section should say that the record is the last restart's, persisted, carried by every `upgrade.state` until the next request, and logged at each start. No code change is owed.
+
 ## 7. Rollout notes for an operator
 
 - **Order.** Units before relays (`docs/releasing.md`), the relay last through the managed path. A unit of 0.6.14 behind a relay of 0.6.13 holds: the route is forwarded like any other, and the relay keeps `upgrade.state` whole.
