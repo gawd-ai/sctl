@@ -895,7 +895,11 @@ Bearer.**
 
 Response `200`: JSON array of watchdog event entries; `[]` when the file
 does not exist. The file is read as a playbook's is: only a regular file
-is opened, without waiting.
+is opened, without waiting. The watchdog writes one event a line. Before
+0.6.14 it appended each event with no newline, so the file was one line of
+values run together and this route answered `[]` once two events were
+there; the route reads both forms, so a unit's history from before the
+upgrade is answered whole.
 
 Errors: `400` `NOT_A_REGULAR_FILE` (a FIFO, a socket or a device is at the
 history's name), `500` `IO_ERROR`.

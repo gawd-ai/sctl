@@ -201,6 +201,24 @@ pub async fn manual_usb_cycle(State(state): State<AppState>) -> ApiResult<Value>
     Ok(Json(result))
 }
 
+/// The events of a history file, in order. The watchdog writes one event
+/// a line; until 0.6.14 it wrote them with no newline, so a unit's file
+/// holds values run together on one line, and each line is read as that:
+/// one value after another. Where a line stops being JSON, what was read of
+/// it is kept and the rest of that line is skipped, as a line that is not
+/// JSON always was.
+fn history_entries(contents: &str) -> Vec<Value> {
+    contents
+        .lines()
+        .flat_map(|line| {
+            serde_json::Deserializer::from_str(line)
+                .into_iter::<Value>()
+                .map_while(Result::ok)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// The most of the watchdog's history one read returns: the size it
 /// rotates at, and one more entry's room. A file that is not the
 /// watchdog's own is cut here.
@@ -236,12 +254,7 @@ pub async fn watchdog_history(State(state): State<AppState>) -> ApiResult<Value>
         return Ok(Json(json!([])));
     };
     let contents = String::from_utf8_lossy(&bytes);
-    let entries: Vec<Value> = contents
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .collect();
-    Ok(Json(json!(entries)))
+    Ok(Json(json!(history_entries(&contents))))
 }
 
 fn ensure_lte_configured(state: &AppState) -> Result<(), (StatusCode, Json<ApiError>)> {
@@ -372,6 +385,81 @@ mod tests {
             panic!("the history read waited");
         };
         answer
+    }
+
+    /// The route answers what the watchdog wrote, event for event. The
+    /// watchdog appended each event with no newline, so its file was one
+    /// line of values run together, and the route, which read a value per
+    /// line, answered nothing once two events were there. The append
+    /// writes a line per event now, and the reader still reads values run
+    /// together, which is what every unit holds at the upgrade.
+    #[test]
+    fn the_history_route_answers_what_the_watchdogs_own_append_wrote() {
+        let dir = std::env::temp_dir().join(format!("sctl-lte-history-own-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let mut config: Config = toml::from_str("").unwrap();
+        config.server.data_dir = dir.join("data").display().to_string();
+        let data_dir = config.server.data_dir.clone();
+        let gate = Arc::new(Gate::for_agent(&config, None, None));
+        let state = AppState::for_tests(config, gate);
+        let path = dir.join("data/watchdog_history.jsonl");
+
+        // What a unit holds today: the events an older agent appended, run
+        // together on one line.
+        let old = [
+            json!({"ts": 1, "symptom": "no_ipv4", "action": "soft_reset", "detail": "a {brace} and a \"quote\""}),
+            json!({"ts": 2, "symptom": "not_registered", "action": null, "detail": ""}),
+        ];
+        let run_together: String = old.iter().map(Value::to_string).collect();
+        std::fs::write(&path, &run_together).unwrap();
+        let Json(read) = history(&state, None).expect("the old file");
+        assert_eq!(read, json!(old), "no history is lost at the upgrade");
+
+        // The watchdog's own append, three times, after it.
+        let new = [
+            json!({"ts": 3, "symptom": "no_ipv4", "action": "usb_cycle", "detail": "x"}),
+            json!({"ts": 4, "symptom": "no_ipv4", "action": null, "detail": "y"}),
+            json!({"ts": 5, "symptom": "recovered", "action": null, "detail": "z"}),
+        ];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for event in &new {
+            runtime
+                .block_on(crate::lte_watchdog::append_history(&data_dir, event))
+                .unwrap();
+        }
+        let Json(read) = history(&state, None).expect("the history");
+        let all: Vec<Value> = old.iter().chain(&new).cloned().collect();
+        assert_eq!(read, json!(all), "every event, old and new, in order");
+        // One event per line from now on.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.ends_with('\n'));
+        // The first joins the old line, which ended with no newline.
+        assert_eq!(text.lines().count(), 3, "{text}");
+
+        // A file of the watchdog's own lines alone, and a line that is not
+        // JSON among them, which is skipped as before.
+        std::fs::remove_file(&path).unwrap();
+        for event in &new[..2] {
+            runtime
+                .block_on(crate::lte_watchdog::append_history(&data_dir, event))
+                .unwrap();
+        }
+        std::fs::write(
+            &path,
+            format!(
+                "{}not json\n{}\n",
+                std::fs::read_to_string(&path).unwrap(),
+                new[2]
+            ),
+        )
+        .unwrap();
+        let Json(read) = history(&state, None).expect("the history");
+        assert_eq!(read, json!(new));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A FIFO at the history's name held a runtime worker for good, and

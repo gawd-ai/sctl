@@ -910,12 +910,21 @@ async fn record(
         st.events.pop_front();
     }
 
-    let path = PathBuf::from(data_dir).join("watchdog_history.jsonl");
-    if let Ok(line) = serde_json::to_string(&event) {
-        if let Err(e) = crate::util::append_rotating(&path, &line, HISTORY_MAX_BYTES).await {
-            warn!("lte watchdog: history write failed: {e}");
-        }
+    if let Err(e) = append_history(data_dir, &event).await {
+        warn!("lte watchdog: history write failed: {e}");
     }
+}
+
+/// Append one event to `<data_dir>/watchdog_history.jsonl`, rotating: one
+/// event, one line. Until 0.6.14 an event was appended with no newline, so
+/// the file was one line of values run together, which a reader that took
+/// a value per line could not read; `GET /api/lte/watchdog/history` reads
+/// both.
+pub(crate) async fn append_history(data_dir: &str, event: &Value) -> std::io::Result<bool> {
+    let path = PathBuf::from(data_dir).join("watchdog_history.jsonl");
+    let mut line = serde_json::to_string(event).map_err(std::io::Error::other)?;
+    line.push('\n');
+    crate::util::append_rotating(&path, &line, HISTORY_MAX_BYTES).await
 }
 
 /// Write the live snapshot into `CommsState.watchdog` for `/api/lte`.
