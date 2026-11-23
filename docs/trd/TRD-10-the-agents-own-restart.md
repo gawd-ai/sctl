@@ -1,6 +1,6 @@
 # TRD-10: The agent's own restart
 
-Implements [ADR-014](../adr/014-the-agent-restarts-itself-through-one-authenticated-route.md), as ruled in its section 7. Status: Planned. It rides sctl's next release, the first after 0.6.13, and never a release of its own; section 5 lists what that release also carries, in a TRD of its own. (TRD-7 is held for ADR-007's option B, and TRD-8 and TRD-9 are taken, so this is TRD-10.)
+Implements [ADR-014](../adr/014-the-agent-restarts-itself-through-one-authenticated-route.md), as ruled in its section 7. Status: Planned. It rides sctl's next release, the first after 0.6.13 (0.6.14, [TRD-11](TRD-11-release-0-6-14.md)), and never a release of its own; section 5 lists what that release also carries, in a TRD of its own. (TRD-7 is held for ADR-007's option B, and TRD-8 and TRD-9 are taken, so this is TRD-10.)
 
 ## 1. Objective
 

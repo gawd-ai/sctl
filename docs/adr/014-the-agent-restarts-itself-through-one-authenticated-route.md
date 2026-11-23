@@ -1,6 +1,6 @@
 # ADR-014: The agent restarts itself through one authenticated route
 
-Status: Proposed (2026-11-22). Realized by [TRD-10](../trd/TRD-10-the-agents-own-restart.md), which rides sctl's next release. Cites `docs/upgrade.md` (the layouts, the hand-off to the helper, `upgrade.state`), `docs/http-api.md` (`GET /api/health`, `POST /api/exec`, `GET /api/upgrade`, `net.state`, `/d/{serial}/api/*`), `docs/safe-mode.md` and ADR-010, ADR-013. Lines are at sctl `a222339`.
+Status: Proposed (2026-11-22). Realized by [TRD-10](../trd/TRD-10-the-agents-own-restart.md), which rides sctl 0.6.14 ([TRD-11](../trd/TRD-11-release-0-6-14.md)). Cites `docs/upgrade.md` (the layouts, the hand-off to the helper, `upgrade.state`), `docs/http-api.md` (`GET /api/health`, `POST /api/exec`, `GET /api/upgrade`, `net.state`, `/d/{serial}/api/*`), `docs/safe-mode.md` and ADR-010, ADR-013. Lines are at sctl `a222339`.
 
 ## 1. Trigger
 
