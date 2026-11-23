@@ -1491,6 +1491,7 @@ async fn connect_and_run(
     let upgrade_state_task = upgrade_state::spawn_forwarder(
         relay_takes_upgrade_state,
         state.upgrade.subscribe(),
+        state.restart.subscribe(),
         state.install.as_ref().map(|i| i.layout.as_str()),
         ws_sink.request_tx.clone(),
     );

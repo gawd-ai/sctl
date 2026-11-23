@@ -1035,3 +1035,44 @@ async fn a_device_says_what_it_is_and_its_upgrade_state_is_kept_and_replayed() {
     assert_eq!(kinds, ["device.connected", "upgrade.state"]);
     assert_eq!(replayed[1]["state"], state);
 }
+
+/// The record of the agent's own restart (ADR-014) rides `upgrade.state`
+/// as `restart`. The relay keeps the message whole, so it publishes and
+/// replays a key it knows nothing of: no relay change carries the record.
+#[tokio::test]
+async fn an_upgrade_state_that_carries_the_restarts_record_is_kept_whole() {
+    let relay = relay().await;
+    let (mut sub, _) = relay.subscribe_replayed().await;
+    let url = format!("ws://{}/api/tunnel/register?serial=DEV-8", relay.addr);
+    let mut device = connect(url, Some(KEY)).await.unwrap();
+    send(
+        &mut device,
+        &json!({"type": "tunnel.register", "api_key": DEVICE_KEY, "features": ["upgrade.state"],
+                "version": "0.6.13.309", "target": "mips_24kc", "layout": "gz-tmp"}),
+    )
+    .await;
+    assert_eq!(next(&mut device).await["type"], "tunnel.register.ack");
+    assert_eq!(next(&mut sub).await["type"], "device.connected");
+
+    let idle = json!({"type": "upgrade.state", "v": 1, "ts": "2026-11-22T15:00:00Z",
+        "running_version": "0.6.13.309", "target": "mips_24kc", "layout": "gz-tmp",
+        "phase": "idle", "outcome": null,
+        "restart": {"v": 1, "phase": "idle"}});
+    send(&mut device, &idle).await;
+    assert_eq!(next(&mut sub).await["state"], idle);
+
+    let done = json!({"type": "upgrade.state", "v": 1, "ts": "2026-11-22T15:00:00Z",
+        "running_version": "0.6.13.309", "target": "mips_24kc", "layout": "gz-tmp",
+        "phase": "idle", "outcome": null,
+        "restart": {"v": 1, "phase": "done", "request_id": "r-41", "outcome": "ok",
+            "boot_before": 1_790_000_000_000_u64, "boot_after": 1_790_000_004_321_u64,
+            "instance_before": "an-instance", "instance_after": "another",
+            "attempts": 1, "accepted_at": "2026-11-22T15:02:11Z",
+            "ended_at": "2026-11-22T15:02:25Z"}});
+    send(&mut device, &done).await;
+    let pushed = next(&mut sub).await;
+    assert_eq!(pushed["type"], "upgrade.state");
+    assert_eq!(pushed["state"]["restart"], done["restart"]);
+    let (_, replayed) = relay.subscribe_replayed().await;
+    assert_eq!(replayed.last().unwrap()["state"], done);
+}

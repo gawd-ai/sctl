@@ -801,6 +801,29 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         tokio::spawn(sctl::upgrade::watch::watch_until_done(upgrade.clone()));
     }
 
+    // Where its last restart on request stands (ADR-014): settled as this
+    // process reads it, and watched while its helper still works.
+    let instance: Arc<str> = sctl::upgrade::restart::new_instance().into();
+    let restart = Arc::new(sctl::upgrade::restart::Handle::open(
+        config.server.state_dir(),
+    ));
+    let restart_helper_working = sctl::upgrade::restart::reconcile(
+        &restart,
+        &sctl::upgrade::restart::Process {
+            instance: &instance,
+            boot: boot_unix_ms,
+        },
+    );
+    if restart_helper_working {
+        tokio::spawn(sctl::upgrade::restart::watch_until_done(
+            restart.clone(),
+            instance.to_string(),
+            boot_unix_ms,
+        ));
+    } else {
+        sctl::upgrade::restart::note_outcome(&restart.current());
+    }
+
     let mut state = AppState {
         session_manager,
         config: Arc::new(config),
@@ -823,6 +846,9 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
         netwatch: net_rx,
         relay_route,
         upgrade,
+        restart,
+        boot_unix_ms,
+        instance,
         install: install.map(Arc::new),
         install_error,
         cli,

@@ -206,6 +206,9 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
     let mut resp = json!({
         "status": "ok",
         "uptime_secs": uptime,
+        // Opaque, random, made at start (ADR-014): two answers that carry
+        // the same value came from one process.
+        "instance": &*state.instance,
         "version": crate::VERSION,
         "target": crate::upgrade::TARGET,
         "layout": state.install.as_ref().map(|i| i.layout.as_str()),
@@ -279,6 +282,36 @@ mod tests {
         state.cli = Some(PathBuf::from("/usr/bin/sctl"));
         let Json(body) = health(State(state)).await;
         assert_eq!(body["cli"], "/usr/bin/sctl");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `instance` names the process on the route that needs no key
+    /// (ADR-014 decision 6): the same value at every read of one process,
+    /// opaque, and another for another process.
+    #[tokio::test]
+    async fn health_names_the_process_by_an_opaque_instance() {
+        let dir = std::env::temp_dir().join(format!("sctl-health-instance-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state_in = || {
+            let mut config: Config = toml::from_str("").unwrap();
+            config.server.data_dir = dir.join("data").display().to_string();
+            let gate = Arc::new(Gate::for_agent(&config, None, None));
+            AppState::for_tests(config, gate)
+        };
+        let state = state_in();
+        let Json(first) = health(State(state.clone())).await;
+        let Json(second) = health(State(state.clone())).await;
+        let instance = first["instance"].as_str().expect("an instance");
+        assert_eq!(instance, &*state.instance);
+        assert_eq!(second["instance"], instance, "one process, one value");
+        assert_eq!(instance.len(), 32);
+        // Not a time: it does not hold the start time the reports carry.
+        assert!(!instance.contains(&state.boot_unix_ms.to_string()));
+        let Json(other) = health(State(state_in())).await;
+        assert_ne!(
+            other["instance"], instance,
+            "another process, another value"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

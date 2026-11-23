@@ -80,6 +80,16 @@ pub struct AppState {
     /// The upgrade state: the file both halves of an upgrade write, and
     /// the channel the tunnel's `upgrade.state` push reads.
     pub upgrade: Arc<crate::upgrade::state::Handle>,
+    /// The record of the agent's own restart (ADR-014), beside the
+    /// upgrade's state: `GET /api/upgrade`'s and `upgrade.state`'s `restart`.
+    pub restart: Arc<crate::upgrade::restart::Handle>,
+    /// When this process started, unix ms: the `boot` of `net.state` and of
+    /// the Infra digest.
+    pub boot_unix_ms: u64,
+    /// An opaque random value made when this process started: `GET
+    /// /api/health`'s `instance`, by which the restart's helper tells two
+    /// processes apart on the route that needs no key.
+    pub instance: Arc<str>,
     /// How this agent is installed (`/etc/sctl/install.json`); `None` on a
     /// box installed before 0.6.7, which cannot upgrade itself.
     pub install: Option<Arc<crate::upgrade::install::InstallInfo>>,
@@ -119,6 +129,9 @@ impl AppState {
         let upgrade = Arc::new(crate::upgrade::state::Handle::open(
             config.server.state_dir(),
         ));
+        let restart = Arc::new(crate::upgrade::restart::Handle::open(
+            config.server.state_dir(),
+        ));
         Self {
             session_manager: SessionManager::new(
                 config.server.max_sessions,
@@ -144,6 +157,9 @@ impl AppState {
             netwatch: None,
             relay_route: None,
             upgrade,
+            restart,
+            boot_unix_ms: crate::infra::now_unix_ms(),
+            instance: crate::upgrade::restart::new_instance().into(),
             install: None,
             install_error: None,
             cli: None,

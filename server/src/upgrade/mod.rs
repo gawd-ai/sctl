@@ -15,6 +15,8 @@
 //! - [`apply`]: the detached helper's half: swap, restart, watch health,
 //!   roll back.
 //! - [`state`]: the one state file both halves write and the tunnel pushes.
+//! - [`restart`]: the record of the agent's own restart (ADR-014), beside
+//!   the upgrade's state.
 //! - [`routes`]: `POST/GET/DELETE /api/upgrade`.
 
 pub mod apply;
@@ -23,6 +25,7 @@ pub mod fetch;
 pub mod install;
 pub mod keys;
 pub mod manifest;
+pub mod restart;
 pub mod routes;
 pub mod stage;
 pub mod state;

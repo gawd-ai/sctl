@@ -76,10 +76,33 @@ pub fn reconcile(handle: &Handle, stage_dir: &Path, running_version: &str) -> bo
 /// every write. Returns when the outcome is in, or when inotify is not
 /// available (the state is then reported when the agent next starts).
 pub async fn watch_until_done(handle: Arc<Handle>) {
-    use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
     let Some(dir) = handle.path().parent().map(Path::to_path_buf) else {
         return;
     };
+    watch_file(dir, "state.json", move |written| {
+        let Some(state) = handle.reload() else {
+            return false;
+        };
+        if written {
+            info!(phase = ?state.phase, outcome = ?state.outcome, "upgrade: the helper wrote its state");
+        }
+        state.phase == Phase::Done
+    })
+    .await;
+}
+
+/// Watch `dir` for writes of the file `name` (inotify, no polling) until
+/// `done` says so. `done` re-reads the file and answers whether its record
+/// has ended; it is asked once before the first event (`false`), since the
+/// writer may have finished before the watch began, then at every write
+/// (`true`). Returns when `done` answers true, or when the directory cannot
+/// be watched.
+pub async fn watch_file(
+    dir: std::path::PathBuf,
+    name: &'static str,
+    mut done: impl FnMut(bool) -> bool + Send,
+) {
+    use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
     let inotify = match Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC) {
         Ok(i) => i,
         Err(e) => {
@@ -101,8 +124,8 @@ pub async fn watch_until_done(handle: Arc<Handle>) {
             return;
         }
     };
-    // The helper may have finished between reconcile and the watch.
-    if handle.reload().is_some_and(|s| s.phase == Phase::Done) {
+    // The writer may have finished before the watch began.
+    if done(false) {
         return;
     }
     loop {
@@ -123,14 +146,10 @@ pub async fn watch_until_done(handle: Arc<Handle>) {
             Ok(Ok(events)) => {
                 if events
                     .iter()
-                    .any(|e| e.name.as_deref().is_some_and(|n| n == "state.json"))
+                    .any(|e| e.name.as_deref().is_some_and(|n| n == name))
+                    && done(true)
                 {
-                    if let Some(state) = handle.reload() {
-                        info!(phase = ?state.phase, outcome = ?state.outcome, "upgrade: the helper wrote its state");
-                        if state.phase == Phase::Done {
-                            return;
-                        }
-                    }
+                    return;
                 }
             }
             Ok(Err(e)) => {

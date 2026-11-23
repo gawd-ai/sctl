@@ -22,6 +22,9 @@ pub fn report(state: &AppState) -> Value {
         .map(|i| i.report(&state.config.server.listen));
     json!({
         "state": upgrade,
+        // The agent's own restart (ADR-014). Its presence is how a caller
+        // knows the agent has `POST /api/restart`.
+        "restart": state.restart.current(),
         "running_version": crate::VERSION,
         "target": super::TARGET,
         "layout": state.install.as_ref().map(|i| i.layout.as_str()),
@@ -154,6 +157,28 @@ mod tests {
     use crate::infra::checks::CheckResult;
     use crate::infra::monitor::{apply_result, Reading};
     use crate::infra::{CheckSpec, Digest, InfraConfig, InfraState, InfraTarget, RecoveryConfig};
+
+    fn state_in(tag: &str) -> (std::path::PathBuf, AppState) {
+        let dir =
+            std::env::temp_dir().join(format!("sctl-upgrade-routes-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config: Config = toml::from_str("").unwrap();
+        config.server.data_dir = dir.join("data").display().to_string();
+        let gate = Arc::new(Gate::for_agent(&config, None, None));
+        (dir, AppState::for_tests(config, gate))
+    }
+
+    /// `GET /api/upgrade` carries the restart's record on an agent never
+    /// asked: its presence is how a caller knows the route is there
+    /// (ADR-014 decision 7).
+    #[test]
+    fn the_report_carries_the_restart_idle_on_an_agent_never_asked() {
+        let (dir, state) = state_in("report");
+        let report = report(&state);
+        assert_eq!(report["restart"], json!({"v": 1, "phase": "idle"}));
+        assert_eq!(report["state"]["phase"], "idle");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A managed upgrade waits for the recovery runs of the agent's own
     /// Infra state (ADR-010 decision 9): the context `POST /api/upgrade`
