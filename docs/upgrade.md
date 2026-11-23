@@ -19,6 +19,7 @@ application.
 - [What the agent does](#what-the-agent-does)
 - [The `upgrade.state` push](#the-upgradestate-push)
 - [Holds](#holds)
+- [Restarting the agent](#restarting-the-agent)
 - [The relay upgrades itself](#the-relay-upgrades-itself)
 - [A WE826 installed before 0.6.9](#a-we826-installed-before-069)
 - [By hand](#by-hand)
@@ -423,7 +424,9 @@ helper_lost` before it starts.
 ## The `upgrade.state` push
 
 Feature `upgrade.state`, offered in `tunnel.register` and advertised by a relay
-that keeps it. Sent on every connection right after the ack, and whenever the
+that keeps it. With ADR-014 the message also carries `restart`, the record of
+the agent's own restart ([below](#restarting-the-agent)): `{"v": 1, "phase":
+"idle"}` when none was asked, and sent again whenever that record changes. Sent on every connection right after the ack, and whenever the
 state changes, at most one per second. Kept by the relay per connection,
 published on `/api/tunnel/events` as `{"type": "upgrade.state", "serial", "connection_id", "received_at", "state", "replay"}`
 and replayed after `net.state` and `infra.state`.
@@ -461,6 +464,80 @@ which is how a collector tells "rolled back and the old one is talking" from
 and report `outcome: not_applied, reason: held`. The hold is the box's own last
 word; the fleet keeps its own holds (per device, location, vehicle, tenant)
 and never sends a request to a device it holds.
+
+## Restarting the agent
+
+`POST /api/restart` (ADR-014) restarts the agent with no upgrade:
+the same detached helper, the same restart command, the same health check,
+and nothing fetched, swapped or rolled back. A hold does not refuse it: a
+hold is the unit's word on changing versions.
+
+What it shares with an upgrade: `install.json` (the layout, the restart
+command with a file's override, the health URL, the loader words, the
+systemd unit); the detached start of step 6 (its own session, its output in
+a log, the loader words, `systemd-run --collect` on `systemd`); the 2 s the
+helper waits so the answer leaves; the restart command through `sh -c`; two
+healthy answers 5 s apart within 180 s; one in-flight rule, so that while
+either an upgrade or a restart is in flight the other is refused; the
+helper's lock, the reconcile at start and the watch of the record; and the
+`upgrade.state` push, which carries the restart's record as `restart`.
+
+What it does not share: the helper is the running binary started again as
+`sctl restart-apply --dir <state_dir>/upgrade/restart`, not a copy, since
+nothing is replaced. Its record is `<state_dir>/upgrade/restart.json`, its
+plan, lock and log are in `<state_dir>/upgrade/restart/`.
+
+What the agent does:
+
+1. **Refuses early**, before anything stops (`docs/http-api.md` lists the
+   codes): an upgrade or a restart in flight; a relay; no `install.json`;
+   the kill switch; a start its init would refuse (a file it needs, free
+   `/tmp` below `restart_tmp_kb` or below the helper's own image plus
+   `min_free_kb`); a `ramboot` start that would fetch a payload; and, when
+   the request asks, an attached terminal, a running job or a transfer.
+2. **Closes the gate on recovery runs** in the step that finds none in
+   progress, or refuses (`recovery_running`). From then to the stop no run
+   starts: a Down is still recorded and pushed, and its run is left to the
+   next process. A restart on request never cuts a run and never waits for
+   one.
+3. **Writes the record and answers 202**, with what the restart ends.
+4. **Ends every session and job** itself, writes the helper's plan, moves
+   the record to `restarting` and starts the helper.
+5. **The helper** waits 2 s, runs the restart command, and reads
+   `GET health_url` until a process whose `instance` is not the one that
+   accepted the request has answered twice, 5 s apart, within 180 s. The
+   tunnel is not required: the helper proves the process, and the caller
+   proves its reach by the next `net.state`, whose `boot` is new. It writes
+   `ok`, `not_restarted` (the old process still answered at the end of the
+   window) or `not_healthy`, and exits. It never reboots the unit.
+6. **The new agent** reads the record at start, as it reads an upgrade's
+   state, and writes its own `boot` into it as `boot_after`.
+
+What the restart command does per layout, and what starts the agent again
+if the new process exits:
+
+| Layout | The command | The init's kill switch | Started again by |
+|---|---|---|---|
+| `usr-bin` | `/etc/init.d/sctl restart`: procd stops the instance and registers it again | none | procd, 5 s later; procd stops trying after ten quick exits, each within an hour of its start, and after that nothing does |
+| `gz-tmp` | the same; the init checks the kill switch where it has one, the config, the payloads and free `/tmp`, removes `/tmp/sctl`, expands the payloads and registers the instance | the XE300's reads it; the RUT241's has none | procd, 10 s later, without limit. If the init returns before it registers an instance, nothing does until the next boot |
+| `ramboot` under procd | the same; the wrapper expands the cached payloads and runs the agent, through the loader where there is one | read | procd, 30 s later, without limit, each time through the wrapper |
+| `ramboot` with no procd | the init's own `stop` and `start` of its supervisor loop | read, at start and at every respawn | the init's loop, 10 s later, until the kill switch exists |
+| `systemd` | `systemctl restart <unit>`, from a transient unit | none | systemd, 5 s later, on a failed exit only; a unit with a start limit stays failed once it is reached |
+
+**The second run on `gz-tmp`.** There, and only there, when nothing at all
+answers within the first window, the helper runs the restart command once
+more and waits one more window. It is never quiet: the record's `attempts`
+is 2, its `detail` says the first run started nothing, the helper's log
+holds a warning, and the agent that reads the outcome logs it at warn. A
+caller treats it as a defect to chase, not as a success. The `gz-tmp` inits
+in `devices/` remove the cause for a unit installed with them: their
+`restart` runs the start's checks before it stops the running agent, and
+leaves it running when one fails. A unit already installed keeps the init
+it has, since a managed upgrade runs no install script.
+
+The restart does not count against a crash loop: the init's `restart` and
+`systemctl restart` start a fresh instance with no respawn history, and
+`sctl supervise` exits on the signal and starts with an empty history.
 
 ## The relay upgrades itself
 

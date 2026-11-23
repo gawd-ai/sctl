@@ -981,6 +981,10 @@ async fn run_server(config_path: Option<&str>, skip_lock: bool) {
                 .post(sctl::upgrade::routes::post_upgrade)
                 .delete(sctl::upgrade::routes::delete_upgrade),
         )
+        .route(
+            "/api/restart",
+            post(sctl::upgrade::restart_route::post_restart),
+        )
         .layer(middleware::from_fn(sctl::auth::require_api_key));
 
     let ws_route = Router::new().route("/api/ws", get(ws::ws_upgrade));

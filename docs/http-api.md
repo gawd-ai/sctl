@@ -96,6 +96,7 @@ Response `200`:
 {
   "status": "ok",
   "uptime_secs": 12345,
+  "instance": "<32 hex characters>",
   "version": "0.6.12",
   "target": "mips_24kc",
   "layout": "gz-tmp",
@@ -108,6 +109,13 @@ Response `200`:
 }
 ```
 
+- `instance` (ADR-014): an opaque random value made when this process
+  started. It is not a time and not a counter, and it is derived from
+  nothing on the unit: two answers that carry the same value came from one
+  process, and that is all it says. The helper of a
+  [restart on request](#post-apirestart) tells the new process from the old
+  one by it. It is not the `boot` that `net.state` and `infra.state` carry,
+  which is the start time and stays behind the key.
 - `target`, `layout` and `upgrade`: the compile target, the install layout
   (`null` without `install.json`) and the current `upgrade.state` body
   (`docs/upgrade.md`).
@@ -1402,16 +1410,108 @@ does not parse).
 
 ### `GET /api/upgrade`
 
-Where the device stands. Response `200`: `{state, running_version, target,
-layout, install, install_error, hold}`. `state` is the `upgrade.state` body
-(`phase`, `outcome`, `reason`, `from_version`, `to_version`, `log_tail`, ...);
-`install` is `install.json` with the layout's defaults applied; `layout` is
-`null` on a device installed before 0.6.7.
+Where the device stands. Response `200`: `{state, restart, running_version,
+target, layout, install, install_error, hold}`. `state` is the
+`upgrade.state` body (`phase`, `outcome`, `reason`, `from_version`,
+`to_version`, `log_tail`, ...); `install` is `install.json` with the
+layout's defaults applied; `layout` is `null` on a device installed before
+0.6.7.
+
+`restart` (ADR-014) is the record of the agent's last
+[restart on request](#post-apirestart), `{"v": 1, "phase": "idle"}` when
+none was ever asked. Its presence is how a caller knows the agent has the
+route: an agent whose answer has no `restart` is never asked.
 
 ### `DELETE /api/upgrade`
 
 Clear a finished state (for a person at the box; the fleet does not need
 it). Response `200`: as `GET`. Error: `409` `UPGRADE_IN_FLIGHT`.
+
+### `POST /api/restart`
+
+Ask the agent to restart itself (ADR-014). The agent restarts as a managed
+upgrade does, less everything an upgrade moves: a detached helper runs the
+install's restart command and proves the process that comes back. A caller
+sends no shell text and needs no knowledge of the unit's layout. The unit
+does not reboot, its modem and its routes are not touched, and no
+configuration changes. `docs/upgrade.md` has the whole of it.
+**Auth: API key Bearer.** Reachable through the relay like any device route.
+
+Body, both keys optional (an empty body is a request with neither):
+
+```json
+{"request_id": "r-41", "unless": ["sessions", "jobs", "transfers"]}
+```
+
+- `request_id`: the caller's name for this restart, at most 128 bytes,
+  echoed in the record.
+- `unless`: the kinds of work that refuse the restart while they run,
+  decided by the agent at the instant it accepts: `sessions` (a terminal
+  with a client attached), `jobs` (a running job), `transfers` (a file
+  transfer in flight). Without it the restart is accepted and the answer
+  says what it ends.
+
+Response `202`, sent before anything stops:
+
+```json
+{"accepted": true,
+ "restart": {"v": 1, "phase": "accepted", "request_id": "r-41",
+             "boot_before": 1790000000000, "instance_before": "<32 hex characters>",
+             "accepted_at": "2026-11-22T15:02:11Z"},
+ "window_secs": 180,
+ "second_run": false,
+ "safe_mode": false,
+ "ends": {"sessions": 2, "attached": 1, "jobs": ["pb:outlet-cycle"], "transfers": 0}}
+```
+
+- A caller behind a proxy that turns every success into `200` reads
+  `accepted`, never the status.
+- `ends`: what the restart ends. `sessions` counts the running terminals,
+  `attached` those with a client attached, `jobs` names the running jobs
+  (at most 16, each cut to 64 bytes), `transfers` counts the file
+  transfers in flight. After the answer the agent ends every session and
+  job itself, before its helper is started. A `POST /api/exec` in flight
+  is not listed: the agent keeps no list of them.
+- `window_secs`: how long the helper waits for the new process. On
+  `gz-tmp`, `second_run` is true: when nothing answers within the window
+  the helper runs the restart command once more and waits one more window.
+- `safe_mode`: whether the safe-mode flag is present now, in which case the
+  next process starts in safe mode again. The route does not clear it.
+
+Errors, each before anything stops. `409` `UPGRADE_IN_FLIGHT` (an upgrade
+is staging or its helper has the unit; `detail.state`), `409`
+`RESTART_IN_FLIGHT` (a restart is accepted or its helper is still
+watching; `detail.restart` is its record), `400` `RESTART_BAD_REQUEST` (a
+body that is not a request, a `request_id` over 128 bytes, an unknown word
+in `unless`), `422` `RESTART_REFUSED` with `detail.reason` one of:
+
+| `detail.reason` | When |
+|---|---|
+| `no_install_json` | The agent does not know how it is started. |
+| `disabled` | The kill switch, `/etc/sctl/disabled`, exists: an agent stopped now would not start again. |
+| `loader_unknown` | A `ramboot` unit runs its agent under a loader `install.json` does not name (`helper_prefix`): the helper cannot be started. |
+| `start_unreadable` | A file the init needs to start is missing or unreadable: the agent's config, a `gz-tmp` payload, the ramboot wrapper or `ramboot.conf`. |
+| `cache_invalid` | `ramboot`: a payload is not in the cache as `ramboot.conf` names it, so the start would download it over the uplink. |
+| `no_space` | A layout that runs from `/tmp`: less free space there than the install record's `restart_tmp_kb`, or than the helper's own image plus `min_free_kb`. |
+| `relay` | The agent is a relay. |
+| `recovery_running` | An Infra recovery run is in progress. The route does not wait for it. From the accept to the stop no run starts: a Down is still recorded and pushed, and its run is left to the next process. |
+| `sessions_open`, `jobs_running`, `transfers_running` | `unless` named that kind and it is running; `detail.ends` says what. |
+
+**The record.** `GET /api/upgrade`'s `restart`, and the same key in every
+[`upgrade.state`](#upgradestate-where-the-devices-upgrade-stands) push:
+
+| Key | Meaning |
+|---|---|
+| `phase` | `idle`, `accepted` (answered; the agent is ending what the restart ends), `restarting` (the helper has the unit), `done`. |
+| `outcome` | `ok`: a new process answered health twice. `not_restarted`: the process that accepted the request still answered at the end of the window. `not_healthy`: no new process answered twice within the window. `not_started`: the helper never ran. |
+| `detail` | One line for a person, beside `outcome`. |
+| `attempts` | How many times the helper ran the restart command. 2 means the first run started nothing: a defect to chase, which the agent also logs at warn. |
+| `request_id` | The caller's. |
+| `boot_before`, `boot_after` | The `boot` of the process that accepted the request, and of the process the helper proved (written by that process). A caller ties the next `net.state` or `infra.state` to the request by them. |
+| `instance_before`, `instance_after` | The same two processes by `GET /api/health`'s `instance`, which is what the helper reads. |
+| `accepted_at`, `ended_at`, `log_tail` | When, and the last kibibyte of the helper's log. |
+
+A key with nothing to say is left out.
 
 ---
 

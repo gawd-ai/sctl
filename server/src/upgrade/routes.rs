@@ -97,12 +97,20 @@ pub async fn post_upgrade(
         }
     }
     let Ok(_guard) = state.upgrade.in_flight.try_lock() else {
+        // A restart on request holds the same lock (ADR-014): one in flight
+        // at a time, across both.
+        if state.restart.current().in_flight() {
+            return Err(super::restart_route::in_flight(&state));
+        }
         return Err(
             ApiError::new("UPGRADE_IN_FLIGHT", "an upgrade is being staged")
                 .with_detail(json!({"state": state.upgrade.current()}))
                 .into_response_with(StatusCode::CONFLICT),
         );
     };
+    if super::restart_route::restart_in_flight(&state) {
+        return Err(super::restart_route::in_flight(&state));
+    }
     let current = state.upgrade.current();
     if current.in_flight() {
         // The helper may still be at it; when its lock is free it is gone

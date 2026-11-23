@@ -14,6 +14,7 @@ reference both device routes and the tunnel relay share.
 - [Comms provider codes](#comms-provider-codes)
 - [STP transfer codes](#stp-transfer-codes)
 - [Net tool refusals](#net-tool-refusals)
+- [Restart refusals](#restart-refusals)
 - [Relay-only codes](#relay-only-codes)
 
 ## The unified shape
@@ -183,6 +184,35 @@ retry as it stands. The guide's "Network tools" says what each means.
 | `no_answer` | Nothing answered `--expect-mac`'s ARP request |
 | `config_unreadable` | The agent's config could not be read or parsed |
 | `guard_failed` | The tool could not read the routes, ask the wire or bind |
+
+## Restart refusals
+
+`POST /api/restart` (ADR-014) refuses before anything stops, in the unified
+shape. `docs/http-api.md` says when each applies.
+
+| `code` | HTTP | Meaning |
+|--------|------|---------|
+| `RESTART_BAD_REQUEST` | 400 | The body is not a restart request, `request_id` is over 128 bytes, or `unless` holds an unknown word |
+| `RESTART_IN_FLIGHT` | 409 | A restart is accepted or its helper is still watching; `detail.restart` is its record. `POST /api/upgrade` answers it too while a restart is in flight |
+| `UPGRADE_IN_FLIGHT` | 409 | An upgrade is in progress; `detail.state` says which |
+| `RESTART_REFUSED` | 422 | The restart would strand the agent or cut something; `detail.reason` says why |
+
+`detail.reason` of `RESTART_REFUSED`:
+
+| `reason` | Meaning |
+|----------|---------|
+| `no_install_json` | No `install.json`: the agent does not know how it is started |
+| `disabled` | The kill switch (`/etc/sctl/disabled`) exists |
+| `loader_unknown` | A `ramboot` unit runs its agent under a loader `install.json` does not name |
+| `start_unreadable` | A file the init needs to start is missing or unreadable |
+| `cache_invalid` | `ramboot`: the start would download a payload |
+| `no_space` | Too little free `/tmp` for the init to start the agent again |
+| `relay` | The agent is a relay |
+| `recovery_running` | An Infra recovery run is in progress |
+| `sessions_open`, `jobs_running`, `transfers_running` | The request's `unless` named that kind, and it is running; `detail.ends` says what |
+
+None is worth a retry as it stands but `recovery_running` and the two
+in-flight codes, which pass by themselves.
 
 ## Relay-only codes
 

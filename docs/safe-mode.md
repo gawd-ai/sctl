@@ -114,10 +114,13 @@ start. So after `DELETE`:
 
 - With an init system: `systemctl restart sctl` / `/etc/init.d/sctl
   restart`.
-- Remotely with no SSH: restart through sctl itself (e.g. `POST /api/exec`
-  with a detached restart — see the operational notes on restarting sctl
-  over its own tunnel), or wait for a natural power cycle; RAM-boot devices
-  come up fresh on every boot.
+- Remotely with no SSH: `POST /api/restart` (ADR-014, `docs/http-api.md`).
+  The agent restarts itself through a detached helper and reports the
+  process that comes back; its answer's `safe_mode` says whether the flag
+  is still present, in which case the next process starts in safe mode
+  again. An agent that has no such route (its `GET /api/upgrade` carries no
+  `restart`) waits for a power cycle; RAM-boot devices come up fresh on
+  every boot.
 
 A single deliberate restart does not re-trigger safe mode — the supervisor
 needs 3 crashes inside 180 s.

@@ -22,6 +22,7 @@
 //! - [`restart_apply`]: the restart's detached helper: run the install's
 //!   restart command, wait for a new process, write the outcome.
 //! - [`routes`]: `POST/GET/DELETE /api/upgrade`.
+//! - [`restart_route`]: `POST /api/restart`.
 
 pub mod apply;
 pub mod cli_name;
@@ -32,6 +33,7 @@ pub mod manifest;
 pub mod restart;
 pub mod restart_apply;
 pub mod restart_checks;
+pub mod restart_route;
 pub mod routes;
 pub mod stage;
 pub mod state;
