@@ -64,6 +64,7 @@ curl -H "Authorization: Bearer $API_KEY" http://DEVICE:1337/api/safe_mode/flag
 
 - Not in safe mode: `{ "active": false }`
 - In safe mode: `{ "active": true, "flag": { "since_unix": ..., "reason": ..., "consecutive_crashes": ... } }`
+- Something at the flag's name that cannot be read as the flag (a FIFO or a device, content that is not JSON, a link to nothing): `{ "active": true, "flag": null, "reason": "..." }`. It is never "not in safe mode": only an absent flag is.
 
 Remotely, through the relay's generic passthrough (new in 0.6.0 — this is
 the designed recovery path for crash-looping CGNAT devices):

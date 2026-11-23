@@ -187,7 +187,8 @@ Response `200` — an object containing only the requested groups:
 
 - `core` — `serial`, `hostname`, `kernel`, `system_uptime_secs`,
   `cpu_model`, `load_average`, `memory` (`total_bytes`, `available_bytes`,
-  `used_bytes`), `safe_mode` (`{active, flag?}`).
+  `used_bytes`), `safe_mode` (`{active, flag?, reason?}`, as
+  [`GET /api/safe_mode/flag`](#get-apisafe_modeflag) answers it).
 - `interfaces` — array of network interfaces: `name`, `state`, `mac`, `addresses`
   (IP addresses unless `include_interface_addresses_in_info` is off), `master`
   (the bridge the interface is a port of, read from sysfs; `null` otherwise) and
@@ -1261,10 +1262,14 @@ plane (HTTP + tunnel + sessions) live.
 
 Inspect the flag. **Auth: API key Bearer.**
 
-Response `200`: `{active: false}` or `{active: true, flag: {since_unix,
-reason, consecutive_crashes}}`.
-
-Errors: `500` (plain status) if the flag exists but cannot be read.
+Response `200`: `{active: false}` when nothing is at the flag's name;
+`{active: true, flag: {since_unix, reason, consecutive_crashes}}` for the
+supervisor's flag; and `{active: true, flag: null, reason: "..."}` for
+anything else at the name: a FIFO or a device (never opened), content that
+is not JSON, a link to nothing, a name that cannot be looked at. `reason`
+says which. A unit in safe mode whose flag cannot be read never reads as a
+unit out of safe mode; before 0.6.14 an unreadable flag was a `500`.
+`GET /api/info`'s `safe_mode` is the same object.
 
 ### `DELETE /api/safe_mode/flag`
 

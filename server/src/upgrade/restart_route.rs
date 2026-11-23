@@ -301,7 +301,7 @@ pub async fn accept(state: &AppState, body: &[u8], deps: Deps) -> Result<Accepte
         // On gz-tmp the helper may run the command a second time and wait
         // a second window (ADR-014 decision 5).
         "second_run": second_run,
-        "safe_mode": Path::new(&state.config.server.data_dir).join("safe_mode.flag").exists(),
+        "safe_mode": crate::routes::safe_mode::active(Path::new(&state.config.server.data_dir)),
         "ends": ends,
     });
     drop(guard);
