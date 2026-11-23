@@ -786,7 +786,12 @@ API key Bearer.**
 Response `200`: `{ok: true, name, path}`.
 
 The document is written beside the playbook's name and renamed over it, so
-a reader never sees half of one and the name itself is never opened.
+a reader never sees half of one and the name itself is never opened. The
+file it is written to is the request's own: created new and exclusive,
+under a name no other request has, never through a link, and removed when
+the write fails. A replaced playbook keeps its mode; a new one takes the
+default. A playbook that was a symbolic link is replaced by a regular
+file: what the link named is not written.
 
 Errors: `400` `INVALID_CONTENT` (does not parse), `400`
 `NOT_A_REGULAR_FILE` (a FIFO, a socket or a device is at the playbook's

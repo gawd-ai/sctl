@@ -310,7 +310,57 @@ pub async fn get_playbook(
     })))
 }
 
+/// Write `document` to a new file beside `target` and rename it over
+/// `target`.
+///
+/// The file is this request's own: created new and exclusive (`O_EXCL`),
+/// never through a link (`O_NOFOLLOW`), under a name no other request has.
+/// A fixed name was opened plainly, so a FIFO placed there held the write,
+/// a link placed there was written through, and two writes of one playbook
+/// shared it. It takes the mode of the regular file it replaces, and the
+/// default for a new playbook. It is removed on every failure. A rename
+/// replaces the name itself, so a playbook that was a link becomes a
+/// regular file, its target left as it was.
+fn write_beside_and_rename(
+    dir: &std::path::Path,
+    target: &std::path::Path,
+    document: &str,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mode = std::fs::symlink_metadata(target)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .map(|m| m.permissions().mode() & 0o7777);
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let beside = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&beside)?;
+    let written = (|| {
+        file.write_all(document.as_bytes())?;
+        if let Some(mode) = mode {
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+        file.sync_all()?;
+        std::fs::rename(&beside, target)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&beside);
+    }
+    written
+}
+
 /// `PUT /api/playbooks/:name` -- create or update a playbook.
+///
+/// A playbook is replaced whole: the document is written to a file of its
+/// own and renamed over the name. A playbook that was a symbolic link is
+/// replaced by a regular file; what the link named is not written.
 pub async fn put_playbook(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -358,20 +408,22 @@ pub async fn put_playbook(
         .map_err(|e| Refusal::Io(std::io::Error::other(e)))
         .and_then(|judged| judged)
         .map_err(|refusal| playbook_refused(&refusal, "write"))?;
-    // Written beside the name and renamed over it: the name itself is never
-    // opened, so whatever takes its place after the judgment holds nothing.
-    let beside = format!("{dir}/.{name}.md.tmp");
-    let written = match tokio::fs::write(&beside, &body).await {
-        Ok(()) => tokio::fs::rename(&beside, &file_path).await,
-        Err(e) => Err(e),
-    };
-    if let Err(e) = written {
-        let _ = tokio::fs::remove_file(&beside).await;
-        return Err(
+    // Written to a file of this request's own beside the name, and renamed
+    // over it: the name itself is never opened, so whatever takes its place
+    // after the judgment holds nothing.
+    let (dir_path, target, document) = (
+        std::path::PathBuf::from(dir),
+        std::path::PathBuf::from(&file_path),
+        body,
+    );
+    tokio::task::spawn_blocking(move || write_beside_and_rename(&dir_path, &target, &document))
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|written| written)
+        .map_err(|e| {
             ApiError::new(codes::IO_ERROR, format!("Failed to write playbook: {e}"))
-                .into_response_with(StatusCode::INTERNAL_SERVER_ERROR),
-        );
-    }
+                .into_response_with(StatusCode::INTERNAL_SERVER_ERROR)
+        })?;
 
     state
         .activity_log
@@ -574,6 +626,154 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(left.len(), 2, "{left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The file a write goes through is new, exclusive and named for the
+    /// request alone. A fixed name was opened plainly: a FIFO placed there
+    /// held the write, and a link placed there was written through.
+    #[tokio::test]
+    async fn a_write_goes_through_a_file_of_its_own_whatever_sits_at_a_guessable_name() {
+        let (dir, state) = bench("temp");
+        let playbooks = dir.join("playbooks");
+        let put = |body: String| {
+            put_playbook(
+                State(state.clone()),
+                Path("outlet-cycle".to_string()),
+                HeaderMap::new(),
+                body,
+            )
+        };
+        // A FIFO at the name the write used to go through.
+        let fifo = playbooks.join(".outlet-cycle.md.tmp");
+        mkfifo(&fifo);
+        let Json(written) = at_once(&fifo, put(PLAYBOOK.to_string()))
+            .await
+            .expect("written beside the FIFO, not through it");
+        assert_eq!(written["ok"], true);
+        assert_eq!(
+            std::fs::read_to_string(playbooks.join("outlet-cycle.md")).unwrap(),
+            PLAYBOOK
+        );
+        std::fs::remove_file(&fifo).unwrap();
+
+        // A link there, to a file that is not a playbook: not written through.
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, &fifo).unwrap();
+        let again = PLAYBOOK.replace("echo cycle", "echo again");
+        let _ = put(again.clone()).await.expect("written");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+        assert_eq!(
+            std::fs::read_to_string(playbooks.join("outlet-cycle.md")).unwrap(),
+            again
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A replaced playbook keeps its mode, a new one takes the default, and
+    /// a playbook that was a link is replaced by a regular file, the link's
+    /// target left as it was.
+    #[tokio::test]
+    async fn a_replaced_playbook_keeps_its_mode_and_a_link_becomes_a_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, state) = bench("mode");
+        let playbooks = dir.join("playbooks");
+        let put = |name: &str, body: String| {
+            put_playbook(
+                State(state.clone()),
+                Path(name.to_string()),
+                HeaderMap::new(),
+                body,
+            )
+        };
+        let mode = |path: &FsPath| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+
+        let file = playbooks.join("outlet-cycle.md");
+        std::fs::write(&file, PLAYBOOK).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let again = PLAYBOOK.replace("echo cycle", "echo again");
+        let _ = put("outlet-cycle", again.clone()).await.expect("replaced");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), again);
+        assert_eq!(mode(&file), 0o600, "the mode of the file it replaced");
+
+        // A new one: the mode any new file gets here.
+        let probe = dir.join("probe");
+        std::fs::write(&probe, "").unwrap();
+        let fresh = PLAYBOOK.replace("outlet-cycle", "fresh");
+        let _ = put("fresh", fresh).await.expect("written");
+        assert_eq!(mode(&playbooks.join("fresh.md")), mode(&probe));
+
+        // A playbook that is a link to a regular file elsewhere.
+        let elsewhere = dir.join("elsewhere.md");
+        let linked = PLAYBOOK.replace("outlet-cycle", "linked");
+        std::fs::write(&elsewhere, &linked).unwrap();
+        let link = playbooks.join("linked.md");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        let replaced = linked.replace("echo cycle", "echo replaced");
+        let _ = put("linked", replaced.clone()).await.expect("replaced");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "a regular file where the link was"
+        );
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), replaced);
+        assert_eq!(
+            std::fs::read_to_string(&elsewhere).unwrap(),
+            linked,
+            "its target is left"
+        );
+
+        // Nothing is left beside any of them.
+        let left: Vec<_> = std::fs::read_dir(&playbooks)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with('.'))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two writes of one name at once share nothing: both are answered,
+    /// and the playbook is one of the two, whole.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_writes_of_one_name_at_once_leave_one_whole_playbook() {
+        let (dir, state) = bench("two");
+        let playbooks = dir.join("playbooks");
+        let bodies: Vec<String> = (0..8)
+            .map(|n| PLAYBOOK.replace("echo cycle", &format!("echo {}", "x".repeat(4000 + n))))
+            .collect();
+        for _ in 0..10 {
+            let writes: Vec<_> = bodies
+                .iter()
+                .cloned()
+                .map(|body| {
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        put_playbook(
+                            State(state),
+                            Path("outlet-cycle".to_string()),
+                            HeaderMap::new(),
+                            body,
+                        )
+                        .await
+                        .is_ok()
+                    })
+                })
+                .collect();
+            for write in writes {
+                assert!(write.await.unwrap(), "each write is answered");
+            }
+            let on_disk = std::fs::read_to_string(playbooks.join("outlet-cycle.md")).unwrap();
+            assert!(bodies.contains(&on_disk), "one of them, whole");
+            assert_eq!(
+                std::fs::read_dir(&playbooks).unwrap().count(),
+                1,
+                "nothing beside it"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
