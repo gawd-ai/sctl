@@ -12,6 +12,8 @@ The RUT241 has a very small writable overlay, so this deployment stores compress
 /tmp/sctl/lib/*.so            runtime expanded comms plugin
 ```
 
+The init checks before it stops: `/etc/init.d/sctl restart` runs the checks of a start first (the config, both payloads, 8192 KB of free `/tmp`) and stops the running agent only when they pass; otherwise it says why and leaves the agent running. It has no kill switch. `install.sh` writes that threshold into `install.json` as `restart_tmp_kb`, which is what the agent asks for before it accepts `POST /api/restart` (`docs/upgrade.md`).
+
 Known target:
 
 ```text

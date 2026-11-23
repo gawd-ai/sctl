@@ -17,6 +17,9 @@ under per-component headings. `server/CHANGELOG.md` is frozen.
 - **`GET /api/health` gains `instance`**, an opaque random value made when the process starts, by which the restart's helper tells two processes apart on the route that needs no key.
 - **`install.json` gains the optional `restart_tmp_kb`**: the free `/tmp` the device's own init asks for before it starts the agent. Where a `gz-tmp` record gives none the agent takes 16384.
 
+### devices
+- **A `gz-tmp` init checks before it stops** (ADR-014, TRD-10). `/etc/init.d/sctl restart` on the XE300 and on a RUT241 installed as `gz-tmp` runs the checks of a start first (the kill switch on the XE300, the config, both payloads, free `/tmp`) and stops the running agent only when they pass; otherwise it says why and leaves the agent running. `rc.common`'s own `restart` stopped first, and with `/tmp` short of room nothing started the agent again before the next boot. The install scripts write the threshold their init demands into `install.json` as `restart_tmp_kb` (16384 on the XE300, 8192 on the RUT241). An init reaches a unit when its install script runs, never by a managed upgrade.
+
 ## [0.6.13] - 2026-11-19
 
 ### File reads

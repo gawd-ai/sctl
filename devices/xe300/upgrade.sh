@@ -126,7 +126,7 @@ mv -f "$PAYLOAD_DIR/.$SERVER.new" "$PAYLOAD_DIR/$SERVER" &&
     mv -f "$PAYLOAD_DIR/.$PLUGIN.new" "$PAYLOAD_DIR/$PLUGIN" &&
     mv -f "$CONFIG.new" "$CONFIG" || rollback
 # The install layout (docs/upgrade.md): from here on the agent upgrades itself.
-printf '{"v":1,"layout":"gz-tmp","target":"mips_24kc"}\n' > /etc/sctl/install.json
+printf '{"v":1,"layout":"gz-tmp","target":"mips_24kc","restart_tmp_kb":16384}\n' > /etc/sctl/install.json
 if [ "$OWN" = 1 ]; then
     sh "$STAGE/relay-route.sh" adopt "$BACKUP" || rollback
     # Loose rp_filter, now and in /etc/sysctl.conf, lets the answer to the

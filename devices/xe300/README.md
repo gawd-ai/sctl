@@ -53,6 +53,14 @@ WE826 they do not, which is why a field failure there leaves no forensic trail.
 
 `touch /etc/sctl/disabled` keeps the agent down across reboots for field triage.
 
+The init checks before it stops. `/etc/init.d/sctl restart` runs the checks of
+a start first (the kill switch, the config, both payloads, 16384 KB of free
+`/tmp`) and stops the running agent only when they pass; otherwise it says why
+and leaves the agent running. So with the kill switch in place, stop the agent
+with `/etc/init.d/sctl stop`. `install.sh` and `upgrade.sh` write that
+threshold into `install.json` as `restart_tmp_kb`, which is what the agent asks
+for before it accepts `POST /api/restart` (`docs/upgrade.md`).
+
 ### The relay route
 
 `install.sh` writes `relay_route = "follow_default"` into `[tunnel]` (`RELAY_ROUTE`,

@@ -8,6 +8,8 @@ PAYLOAD_DIR=/usr/local/lib/sctl
 RUN_DIR=/tmp/sctl
 BIN=$RUN_DIR/sctl-server
 PLUGIN=$RUN_DIR/lib/libsctl_comms_quectel.so
+SERVER_PAYLOAD=$PAYLOAD_DIR/sctl-server-mipsel_24kc.gz
+PLUGIN_PAYLOAD=$PAYLOAD_DIR/sctl-comms-quectel-mipsel_24kc.so.gz
 CONFIG=/etc/sctl/sctl.toml
 MIN_TMP_KB=8192
 
@@ -28,15 +30,25 @@ extract_payload() {
     mv -f "$dst.tmp" "$dst"
 }
 
-start_service() {
+# What must hold before the agent is started: the config, both payloads and
+# room in /tmp. `restart` asks before it stops the running agent, so a check
+# that fails leaves the agent running instead of stopping one that would not
+# start again.
+start_checks() {
     [ -r "$CONFIG" ] || { echo "sctl: missing config $CONFIG" >&2; return 1; }
+    [ -r "$SERVER_PAYLOAD" ] || { echo "sctl: missing payload $SERVER_PAYLOAD" >&2; return 1; }
+    [ -r "$PLUGIN_PAYLOAD" ] || { echo "sctl: missing payload $PLUGIN_PAYLOAD" >&2; return 1; }
     check_tmp_space || return 1
+}
+
+start_service() {
+    start_checks || return 1
 
     rm -rf "$RUN_DIR"
     mkdir -p "$RUN_DIR/lib" "$RUN_DIR/data"
 
-    extract_payload "$PAYLOAD_DIR/sctl-server-mipsel_24kc.gz" "$BIN" || return 1
-    extract_payload "$PAYLOAD_DIR/sctl-comms-quectel-mipsel_24kc.so.gz" "$PLUGIN" || return 1
+    extract_payload "$SERVER_PAYLOAD" "$BIN" || return 1
+    extract_payload "$PLUGIN_PAYLOAD" "$PLUGIN" || return 1
     chmod 0755 "$BIN"
     chmod 0644 "$PLUGIN"
 
@@ -46,4 +58,18 @@ start_service() {
     procd_set_param stdout 1
     procd_set_param stderr 1
     procd_close_instance
+}
+
+# rc.common leaves `restart` to the script. Its own is `stop` then `start`,
+# which stops the agent before `start_service` has checked anything: with
+# /tmp short of room, the agent was stopped and nothing started it again
+# until the next boot. Ask first.
+restart() {
+    start_checks || {
+        echo "sctl: not restarted: the running agent is left as it is" >&2
+        return 1
+    }
+    trap '' TERM
+    stop "$@"
+    start "$@"
 }
