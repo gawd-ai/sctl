@@ -527,6 +527,8 @@ pub fn main(dir: &str) -> i32 {
     match state.outcome {
         Some(Outcome::Ok) => 0,
         Some(Outcome::NotRestarted) => 1,
+        // `not_healthy`; the helper writes neither `not_started` nor
+        // `interrupted`.
         _ => 2,
     }
 }

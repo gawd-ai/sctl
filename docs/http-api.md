@@ -1508,7 +1508,7 @@ in `unless`), `422` `RESTART_REFUSED` with `detail.reason` one of:
 | Key | Meaning |
 |---|---|
 | `phase` | `idle`, `accepted` (answered; the agent is ending what the restart ends), `restarting` (the helper has the unit), `done`. |
-| `outcome` | `ok`: a new process answered health twice. `not_restarted`: the last health read answered in the window was answered by the process that accepted the request, and it is not established that nothing answers. `not_healthy`: no new process answered twice within the window. `not_started`: the helper never ran. |
+| `outcome` | `ok`: a new process answered health twice. `not_restarted`: the last health read answered in the window was answered by the process that accepted the request, and it is not established that nothing answers. `not_healthy`: no new process answered twice within the window. `not_started`: the helper never ran. `interrupted`: the agent started again while the restart was in flight and its helper left no outcome, so by what it started is not known; `ok` is written only by the helper. |
 | `detail` | One line for a person, beside `outcome`. |
 | `attempts` | How many times the helper ran the restart command. 2 means the first run started nothing: a defect to chase, which the agent also logs at warn. |
 | `request_id` | The caller's. |

@@ -518,7 +518,10 @@ What the agent does:
    process's, and it is not established that nothing answers) or
    `not_healthy`, and exits. It never reboots the unit.
 6. **The new agent** reads the record at start, as it reads an upgrade's
-   state, and writes its own `boot` into it as `boot_after`.
+   state, and writes its own `boot` into it as `boot_after`. A record it
+   finds at `restarting` with no helper's lock held and no outcome it ends
+   as `interrupted`: it did start again, by what is not known (the restart
+   command, a crash, a power cut). `ok` is written only by the helper.
 7. **Neither process waits on the helper for ever.** While the helper
    works the agent looks at the record once a second. A helper found gone
    without an outcome (its lock free 15 s or more after its start), or

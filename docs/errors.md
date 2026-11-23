@@ -214,6 +214,17 @@ shape. `docs/http-api.md` says when each applies.
 None is worth a retry as it stands but `recovery_running` and the two
 in-flight codes, which pass by themselves.
 
+An accepted restart ends with an `outcome` in its record (`GET
+/api/upgrade`'s `restart`), not with an error:
+
+| `outcome` | Meaning |
+|-----------|---------|
+| `ok` | A new process answered health twice. Written only by the helper |
+| `not_restarted` | The process that accepted the request still answers: the restart command did not stop it, or its helper was lost |
+| `not_healthy` | No new process answered twice within the window, or the helper reached its hard limit |
+| `not_started` | The helper never ran |
+| `interrupted` | The agent started again while the restart was in flight and its helper left no outcome: by what it started is not known |
+
 ## Relay-only codes
 
 Produced by the tunnel relay (`server/src/tunnel/relay.rs`) — you only see

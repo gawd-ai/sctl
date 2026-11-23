@@ -52,6 +52,12 @@ pub enum Outcome {
     NotHealthy,
     /// The helper never ran.
     NotStarted,
+    /// The agent started again while the restart was in flight, and its
+    /// helper left no outcome: by what it started is not known (the restart
+    /// command, a crash, a power cut). Written by the process that started;
+    /// `ok` is written only by the helper, which read the new process's
+    /// health.
+    Interrupted,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's `skip_serializing_if` passes a reference.
@@ -511,6 +517,11 @@ impl Timing {
 pub const HELPER_LOST: &str =
     "helper lost: it ended, or ran out of time, without an outcome; this process was not restarted";
 
+/// What a record says when a new process finds it in flight with no helper
+/// and no outcome.
+pub const INTERRUPTED: &str =
+    "the agent started again while this restart was in flight and its helper left no outcome: by what it started is not known";
+
 /// Settle a record whose helper is gone without an outcome, as the process
 /// `me` reads it. `None` when there is nothing to settle: no restart in
 /// flight, or a helper still at work.
@@ -532,13 +543,10 @@ fn settled_now(state: RestartState, me: &Process<'_>) -> RestartState {
     if state.instance_before.as_deref() == Some(me.instance) {
         state.finished(Outcome::NotRestarted, Some(HELPER_LOST.to_string()))
     } else {
-        let mut ok = state.finished(
-            Outcome::Ok,
-            Some("the helper did not report; a new process is running".to_string()),
-        );
-        ok.instance_after = Some(me.instance.to_string());
-        ok.boot_after = Some(me.boot);
-        ok
+        // Another process than the one that accepted the request: the agent
+        // did start again. Whether the restart did it is what only the
+        // helper could say, and it said nothing: never `ok` from here.
+        state.finished(Outcome::Interrupted, Some(INTERRUPTED.to_string()))
     }
 }
 
@@ -748,14 +756,25 @@ mod tests {
     #[test]
     fn a_lost_helper_is_settled_by_who_is_running() {
         let (dir, handle) = bench("lost");
-        // A new process: the restart happened, and the helper did not report.
+        // A new process finds the record in flight with no helper and no
+        // outcome: a crash between the record's write and the helper's
+        // start, or a power cut, leaves exactly this. The agent did start
+        // again; that the restart did it is not known, so it is never `ok`.
         handle.set(RestartState::accepted(Some("r-1".into()), &OLD).restarting());
         assert!(!reconcile(&handle, &NEW));
         let state = handle.current();
-        assert_eq!(state.outcome, Some(Outcome::Ok));
-        assert_eq!(state.instance_after.as_deref(), Some("new-instance"));
-        assert_eq!(state.boot_after, Some(NEW.boot));
-        assert!(state.detail.unwrap().contains("did not report"));
+        assert_eq!(state.outcome, Some(Outcome::Interrupted));
+        assert_eq!(state.detail.as_deref(), Some(INTERRUPTED));
+        assert_eq!(state.instance_after, None, "no process was proven");
+        assert_eq!(state.boot_after, None);
+        assert_eq!(state.request_id.as_deref(), Some("r-1"));
+        assert_eq!(
+            serde_json::to_value(&state).unwrap()["outcome"],
+            "interrupted"
+        );
+        assert_eq!(load(handle.path()), Some(state));
+        // Nor does the wait on a helper that is gone write `ok`.
+        assert!(!stamp(&handle, &NEW));
 
         // The same process: nothing restarted it, and its helper is lost.
         handle.set(RestartState::accepted(None, &OLD).restarting());
@@ -900,6 +919,36 @@ mod tests {
         assert_eq!(ended.outcome, Some(Outcome::NotRestarted));
         assert_eq!(ended.detail.as_deref(), Some(HELPER_LOST));
         assert_eq!(load(handle.path()).unwrap(), ended);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The process a restart started waits on the helper too. A helper
+    /// that goes without an outcome while it waits is not read as a
+    /// success: the record ends `interrupted`.
+    #[tokio::test]
+    async fn the_new_process_ends_a_helper_that_left_no_outcome_as_interrupted() {
+        let (dir, handle) = bench("new-lost");
+        let handle = std::sync::Arc::new(handle);
+        handle.set(RestartState::accepted(Some("r-6".into()), &OLD).restarting());
+        std::fs::create_dir_all(handle.helper_dir()).unwrap();
+        let lock = crate::upgrade::apply::take_lock(handle.helper_dir()).unwrap();
+        assert!(reconcile(&handle, &NEW), "the helper is at work");
+        let supervisor = tokio::spawn(supervise(
+            handle.clone(),
+            NEW.instance.to_string(),
+            NEW.boot,
+            QUICK,
+            std::time::Duration::from_secs(30),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The helper dies: its lock goes, and it wrote nothing.
+        drop(lock);
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), supervisor)
+            .await
+            .expect("bounded")
+            .unwrap();
+        assert_eq!(ended.outcome, Some(Outcome::Interrupted));
+        assert_eq!(ended.boot_after, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
